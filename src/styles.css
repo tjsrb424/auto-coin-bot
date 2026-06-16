@@ -45,6 +45,48 @@ input {
   border-color: #18e0c8;
 }
 
+.confirm-input-shell {
+  position: relative;
+  height: 40px;
+  overflow: hidden;
+  border: 1px solid #1d2a3d;
+  background: #101827;
+}
+
+.confirm-input-shell:focus-within {
+  border-color: #18e0c8;
+}
+
+.confirm-input-ghost {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  color: #7f91aa;
+  font-family: "Roboto Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  letter-spacing: 0;
+  opacity: 0.28;
+  white-space: nowrap;
+}
+
+.control input.confirm-input {
+  position: relative;
+  z-index: 1;
+  height: 38px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #e2e8f0;
+  font-family: "Roboto Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  letter-spacing: 0;
+  outline: none;
+}
+
 .field {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 120px;

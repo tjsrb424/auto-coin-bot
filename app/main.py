@@ -43,6 +43,7 @@ from app.database import (
     stop_latest_paper_session,
     update_live_order_log,
 )
+from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
 from app.live_broker import (
     LiveBroker,
@@ -200,6 +201,7 @@ class LiveOrderPlaceRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    load_server_env()
     init_db()
     reset_live_runtime_state()
     insert_live_mode_event("SERVER_START", current_live_mode(), "서버 시작 시 실거래 모드는 자동 잠금 상태로 초기화되었습니다.")

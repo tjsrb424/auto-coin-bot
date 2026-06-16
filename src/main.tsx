@@ -700,6 +700,35 @@ function NumberField({
   );
 }
 
+function ConfirmationField({
+  label,
+  value,
+  phrase,
+  onChange
+}: {
+  label: string;
+  value: string;
+  phrase: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="control w-full">
+      <span>{label}</span>
+      <div className="confirm-input-shell">
+        <span className="confirm-input-ghost">{phrase}</span>
+        <input
+          className="confirm-input"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          aria-label={label}
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </div>
+    </label>
+  );
+}
+
 function ChartPanel({ candles, signals }: { candles: Candle[]; signals: Signal[] }) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const chartRef = React.useRef<IChartApi | null>(null);
@@ -1528,14 +1557,12 @@ function App() {
                   <p className="text-xs text-slate-400">
                     긴급정지는 모든 실거래 주문 후보를 차단합니다. 해제해도 실거래는 자동으로 켜지지 않고 잠금 상태로 돌아갑니다.
                   </p>
-                  <label className="control w-full">
-                    <span>해제 확인 문구</span>
-                    <input
-                      value={liveEmergencyResetConfirmation}
-                      onChange={(event) => setLiveEmergencyResetConfirmation(event.target.value)}
-                      placeholder="RESET EMERGENCY"
-                    />
-                  </label>
+                  <ConfirmationField
+                    label="해제 확인 문구"
+                    value={liveEmergencyResetConfirmation}
+                    phrase="RESET EMERGENCY"
+                    onChange={setLiveEmergencyResetConfirmation}
+                  />
                   <button
                     onClick={() => void resetEmergencyStop()}
                     disabled={liveLoading || liveEmergencyResetConfirmation !== "RESET EMERGENCY"}
@@ -1557,10 +1584,12 @@ function App() {
                     />
                     <span>실주문은 손실이 발생할 수 있으며, 자동매매가 아니라 수동 소액 테스트임을 확인합니다.</span>
                   </label>
-                  <label className="control w-full">
-                    <span>확인 문구</span>
-                    <input value={liveArmConfirmation} onChange={(event) => setLiveArmConfirmation(event.target.value)} placeholder="LIVE ENABLE" />
-                  </label>
+                  <ConfirmationField
+                    label="확인 문구"
+                    value={liveArmConfirmation}
+                    phrase="LIVE ENABLE"
+                    onChange={setLiveArmConfirmation}
+                  />
                   <button
                     onClick={() => void armLiveTrading()}
                     disabled={liveLoading}
@@ -1701,10 +1730,12 @@ function App() {
                 <MetricCard label="차단 사유" value={formatRiskStatus(livePreview.blocked_reason)} tone={livePreview.allowed ? "neutral" : "red"} />
               </div>
               <div className="space-y-3 border-t border-terminal-line p-4">
-                <label className="control w-full">
-                  <span>최종 확인 문구</span>
-                  <input value={livePlaceConfirmation} onChange={(event) => setLivePlaceConfirmation(event.target.value)} placeholder="PLACE LIVE ORDER" />
-                </label>
+                <ConfirmationField
+                  label="최종 확인 문구"
+                  value={livePlaceConfirmation}
+                  phrase="PLACE LIVE ORDER"
+                  onChange={setLivePlaceConfirmation}
+                />
                 <button
                   onClick={() => void placeLiveOrder()}
                   disabled={!livePreview.allowed || livePlaceConfirmation !== "PLACE LIVE ORDER" || liveLoading}
