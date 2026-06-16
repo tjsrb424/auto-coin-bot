@@ -392,6 +392,64 @@ type AutoLivePilotStatus = {
   message?: string;
 };
 
+type LiveStrategySession = {
+  id: number;
+  exchange: string;
+  market: string;
+  candidate_strategy_id: number;
+  strategy_name: string;
+  strategy_parameters: Record<string, number>;
+  status: "READY" | "RUNNING" | "PAUSED" | "STOPPED" | "ERROR" | "EMERGENCY_STOPPED";
+  auto_enabled: boolean;
+  max_order_krw: number;
+  max_orders_per_day: number;
+  orders_created_today: number;
+  current_open_order_uuid?: string | null;
+  current_position_id?: number | null;
+  last_signal?: string | null;
+  last_signal_time_utc?: string | null;
+  last_risk_result?: string | null;
+  last_order_status?: string | null;
+  last_order_time_utc?: string | null;
+  last_processed_candle_time_utc?: string | null;
+};
+
+type LivePosition = {
+  id: number;
+  status: string;
+  entry_price: number;
+  entry_volume: number;
+  entry_amount_krw: number;
+  current_price: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  stop_loss_price: number;
+  take_profit_price: number;
+  opened_at?: string | null;
+};
+
+type LiveStrategyStatus = {
+  session?: LiveStrategySession | null;
+  position?: LivePosition | null;
+  exchange: string;
+  market: string;
+  current_mode: string;
+  live_trading_enabled: boolean;
+  live_auto_trading_enabled: boolean;
+  auto_strategy_pilot_enabled: boolean;
+  emergency_stop: boolean;
+  api_key_loaded: boolean;
+  max_order_krw: number;
+  max_orders_per_day: number;
+  max_open_position_count: number;
+  cancel_unfilled_after_seconds: number;
+  entry_price_offset_percent: number;
+  exit_enabled: boolean;
+  market_order_enabled: boolean;
+  ok?: boolean;
+  message?: string;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 const STRATEGY_LABELS: Record<Strategy, string> = {
@@ -1006,6 +1064,8 @@ function App() {
   const [autoPilot, setAutoPilot] = React.useState<AutoLivePilotStatus | null>(null);
   const [autoPilotCandidateId, setAutoPilotCandidateId] = React.useState<number | "">("");
   const [autoPilotAmount, setAutoPilotAmount] = React.useState(10000);
+  const [liveStrategy, setLiveStrategy] = React.useState<LiveStrategyStatus | null>(null);
+  const [liveStrategyCandidateId, setLiveStrategyCandidateId] = React.useState<number | "">("");
   const [liveOrderForm, setLiveOrderForm] = React.useState({
     exchange: "upbit" as Exchange,
     market: "KRW-BTC",
@@ -1024,11 +1084,13 @@ function App() {
   const [forwardLoading, setForwardLoading] = React.useState(false);
   const [liveLoading, setLiveLoading] = React.useState(false);
   const [autoPilotLoading, setAutoPilotLoading] = React.useState(false);
+  const [liveStrategyLoading, setLiveStrategyLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [paperError, setPaperError] = React.useState<string | null>(null);
   const [forwardError, setForwardError] = React.useState<string | null>(null);
   const [liveError, setLiveError] = React.useState<string | null>(null);
   const [autoPilotError, setAutoPilotError] = React.useState<string | null>(null);
+  const [liveStrategyError, setLiveStrategyError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     setSettings(strategySettings[strategy]);
@@ -1039,7 +1101,11 @@ function App() {
       const firstBtc = candidateStrategies.find((candidate) => candidate.market === "KRW-BTC") ?? candidateStrategies[0];
       setAutoPilotCandidateId(firstBtc.id);
     }
-  }, [autoPilotCandidateId, candidateStrategies]);
+    if (!liveStrategyCandidateId && candidateStrategies.length > 0) {
+      const firstBtc = candidateStrategies.find((candidate) => candidate.market === "KRW-BTC") ?? candidateStrategies[0];
+      setLiveStrategyCandidateId(firstBtc.id);
+    }
+  }, [autoPilotCandidateId, candidateStrategies, liveStrategyCandidateId]);
 
   const fetchLatestPaper = React.useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/paper-trading/live/latest`);
@@ -1150,6 +1216,13 @@ function App() {
     }
   }, []);
 
+  const fetchLiveStrategyStatus = React.useCallback(async () => {
+    const response = await fetch(`${API_BASE}/api/live-strategy-pilot/status`);
+    if (response.ok) {
+      setLiveStrategy(await response.json());
+    }
+  }, []);
+
   const startAutoPilot = React.useCallback(async () => {
     if (!autoPilotCandidateId) return;
     setAutoPilotLoading(true);
@@ -1208,6 +1281,64 @@ function App() {
     await startAutoPilot();
   }, [autoPilot?.session?.status, startAutoPilot, stopAutoPilot]);
 
+  const startLiveStrategy = React.useCallback(async () => {
+    if (!liveStrategyCandidateId) return;
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-strategy-pilot/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          candidate_strategy_id: liveStrategyCandidateId,
+          confirmation: "AUTO STRATEGY ENABLE",
+          order_confirmation: "PLACE AUTO LIVE ORDER"
+        })
+      });
+      const body = (await response.json()) as LiveStrategyStatus;
+      setLiveStrategy(body);
+      if (!body.ok) setLiveStrategyError(body.message ?? "Auto Strategy start blocked.");
+      await fetchLiveOrders();
+    } catch (err) {
+      setLiveStrategyError(err instanceof Error ? err.message : "Auto Strategy start failed.");
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [fetchLiveOrders, liveStrategyCandidateId]);
+
+  const stopLiveStrategy = React.useCallback(async () => {
+    setLiveStrategyLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-strategy-pilot/stop`, { method: "POST" });
+      if (response.ok) setLiveStrategy(await response.json());
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, []);
+
+  const cancelLiveStrategyOpenOrder = React.useCallback(async () => {
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-strategy-pilot/cancel-open-order`, { method: "POST" });
+      const body = (await response.json()) as LiveStrategyStatus;
+      setLiveStrategy(body);
+      if (!body.ok) setLiveStrategyError(body.message ?? "Cancel open Auto Strategy order failed.");
+      await fetchLiveOrders();
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [fetchLiveOrders]);
+
+  const toggleLiveStrategy = React.useCallback(async () => {
+    const status = liveStrategy?.session?.status;
+    if (status === "RUNNING" || status === "READY") {
+      await stopLiveStrategy();
+      return;
+    }
+    await startLiveStrategy();
+  }, [liveStrategy?.session?.status, startLiveStrategy, stopLiveStrategy]);
+
   React.useEffect(() => {
     setLiveOrderForm((prev) => ({ ...prev, exchange: liveExchange }));
     setLiveBalances(null);
@@ -1216,7 +1347,8 @@ function App() {
     setLiveError(null);
     void fetchLiveStatus(liveExchange);
     void fetchAutoPilotStatus();
-  }, [fetchAutoPilotStatus, fetchLiveStatus, liveExchange]);
+    void fetchLiveStrategyStatus();
+  }, [fetchAutoPilotStatus, fetchLiveStatus, fetchLiveStrategyStatus, liveExchange]);
 
   const armLiveTrading = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1548,6 +1680,7 @@ function App() {
     void fetchLiveStatus();
     void fetchLiveOrders();
     void fetchAutoPilotStatus();
+    void fetchLiveStrategyStatus();
   }, []);
 
   React.useEffect(() => {
@@ -1555,9 +1688,10 @@ function App() {
       void fetchLiveStatus(liveExchange);
       void fetchLiveOrders();
       void fetchAutoPilotStatus();
+      void fetchLiveStrategyStatus();
     }, 15000);
     return () => window.clearInterval(intervalId);
-  }, [fetchAutoPilotStatus, fetchLiveOrders, fetchLiveStatus, liveExchange]);
+  }, [fetchAutoPilotStatus, fetchLiveOrders, fetchLiveStatus, fetchLiveStrategyStatus, liveExchange]);
 
   React.useEffect(() => {
     void fetchChartCandles();
@@ -1645,6 +1779,19 @@ function App() {
     autoSession?.last_order_status === "FAILED" ? "주문 실패" :
     autoSession?.last_order_status === "BLOCKED" ? "차단/재시도 대기" :
     isAutoPilotOn ? "신호 감시 중" : "정지";
+
+  const liveStrategySession = liveStrategy?.session;
+  const liveStrategyPosition = liveStrategy?.position;
+  const liveStrategyCandidate = candidateStrategies.find((candidate) => candidate.id === liveStrategyCandidateId);
+  const isLiveStrategyOn = liveStrategySession?.status === "RUNNING" || liveStrategySession?.status === "READY";
+  const liveStrategyFlow =
+    liveStrategyPosition?.status === "OPEN" ? "OPEN_POSITION" :
+    liveStrategySession?.last_order_status === "CANCELED" ? "AUTO_CANCELED" :
+    liveStrategySession?.last_order_status === "WAITING" ? "WAITING" :
+    liveStrategySession?.last_order_status === "SUBMITTED" ? "SUBMITTED" :
+    liveStrategySession?.last_order_status === "FILLED" ? "FILLED_POSITION_CREATED" :
+    liveStrategySession?.last_order_status === "BLOCKED" ? "BLOCKED" :
+    isLiveStrategyOn ? "WATCHING" : "STOPPED";
 
   return (
     <main className="min-h-screen bg-terminal-bg text-slate-100">
@@ -1779,6 +1926,76 @@ function App() {
               {isAutoPilotOn ? "1회 테스트 중지" : "1회 테스트 주문 실행"}
             </button>
           </div>
+        </section>
+
+        <section className="border-b border-terminal-line bg-[#071016] px-4 py-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">Auto Live Strategy / Controlled Strategy Pilot</h2>
+              <p className="text-xs text-slate-500">Bithumb KRW-BTC limit BUY only. Market orders, auto sell, withdrawals, leverage are disabled.</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={() => void fetchLiveStrategyStatus()} className="inline-flex h-9 items-center gap-2 border border-terminal-cyan px-3 text-xs font-semibold text-terminal-cyan hover:bg-[#0d2d33]">Refresh Status</button>
+              <button onClick={() => void cancelLiveStrategyOpenOrder()} disabled={liveStrategyLoading || !liveStrategySession?.current_open_order_uuid} className="inline-flex h-9 items-center gap-2 border border-terminal-red px-3 text-xs font-semibold text-terminal-red hover:bg-[#331018] disabled:opacity-50">Cancel Open Order</button>
+            </div>
+          </div>
+          {liveStrategyError && <div className="mb-3 border border-terminal-red px-3 py-2 text-sm text-terminal-red">{liveStrategyError}</div>}
+          <section className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-8">
+            <MetricCard label="Exchange" value={liveStrategy?.exchange?.toUpperCase() ?? "BITHUMB"} tone="cyan" />
+            <MetricCard label="Market" value={liveStrategy?.market ?? "KRW-BTC"} />
+            <MetricCard label="Current Mode" value={liveStrategy?.current_mode ?? currentLiveMode} tone={liveStrategy?.current_mode === "AUTO_STRATEGY_RUNNING" ? "green" : liveStrategy?.current_mode === "EMERGENCY_STOPPED" ? "red" : "amber"} />
+            <MetricCard label="Strategy Status" value={liveStrategySession?.status ?? "STOPPED"} tone={liveStrategySession?.status === "RUNNING" ? "green" : liveStrategySession?.status === "ERROR" ? "red" : "amber"} />
+            <MetricCard label="Live Trading" value={liveStrategy?.live_trading_enabled ? "TRUE" : "FALSE"} tone={liveStrategy?.live_trading_enabled ? "amber" : "neutral"} />
+            <MetricCard label="Auto Trading" value={liveStrategy?.live_auto_trading_enabled ? "TRUE" : "FALSE"} tone={liveStrategy?.live_auto_trading_enabled ? "amber" : "neutral"} />
+            <MetricCard label="Strategy Env" value={liveStrategy?.auto_strategy_pilot_enabled ? "TRUE" : "FALSE"} tone={liveStrategy?.auto_strategy_pilot_enabled ? "amber" : "neutral"} />
+            <MetricCard label="Emergency Stop" value={liveStrategy?.emergency_stop ? "ACTIVE" : "INACTIVE"} tone={liveStrategy?.emergency_stop ? "red" : "green"} />
+            <MetricCard label="API Key Loaded" value={liveStrategy?.api_key_loaded ? "YES" : "NO"} tone={liveStrategy?.api_key_loaded ? "green" : "red"} />
+            <MetricCard label="Max Order KRW" value={formatKrw(liveStrategy?.max_order_krw)} tone="amber" />
+            <MetricCard label="Orders Today" value={`${liveStrategySession?.orders_created_today ?? 0}/${liveStrategy?.max_orders_per_day ?? 3}`} />
+            <MetricCard label="Open Order" value={liveStrategySession?.current_open_order_uuid ? `${liveStrategySession.current_open_order_uuid.slice(0, 8)}...` : "-"} title={liveStrategySession?.current_open_order_uuid ?? undefined} />
+            <MetricCard label="Current Position" value={liveStrategyPosition ? `${liveStrategyPosition.status} #${liveStrategyPosition.id}` : "-"} tone={liveStrategyPosition?.status === "OPEN" ? "green" : "neutral"} />
+            <MetricCard label="Last Signal" value={liveStrategySession?.last_signal ?? "-"} />
+            <MetricCard label="Last Risk Result" value={liveStrategySession?.last_risk_result ?? "-"} tone={liveStrategySession?.last_risk_result?.startsWith("BLOCKED") ? "red" : "neutral"} />
+            <MetricCard label="Last Order Status" value={liveStrategySession?.last_order_status ?? "-"} />
+            <MetricCard label="Last Candle" value={formatKstShort(liveStrategySession?.last_processed_candle_time_utc ?? undefined)} title={formatKstDateTime(liveStrategySession?.last_processed_candle_time_utc ?? undefined)} />
+            <MetricCard label="Flow" value={liveStrategyFlow} tone={liveStrategyFlow === "BLOCKED" ? "red" : liveStrategyFlow.includes("CANCELED") || liveStrategyFlow.includes("POSITION") ? "green" : "cyan"} />
+          </section>
+
+          <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+            <label className="control">
+              <span>Candidate Strategy</span>
+              <select value={liveStrategyCandidateId} onChange={(event) => setLiveStrategyCandidateId(Number(event.target.value))}>
+                <option value="">Select candidate</option>
+                {candidateStrategies.filter((candidate) => candidate.market === "KRW-BTC").map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {`${STRATEGY_BADGES[candidate.strategy]} ? ${formatTimeframe(candidate.unit)} ? ${formatDecimal(candidate.score)}pt`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              onClick={() => void toggleLiveStrategy()}
+              disabled={liveStrategyLoading || (!isLiveStrategyOn && !liveStrategyCandidate)}
+              className={`inline-flex h-10 min-w-[180px] self-end items-center justify-center border px-4 text-xs font-black disabled:cursor-not-allowed disabled:opacity-50 ${
+                isLiveStrategyOn
+                  ? "border-terminal-amber text-terminal-amber hover:bg-[#2c2412]"
+                  : "border-terminal-green bg-terminal-green text-black hover:bg-[#4ff0ad]"
+              }`}
+            >
+              {isLiveStrategyOn ? "Auto Strategy OFF" : "Auto Strategy ON"}
+            </button>
+          </div>
+
+          <section className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <MetricCard label="Position Status" value={liveStrategyPosition?.status ?? "-"} />
+            <MetricCard label="Entry Price" value={formatKrw(liveStrategyPosition?.entry_price)} />
+            <MetricCard label="Current Price" value={formatKrw(liveStrategyPosition?.current_price)} />
+            <MetricCard label="Volume" value={formatNumber(liveStrategyPosition?.entry_volume)} tone="cyan" />
+            <MetricCard label="Entry Amount" value={formatKrw(liveStrategyPosition?.entry_amount_krw)} />
+            <MetricCard label="Unrealized PnL" value={formatKrw(liveStrategyPosition?.unrealized_pnl)} tone={pnlTone(liveStrategyPosition?.unrealized_pnl ?? 0)} />
+            <MetricCard label="Stop Loss" value={formatKrw(liveStrategyPosition?.stop_loss_price)} tone="red" />
+            <MetricCard label="Take Profit" value={formatKrw(liveStrategyPosition?.take_profit_price)} tone="green" />
+          </section>
         </section>
 
         <section className="border-b border-terminal-line bg-terminal-bg px-4 py-4">

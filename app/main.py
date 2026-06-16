@@ -68,6 +68,13 @@ from app.live_broker import (
     trigger_emergency_stop,
 )
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
+from app.live_strategy_pilot import (
+    cancel_live_strategy_open_order,
+    live_strategy_status,
+    run_live_strategy_tick,
+    start_live_strategy_pilot,
+    stop_live_strategy_pilot,
+)
 from app.paper_trading import run_paper_trading
 from app.strategy_validation import run_strategy_validation
 from app.upbit import UpbitClientError, fetch_minute_candles
@@ -217,6 +224,12 @@ class AutoLivePilotStartRequest(BaseModel):
     order_confirmation: str = ""
 
 
+class LiveStrategyPilotStartRequest(BaseModel):
+    candidate_strategy_id: int
+    confirmation: str = ""
+    order_confirmation: str = ""
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     load_server_env()
@@ -257,10 +270,20 @@ async def lifespan(_: FastAPI):
         coalesce=True,
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_live_strategy_tick,
+        "interval",
+        seconds=10,
+        id="live_strategy_pilot_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info("[paper-live] scheduler started interval_seconds=60")
     logger.info("[paper-forward] scheduler started interval_seconds=60")
     logger.info("[auto-live] pilot scheduler started interval_seconds=10")
+    logger.info("[live-strategy] pilot scheduler started interval_seconds=10")
     try:
         yield
     finally:
@@ -811,6 +834,30 @@ def stop_auto_live_pilot_endpoint() -> dict:
 @app.post("/api/auto-live-pilot/cancel-open-order")
 def cancel_auto_live_pilot_open_order_endpoint() -> dict:
     return cancel_auto_live_pilot_open_order()
+
+
+@app.get("/api/live-strategy-pilot/status")
+def get_live_strategy_pilot_status() -> dict:
+    return live_strategy_status()
+
+
+@app.post("/api/live-strategy-pilot/start")
+def start_live_strategy_pilot_endpoint(payload: LiveStrategyPilotStartRequest) -> dict:
+    return start_live_strategy_pilot(
+        candidate_strategy_id=payload.candidate_strategy_id,
+        confirmation=payload.confirmation,
+        order_confirmation=payload.order_confirmation,
+    )
+
+
+@app.post("/api/live-strategy-pilot/stop")
+def stop_live_strategy_pilot_endpoint() -> dict:
+    return stop_live_strategy_pilot()
+
+
+@app.post("/api/live-strategy-pilot/cancel-open-order")
+def cancel_live_strategy_open_order_endpoint() -> dict:
+    return cancel_live_strategy_open_order()
 
 
 @app.post("/api/forward-paper/start")
