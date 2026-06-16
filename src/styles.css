@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: #05070b;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+select,
+input {
+  border-radius: 0;
+}
+
+.control {
+  display: flex;
+  min-width: 150px;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.control select,
+.control input,
+.field input {
+  height: 40px;
+  border: 1px solid #1d2a3d;
+  background: #101827;
+  padding: 0 10px;
+  color: #e2e8f0;
+  outline: none;
+}
+
+.control select:focus,
+.control input:focus,
+.field input:focus {
+  border-color: #18e0c8;
+}
+
+.field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.field input {
+  width: 100%;
+}
+
+.badge {
+  display: inline-flex;
+  min-width: 42px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid currentColor;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.mono-num {
+  font-variant-numeric: tabular-nums;
+  font-family: "Roboto Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  white-space: nowrap;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.table-scroll {
+  scrollbar-color: #1d2a3d #05070b;
+}
+
+.ops-table th,
+.ops-table td {
+  vertical-align: middle;
+}
+
+.ops-table tbody tr:hover {
+  background: rgba(24, 224, 200, 0.04);
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+.env
+.env.*
+!.env.example
+.codex-*.log
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
