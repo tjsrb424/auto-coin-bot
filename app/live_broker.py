@@ -314,7 +314,26 @@ class BithumbBroker(BaseJwtBroker):
         return {"balances": balances, "order_chance": chance, "order": order}
 
     async def place_order(self, order: dict) -> dict:
-        raise LiveBrokerError("Bithumb live order submission is blocked in Sprint 6.5.")
+        side = str(order.get("side", "")).lower()
+        ord_type = str(order.get("ord_type", order.get("order_type", ""))).lower()
+        if side not in {"bid", "ask"}:
+            side = "bid" if str(order.get("side", "")).upper() == "BUY" else "ask"
+        if ord_type == "limit" or str(order.get("order_type", "")).upper() == "LIMIT":
+            ord_type = "limit"
+        payload: dict[str, Any] = {
+            "market": order["market"],
+            "side": side,
+            "volume": str(order["volume"]),
+            "price": str(order["price"]),
+            "ord_type": ord_type,
+        }
+        client_order_id = order.get("client_order_id") or order.get("request_id")
+        if client_order_id:
+            payload["client_order_id"] = str(client_order_id)[:36]
+        if payload["side"] != "bid" or payload["ord_type"] != "limit":
+            raise LiveBrokerError("Bithumb Auto Live Pilot only allows limit bid orders.")
+        result = await self._request("POST", "/v1/orders", payload)
+        return result if isinstance(result, dict) else {"raw": result}
 
     async def get_order(self, order_id: str) -> dict:
         result = await self._request("GET", "/v1/order", {"uuid": order_id})
@@ -325,7 +344,8 @@ class BithumbBroker(BaseJwtBroker):
         return {"orders": result if isinstance(result, list) else result}
 
     async def cancel_order(self, order_id: str) -> dict:
-        raise LiveBrokerError("Bithumb order cancel is not enabled in Sprint 6.5.")
+        result = await self._request("DELETE", "/v1/order", {"uuid": order_id})
+        return result if isinstance(result, dict) else {"raw": result}
 
 
 LiveBroker = UpbitBroker

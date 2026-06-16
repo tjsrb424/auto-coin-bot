@@ -349,6 +349,47 @@ type LiveOrderLog = {
   error_message?: string | null;
   created_at: string;
   updated_at: string;
+  order_uuid?: string | null;
+  strategy_name?: string | null;
+  signal_reason?: string | null;
+  candle_time_utc?: string | null;
+};
+
+type AutoLivePilotSession = {
+  id: number;
+  exchange: string;
+  market: string;
+  candidate_strategy_id?: number | null;
+  strategy_name: string;
+  status: "READY" | "RUNNING" | "STOPPED" | "ERROR" | "EMERGENCY_STOPPED";
+  auto_enabled: boolean;
+  order_amount_krw: number;
+  max_orders_per_day: number;
+  orders_created_today: number;
+  last_signal?: string | null;
+  last_signal_time_utc?: string | null;
+  last_order_time_utc?: string | null;
+  last_order_uuid?: string | null;
+  last_order_status?: string | null;
+  last_processed_candle_time_utc?: string | null;
+};
+
+type AutoLivePilotStatus = {
+  session?: AutoLivePilotSession | null;
+  exchange: string;
+  market: string;
+  live_trading_enabled: boolean;
+  live_auto_trading_enabled: boolean;
+  auto_pilot_enabled: boolean;
+  emergency_stop: boolean;
+  api_key_loaded: boolean;
+  min_auto_order_krw: number;
+  max_auto_order_krw: number;
+  max_orders_per_day: number;
+  auto_cancel_after_seconds: number;
+  order_type: string;
+  ok?: boolean;
+  message?: string;
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
@@ -962,6 +1003,9 @@ function App() {
   const [liveOrderChance, setLiveOrderChance] = React.useState<LiveOrderChance | null>(null);
   const [liveOrders, setLiveOrders] = React.useState<LiveOrderLog[]>([]);
   const [livePreview, setLivePreview] = React.useState<LiveOrderPreview | null>(null);
+  const [autoPilot, setAutoPilot] = React.useState<AutoLivePilotStatus | null>(null);
+  const [autoPilotCandidateId, setAutoPilotCandidateId] = React.useState<number | "">("");
+  const [autoPilotAmount, setAutoPilotAmount] = React.useState(10000);
   const [liveOrderForm, setLiveOrderForm] = React.useState({
     exchange: "upbit" as Exchange,
     market: "KRW-BTC",
@@ -979,14 +1023,23 @@ function App() {
   const [paperLoading, setPaperLoading] = React.useState(false);
   const [forwardLoading, setForwardLoading] = React.useState(false);
   const [liveLoading, setLiveLoading] = React.useState(false);
+  const [autoPilotLoading, setAutoPilotLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [paperError, setPaperError] = React.useState<string | null>(null);
   const [forwardError, setForwardError] = React.useState<string | null>(null);
   const [liveError, setLiveError] = React.useState<string | null>(null);
+  const [autoPilotError, setAutoPilotError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     setSettings(strategySettings[strategy]);
   }, [strategy, strategySettings]);
+
+  React.useEffect(() => {
+    if (!autoPilotCandidateId && candidateStrategies.length > 0) {
+      const firstBtc = candidateStrategies.find((candidate) => candidate.market === "KRW-BTC") ?? candidateStrategies[0];
+      setAutoPilotCandidateId(firstBtc.id);
+    }
+  }, [autoPilotCandidateId, candidateStrategies]);
 
   const fetchLatestPaper = React.useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/paper-trading/live/latest`);
@@ -1090,6 +1143,71 @@ function App() {
     }
   }, [liveExchange]);
 
+  const fetchAutoPilotStatus = React.useCallback(async () => {
+    const response = await fetch(`${API_BASE}/api/auto-live-pilot/status`);
+    if (response.ok) {
+      setAutoPilot(await response.json());
+    }
+  }, []);
+
+  const startAutoPilot = React.useCallback(async () => {
+    if (!autoPilotCandidateId) return;
+    setAutoPilotLoading(true);
+    setAutoPilotError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/auto-live-pilot/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          candidate_strategy_id: autoPilotCandidateId,
+          order_amount_krw: Math.min(Math.max(autoPilotAmount, autoPilot?.min_auto_order_krw ?? 10000), Math.max(autoPilot?.max_auto_order_krw ?? 10000, autoPilot?.min_auto_order_krw ?? 10000)),
+          confirmation: "AUTO PILOT ENABLE",
+          order_confirmation: "PLACE AUTO LIVE ORDER"
+        })
+      });
+      const body = (await response.json()) as AutoLivePilotStatus;
+      setAutoPilot(body);
+      if (!body.ok) setAutoPilotError(body.message ?? "Auto Pilot 시작이 차단되었습니다.");
+      await fetchLiveOrders();
+    } catch (err) {
+      setAutoPilotError(err instanceof Error ? err.message : "Auto Pilot 시작 오류가 발생했습니다.");
+    } finally {
+      setAutoPilotLoading(false);
+    }
+  }, [autoPilot?.max_auto_order_krw, autoPilot?.min_auto_order_krw, autoPilotAmount, autoPilotCandidateId, fetchLiveOrders]);
+
+  const stopAutoPilot = React.useCallback(async () => {
+    setAutoPilotLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/auto-live-pilot/stop`, { method: "POST" });
+      if (response.ok) setAutoPilot(await response.json());
+    } finally {
+      setAutoPilotLoading(false);
+    }
+  }, []);
+
+  const cancelAutoPilotOpenOrder = React.useCallback(async () => {
+    setAutoPilotLoading(true);
+    setAutoPilotError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/auto-live-pilot/cancel-open-order`, { method: "POST" });
+      const body = (await response.json()) as AutoLivePilotStatus;
+      setAutoPilot(body);
+      if (!body.ok) setAutoPilotError(body.message ?? "오픈 주문 취소에 실패했습니다.");
+      await fetchLiveOrders();
+    } finally {
+      setAutoPilotLoading(false);
+    }
+  }, [fetchLiveOrders]);
+
+  const toggleAutoPilot = React.useCallback(async () => {
+    if (autoPilot?.session?.status === "RUNNING" || autoPilot?.session?.status === "READY") {
+      await stopAutoPilot();
+      return;
+    }
+    await startAutoPilot();
+  }, [autoPilot?.session?.status, startAutoPilot, stopAutoPilot]);
+
   React.useEffect(() => {
     setLiveOrderForm((prev) => ({ ...prev, exchange: liveExchange }));
     setLiveBalances(null);
@@ -1097,7 +1215,8 @@ function App() {
     setLivePreview(null);
     setLiveError(null);
     void fetchLiveStatus(liveExchange);
-  }, [fetchLiveStatus, liveExchange]);
+    void fetchAutoPilotStatus();
+  }, [fetchAutoPilotStatus, fetchLiveStatus, liveExchange]);
 
   const armLiveTrading = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1428,15 +1547,17 @@ function App() {
     void fetchForwardPaper();
     void fetchLiveStatus();
     void fetchLiveOrders();
+    void fetchAutoPilotStatus();
   }, []);
 
   React.useEffect(() => {
     const intervalId = window.setInterval(() => {
       void fetchLiveStatus(liveExchange);
       void fetchLiveOrders();
+      void fetchAutoPilotStatus();
     }, 15000);
     return () => window.clearInterval(intervalId);
-  }, [fetchLiveOrders, fetchLiveStatus, liveExchange]);
+  }, [fetchAutoPilotStatus, fetchLiveOrders, fetchLiveStatus, liveExchange]);
 
   React.useEffect(() => {
     void fetchChartCandles();
@@ -1511,6 +1632,19 @@ function App() {
   const liveEth = liveBalances?.balances?.eth;
   const activeExchange = liveExchange;
   const orderChanceStatus = liveOrderChance?.order_chance_status ?? liveStatus?.order_chance_status ?? "NOT_REQUESTED";
+  const autoSession = autoPilot?.session;
+  const autoPilotCandidate = candidateStrategies.find((candidate) => candidate.id === autoPilotCandidateId);
+  const isAutoPilotOn = autoSession?.status === "RUNNING" || autoSession?.status === "READY";
+  const autoPilotMinOrder = autoPilot?.min_auto_order_krw ?? 10000;
+  const autoPilotMaxOrder = Math.max(autoPilot?.max_auto_order_krw ?? 10000, autoPilotMinOrder);
+  const autoPilotFlow =
+    autoSession?.last_order_status === "CANCELED" ? "자동취소 완료" :
+    autoSession?.last_order_status === "WAITING" ? "취소 대기" :
+    autoSession?.last_order_status === "SUBMITTED" ? "주문 접수" :
+    autoSession?.last_order_status === "FILLED" ? "체결 완료" :
+    autoSession?.last_order_status === "FAILED" ? "주문 실패" :
+    autoSession?.last_order_status === "BLOCKED" ? "차단/재시도 대기" :
+    isAutoPilotOn ? "신호 감시 중" : "정지";
 
   return (
     <main className="min-h-screen bg-terminal-bg text-slate-100">
@@ -1577,6 +1711,75 @@ function App() {
             </button>
           </div>
         </header>
+
+        <section className="border-b border-terminal-line bg-[#080d14] px-4 py-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">Auto Live Pilot / 빗썸 소액 자동주문 파일럿</h2>
+              <p className="text-xs text-slate-500">Bithumb KRW-BTC 지정가 매수 1회만 허용하며, 시장가/자동매도/출금 기능은 없습니다.</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={() => void fetchAutoPilotStatus()} className="inline-flex h-9 items-center gap-2 border border-terminal-cyan px-3 text-xs font-semibold text-terminal-cyan hover:bg-[#0d2d33]">
+                상태 새로고침
+              </button>
+              <button onClick={() => void cancelAutoPilotOpenOrder()} disabled={autoPilotLoading || !autoSession?.last_order_uuid} className="inline-flex h-9 items-center gap-2 border border-terminal-red px-3 text-xs font-semibold text-terminal-red hover:bg-[#331018] disabled:opacity-50">
+                Cancel Open Order
+              </button>
+            </div>
+          </div>
+          {autoPilotError && <div className="mb-3 border border-terminal-red px-3 py-2 text-sm text-terminal-red">{autoPilotError}</div>}
+          <section className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-8">
+            <MetricCard label="Exchange" value={autoPilot?.exchange?.toUpperCase() ?? "BITHUMB"} tone="cyan" />
+            <MetricCard label="Market" value={autoPilot?.market ?? "KRW-BTC"} />
+            <MetricCard label="Auto Pilot Status" value={autoSession?.status ?? "STOPPED"} tone={autoSession?.status === "RUNNING" ? "green" : autoSession?.status === "ERROR" ? "red" : "amber"} />
+            <MetricCard label="Live Trading" value={autoPilot?.live_trading_enabled ? "TRUE" : "FALSE"} tone={autoPilot?.live_trading_enabled ? "amber" : "neutral"} />
+            <MetricCard label="Auto Trading" value={autoPilot?.live_auto_trading_enabled ? "TRUE" : "FALSE"} tone={autoPilot?.live_auto_trading_enabled ? "amber" : "neutral"} />
+            <MetricCard label="Pilot Env" value={autoPilot?.auto_pilot_enabled ? "TRUE" : "FALSE"} tone={autoPilot?.auto_pilot_enabled ? "amber" : "neutral"} />
+            <MetricCard label="Emergency Stop" value={autoPilot?.emergency_stop ? "ACTIVE" : "INACTIVE"} tone={autoPilot?.emergency_stop ? "red" : "green"} />
+            <MetricCard label="API Key Loaded" value={autoPilot?.api_key_loaded ? "YES" : "NO"} tone={autoPilot?.api_key_loaded ? "green" : "red"} />
+            <MetricCard label="Max Auto Order" value={formatKrw(autoPilot?.max_auto_order_krw)} tone="amber" />
+            <MetricCard label="Min Test Order" value={formatKrw(autoPilotMinOrder)} tone="amber" />
+            <MetricCard label="Orders Today" value={`${autoSession?.orders_created_today ?? 0}/${autoPilot?.max_orders_per_day ?? 1}`} />
+            <MetricCard label="Test Flow" value={autoPilotFlow} tone={autoPilotFlow.includes("완료") ? "green" : autoPilotFlow.includes("실패") || autoPilotFlow.includes("차단") ? "red" : "cyan"} />
+            <MetricCard label="Last Signal" value={autoSession?.last_signal ?? "-"} />
+            <MetricCard label="Last Candle" value={formatKstShort(autoSession?.last_processed_candle_time_utc ?? undefined)} title={formatKstDateTime(autoSession?.last_processed_candle_time_utc ?? undefined)} />
+            <MetricCard label="Last Order Status" value={autoSession?.last_order_status ?? "-"} />
+            <MetricCard label="Last Order Time" value={formatKstShort(autoSession?.last_order_time_utc ?? undefined)} title={formatKstDateTime(autoSession?.last_order_time_utc ?? undefined)} />
+            <MetricCard label="Last Order UUID" value={autoSession?.last_order_uuid ? `${autoSession.last_order_uuid.slice(0, 8)}...` : "-"} title={autoSession?.last_order_uuid ?? undefined} />
+            <MetricCard label="Auto Cancel" value={`${autoPilot?.auto_cancel_after_seconds ?? 60}s`} />
+          </section>
+          <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,180px)_auto]">
+            <label className="control">
+              <span>Candidate Strategy</span>
+              <select value={autoPilotCandidateId} onChange={(event) => setAutoPilotCandidateId(Number(event.target.value))}>
+                <option value="">후보 전략 선택</option>
+                {candidateStrategies.filter((candidate) => candidate.market === "KRW-BTC").map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {`${STRATEGY_BADGES[candidate.strategy]} · ${formatTimeframe(candidate.unit)} · ${formatDecimal(candidate.score)}점`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="control">
+              <span>Order KRW</span>
+              <input type="number" min={autoPilotMinOrder} max={autoPilotMaxOrder} value={autoPilotAmount} onChange={(event) => setAutoPilotAmount(Math.min(Math.max(Number(event.target.value), autoPilotMinOrder), autoPilotMaxOrder))} />
+            </label>
+            <button
+              onClick={() => void toggleAutoPilot()}
+              disabled={
+                autoPilotLoading ||
+                (!isAutoPilotOn && !autoPilotCandidate)
+              }
+              className={`inline-flex h-10 min-w-[150px] self-end items-center justify-center border px-4 text-xs font-black disabled:cursor-not-allowed disabled:opacity-50 ${
+                isAutoPilotOn
+                  ? "border-terminal-amber text-terminal-amber hover:bg-[#2c2412]"
+                  : "border-terminal-green bg-terminal-green text-black hover:bg-[#4ff0ad]"
+              }`}
+            >
+              {isAutoPilotOn ? "1회 테스트 중지" : "1회 테스트 주문 실행"}
+            </button>
+          </div>
+        </section>
 
         <section className="border-b border-terminal-line bg-terminal-bg px-4 py-4">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -1752,7 +1955,7 @@ function App() {
                   <span className="text-xs text-slate-500">페이퍼 로그와 분리 저장</span>
                 </div>
                 <div className="table-scroll max-h-72 overflow-auto">
-                  <table className="ops-table min-w-[1080px] w-full text-left text-sm">
+                  <table className="ops-table min-w-[1380px] w-full text-left text-sm">
                     <thead className="sticky top-0 z-10 bg-terminal-panel2 text-xs text-slate-500">
                       <tr>
                         <th className="px-3 py-2">Time, KST</th>
@@ -1760,6 +1963,9 @@ function App() {
                         <th className="px-3 py-2">Market</th>
                         <th className="px-3 py-2">Side</th>
                         <th className="px-3 py-2">Order Type</th>
+                        <th className="px-3 py-2">Strategy</th>
+                        <th className="px-3 py-2">Order UUID</th>
+                        <th className="px-3 py-2">Candle</th>
                         <th className="px-3 py-2 text-right">Price</th>
                         <th className="px-3 py-2 text-right">Amount KRW</th>
                         <th className="px-3 py-2">Status</th>
@@ -1775,6 +1981,9 @@ function App() {
                           <td className="nowrap px-3 py-2 font-semibold">{order.market}</td>
                           <td className="px-3 py-2"><SideBadge side={order.side} /></td>
                           <td className="nowrap px-3 py-2">{order.order_type}</td>
+                          <td className="nowrap px-3 py-2">{order.strategy_name ? <StatusBadge value={STRATEGY_BADGES[order.strategy_name as Strategy] ?? order.strategy_name} tone="cyan" /> : "-"}</td>
+                          <td className="max-w-[120px] truncate px-3 py-2 text-slate-300" title={order.order_uuid ?? ""}>{order.order_uuid ?? "-"}</td>
+                          <td className="nowrap px-3 py-2 text-slate-400" title={formatKstDateTime(order.candle_time_utc ?? undefined)}>{formatKstShort(order.candle_time_utc ?? undefined)}</td>
                           <td className="mono-num px-3 py-2 text-right">{formatKrw(order.price ?? undefined)}</td>
                           <td className="mono-num px-3 py-2 text-right">{formatKrw(order.amount_krw ?? undefined)}</td>
                           <td className="nowrap px-3 py-2">

@@ -14,6 +14,13 @@ from pydantic import BaseModel, Field
 
 from app.backtest import run_backtest
 from app.backtest import compare_strategies
+from app.auto_live_pilot import (
+    auto_live_pilot_status,
+    cancel_auto_live_pilot_open_order,
+    run_auto_live_pilot_tick,
+    start_auto_live_pilot,
+    stop_auto_live_pilot,
+)
 from app.database import (
     create_forward_session_from_candidate,
     create_live_paper_session,
@@ -203,6 +210,13 @@ class LiveOrderPlaceRequest(BaseModel):
     final_confirmation: str = ""
 
 
+class AutoLivePilotStartRequest(BaseModel):
+    candidate_strategy_id: int
+    order_amount_krw: float = Field(10000, ge=10000)
+    confirmation: str = ""
+    order_confirmation: str = ""
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     load_server_env()
@@ -234,9 +248,19 @@ async def lifespan(_: FastAPI):
         coalesce=True,
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_auto_live_pilot_tick,
+        "interval",
+        seconds=10,
+        id="auto_live_pilot_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info("[paper-live] scheduler started interval_seconds=60")
     logger.info("[paper-forward] scheduler started interval_seconds=60")
+    logger.info("[auto-live] pilot scheduler started interval_seconds=10")
     try:
         yield
     finally:
@@ -762,6 +786,31 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
 @app.get("/api/live-orders")
 def list_live_orders() -> dict:
     return {"orders": load_live_order_logs(), **_live_status()}
+
+
+@app.get("/api/auto-live-pilot/status")
+def get_auto_live_pilot_status() -> dict:
+    return auto_live_pilot_status()
+
+
+@app.post("/api/auto-live-pilot/start")
+def start_auto_live_pilot_endpoint(payload: AutoLivePilotStartRequest) -> dict:
+    return start_auto_live_pilot(
+        candidate_strategy_id=payload.candidate_strategy_id,
+        order_amount_krw=payload.order_amount_krw,
+        confirmation=payload.confirmation,
+        order_confirmation=payload.order_confirmation,
+    )
+
+
+@app.post("/api/auto-live-pilot/stop")
+def stop_auto_live_pilot_endpoint() -> dict:
+    return stop_auto_live_pilot()
+
+
+@app.post("/api/auto-live-pilot/cancel-open-order")
+def cancel_auto_live_pilot_open_order_endpoint() -> dict:
+    return cancel_auto_live_pilot_open_order()
 
 
 @app.post("/api/forward-paper/start")

@@ -284,8 +284,35 @@ def init_db() -> None:
                 exchange_response_payload TEXT NOT NULL,
                 status TEXT NOT NULL,
                 error_message TEXT,
+                order_uuid TEXT,
+                strategy_name TEXT,
+                signal_reason TEXT,
+                candle_time_utc TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS auto_live_pilot_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                candidate_strategy_id INTEGER,
+                strategy_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                auto_enabled INTEGER NOT NULL,
+                order_amount_krw REAL NOT NULL,
+                max_orders_per_day INTEGER NOT NULL,
+                orders_created_today INTEGER NOT NULL DEFAULT 0,
+                last_signal TEXT NOT NULL DEFAULT 'NONE',
+                last_signal_time_utc TEXT,
+                last_order_time_utc TEXT,
+                last_order_uuid TEXT,
+                last_order_status TEXT,
+                last_processed_candle_time_utc TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                stopped_at TEXT,
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
             );
 
             CREATE TABLE IF NOT EXISTS live_mode_events (
@@ -310,6 +337,10 @@ def init_db() -> None:
         _ensure_column(conn, "candidate_strategies", "backtest_average_trade_pnl", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "candidate_strategies", "warning", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "live_order_logs", "exchange", "TEXT NOT NULL DEFAULT 'upbit'")
+        _ensure_column(conn, "live_order_logs", "order_uuid", "TEXT")
+        _ensure_column(conn, "live_order_logs", "strategy_name", "TEXT")
+        _ensure_column(conn, "live_order_logs", "signal_reason", "TEXT")
+        _ensure_column(conn, "live_order_logs", "candle_time_utc", "TEXT")
         conn.execute(
             """
             UPDATE paper_sessions
@@ -902,8 +933,9 @@ def insert_live_order_log(log: dict) -> int:
                 request_id, exchange, market, side, order_type, price, volume, amount_krw,
                 fee_estimate, risk_result, order_preview_payload,
                 exchange_request_payload_masked, exchange_response_payload,
-                status, error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, error_message, order_uuid, strategy_name, signal_reason,
+                candle_time_utc, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 log["request_id"],
@@ -921,6 +953,10 @@ def insert_live_order_log(log: dict) -> int:
                 json.dumps(log.get("exchange_response_payload", {}), ensure_ascii=False),
                 log["status"],
                 log.get("error_message"),
+                log.get("order_uuid"),
+                log.get("strategy_name"),
+                log.get("signal_reason"),
+                log.get("candle_time_utc"),
                 now_utc,
                 now_utc,
             ),
@@ -943,6 +979,10 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
                 exchange_response_payload = ?,
                 status = ?,
                 error_message = ?,
+                order_uuid = ?,
+                strategy_name = ?,
+                signal_reason = ?,
+                candle_time_utc = ?,
                 updated_at = ?
             WHERE request_id = ?
             """,
@@ -952,6 +992,10 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
                 json.dumps(merged.get("exchange_response_payload", {}), ensure_ascii=False),
                 merged["status"],
                 merged.get("error_message"),
+                merged.get("order_uuid"),
+                merged.get("strategy_name"),
+                merged.get("signal_reason"),
+                merged.get("candle_time_utc"),
                 now_utc,
                 request_id,
             ),
@@ -1029,6 +1073,164 @@ def _normalize_live_order_log(row: dict) -> dict:
     row["order_preview_payload"] = json.loads(row.get("order_preview_payload") or "{}")
     row["exchange_request_payload_masked"] = json.loads(row.get("exchange_request_payload_masked") or "{}")
     row["exchange_response_payload"] = json.loads(row.get("exchange_response_payload") or "{}")
+    return row
+
+
+def create_auto_live_pilot_session(session: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE auto_live_pilot_sessions
+            SET status = 'STOPPED', stopped_at = ?, updated_at = ?
+            WHERE status IN ('READY', 'RUNNING')
+            """,
+            (now_utc, now_utc),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO auto_live_pilot_sessions (
+                exchange, market, candidate_strategy_id, strategy_name, status,
+                auto_enabled, order_amount_krw, max_orders_per_day,
+                orders_created_today, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session["exchange"],
+                session["market"],
+                session.get("candidate_strategy_id"),
+                session["strategy_name"],
+                session.get("status", "READY"),
+                1 if session.get("auto_enabled", False) else 0,
+                session["order_amount_krw"],
+                session["max_orders_per_day"],
+                session.get("orders_created_today", 0),
+                now_utc,
+                now_utc,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_latest_auto_live_pilot_session() -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM auto_live_pilot_sessions
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return _normalize_auto_live_pilot_session(dict(row)) if row else None
+
+
+def load_running_auto_live_pilot_sessions() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM auto_live_pilot_sessions
+            WHERE status IN ('READY', 'RUNNING')
+            ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+    return [_normalize_auto_live_pilot_session(dict(row)) for row in rows]
+
+
+def update_auto_live_pilot_session(session_id: int, updates: dict) -> None:
+    allowed = {
+        "status",
+        "auto_enabled",
+        "orders_created_today",
+        "last_signal",
+        "last_signal_time_utc",
+        "last_order_time_utc",
+        "last_order_uuid",
+        "last_order_status",
+        "last_processed_candle_time_utc",
+        "stopped_at",
+    }
+    values = {key: value for key, value in updates.items() if key in allowed}
+    if not values:
+        return
+    values["updated_at"] = _utc_now()
+    columns = ", ".join(f"{key} = ?" for key in values)
+    params = list(values.values()) + [session_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE auto_live_pilot_sessions SET {columns} WHERE id = ?", params)
+
+
+def count_auto_live_orders_today(exchange: str, market: str) -> int:
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.now(kst)
+    start_utc = now_kst.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_utc = (now_kst.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND market = ?
+              AND strategy_name IS NOT NULL
+              AND status IN ('SUBMITTED', 'WAITING', 'CANCELED', 'FILLED')
+              AND request_id NOT LIKE '%-submitted'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+              AND created_at >= ?
+              AND created_at < ?
+            """,
+            (exchange, market, start_utc, end_utc),
+        ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def has_live_order_for_candle(exchange: str, market: str, candle_time_utc: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM live_order_logs
+            WHERE exchange = ?
+              AND market = ?
+              AND candle_time_utc = ?
+              AND strategy_name IS NOT NULL
+              AND status IN ('SUBMITTED', 'WAITING', 'CANCELED', 'FILLED')
+              AND request_id NOT LIKE '%-submitted'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            LIMIT 1
+            """,
+            (exchange, market, candle_time_utc),
+        ).fetchone()
+    return row is not None
+
+
+def has_open_auto_live_order(exchange: str, market: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM live_order_logs
+            WHERE exchange = ?
+              AND market = ?
+              AND strategy_name IS NOT NULL
+              AND status IN ('SUBMITTED', 'WAITING')
+              AND request_id NOT LIKE '%-submitted'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            LIMIT 1
+            """,
+            (exchange, market),
+        ).fetchone()
+    return row is not None
+
+
+def _normalize_auto_live_pilot_session(row: dict) -> dict:
+    row["auto_enabled"] = bool(row.get("auto_enabled"))
     return row
 
 
