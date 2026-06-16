@@ -5,11 +5,15 @@ import unittest
 from unittest.mock import patch
 
 from app.live_broker import (
+    BithumbBroker,
     LiveBroker,
     LiveTradingConfig,
+    UpbitBroker,
     evaluate_live_order_risk,
+    get_live_broker,
     reset_live_runtime_state,
     current_live_mode,
+    LiveBrokerError,
 )
 from app.live_paper import PaperBroker
 
@@ -27,6 +31,7 @@ def balances(krw: float = 100_000, btc: float = 0.01) -> dict:
 
 def config() -> LiveTradingConfig:
     return LiveTradingConfig(
+        exchange="upbit",
         access_key_loaded=True,
         secret_key_loaded=True,
         live_trading_enabled=True,
@@ -60,6 +65,22 @@ class LiveBrokerRiskTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["risk_result"], "BLOCKED_LIVE_LOCKED")
 
+    def test_live_disabled_blocks_orders(self) -> None:
+        disabled = LiveTradingConfig(
+            **{**config().__dict__, "live_trading_enabled": False}
+        )
+        result = evaluate_live_order_risk(
+            order={"market": "KRW-BTC", "side": "BUY", "order_type": "LIMIT", "amount_krw": 5_000, "price": 100_000_000},
+            config=disabled,
+            mode="PAPER",
+            balances=balances(),
+            request_exists=False,
+            recent_duplicate=False,
+            market_snapshot={"price": 100_000_000, "range_rate": 0.01, "volume": 10},
+        )
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["risk_result"], "BLOCKED_LIVE_DISABLED")
+
     def test_emergency_stop_blocks_orders(self) -> None:
         result = risk({"market": "KRW-BTC", "side": "BUY", "order_type": "LIMIT", "amount_krw": 5_000, "price": 100_000_000}, mode="EMERGENCY_STOPPED")
         self.assertEqual(result["risk_result"], "BLOCKED_EMERGENCY_STOP")
@@ -88,6 +109,30 @@ class LiveBrokerRiskTests(unittest.TestCase):
 
     def test_live_and_paper_brokers_are_separate_classes(self) -> None:
         self.assertIsNot(LiveBroker, PaperBroker)
+        self.assertIs(LiveBroker, UpbitBroker)
+        self.assertIsNot(BithumbBroker, UpbitBroker)
+
+    def test_bithumb_config_reads_bithumb_keys(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXCHANGE": "bithumb",
+                "BITHUMB_ACCESS_KEY": "loaded",
+                "BITHUMB_SECRET_KEY": "loaded",
+                "UPBIT_ACCESS_KEY": "",
+                "UPBIT_SECRET_KEY": "",
+                "LIVE_TRADING_ENABLED": "false",
+            },
+            clear=False,
+        ):
+            loaded = LiveTradingConfig.from_env()
+        self.assertEqual(loaded.exchange, "bithumb")
+        self.assertTrue(loaded.api_key_loaded)
+        self.assertFalse(loaded.live_trading_enabled)
+
+    def test_broker_factory_rejects_unknown_exchange(self) -> None:
+        with self.assertRaises(LiveBrokerError):
+            get_live_broker("unknown")
 
     def test_server_restart_does_not_keep_live_manual_mode(self) -> None:
         with patch.dict(os.environ, {"LIVE_TRADING_ENABLED": "true"}, clear=False):

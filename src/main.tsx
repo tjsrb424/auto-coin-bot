@@ -22,6 +22,7 @@ import {
 import "./styles.css";
 
 type Strategy = "ma_cross" | "rsi" | "volatility_breakout";
+type Exchange = "upbit" | "bithumb";
 type Tone = "neutral" | "green" | "red" | "amber" | "cyan";
 
 type Candle = {
@@ -277,12 +278,14 @@ type LiveMode = "PAPER" | "LIVE_LOCKED" | "LIVE_ARMED" | "LIVE_MANUAL_ONLY" | "E
 
 type LiveStatus = {
   mode: LiveMode;
+  exchange?: Exchange;
   live_trading_enabled: boolean;
   broker_status: string;
   api_key_loaded: boolean;
   access_key_loaded: boolean;
   secret_key_loaded: boolean;
   balance_fetch_status: string;
+  order_chance_status?: string;
   risk_manager_status: string;
   emergency_stop: boolean;
   max_live_order_krw: number;
@@ -302,11 +305,19 @@ type LiveBalances = LiveStatus & {
   };
 };
 
+type LiveOrderChance = LiveStatus & {
+  market: string;
+  order_chance_status: string;
+  order_chance_error?: string | null;
+  order_chance?: Record<string, unknown>;
+};
+
 type LiveOrderPreview = {
   request_id: string;
   allowed: boolean;
   risk_result: string;
   blocked_reason?: string;
+  exchange?: string;
   market: string;
   side: "BUY" | "SELL";
   order_type: "LIMIT" | "MARKET";
@@ -318,11 +329,14 @@ type LiveOrderPreview = {
   estimated_post_asset_balance: number;
   balance_fetch_status?: string;
   balance_error?: string | null;
+  order_chance_status?: string;
+  order_chance_error?: string | null;
 };
 
 type LiveOrderLog = {
   id: number;
   request_id: string;
+  exchange?: string;
   market: string;
   side: "BUY" | "SELL";
   order_type: string;
@@ -942,11 +956,14 @@ function App() {
   const [chartUpdatedAt, setChartUpdatedAt] = React.useState<string | null>(null);
   const [paper, setPaper] = React.useState<PaperResponse>({ status: "EMPTY" });
   const [forwardPaper, setForwardPaper] = React.useState<ForwardPaperResponse>({ status: "EMPTY", mode: "FORWARD_PAPER" });
+  const [liveExchange, setLiveExchange] = React.useState<Exchange>("upbit");
   const [liveStatus, setLiveStatus] = React.useState<LiveStatus | null>(null);
   const [liveBalances, setLiveBalances] = React.useState<LiveBalances | null>(null);
+  const [liveOrderChance, setLiveOrderChance] = React.useState<LiveOrderChance | null>(null);
   const [liveOrders, setLiveOrders] = React.useState<LiveOrderLog[]>([]);
   const [livePreview, setLivePreview] = React.useState<LiveOrderPreview | null>(null);
   const [liveOrderForm, setLiveOrderForm] = React.useState({
+    exchange: "upbit" as Exchange,
     market: "KRW-BTC",
     side: "BUY" as "BUY" | "SELL",
     order_type: "LIMIT" as "LIMIT" | "MARKET",
@@ -1007,10 +1024,16 @@ function App() {
     }
   }, []);
 
-  const fetchLiveStatus = React.useCallback(async () => {
-    const response = await fetch(`${API_BASE}/api/live-trading/status`);
+  const fetchLiveStatus = React.useCallback(async (exchange?: Exchange) => {
+    const params = exchange ? `?${new URLSearchParams({ exchange }).toString()}` : "";
+    const response = await fetch(`${API_BASE}/api/live/status${params}`);
     if (response.ok) {
-      setLiveStatus(await response.json());
+      const body = (await response.json()) as LiveStatus;
+      setLiveStatus(body);
+      if (!exchange && body.exchange) {
+        setLiveExchange(body.exchange);
+        setLiveOrderForm((prev) => ({ ...prev, exchange: body.exchange as Exchange }));
+      }
     }
   }, []);
 
@@ -1018,7 +1041,8 @@ function App() {
     setLiveLoading(true);
     setLiveError(null);
     try {
-      const response = await fetch(`${API_BASE}/api/live-trading/balances`);
+      const params = new URLSearchParams({ exchange: liveExchange });
+      const response = await fetch(`${API_BASE}/api/live/balances?${params.toString()}`);
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail ?? "실계좌 잔고 조회에 실패했습니다.");
@@ -1031,16 +1055,49 @@ function App() {
     } finally {
       setLiveLoading(false);
     }
-  }, []);
+  }, [liveExchange]);
+
+  const fetchLiveOrderChance = React.useCallback(async () => {
+    setLiveLoading(true);
+    setLiveError(null);
+    try {
+      const params = new URLSearchParams({
+        market: liveOrderForm.market,
+        exchange: liveExchange
+      });
+      const response = await fetch(`${API_BASE}/api/live-trading/order-chance?${params.toString()}`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? "주문 가능 정보 조회에 실패했습니다.");
+      }
+      const body = (await response.json()) as LiveOrderChance;
+      setLiveOrderChance(body);
+      setLiveStatus(body);
+      if (body.order_chance_error) setLiveError(body.order_chance_error);
+    } catch (err) {
+      setLiveError(err instanceof Error ? err.message : "알 수 없는 주문 가능 정보 조회 오류가 발생했습니다.");
+    } finally {
+      setLiveLoading(false);
+    }
+  }, [liveExchange, liveOrderForm.market]);
 
   const fetchLiveOrders = React.useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/live-orders`);
     if (response.ok) {
       const body = (await response.json()) as { orders: LiveOrderLog[] } & LiveStatus;
       setLiveOrders(body.orders);
-      setLiveStatus(body);
+      if (body.exchange === liveExchange) setLiveStatus(body);
     }
-  }, []);
+  }, [liveExchange]);
+
+  React.useEffect(() => {
+    setLiveOrderForm((prev) => ({ ...prev, exchange: liveExchange }));
+    setLiveBalances(null);
+    setLiveOrderChance(null);
+    setLivePreview(null);
+    setLiveError(null);
+    void fetchLiveStatus(liveExchange);
+  }, [fetchLiveStatus, liveExchange]);
 
   const armLiveTrading = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1104,7 +1161,7 @@ function App() {
       const response = await fetch(`${API_BASE}/api/live-orders/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(liveOrderForm)
+        body: JSON.stringify({ ...liveOrderForm, exchange: liveExchange })
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail ?? "주문 미리보기에 실패했습니다.");
@@ -1116,7 +1173,7 @@ function App() {
     } finally {
       setLiveLoading(false);
     }
-  }, [fetchLiveOrders, liveOrderForm]);
+  }, [fetchLiveOrders, liveExchange, liveOrderForm]);
 
   const placeLiveOrder = React.useCallback(async () => {
     if (!livePreview) return;
@@ -1375,11 +1432,11 @@ function App() {
 
   React.useEffect(() => {
     const intervalId = window.setInterval(() => {
-      void fetchLiveStatus();
+      void fetchLiveStatus(liveExchange);
       void fetchLiveOrders();
     }, 15000);
     return () => window.clearInterval(intervalId);
-  }, [fetchLiveOrders, fetchLiveStatus]);
+  }, [fetchLiveOrders, fetchLiveStatus, liveExchange]);
 
   React.useEffect(() => {
     void fetchChartCandles();
@@ -1452,6 +1509,8 @@ function App() {
   const liveKrw = liveBalances?.balances?.krw;
   const liveBtc = liveBalances?.balances?.btc;
   const liveEth = liveBalances?.balances?.eth;
+  const activeExchange = liveExchange;
+  const orderChanceStatus = liveOrderChance?.order_chance_status ?? liveStatus?.order_chance_status ?? "NOT_REQUESTED";
 
   return (
     <main className="min-h-screen bg-terminal-bg text-slate-100">
@@ -1526,9 +1585,19 @@ function App() {
               <p className="text-xs text-slate-500">API Key는 백엔드 환경변수에서만 읽습니다. 출금 권한 없는 API Key와 허용 IP 설정을 전제로 합니다.</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <label className="control min-w-[150px]">
+                <span>Exchange</span>
+                <select value={liveExchange} onChange={(event) => setLiveExchange(event.target.value as Exchange)}>
+                  <option value="upbit">Upbit</option>
+                  <option value="bithumb">Bithumb</option>
+                </select>
+              </label>
               <button onClick={() => void fetchLiveBalances()} disabled={liveLoading} className="inline-flex h-9 items-center gap-2 border border-terminal-cyan px-3 text-xs font-semibold text-terminal-cyan hover:bg-[#0d2d33] disabled:opacity-60">
                 <RefreshCw className="h-4 w-4" />
                 실계좌 잔고 조회
+              </button>
+              <button onClick={() => void fetchLiveOrderChance()} disabled={liveLoading} className="inline-flex h-9 items-center gap-2 border border-terminal-cyan px-3 text-xs font-semibold text-terminal-cyan hover:bg-[#0d2d33] disabled:opacity-60">
+                주문 가능 정보 조회
               </button>
               <button onClick={() => void lockLiveTradingMode()} className="inline-flex h-9 items-center gap-2 border border-terminal-amber px-3 text-xs font-semibold text-terminal-amber hover:bg-[#2c2412]">
                 실거래 잠금
@@ -1538,10 +1607,12 @@ function App() {
           {liveError && <div className="mb-3 border border-terminal-red px-3 py-2 text-sm text-terminal-red">{liveError}</div>}
 
           <section className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-8">
+            <MetricCard label="Exchange" value={activeExchange === "bithumb" ? "Bithumb" : "Upbit"} tone="cyan" />
             <MetricCard label="Live Trading Enabled" value={liveStatus?.live_trading_enabled ? "TRUE" : "FALSE"} tone={liveStatus?.live_trading_enabled ? "amber" : "neutral"} />
             <MetricCard label="Broker Status" value={liveStatus?.broker_status ?? "-"} tone={liveStatus?.broker_status === "READY" ? "green" : liveStatus?.broker_status === "EMERGENCY_STOPPED" ? "red" : "amber"} />
             <MetricCard label="API Key Loaded" value={liveStatus?.api_key_loaded ? "YES" : "NO"} tone={liveStatus?.api_key_loaded ? "green" : "amber"} />
             <MetricCard label="Balance Fetch" value={liveBalances?.balance_fetch_status ?? liveStatus?.balance_fetch_status ?? "-"} tone={liveBalances?.balance_fetch_status === "SUCCESS" ? "green" : "amber"} />
+            <MetricCard label="Order Chance" value={orderChanceStatus} tone={orderChanceStatus === "SUCCESS" ? "green" : orderChanceStatus === "FAILED" ? "red" : "amber"} />
             <MetricCard label="Risk Manager" value={liveStatus?.risk_manager_status ?? "-"} tone={liveStatus?.risk_manager_status === "ACTIVE" ? "green" : "amber"} />
             <MetricCard label="Emergency Stop" value={liveStatus?.emergency_stop ? "ACTIVE" : "INACTIVE"} tone={liveStatus?.emergency_stop ? "red" : "green"} />
             <MetricCard label="Max Live Order" value={formatKrw(liveStatus?.max_live_order_krw)} tone="amber" />
@@ -1606,7 +1677,11 @@ function App() {
                   <MetricCard label="KRW 사용 가능" value={formatKrw(liveKrw?.balance)} />
                   <MetricCard label="KRW 잠김" value={formatKrw(liveKrw?.locked)} />
                   <MetricCard label="BTC 보유" value={formatNumber(liveBtc?.balance)} tone="cyan" />
+                  <MetricCard label="BTC 잠김" value={formatNumber(liveBtc?.locked)} />
+                  <MetricCard label="BTC 평균가" value={formatKrw(liveBtc?.avg_buy_price)} />
                   <MetricCard label="ETH 보유" value={formatNumber(liveEth?.balance)} tone="cyan" />
+                  <MetricCard label="ETH 잠김" value={formatNumber(liveEth?.locked)} />
+                  <MetricCard label="ETH 평균가" value={formatKrw(liveEth?.avg_buy_price)} />
                   <MetricCard label="총 자산 추정" value={formatKrw(liveBalances?.estimated_total_equity_krw)} tone="amber" />
                 </div>
               </div>
@@ -1619,6 +1694,13 @@ function App() {
                   <span className="text-xs text-slate-500">미리보기는 실제 주문을 만들지 않습니다</span>
                 </div>
                 <div className="grid grid-cols-1 gap-3 p-4 md:grid-cols-3 xl:grid-cols-6">
+                  <label className="control">
+                    <span>거래소</span>
+                    <select value={liveExchange} onChange={(event) => setLiveExchange(event.target.value as Exchange)}>
+                      <option value="upbit">Upbit</option>
+                      <option value="bithumb">Bithumb</option>
+                    </select>
+                  </label>
                   <label className="control">
                     <span>마켓</span>
                     <select value={liveOrderForm.market} onChange={(event) => setLiveOrderForm((prev) => ({ ...prev, market: event.target.value }))}>
@@ -1674,6 +1756,7 @@ function App() {
                     <thead className="sticky top-0 z-10 bg-terminal-panel2 text-xs text-slate-500">
                       <tr>
                         <th className="px-3 py-2">Time, KST</th>
+                        <th className="px-3 py-2">Exchange</th>
                         <th className="px-3 py-2">Market</th>
                         <th className="px-3 py-2">Side</th>
                         <th className="px-3 py-2">Order Type</th>
@@ -1688,6 +1771,7 @@ function App() {
                       {liveOrders.map((order) => (
                         <tr key={order.request_id} className="border-t border-terminal-line">
                           <td className="nowrap px-3 py-2 text-slate-400" title={formatKstDateTime(order.created_at)}>{formatKstShort(order.created_at)}</td>
+                          <td className="nowrap px-3 py-2 uppercase text-terminal-cyan">{order.exchange ?? "upbit"}</td>
                           <td className="nowrap px-3 py-2 font-semibold">{order.market}</td>
                           <td className="px-3 py-2"><SideBadge side={order.side} /></td>
                           <td className="nowrap px-3 py-2">{order.order_type}</td>
@@ -1718,6 +1802,7 @@ function App() {
                 <button onClick={() => setLivePreview(null)} className="border border-terminal-line px-2 py-1 text-xs text-slate-300">닫기</button>
               </div>
               <div className="grid grid-cols-2 gap-3 p-4">
+                <MetricCard label="거래소" value={(livePreview.exchange ?? activeExchange).toUpperCase()} tone="cyan" />
                 <MetricCard label="방향" value={<SideBadge side={livePreview.side} />} />
                 <MetricCard label="마켓" value={livePreview.market} />
                 <MetricCard label="주문 가격" value={formatKrw(livePreview.price)} />
@@ -1727,6 +1812,7 @@ function App() {
                 <MetricCard label="주문 후 KRW" value={formatKrw(livePreview.estimated_post_krw_balance)} />
                 <MetricCard label="주문 후 코인" value={formatNumber(livePreview.estimated_post_asset_balance)} />
                 <MetricCard label="Risk Result" value={formatRiskStatus(livePreview.risk_result)} tone={livePreview.allowed ? "green" : "red"} />
+                <MetricCard label="Order Chance" value={livePreview.order_chance_status ?? "-"} tone={livePreview.order_chance_status === "SUCCESS" ? "green" : livePreview.order_chance_status === "FAILED" ? "red" : "amber"} title={livePreview.order_chance_error ?? undefined} />
                 <MetricCard label="차단 사유" value={formatRiskStatus(livePreview.blocked_reason)} tone={livePreview.allowed ? "neutral" : "red"} />
               </div>
               <div className="space-y-3 border-t border-terminal-line p-4">

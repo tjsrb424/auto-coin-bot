@@ -270,6 +270,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS live_order_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT NOT NULL UNIQUE,
+                exchange TEXT NOT NULL DEFAULT 'upbit',
                 market TEXT NOT NULL,
                 side TEXT NOT NULL,
                 order_type TEXT NOT NULL,
@@ -308,6 +309,7 @@ def init_db() -> None:
         _ensure_column(conn, "candidate_strategies", "backtest_trade_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "candidate_strategies", "backtest_average_trade_pnl", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "candidate_strategies", "warning", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "live_order_logs", "exchange", "TEXT NOT NULL DEFAULT 'upbit'")
         conn.execute(
             """
             UPDATE paper_sessions
@@ -897,14 +899,15 @@ def insert_live_order_log(log: dict) -> int:
         cursor = conn.execute(
             """
             INSERT INTO live_order_logs (
-                request_id, market, side, order_type, price, volume, amount_krw,
+                request_id, exchange, market, side, order_type, price, volume, amount_krw,
                 fee_estimate, risk_result, order_preview_payload,
                 exchange_request_payload_masked, exchange_response_payload,
                 status, error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 log["request_id"],
+                log.get("exchange", "upbit"),
                 log["market"],
                 log["side"],
                 log["order_type"],
@@ -1022,6 +1025,7 @@ def insert_live_mode_event(event_type: str, mode: str, message: str) -> int:
 
 
 def _normalize_live_order_log(row: dict) -> dict:
+    row["exchange"] = row.get("exchange") or "upbit"
     row["order_preview_payload"] = json.loads(row.get("order_preview_payload") or "{}")
     row["exchange_request_payload_masked"] = json.loads(row.get("exchange_request_payload_masked") or "{}")
     row["exchange_response_payload"] = json.loads(row.get("exchange_response_payload") or "{}")

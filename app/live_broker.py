@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,15 +18,18 @@ from app.upbit import UPBIT_BASE_URL
 
 
 class BrokerInterface(Protocol):
-    async def get_balance(self) -> dict: ...
+    async def get_balances(self) -> dict: ...
+    async def get_order_chance(self, market: str) -> dict: ...
     async def create_order_preview(self, order: dict) -> dict: ...
     async def place_order(self, order: dict) -> dict: ...
+    async def get_order(self, order_id: str) -> dict: ...
+    async def list_open_orders(self, market: str) -> dict: ...
     async def cancel_order(self, order_id: str) -> dict: ...
-    async def get_order_status(self, order_id: str) -> dict: ...
 
 
 @dataclass(frozen=True)
 class LiveTradingConfig:
+    exchange: str
     access_key_loaded: bool
     secret_key_loaded: bool
     live_trading_enabled: bool
@@ -41,11 +45,28 @@ class LiveTradingConfig:
 
     @classmethod
     def from_env(cls) -> "LiveTradingConfig":
+        exchange = os.getenv("EXCHANGE", "upbit").strip().lower()
+        return cls.for_exchange(exchange)
+
+    @classmethod
+    def for_exchange(cls, exchange: str) -> "LiveTradingConfig":
+        exchange = exchange.strip().lower()
+        if exchange not in {"upbit", "bithumb"}:
+            exchange = "upbit"
+        if exchange == "bithumb":
+            access_key = os.getenv("BITHUMB_ACCESS_KEY", "")
+            secret_key = os.getenv("BITHUMB_SECRET_KEY", "")
+            base_url = os.getenv("BITHUMB_BASE_URL", "https://api.bithumb.com")
+        else:
+            access_key = os.getenv("UPBIT_ACCESS_KEY", "")
+            secret_key = os.getenv("UPBIT_SECRET_KEY", "")
+            base_url = os.getenv("UPBIT_BASE_URL", UPBIT_BASE_URL)
         return cls(
-            access_key_loaded=bool(os.getenv("UPBIT_ACCESS_KEY")),
-            secret_key_loaded=bool(os.getenv("UPBIT_SECRET_KEY")),
+            exchange=exchange,
+            access_key_loaded=bool(access_key),
+            secret_key_loaded=bool(secret_key),
             live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
-            base_url=os.getenv("UPBIT_BASE_URL", UPBIT_BASE_URL).rstrip("/"),
+            base_url=base_url.rstrip("/"),
             max_live_order_krw=float(os.getenv("MAX_LIVE_ORDER_KRW", "10000")),
             max_daily_live_loss_percent=float(os.getenv("MAX_DAILY_LIVE_LOSS_PERCENT", "1")),
             min_order_krw=float(os.getenv("MIN_LIVE_ORDER_KRW", "5000")),
@@ -154,15 +175,62 @@ def _available_balance(balances: dict, currency: str) -> float:
     return _float(item.get("balance"))
 
 
-class LiveBroker:
+class BaseJwtBroker:
+    exchange = "unknown"
+
     def __init__(self) -> None:
         self.config = LiveTradingConfig.from_env()
-        self.access_key = os.getenv("UPBIT_ACCESS_KEY", "")
-        self.secret_key = os.getenv("UPBIT_SECRET_KEY", "")
+        self.access_key = ""
+        self.secret_key = ""
+        self.base_url = self.config.base_url
 
     @property
     def is_ready(self) -> bool:
-        return self.config.live_trading_enabled and self.config.api_key_loaded
+        return bool(self.access_key and self.secret_key)
+
+    def _jwt(self, params: dict[str, Any] | None = None) -> str:
+        raise NotImplementedError
+
+    def _headers(self, params: dict[str, Any] | None = None) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._jwt(params)}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    async def _request(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict | list:
+        if not self.is_ready:
+            raise LiveBrokerError(f"{self.exchange} API keys are missing.")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = f"{self.base_url}{path}"
+            headers = self._headers(params)
+            if method == "GET":
+                response = await client.get(url, params=params, headers=headers)
+            elif method == "DELETE":
+                response = await client.delete(url, params=params, headers=headers)
+            elif method == "POST":
+                response = await client.post(url, json=params or {}, headers=headers)
+            else:
+                raise LiveBrokerError("Unsupported method")
+        if response.status_code >= 400:
+            raise LiveBrokerError(f"{self.exchange} private API error: {response.status_code} {response.text[:300]}")
+        return response.json()
+
+    async def get_balance(self) -> dict:
+        return await self.get_balances()
+
+    async def get_order_status(self, order_id: str) -> dict:
+        return await self.get_order(order_id)
+
+
+class UpbitBroker(BaseJwtBroker):
+    exchange = "upbit"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.access_key = os.getenv("UPBIT_ACCESS_KEY", "")
+        self.secret_key = os.getenv("UPBIT_SECRET_KEY", "")
+        self.base_url = os.getenv("UPBIT_BASE_URL", UPBIT_BASE_URL).rstrip("/")
 
     def _jwt(self, params: dict[str, Any] | None = None) -> str:
         header = {"alg": "HS512", "typ": "JWT"}
@@ -178,32 +246,7 @@ class LiveBroker:
         signature = hmac.new(self.secret_key.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha512).digest()
         return f"{signing_input}.{_b64url(signature)}"
 
-    def _headers(self, params: dict[str, Any] | None = None) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._jwt(params)}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-
-    async def _request(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict | list:
-        if not self.is_ready:
-            raise LiveBrokerError("LiveBroker is locked or API keys are missing.")
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = f"{self.config.base_url}{path}"
-            headers = self._headers(params)
-            if method == "GET":
-                response = await client.get(url, params=params, headers=headers)
-            elif method == "DELETE":
-                response = await client.delete(url, params=params, headers=headers)
-            elif method == "POST":
-                response = await client.post(url, json=params or {}, headers=headers)
-            else:
-                raise LiveBrokerError("Unsupported method")
-        if response.status_code >= 400:
-            raise LiveBrokerError(f"Upbit private API error: {response.status_code} {response.text[:300]}")
-        return response.json()
-
-    async def get_balance(self) -> dict:
+    async def get_balances(self) -> dict:
         accounts = await self._request("GET", "/v1/accounts")
         return normalize_accounts(accounts if isinstance(accounts, list) else [])
 
@@ -212,20 +255,80 @@ class LiveBroker:
         return result if isinstance(result, dict) else {"raw": result}
 
     async def create_order_preview(self, order: dict) -> dict:
-        balances = await self.get_balance()
-        return {"balances": balances, "order": order}
+        balances = await self.get_balances()
+        chance = await self.get_order_chance(str(order.get("market", "KRW-BTC")))
+        return {"balances": balances, "order_chance": chance, "order": order}
 
     async def place_order(self, order: dict) -> dict:
         payload = to_upbit_order_payload(order)
         return await self._request("POST", "/v1/orders", payload)
 
+    async def get_order(self, order_id: str) -> dict:
+        result = await self._request("GET", "/v1/order", {"uuid": order_id})
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def list_open_orders(self, market: str) -> dict:
+        result = await self._request("GET", "/v1/orders", {"market": market, "state": "wait"})
+        return {"orders": result if isinstance(result, list) else result}
+
     async def cancel_order(self, order_id: str) -> dict:
         result = await self._request("DELETE", "/v1/order", {"uuid": order_id})
         return result if isinstance(result, dict) else {"raw": result}
 
-    async def get_order_status(self, order_id: str) -> dict:
+
+class BithumbBroker(BaseJwtBroker):
+    exchange = "bithumb"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.access_key = os.getenv("BITHUMB_ACCESS_KEY", "")
+        self.secret_key = os.getenv("BITHUMB_SECRET_KEY", "")
+        self.base_url = os.getenv("BITHUMB_BASE_URL", "https://api.bithumb.com").rstrip("/")
+
+    def _jwt(self, params: dict[str, Any] | None = None) -> str:
+        header = {"alg": "HS256", "typ": "JWT"}
+        payload: dict[str, Any] = {
+            "access_key": self.access_key,
+            "nonce": str(uuid.uuid4()),
+            "timestamp": int(time.time() * 1000),
+        }
+        query = _query_string(params)
+        if query:
+            payload["query_hash"] = hashlib.sha512(query.encode("utf-8")).hexdigest()
+            payload["query_hash_alg"] = "SHA512"
+        signing_input = f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}.{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+        signature = hmac.new(self.secret_key.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
+        return f"{signing_input}.{_b64url(signature)}"
+
+    async def get_balances(self) -> dict:
+        accounts = await self._request("GET", "/v1/accounts")
+        return normalize_accounts(accounts if isinstance(accounts, list) else [])
+
+    async def get_order_chance(self, market: str) -> dict:
+        result = await self._request("GET", "/v1/orders/chance", {"market": market})
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def create_order_preview(self, order: dict) -> dict:
+        balances = await self.get_balances()
+        chance = await self.get_order_chance(str(order.get("market", "KRW-BTC")))
+        return {"balances": balances, "order_chance": chance, "order": order}
+
+    async def place_order(self, order: dict) -> dict:
+        raise LiveBrokerError("Bithumb live order submission is blocked in Sprint 6.5.")
+
+    async def get_order(self, order_id: str) -> dict:
         result = await self._request("GET", "/v1/order", {"uuid": order_id})
         return result if isinstance(result, dict) else {"raw": result}
+
+    async def list_open_orders(self, market: str) -> dict:
+        result = await self._request("GET", "/v1/orders", {"market": market, "state": "wait"})
+        return {"orders": result if isinstance(result, list) else result}
+
+    async def cancel_order(self, order_id: str) -> dict:
+        raise LiveBrokerError("Bithumb order cancel is not enabled in Sprint 6.5.")
+
+
+LiveBroker = UpbitBroker
 
 
 class LiveBrokerError(RuntimeError):
@@ -281,10 +384,26 @@ def to_upbit_order_payload(order: dict) -> dict:
 
 
 def masked_exchange_request(order: dict) -> dict:
-    return {
-        **to_upbit_order_payload(order),
-        "authorization": "MASKED",
-    }
+    exchange = str(order.get("exchange", "upbit")).lower()
+    if exchange == "bithumb":
+        return {
+            "market": order["market"],
+            "side": "bid" if str(order.get("side", "")).upper() == "BUY" else "ask",
+            "order_type": str(order.get("order_type", "LIMIT")).lower(),
+            "price": str(order.get("price")),
+            "volume": str(order.get("volume")),
+            "authorization": "MASKED",
+        }
+    return {**to_upbit_order_payload(order), "authorization": "MASKED"}
+
+
+def get_live_broker(exchange: str | None = None) -> BrokerInterface:
+    selected = (exchange or LiveTradingConfig.from_env().exchange).strip().lower()
+    if selected not in {"upbit", "bithumb"}:
+        raise LiveBrokerError(f"Unknown exchange: {selected}")
+    if selected == "bithumb":
+        return BithumbBroker()
+    return UpbitBroker()
 
 
 def evaluate_live_order_risk(
@@ -324,6 +443,8 @@ def evaluate_live_order_risk(
     reason = ""
     if mode != "LIVE_MANUAL_ONLY":
         risk_result = "BLOCKED_EMERGENCY_STOP" if mode == "EMERGENCY_STOPPED" else "BLOCKED_LIVE_LOCKED"
+        if risk_result == "BLOCKED_LIVE_LOCKED" and not config.live_trading_enabled:
+            risk_result = "BLOCKED_LIVE_DISABLED"
     elif request_exists or recent_duplicate:
         risk_result = "BLOCKED_DUPLICATE_ORDER"
     elif side == "SELL" and asset_available < volume:

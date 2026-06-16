@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import uuid
@@ -52,6 +52,7 @@ from app.live_broker import (
     arm_live_manual_mode,
     current_live_mode,
     evaluate_live_order_risk,
+    get_live_broker,
     is_emergency_stopped,
     lock_live_trading,
     masked_exchange_request,
@@ -63,6 +64,8 @@ from app.live_paper import process_running_live_paper_sessions, run_scheduler_ti
 from app.paper_trading import run_paper_trading
 from app.strategy_validation import run_strategy_validation
 from app.upbit import UpbitClientError, fetch_minute_candles
+
+load_server_env()
 
 DEFAULT_MARKET = "KRW-BTC"
 logger = logging.getLogger("uvicorn.error")
@@ -89,7 +92,7 @@ async def _load_period_candles(market: str, unit: int, start_time_utc: str, end_
     start = _parse_utc(start_time_utc)
     end = _parse_utc(end_time_utc)
     if end <= start:
-        raise ValueError("종료 시간은 시작 시간보다 뒤여야 합니다.")
+        raise ValueError("醫낅즺 ?쒓컙? ?쒖옉 ?쒓컙蹂대떎 ?ㅼ뿬???⑸땲??")
     expected_count = ceil((end - start).total_seconds() / (unit * 60)) + 5
     fetch_count = min(max(expected_count, 30), 20000)
     fresh = await fetch_minute_candles(
@@ -106,7 +109,7 @@ async def _load_period_candles(market: str, unit: int, start_time_utc: str, end_
         _format_candle_time(end),
     )
     if len(candles) < 30:
-        raise ValueError("선택한 기간에 백테스트에 필요한 캔들이 30개 미만입니다.")
+        raise ValueError("?좏깮??湲곌컙??諛깊뀒?ㅽ듃???꾩슂??罹붾뱾??30媛?誘몃쭔?낅땲??")
     return candles
 
 
@@ -186,6 +189,7 @@ class LiveEmergencyResetRequest(BaseModel):
 
 class LiveOrderPreviewRequest(BaseModel):
     request_id: str | None = None
+    exchange: str | None = Field(None, pattern=r"^(upbit|bithumb)$")
     market: str = Field(DEFAULT_MARKET, pattern=r"^[A-Z]+-[A-Z0-9]+$")
     side: str = Field("BUY", pattern=r"^(BUY|SELL)$")
     order_type: str = Field("LIMIT", pattern=r"^(LIMIT|MARKET)$")
@@ -204,7 +208,7 @@ async def lifespan(_: FastAPI):
     load_server_env()
     init_db()
     reset_live_runtime_state()
-    insert_live_mode_event("SERVER_START", current_live_mode(), "서버 시작 시 실거래 모드는 자동 잠금 상태로 초기화되었습니다.")
+    insert_live_mode_event("SERVER_START", current_live_mode(), "?쒕쾭 ?쒖옉 ???ㅺ굅??紐⑤뱶???먮룞 ?좉툑 ?곹깭濡?珥덇린?붾릺?덉뒿?덈떎.")
     stopped_forward_sessions = pause_running_forward_sessions_on_startup()
     if stopped_forward_sessions:
         logger.info(
@@ -272,7 +276,7 @@ async def get_candles(
 @app.post("/api/backtests")
 async def create_backtest(payload: BacktestRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 0 기본 대상 마켓은 KRW-BTC만 지원합니다.")
+        raise HTTPException(status_code=400, detail="Sprint 0 湲곕낯 ???留덉폆? KRW-BTC留?吏?먰빀?덈떎.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -308,11 +312,11 @@ async def create_backtest(payload: BacktestRequest) -> dict:
 @app.post("/api/backtests/compare")
 async def compare_backtests(payload: BacktestCompareRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 3 백테스트 비교는 KRW-BTC만 지원합니다.")
+        raise HTTPException(status_code=400, detail="Sprint 3 諛깊뀒?ㅽ듃 鍮꾧탳??KRW-BTC留?吏?먰빀?덈떎.")
     allowed = {"ma_cross", "rsi", "volatility_breakout"}
     strategies = [strategy for strategy in payload.strategies if strategy in allowed]
     if not strategies:
-        raise HTTPException(status_code=400, detail="비교할 전략이 없습니다.")
+        raise HTTPException(status_code=400, detail="鍮꾧탳???꾨왂???놁뒿?덈떎.")
     try:
         candles = await _load_period_candles(
             payload.market,
@@ -344,7 +348,7 @@ async def compare_backtests(payload: BacktestCompareRequest) -> dict:
 @app.post("/api/paper-trading/simulate")
 async def simulate_paper_trading(payload: PaperTradingRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 1 기본 대상 마켓은 KRW-BTC만 지원합니다.")
+        raise HTTPException(status_code=400, detail="Sprint 1 湲곕낯 ???留덉폆? KRW-BTC留?吏?먰빀?덈떎.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -380,7 +384,7 @@ def stop_paper_trading() -> dict:
     if session is None:
         latest = load_latest_paper_session()
         if latest is None:
-            return {"status": "STOPPED", "message": "중지할 페이퍼 트레이딩 세션이 없습니다."}
+            return {"status": "STOPPED", "message": "以묒????섏씠???몃젅?대뵫 ?몄뀡???놁뒿?덈떎."}
         return {**latest, "status": "STOPPED"}
     return session
 
@@ -396,9 +400,9 @@ def latest_paper_trading() -> dict:
 @app.post("/api/strategy-validation/run")
 async def run_validation(payload: StrategyValidationRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 4 전략 검증은 KRW-BTC만 지원합니다.")
+        raise HTTPException(status_code=400, detail="Sprint 4 ?꾨왂 寃利앹? KRW-BTC留?吏?먰빀?덈떎.")
     if payload.strategy not in {"ma_cross", "rsi", "volatility_breakout"}:
-        raise HTTPException(status_code=400, detail="지원하지 않는 전략입니다.")
+        raise HTTPException(status_code=400, detail="吏?먰븯吏 ?딅뒗 ?꾨왂?낅땲??")
     try:
         result = await run_strategy_validation(
             market=payload.market,
@@ -427,7 +431,7 @@ async def run_validation(payload: StrategyValidationRequest) -> dict:
 @app.post("/api/candidate-strategies")
 def create_candidate_strategy(payload: CandidateStrategyRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="후보 전략은 KRW-BTC만 지원합니다.")
+        raise HTTPException(status_code=400, detail="?꾨낫 ?꾨왂? KRW-BTC留?吏?먰빀?덈떎.")
     candidate = payload.model_dump()
     candidate_id = save_candidate_strategy(candidate)
     return {"id": candidate_id, **candidate}
@@ -438,27 +442,31 @@ def list_candidate_strategies() -> dict:
     return {"candidates": load_candidate_strategies()}
 
 
-def _live_status() -> dict:
-    config = LiveTradingConfig.from_env()
+def _live_status(exchange: str | None = None) -> dict:
+    config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
     mode = current_live_mode()
-    broker_status = "READY" if config.live_trading_enabled and config.api_key_loaded else "LOCKED"
+    broker_status = "READY" if config.api_key_loaded else "API_KEY_MISSING"
+    if config.api_key_loaded and not config.live_trading_enabled:
+        broker_status = "READY_READ_ONLY"
     if is_emergency_stopped():
         broker_status = "EMERGENCY_STOPPED"
     return {
         "mode": mode,
+        "exchange": config.exchange,
         "live_trading_enabled": config.live_trading_enabled,
         "broker_status": broker_status,
         "api_key_loaded": config.api_key_loaded,
         "access_key_loaded": config.access_key_loaded,
         "secret_key_loaded": config.secret_key_loaded,
         "balance_fetch_status": "NOT_REQUESTED",
+        "order_chance_status": "NOT_REQUESTED",
         "risk_manager_status": "ACTIVE" if mode == "LIVE_MANUAL_ONLY" else "LOCKED",
         "emergency_stop": is_emergency_stopped(),
         "max_live_order_krw": config.max_live_order_krw,
         "daily_loss_limit_percent": config.max_daily_live_loss_percent,
         "min_order_krw": config.min_order_krw,
         "last_live_order_time": get_last_live_order_time(),
-        "api_key_policy": "API Key는 서버 환경변수에서만 읽으며, 출금 권한 없는 키만 사용하세요.",
+        "api_key_policy": "API Key???쒕쾭 ?섍꼍蹂?섏뿉?쒕쭔 ?쎌쑝硫? 異쒓툑 沅뚰븳 ?녿뒗 ?ㅻ쭔 ?ъ슜?섏꽭??",
     }
 
 
@@ -482,9 +490,9 @@ async def _market_snapshot(market: str) -> dict | None:
 async def _safe_live_balances() -> tuple[dict, str, str | None]:
     config = LiveTradingConfig.from_env()
     if not config.live_trading_enabled:
-        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "DISABLED", "LIVE_TRADING_ENABLED=false 입니다."
+        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "DISABLED", "LIVE_TRADING_ENABLED=false ?낅땲??"
     if not config.api_key_loaded:
-        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "API_KEY_MISSING", "UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY가 필요합니다."
+        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "API_KEY_MISSING", "UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY媛 ?꾩슂?⑸땲??"
     try:
         balances = await LiveBroker().get_balance()
         return balances, "SUCCESS", None
@@ -492,14 +500,42 @@ async def _safe_live_balances() -> tuple[dict, str, str | None]:
         return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "FAILED", str(exc)
 
 
+async def _safe_live_balances_for_exchange(exchange: str | None = None) -> tuple[dict, str, str | None]:
+    empty = {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}
+    config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
+    if not config.api_key_loaded:
+        prefix = "BITHUMB" if config.exchange == "bithumb" else "UPBIT"
+        return empty, "API_KEY_MISSING", f"{prefix}_ACCESS_KEY/{prefix}_SECRET_KEY媛 ?꾩슂?⑸땲??"
+    try:
+        balances = await get_live_broker(config.exchange).get_balances()
+        return balances, "SUCCESS", None
+    except LiveBrokerError as exc:
+        return empty, "FAILED", str(exc)
+
+
+async def _safe_order_chance(market: str, exchange: str | None = None) -> tuple[dict, str, str | None]:
+    config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
+    if not config.api_key_loaded:
+        prefix = "BITHUMB" if config.exchange == "bithumb" else "UPBIT"
+        return {}, "API_KEY_MISSING", f"{prefix}_ACCESS_KEY/{prefix}_SECRET_KEY媛 ?꾩슂?⑸땲??"
+    try:
+        chance = await get_live_broker(config.exchange).get_order_chance(market)
+        return chance, "SUCCESS", None
+    except LiveBrokerError as exc:
+        return {}, "FAILED", str(exc)
+
+
 @app.get("/api/live-trading/status")
-def live_trading_status() -> dict:
-    return _live_status()
+@app.get("/api/live/status")
+def live_trading_status(exchange: str | None = Query(None, pattern=r"^(upbit|bithumb)$")) -> dict:
+    return _live_status(exchange)
 
 
 @app.get("/api/live-trading/balances")
-async def live_trading_balances() -> dict:
-    balances, status, error = await _safe_live_balances()
+@app.get("/api/live/balances")
+async def live_trading_balances(exchange: str | None = Query(None, pattern=r"^(upbit|bithumb)$")) -> dict:
+    selected_config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
+    balances, status, error = await _safe_live_balances_for_exchange(selected_config.exchange)
     estimated_total = float(balances.get("krw", {}).get("balance", 0)) + float(balances.get("krw", {}).get("locked", 0))
     btc_snapshot = await _market_snapshot("KRW-BTC")
     eth_snapshot = await _market_snapshot("KRW-ETH")
@@ -508,12 +544,26 @@ async def live_trading_balances() -> dict:
     if eth_snapshot:
         estimated_total += (float(balances.get("eth", {}).get("balance", 0)) + float(balances.get("eth", {}).get("locked", 0))) * eth_snapshot["price"]
     return {
-        **_live_status(),
+        **_live_status(selected_config.exchange),
         "balance_fetch_status": status,
         "error_message": error,
         "balances": balances,
         "estimated_total_equity_krw": estimated_total,
         "prices": {"KRW-BTC": btc_snapshot, "KRW-ETH": eth_snapshot},
+    }
+
+
+@app.get("/api/live-trading/order-chance")
+async def live_trading_order_chance(market: str = Query(DEFAULT_MARKET), exchange: str | None = Query(None, pattern=r"^(upbit|bithumb)$")) -> dict:
+    chance, status, error = await _safe_order_chance(market, exchange)
+    config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
+    return {
+        **_live_status(config.exchange),
+        "exchange": config.exchange,
+        "market": market,
+        "order_chance_status": status,
+        "order_chance_error": error,
+        "order_chance": chance,
     }
 
 
@@ -527,15 +577,15 @@ def arm_live_trading(payload: LiveArmRequest) -> dict:
 @app.post("/api/live-trading/lock")
 def lock_live_trading_endpoint() -> dict:
     mode = lock_live_trading()
-    insert_live_mode_event("LOCK", mode, "사용자가 실거래 모드를 잠금 처리했습니다.")
-    return {**_live_status(), "message": "실거래 모드가 잠금 상태입니다."}
+    insert_live_mode_event("LOCK", mode, "?ъ슜?먭? ?ㅺ굅??紐⑤뱶瑜??좉툑 泥섎━?덉뒿?덈떎.")
+    return {**_live_status(), "message": "?ㅺ굅??紐⑤뱶媛 ?좉툑 ?곹깭?낅땲??"}
 
 
 @app.post("/api/live-trading/emergency-stop")
 def emergency_stop_live_trading() -> dict:
     mode = trigger_emergency_stop()
-    insert_live_mode_event("EMERGENCY_STOP", mode, "Emergency Stop이 활성화되어 모든 실거래 주문 후보를 차단합니다.")
-    return {**_live_status(), "message": "Emergency Stop 활성화: 자동 청산은 실행하지 않습니다."}
+    insert_live_mode_event("EMERGENCY_STOP", mode, "Emergency Stop???쒖꽦?붾릺??紐⑤뱺 ?ㅺ굅??二쇰Ц ?꾨낫瑜?李⑤떒?⑸땲??")
+    return {**_live_status(), "message": "Emergency Stop ?쒖꽦?? ?먮룞 泥?궛? ?ㅽ뻾?섏? ?딆뒿?덈떎."}
 
 
 @app.post("/api/live-trading/reset-emergency")
@@ -546,7 +596,11 @@ def reset_live_emergency(payload: LiveEmergencyResetRequest) -> dict:
 
 
 @app.post("/api/live-orders/preview")
+@app.post("/api/live/order-preview")
 async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
+    active_config = LiveTradingConfig.from_env()
+    exchange = payload.exchange or active_config.exchange
+    config = LiveTradingConfig.for_exchange(exchange)
     request_id = payload.request_id or f"live-{uuid.uuid4()}"
     if get_live_order_log(request_id) is not None:
         risk = {
@@ -556,10 +610,11 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
             "fee_estimate": 0.0,
             "request_id": request_id,
         }
-        return {"request_id": request_id, "preview": risk, "status": "BLOCKED", **_live_status()}
+        return {"request_id": request_id, "preview": risk, "status": "BLOCKED", **_live_status(exchange)}
 
     order = {
         "request_id": request_id,
+        "exchange": exchange,
         "market": payload.market,
         "side": payload.side,
         "order_type": payload.order_type,
@@ -567,9 +622,9 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
         "amount_krw": payload.amount_krw,
         "volume": payload.volume,
     }
-    balances, balance_status, balance_error = await _safe_live_balances()
+    balances, balance_status, balance_error = await _safe_live_balances_for_exchange(exchange)
+    order_chance, order_chance_status, order_chance_error = await _safe_order_chance(payload.market, exchange)
     snapshot = await _market_snapshot(payload.market)
-    config = LiveTradingConfig.from_env()
     preview = evaluate_live_order_risk(
         order=order,
         config=config,
@@ -590,13 +645,22 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
         preview["allowed"] = False
         preview["risk_result"] = "BLOCKED_API_RESPONSE_ERROR"
         preview["blocked_reason"] = balance_error or balance_status
+    if order_chance_status != "SUCCESS" and preview["risk_result"] == "ALLOWED":
+        preview["allowed"] = False
+        preview["risk_result"] = "BLOCKED_API_RESPONSE_ERROR"
+        preview["blocked_reason"] = order_chance_error or order_chance_status
     preview["request_id"] = request_id
     preview["balance_fetch_status"] = balance_status
     preview["balance_error"] = balance_error
+    preview["exchange"] = exchange
+    preview["order_chance_status"] = order_chance_status
+    preview["order_chance_error"] = order_chance_error
+    preview["order_chance"] = order_chance
     preview["market_snapshot"] = snapshot
     insert_live_order_log(
         {
             "request_id": request_id,
+            "exchange": exchange,
             "market": payload.market,
             "side": payload.side,
             "order_type": payload.order_type,
@@ -612,24 +676,26 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
             "error_message": preview.get("blocked_reason") or balance_error,
         }
     )
-    return {"request_id": request_id, "preview": preview, "status": "PREVIEWED" if preview["allowed"] else "BLOCKED", **_live_status()}
+    return {"request_id": request_id, "preview": preview, "status": "PREVIEWED" if preview["allowed"] else "BLOCKED", **_live_status(exchange)}
 
 
 @app.post("/api/live-orders/place")
 async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
     if payload.final_confirmation != "PLACE LIVE ORDER":
-        raise HTTPException(status_code=400, detail="최종 확인 문구 PLACE LIVE ORDER가 필요합니다.")
+        raise HTTPException(status_code=400, detail="理쒖쥌 ?뺤씤 臾멸뎄 PLACE LIVE ORDER媛 ?꾩슂?⑸땲??")
     preview_log = get_live_order_log(payload.request_id)
     if preview_log is None:
-        raise HTTPException(status_code=404, detail="먼저 주문 미리보기를 실행해야 합니다.")
+        raise HTTPException(status_code=404, detail="癒쇱? 二쇰Ц 誘몃━蹂닿린瑜??ㅽ뻾?댁빞 ?⑸땲??")
     if preview_log["status"] != "PREVIEWED" or preview_log["risk_result"] != "ALLOWED":
-        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": preview_log["risk_result"], "message": "Risk Manager가 주문을 차단했습니다."}
+        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": preview_log["risk_result"], "message": "Risk Manager媛 二쇰Ц??李⑤떒?덉뒿?덈떎."}
     if current_live_mode() != "LIVE_MANUAL_ONLY":
-        update_live_order_log(payload.request_id, {"status": "BLOCKED", "risk_result": "BLOCKED_LIVE_LOCKED", "error_message": "실거래 모드가 LIVE_MANUAL_ONLY가 아닙니다."})
-        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": "BLOCKED_LIVE_LOCKED", **_live_status()}
-
+        live_config = LiveTradingConfig.from_env()
+        blocked_result = "BLOCKED_LIVE_DISABLED" if not live_config.live_trading_enabled else "BLOCKED_LIVE_LOCKED"
+        update_live_order_log(payload.request_id, {"status": "BLOCKED", "risk_result": blocked_result, "error_message": "LIVE_MANUAL_ONLY mode is required."})
+        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": blocked_result, **_live_status(preview_log.get("exchange"))}
     order_payload = {
         "request_id": payload.request_id,
+        "exchange": preview_log.get("exchange", LiveTradingConfig.from_env().exchange),
         "market": preview_log["market"],
         "side": preview_log["side"],
         "order_type": preview_log["order_type"],
@@ -637,8 +703,8 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
         "amount_krw": preview_log["amount_krw"],
         "volume": preview_log["volume"],
     }
-    config = LiveTradingConfig.from_env()
-    balances, balance_status, balance_error = await _safe_live_balances()
+    config = LiveTradingConfig.for_exchange(str(order_payload["exchange"]))
+    balances, balance_status, balance_error = await _safe_live_balances_for_exchange(str(order_payload["exchange"]))
     snapshot = await _market_snapshot(preview_log["market"])
     final_risk = evaluate_live_order_risk(
         order=order_payload,
@@ -663,8 +729,8 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
                 "error_message": final_risk.get("blocked_reason"),
             },
         )
-        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": final_risk["risk_result"], "preview": final_risk, **_live_status()}
-    broker = LiveBroker()
+        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": final_risk["risk_result"], "preview": final_risk, **_live_status(str(order_payload["exchange"]))}
+    broker = get_live_broker(str(order_payload["exchange"]))
     try:
         masked_request = masked_exchange_request(order_payload)
         exchange_response = await broker.place_order(order_payload)
@@ -678,7 +744,7 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
                 "error_message": None,
             },
         )
-        return {"request_id": payload.request_id, "status": "SUBMITTED", "exchange_response": exchange_response, **_live_status()}
+        return {"request_id": payload.request_id, "status": "SUBMITTED", "exchange_response": exchange_response, **_live_status(str(order_payload["exchange"]))}
     except Exception as exc:
         update_live_order_log(
             payload.request_id,
@@ -690,7 +756,7 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
                 "error_message": str(exc),
             },
         )
-        return {"request_id": payload.request_id, "status": "FAILED", "risk_result": "BLOCKED_API_RESPONSE_ERROR", "error_message": str(exc), **_live_status()}
+        return {"request_id": payload.request_id, "status": "FAILED", "risk_result": "BLOCKED_API_RESPONSE_ERROR", "error_message": str(exc), **_live_status(str(order_payload["exchange"]))}
 
 
 @app.get("/api/live-orders")
@@ -702,9 +768,9 @@ def list_live_orders() -> dict:
 async def start_forward_paper(payload: ForwardPaperStartRequest) -> dict:
     candidate = load_candidate_strategy(payload.candidate_strategy_id)
     if candidate is None:
-        raise HTTPException(status_code=404, detail="후보 전략을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="?꾨낫 ?꾨왂??李얠쓣 ???놁뒿?덈떎.")
     if candidate["market"] != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Forward Paper는 KRW-BTC 후보 전략만 지원합니다.")
+        raise HTTPException(status_code=400, detail="Forward Paper??KRW-BTC ?꾨낫 ?꾨왂留?吏?먰빀?덈떎.")
     try:
         fresh = await fetch_minute_candles(
             market=candidate["market"],
@@ -715,7 +781,7 @@ async def start_forward_paper(payload: ForwardPaperStartRequest) -> dict:
         candles = load_candles(candidate["market"], int(candidate["unit"]), 300)
         latest_candle = latest_completed_candle(candles, int(candidate["unit"]))
         if latest_candle is None:
-            raise HTTPException(status_code=502, detail="Forward Paper를 시작할 완성 캔들이 없습니다.")
+            raise HTTPException(status_code=502, detail="Forward Paper瑜??쒖옉???꾩꽦 罹붾뱾???놁뒿?덈떎.")
         risk = {
             "initial_cash": payload.initial_balance_krw,
             "max_order_amount": 100_000,
@@ -755,7 +821,7 @@ def stop_forward_paper(payload: ForwardPaperStopRequest | None = None) -> dict:
     if session is None:
         latest = load_latest_forward_session()
         if latest is None:
-            return {"status": "STOPPED", "mode": "FORWARD_PAPER", "message": "중지할 Forward Paper 세션이 없습니다."}
+            return {"status": "STOPPED", "mode": "FORWARD_PAPER", "message": "以묒???Forward Paper ?몄뀡???놁뒿?덈떎."}
         return {**latest, "status": "STOPPED"}
     logger.info("[paper-forward] session=%s stopped", session["id"])
     return session
@@ -782,7 +848,7 @@ async def tick_forward_paper() -> dict:
 @app.post("/api/paper-trading/live/start")
 async def start_live_paper_trading(payload: PaperTradingRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 2.5 실시간 페이퍼는 KRW-BTC만 지원합니다.")
+        raise HTTPException(status_code=400, detail="Sprint 2.5 ?ㅼ떆媛??섏씠?쇰뒗 KRW-BTC留?吏?먰빀?덈떎.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -793,7 +859,7 @@ async def start_live_paper_trading(payload: PaperTradingRequest) -> dict:
         candles = load_candles(payload.market, payload.unit, max(payload.count, 30))
         latest_candle = candles[-1] if candles else None
         if latest_candle is None:
-            raise HTTPException(status_code=502, detail="초기화할 최신 캔들이 없습니다.")
+            raise HTTPException(status_code=502, detail="珥덇린?뷀븷 理쒖떊 罹붾뱾???놁뒿?덈떎.")
         session_id = create_live_paper_session(
             payload.market,
             payload.unit,
@@ -822,7 +888,7 @@ def stop_live_paper_trading() -> dict:
     if session is None:
         latest = load_latest_live_paper_session()
         if latest is None:
-            return {"status": "STOPPED", "message": "중지할 실시간 페이퍼 세션이 없습니다."}
+            return {"status": "STOPPED", "message": "以묒????ㅼ떆媛??섏씠???몄뀡???놁뒿?덈떎."}
         return {**latest, "status": "STOPPED"}
     logger.info("[paper-live] session=%s stopped", session["id"])
     return session
