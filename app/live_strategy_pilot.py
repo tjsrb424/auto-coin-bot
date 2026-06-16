@@ -553,6 +553,8 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
     update_live_order_log(request_id, {"status": status, "exchange_response_payload": response, "order_uuid": order_uuid})
     current = get_live_order_log(request_id)
     if current is not None and status in {"WAITING", "PARTIALLY_FILLED", "CANCELED", "FILLED", "FAILED"}:
+        if _has_recent_status_event(order_uuid, status):
+            return
         event_payload = {
             **current,
             "request_id": f"{request_id}-{status.lower()}-{uuid.uuid4().hex[:8]}",
@@ -572,6 +574,13 @@ def _is_strategy_order_event_request(request_id: str) -> bool:
         or "-filled-" in request_id
         or "-failed-" in request_id
     )
+
+
+def _has_recent_status_event(order_uuid: str, status: str) -> bool:
+    for item in load_live_order_logs(50):
+        if item.get("order_uuid") == order_uuid and item.get("status") == status and _is_strategy_order_event_request(str(item.get("request_id", ""))):
+            return True
+    return False
 
 
 def _should_stop_on_block(risk_result: str) -> bool:

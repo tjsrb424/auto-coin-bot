@@ -1902,7 +1902,7 @@ function App() {
                 <option value="">후보 전략 선택</option>
                 {candidateStrategies.filter((candidate) => candidate.market === "KRW-BTC").map((candidate) => (
                   <option key={candidate.id} value={candidate.id}>
-                    {`${STRATEGY_BADGES[candidate.strategy]} · ${formatTimeframe(candidate.unit)} · ${formatDecimal(candidate.score)}점`}
+                    {`${STRATEGY_BADGES[candidate.strategy]} | ${formatTimeframe(candidate.unit)} | ${formatDecimal(candidate.score)}점`}
                   </option>
                 ))}
               </select>
@@ -1968,7 +1968,7 @@ function App() {
                 <option value="">Select candidate</option>
                 {candidateStrategies.filter((candidate) => candidate.market === "KRW-BTC").map((candidate) => (
                   <option key={candidate.id} value={candidate.id}>
-                    {`${STRATEGY_BADGES[candidate.strategy]} ? ${formatTimeframe(candidate.unit)} ? ${formatDecimal(candidate.score)}pt`}
+                    {`${STRATEGY_BADGES[candidate.strategy]} | ${formatTimeframe(candidate.unit)} | ${formatDecimal(candidate.score)}pt`}
                   </option>
                 ))}
               </select>
