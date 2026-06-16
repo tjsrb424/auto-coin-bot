@@ -2,11 +2,39 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
+  Bell,
+  Bot,
+  CheckCircle2,
+  ClipboardList,
+  Copy,
+  DollarSign,
+  Download,
+  FileText,
+  Filter,
+  Gauge,
+  History,
+  Home,
+  LineChart,
+  Link,
+  Lock,
+  Menu,
   PauseCircle,
+  PieChart,
   Play,
+  Power,
+  Plus,
   RefreshCw,
+  Save,
+  Search,
+  Settings,
   ShieldCheck,
+  SlidersHorizontal,
+  Target,
+  TestTube2,
+  TrendingUp,
+  UserCircle,
   Wallet
 } from "lucide-react";
 import {
@@ -331,6 +359,12 @@ type LiveOrderPreview = {
   balance_error?: string | null;
   order_chance_status?: string;
   order_chance_error?: string | null;
+  risk_level?: string;
+  block_code?: string | null;
+  block_reason?: string | null;
+  warnings?: string[];
+  max_allowed_order_krw?: number;
+  checks?: Record<string, { allowed?: boolean; code?: string; reason?: string; detail?: unknown }>;
 };
 
 type LiveOrderLog = {
@@ -350,9 +384,52 @@ type LiveOrderLog = {
   created_at: string;
   updated_at: string;
   order_uuid?: string | null;
+  executed_volume?: number;
+  remaining_volume?: number;
+  filled_amount_krw?: number;
+  paid_fee?: number;
   strategy_name?: string | null;
   signal_reason?: string | null;
   candle_time_utc?: string | null;
+};
+
+type RiskState = {
+  status: "OK" | "WARNING" | "BLOCKED" | "EMERGENCY_STOPPED" | "MANUAL_REVIEW_REQUIRED";
+  daily_realized_pnl: number;
+  daily_unrealized_pnl: number;
+  daily_total_pnl: number;
+  daily_loss_percent: number;
+  daily_order_count: number;
+  daily_entry_count: number;
+  daily_exit_count: number;
+  consecutive_loss_count: number;
+  open_order_count: number;
+  open_position_count: number;
+  last_order_time_utc?: string | null;
+  emergency_stop_enabled: boolean;
+  balance_mismatch_detected: boolean;
+  partial_fill_detected: boolean;
+  volatility_block_enabled: boolean;
+  low_volume_block_enabled: boolean;
+};
+
+type RiskDashboard = {
+  risk_state: RiskState;
+  risk_logs: Array<{ id: number; risk_level: string; allowed: boolean; block_code?: string | null; block_reason?: string | null; created_at: string }>;
+  config: Record<string, unknown>;
+};
+
+type RecoveryEvent = {
+  id: number;
+  event_type: string;
+  severity: string;
+  exchange: string;
+  market: string;
+  session_id?: number | null;
+  request_id?: string | null;
+  order_uuid?: string | null;
+  message: string;
+  created_at: string;
 };
 
 type AutoLivePilotSession = {
@@ -361,7 +438,7 @@ type AutoLivePilotSession = {
   market: string;
   candidate_strategy_id?: number | null;
   strategy_name: string;
-  status: "READY" | "RUNNING" | "STOPPED" | "ERROR" | "EMERGENCY_STOPPED";
+  status: "READY" | "RUNNING" | "LIVE_PAUSED" | "STOPPED" | "ERROR" | "EMERGENCY_STOPPED";
   auto_enabled: boolean;
   order_amount_krw: number;
   max_orders_per_day: number;
@@ -388,6 +465,9 @@ type AutoLivePilotStatus = {
   max_orders_per_day: number;
   auto_cancel_after_seconds: number;
   order_type: string;
+  partial_fill_policy?: string;
+  restart_policy?: string;
+  recent_recovery_events?: RecoveryEvent[];
   ok?: boolean;
   message?: string;
 };
@@ -399,7 +479,7 @@ type LiveStrategySession = {
   candidate_strategy_id: number;
   strategy_name: string;
   strategy_parameters: Record<string, number>;
-  status: "READY" | "RUNNING" | "PAUSED" | "STOPPED" | "ERROR" | "EMERGENCY_STOPPED";
+  status: "READY" | "RUNNING" | "LIVE_PAUSED" | "PAUSED" | "STOPPED" | "ERROR" | "EMERGENCY_STOPPED";
   auto_enabled: boolean;
   max_order_krw: number;
   max_orders_per_day: number;
@@ -416,6 +496,7 @@ type LiveStrategySession = {
 
 type LivePosition = {
   id: number;
+  session_id?: number;
   status: string;
   entry_price: number;
   entry_volume: number;
@@ -428,9 +509,30 @@ type LivePosition = {
   opened_at?: string | null;
 };
 
+type ExitCandidate = {
+  id: number;
+  position_id: number;
+  session_id: number;
+  exchange: string;
+  market: string;
+  reason: string;
+  status: string;
+  entry_price: number;
+  current_price: number;
+  target_exit_price: number;
+  volume: number;
+  expected_amount_krw: number;
+  expected_fee: number;
+  expected_pnl: number;
+  risk_result: string;
+  created_at: string;
+  updated_at: string;
+};
+
 type LiveStrategyStatus = {
   session?: LiveStrategySession | null;
   position?: LivePosition | null;
+  exit_candidate?: ExitCandidate | null;
   exchange: string;
   market: string;
   current_mode: string;
@@ -446,6 +548,15 @@ type LiveStrategyStatus = {
   entry_price_offset_percent: number;
   exit_enabled: boolean;
   market_order_enabled: boolean;
+  auto_exit_enabled?: boolean;
+  exit_order_type?: string;
+  exit_price_offset_percent?: number;
+  cancel_exit_order_after_seconds?: number;
+  max_exit_retry_count?: number;
+  manual_confirm_required?: boolean;
+  partial_fill_policy?: string;
+  restart_policy?: string;
+  recent_recovery_events?: RecoveryEvent[];
   ok?: boolean;
   message?: string;
 };
@@ -767,17 +878,22 @@ function MetricCard({
   label,
   value,
   tone = "neutral",
-  title
+  title,
+  icon
 }: {
   label: string;
   value: React.ReactNode;
   tone?: Tone;
   title?: string;
+  icon?: React.ReactNode;
 }) {
   return (
-    <div className="border border-terminal-line bg-terminal-panel2 px-3 py-2" title={title}>
-      <div className="text-[11px] uppercase text-slate-500">{label}</div>
-      <div className={`mt-1 min-h-7 truncate text-lg font-semibold ${toneClass(tone)}`}>{value}</div>
+    <div className="metric-card border border-terminal-line bg-terminal-panel2 px-3 py-2" title={title}>
+      {icon && <div className={`metric-icon ${toneClass(tone)}`}>{icon}</div>}
+      <div className="min-w-0">
+        <div className="text-[11px] uppercase text-slate-500">{label}</div>
+        <div className={`mt-1 min-h-7 truncate text-lg font-semibold ${toneClass(tone)}`}>{value}</div>
+      </div>
     </div>
   );
 }
@@ -1060,6 +1176,7 @@ function App() {
   const [liveBalances, setLiveBalances] = React.useState<LiveBalances | null>(null);
   const [liveOrderChance, setLiveOrderChance] = React.useState<LiveOrderChance | null>(null);
   const [liveOrders, setLiveOrders] = React.useState<LiveOrderLog[]>([]);
+  const [riskDashboard, setRiskDashboard] = React.useState<RiskDashboard | null>(null);
   const [livePreview, setLivePreview] = React.useState<LiveOrderPreview | null>(null);
   const [autoPilot, setAutoPilot] = React.useState<AutoLivePilotStatus | null>(null);
   const [autoPilotCandidateId, setAutoPilotCandidateId] = React.useState<number | "">("");
@@ -1078,7 +1195,11 @@ function App() {
   const [liveArmAcknowledged, setLiveArmAcknowledged] = React.useState(false);
   const [liveArmConfirmation, setLiveArmConfirmation] = React.useState("");
   const [livePlaceConfirmation, setLivePlaceConfirmation] = React.useState("");
+  const [exitPlaceConfirmation, setExitPlaceConfirmation] = React.useState("");
+  const [exitPreviewRequestId, setExitPreviewRequestId] = React.useState<string | null>(null);
   const [liveEmergencyResetConfirmation, setLiveEmergencyResetConfirmation] = React.useState("");
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
+  const [activeView, setActiveView] = React.useState("dashboard");
   const [loading, setLoading] = React.useState(false);
   const [paperLoading, setPaperLoading] = React.useState(false);
   const [forwardLoading, setForwardLoading] = React.useState(false);
@@ -1223,6 +1344,13 @@ function App() {
     }
   }, [liveExchange]);
 
+  const fetchRiskDashboard = React.useCallback(async () => {
+    const response = await fetch(`${API_BASE}/api/risk/status?${new URLSearchParams({ exchange: "bithumb" }).toString()}`);
+    if (response.ok) {
+      setRiskDashboard(await response.json());
+    }
+  }, []);
+
   const fetchAutoPilotStatus = React.useCallback(async () => {
     const response = await fetch(`${API_BASE}/api/auto-live-pilot/status`);
     if (response.ok) {
@@ -1256,13 +1384,14 @@ function App() {
       setAutoPilot(body);
       if (!body.ok) setAutoPilotError(body.message ?? "Auto Pilot 시작이 차단되었습니다.");
       await fetchLiveOrders();
+      await fetchRiskDashboard();
       await refreshLiveBalancesSilently();
     } catch (err) {
       setAutoPilotError(err instanceof Error ? err.message : "Auto Pilot 시작 오류가 발생했습니다.");
     } finally {
       setAutoPilotLoading(false);
     }
-  }, [autoPilot?.max_auto_order_krw, autoPilot?.min_auto_order_krw, autoPilotAmount, autoPilotCandidateId, fetchLiveOrders, refreshLiveBalancesSilently]);
+  }, [autoPilot?.max_auto_order_krw, autoPilot?.min_auto_order_krw, autoPilotAmount, autoPilotCandidateId, fetchLiveOrders, fetchRiskDashboard, refreshLiveBalancesSilently]);
 
   const stopAutoPilot = React.useCallback(async () => {
     setAutoPilotLoading(true);
@@ -1283,6 +1412,7 @@ function App() {
       setAutoPilot(body);
       if (!body.ok) setAutoPilotError(body.message ?? "오픈 주문 취소에 실패했습니다.");
       await fetchLiveOrders();
+      await fetchRiskDashboard();
       await refreshLiveBalancesSilently();
     } finally {
       setAutoPilotLoading(false);
@@ -1315,13 +1445,14 @@ function App() {
       setLiveStrategy(body);
       if (!body.ok) setLiveStrategyError(body.message ?? "Auto Strategy start blocked.");
       await fetchLiveOrders();
+      await fetchRiskDashboard();
       await refreshLiveBalancesSilently();
     } catch (err) {
       setLiveStrategyError(err instanceof Error ? err.message : "Auto Strategy start failed.");
     } finally {
       setLiveStrategyLoading(false);
     }
-  }, [fetchLiveOrders, liveStrategyCandidateId, refreshLiveBalancesSilently]);
+  }, [fetchLiveOrders, fetchRiskDashboard, liveStrategyCandidateId, refreshLiveBalancesSilently]);
 
   const stopLiveStrategy = React.useCallback(async () => {
     setLiveStrategyLoading(true);
@@ -1342,11 +1473,111 @@ function App() {
       setLiveStrategy(body);
       if (!body.ok) setLiveStrategyError(body.message ?? "Cancel open Auto Strategy order failed.");
       await fetchLiveOrders();
+      await fetchRiskDashboard();
       await refreshLiveBalancesSilently();
     } finally {
       setLiveStrategyLoading(false);
     }
-  }, [fetchLiveOrders, refreshLiveBalancesSilently]);
+  }, [fetchLiveOrders, fetchRiskDashboard, refreshLiveBalancesSilently]);
+
+  const approveExitCandidate = React.useCallback(async () => {
+    const candidate = liveStrategy?.exit_candidate;
+    if (!candidate) return;
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-exit-candidates/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ candidate_id: candidate.id })
+      });
+      const body = await response.json();
+      if (!body.ok) setLiveStrategyError(body.message ?? "Exit candidate approval failed.");
+      await fetchLiveStrategyStatus();
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [fetchLiveStrategyStatus, liveStrategy?.exit_candidate]);
+
+  const rejectExitCandidate = React.useCallback(async () => {
+    const candidate = liveStrategy?.exit_candidate;
+    if (!candidate) return;
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-exit-candidates/reject`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ candidate_id: candidate.id })
+      });
+      const body = await response.json();
+      if (!body.ok) setLiveStrategyError(body.message ?? "Exit candidate reject failed.");
+      setExitPreviewRequestId(null);
+      await fetchLiveStrategyStatus();
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [fetchLiveStrategyStatus, liveStrategy?.exit_candidate]);
+
+  const createExitPreview = React.useCallback(async () => {
+    const candidate = liveStrategy?.exit_candidate;
+    if (!candidate) return;
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-exit-orders/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ exit_candidate_id: candidate.id, manual_confirmed: true })
+      });
+      const body = await response.json();
+      if (body.request_id) setExitPreviewRequestId(body.request_id);
+      if (!body.ok) setLiveStrategyError(body.preview?.blocked_reason ?? body.risk_result ?? "Exit preview blocked.");
+      await fetchLiveOrders();
+      await fetchLiveStrategyStatus();
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [fetchLiveOrders, fetchLiveStrategyStatus, liveStrategy?.exit_candidate]);
+
+  const submitExitOrder = React.useCallback(async () => {
+    if (!exitPreviewRequestId) return;
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-exit-orders/submit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: exitPreviewRequestId, final_confirmation: exitPlaceConfirmation })
+      });
+      const body = await response.json();
+      if (!body.ok) setLiveStrategyError(body.message ?? body.risk_result ?? "Exit order submit failed.");
+      await fetchLiveOrders();
+      await fetchLiveStrategyStatus();
+      await refreshLiveBalancesSilently();
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [exitPlaceConfirmation, exitPreviewRequestId, fetchLiveOrders, fetchLiveStrategyStatus, refreshLiveBalancesSilently]);
+
+  const cancelExitOrder = React.useCallback(async () => {
+    if (!exitPreviewRequestId) return;
+    setLiveStrategyLoading(true);
+    setLiveStrategyError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/live-exit-orders/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: exitPreviewRequestId })
+      });
+      const body = await response.json();
+      if (!body.ok) setLiveStrategyError(body.message ?? "Exit order cancel failed.");
+      await fetchLiveOrders();
+      await fetchLiveStrategyStatus();
+    } finally {
+      setLiveStrategyLoading(false);
+    }
+  }, [exitPreviewRequestId, fetchLiveOrders, fetchLiveStrategyStatus]);
 
   const toggleLiveStrategy = React.useCallback(async () => {
     const status = liveStrategy?.session?.status;
@@ -1364,9 +1595,10 @@ function App() {
     setLivePreview(null);
     setLiveError(null);
     void fetchLiveStatus(liveExchange);
+    void fetchRiskDashboard();
     void fetchAutoPilotStatus();
     void fetchLiveStrategyStatus();
-  }, [fetchAutoPilotStatus, fetchLiveStatus, fetchLiveStrategyStatus, liveExchange]);
+  }, [fetchAutoPilotStatus, fetchLiveStatus, fetchLiveStrategyStatus, fetchRiskDashboard, liveExchange]);
 
   const armLiveTrading = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1396,8 +1628,9 @@ function App() {
     const response = await fetch(`${API_BASE}/api/live-trading/emergency-stop`, { method: "POST" });
     if (response.ok) setLiveStatus(await response.json());
     await fetchLiveOrders();
+    await fetchRiskDashboard();
     await refreshLiveBalancesSilently();
-  }, [fetchLiveOrders, refreshLiveBalancesSilently]);
+  }, [fetchLiveOrders, fetchRiskDashboard, refreshLiveBalancesSilently]);
 
   const resetEmergencyStop = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1416,13 +1649,14 @@ function App() {
         setLiveEmergencyResetConfirmation("");
       }
       await fetchLiveOrders();
+      await fetchRiskDashboard();
       await refreshLiveBalancesSilently();
     } catch (err) {
       setLiveError(err instanceof Error ? err.message : "알 수 없는 Emergency Stop 해제 오류가 발생했습니다.");
     } finally {
       setLiveLoading(false);
     }
-  }, [fetchLiveOrders, liveEmergencyResetConfirmation, refreshLiveBalancesSilently]);
+  }, [fetchLiveOrders, fetchRiskDashboard, liveEmergencyResetConfirmation, refreshLiveBalancesSilently]);
 
   const previewLiveOrder = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1439,12 +1673,13 @@ function App() {
       setLiveStatus(body);
       setLivePreview(body.preview);
       await fetchLiveOrders();
+      await fetchRiskDashboard();
     } catch (err) {
       setLiveError(err instanceof Error ? err.message : "알 수 없는 주문 미리보기 오류가 발생했습니다.");
     } finally {
       setLiveLoading(false);
     }
-  }, [fetchLiveOrders, liveExchange, liveOrderForm]);
+  }, [fetchLiveOrders, fetchRiskDashboard, liveExchange, liveOrderForm]);
 
   const placeLiveOrder = React.useCallback(async () => {
     if (!livePreview) return;
@@ -1462,6 +1697,7 @@ function App() {
         setLiveError(body.error_message ?? body.message ?? "실주문이 차단되었거나 실패했습니다.");
       }
       await fetchLiveOrders();
+      await fetchRiskDashboard();
       await refreshLiveBalancesSilently();
       setLivePreview(null);
       setLivePlaceConfirmation("");
@@ -1470,7 +1706,7 @@ function App() {
     } finally {
       setLiveLoading(false);
     }
-  }, [fetchLiveOrders, livePlaceConfirmation, livePreview, refreshLiveBalancesSilently]);
+  }, [fetchLiveOrders, fetchRiskDashboard, livePlaceConfirmation, livePreview, refreshLiveBalancesSilently]);
 
   const runBacktestSet = React.useCallback(async (strategies: Strategy[]) => {
     setLoading(true);
@@ -1700,6 +1936,7 @@ function App() {
     void fetchForwardPaper();
     void fetchLiveStatus();
     void fetchLiveOrders();
+    void fetchRiskDashboard();
     void fetchAutoPilotStatus();
     void fetchLiveStrategyStatus();
   }, []);
@@ -1708,11 +1945,12 @@ function App() {
     const intervalId = window.setInterval(() => {
       void fetchLiveStatus(liveExchange);
       void fetchLiveOrders();
+      void fetchRiskDashboard();
       void fetchAutoPilotStatus();
       void fetchLiveStrategyStatus();
     }, 15000);
     return () => window.clearInterval(intervalId);
-  }, [fetchAutoPilotStatus, fetchLiveOrders, fetchLiveStatus, fetchLiveStrategyStatus, liveExchange]);
+  }, [fetchAutoPilotStatus, fetchLiveOrders, fetchLiveStatus, fetchLiveStrategyStatus, fetchRiskDashboard, liveExchange]);
 
   React.useEffect(() => {
     const balanceImpactingStatuses = new Set(["SUBMITTED", "WAITING", "PARTIALLY_FILLED", "FILLED", "CANCELED"]);
@@ -1824,6 +2062,7 @@ function App() {
   const liveEth = liveBalances?.balances?.eth;
   const activeExchange = liveExchange;
   const orderChanceStatus = liveOrderChance?.order_chance_status ?? liveStatus?.order_chance_status ?? "NOT_REQUESTED";
+  const riskState = riskDashboard?.risk_state;
   const autoSession = autoPilot?.session;
   const autoPilotCandidate = candidateStrategies.find((candidate) => candidate.id === autoPilotCandidateId);
   const isAutoPilotOn = autoSession?.status === "RUNNING" || autoSession?.status === "READY";
@@ -1840,9 +2079,12 @@ function App() {
 
   const liveStrategySession = liveStrategy?.session;
   const liveStrategyPosition = liveStrategy?.position;
+  const liveExitCandidate = liveStrategy?.exit_candidate;
   const liveStrategyCandidate = candidateStrategies.find((candidate) => candidate.id === liveStrategyCandidateId);
   const isLiveStrategyOn = liveStrategySession?.status === "RUNNING" || liveStrategySession?.status === "READY";
   const liveStrategyFlow =
+    liveExitCandidate?.status === "PENDING" ? "EXIT_CANDIDATE" :
+    liveExitCandidate?.status === "APPROVED" ? "EXIT_APPROVED" :
     liveStrategyPosition?.status === "OPEN" ? "OPEN_POSITION" :
     liveStrategySession?.last_order_status === "CANCELED" ? "AUTO_CANCELED" :
     liveStrategySession?.last_order_status === "WAITING" ? "WAITING" :
@@ -1850,74 +2092,406 @@ function App() {
     liveStrategySession?.last_order_status === "FILLED" ? "FILLED_POSITION_CREATED" :
     liveStrategySession?.last_order_status === "BLOCKED" ? "BLOCKED" :
     isLiveStrategyOn ? "WATCHING" : "STOPPED";
+  const topStatusTone = liveStatus?.emergency_stop || riskState?.status === "EMERGENCY_STOPPED"
+    ? "red"
+    : riskState?.status === "BLOCKED" || currentLiveMode === "LIVE_MANUAL_ONLY" || currentLiveMode === "LIVE_ARMED"
+      ? "amber"
+      : "green";
+  const navItems = [
+    { id: "dashboard", label: "대시보드", icon: Home },
+    { id: "auto-trade", label: "자동매매", icon: Bot },
+    { id: "strategies", label: "전략관리", icon: ClipboardList },
+    { id: "portfolio", label: "포트폴리오", icon: PieChart },
+    { id: "trades", label: "거래내역", icon: History },
+    { id: "backtest", label: "백테스트", icon: LineChart },
+    { id: "alerts", label: "알림로그", icon: Bell },
+    { id: "settings", label: "설정", icon: Settings }
+  ];
+  const showView = (id: string) => {
+    setActiveView(id);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const viewSection = (id: string, className: string) => `${className} ${activeView === id ? "" : "hidden"}`;
+  const latestRiskLog = riskDashboard?.risk_logs?.[0];
+  const latestLiveOrder = liveOrders[0];
+  const estimatedPortfolioTotal = liveBalances?.estimated_total_equity_krw ?? balance?.equity ?? forwardBalance?.equity;
+  const openLiveOrders = liveOrders.filter((order) => ["SUBMITTED", "WAITING", "PARTIALLY_FILLED"].includes(order.status));
+  const filledLiveOrders = liveOrders.filter((order) => order.status === "FILLED");
+  const latestDisplayCandle = displayCandles.length > 0 ? displayCandles[displayCandles.length - 1] : undefined;
+  const strategyCardRows = candidateStrategies.length > 0
+    ? candidateStrategies.slice(0, 6).map((candidate) => ({
+      key: `candidate-${candidate.id}`,
+      strategy: candidate.strategy,
+      unit: candidate.unit,
+      returnValue: candidate.backtest_total_return
+    }))
+    : comparisonRows.slice(0, 6).map((row) => ({
+      key: `comparison-${row.strategy}`,
+      strategy: row.strategy,
+      unit,
+      returnValue: row.total_return
+    }));
 
   return (
-    <main className="min-h-screen bg-terminal-bg text-slate-100">
-      <div className="flex min-h-screen flex-col">
-        <div className={`border-b px-5 py-3 ${liveModeBannerClass(currentLiveMode)}`}>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="text-xl font-black tracking-wide">{liveModeLabel(currentLiveMode)}</div>
-              <div className="text-xs opacity-90">
-                전략 신호는 실주문 후보까지만 생성합니다. 실제 주문은 미리보기, Risk Manager, 최종 확인 문구를 모두 통과한 수동 요청만 허용됩니다.
-              </div>
-            </div>
-            <button
-              onClick={() => void emergencyStopLiveTrading()}
-              className="inline-flex h-11 items-center gap-2 border border-terminal-red bg-terminal-red px-4 text-sm font-black text-black hover:bg-[#ff8ba0]"
-            >
-              <PauseCircle className="h-4 w-4" />
-              EMERGENCY STOP
-            </button>
-          </div>
+    <main className="app-root min-h-screen bg-terminal-bg text-slate-100">
+      <aside className={`app-sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}>
+        <div className="app-brand">
+          <div className="brand-mark">Q</div>
+          {!sidebarCollapsed && <span>Auto Trader</span>}
         </div>
-        <header className="border-b border-terminal-line bg-[#070b12] px-5 py-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="flex items-center gap-2 pr-4">
-              <Activity className="h-5 w-5 text-terminal-cyan" />
-              <div>
-                <h1 className="text-base font-semibold tracking-wide">Coin Bot Lab</h1>
-                <p className="text-xs text-slate-500">페이퍼/백테스트 우선. Sprint 6 실거래는 수동 소액 주문만 잠금 해제 후 가능합니다.</p>
-              </div>
+        <nav className="app-nav">
+          {navItems.map((item, index) => {
+            const Icon = item.icon;
+            return (
+              <button key={item.id} onClick={() => showView(item.id)} className={`app-nav-item ${activeView === item.id ? "is-active" : ""}`} title={item.label}>
+                <Icon className="h-4 w-4" />
+                {!sidebarCollapsed && <span>{item.label}</span>}
+              </button>
+            );
+          })}
+        </nav>
+        <button className="app-collapse" onClick={() => setSidebarCollapsed((value) => !value)}>
+          <Menu className="h-4 w-4" />
+          {!sidebarCollapsed && <span>메뉴 접기</span>}
+        </button>
+      </aside>
+
+      <div className="app-frame">
+        <header className="app-topbar">
+          <div className="topbar-left">
+            <button className="icon-button" onClick={() => setSidebarCollapsed((value) => !value)} title="메뉴">
+              <Menu className="h-5 w-5" />
+            </button>
+            <div>
+              <h1>Auto Trader</h1>
+              <p>개인용 코인 전략 실험실 · 제한적 자동매매 대시보드</p>
             </div>
-            <label className="control">
-              <span>마켓</span>
-              <select value={market} disabled>
-                <option>KRW-BTC</option>
+          </div>
+          <div className="topbar-center">
+            <span className={`status-pill ${topStatusTone}`}>계정 상태 {riskState?.status ?? "대기"}</span>
+            <label className="topbar-select">
+              <span>거래소</span>
+              <select value={liveExchange} onChange={(event) => setLiveExchange(event.target.value as Exchange)}>
+                <option value="upbit">업비트 (Upbit)</option>
+                <option value="bithumb">빗썸 (Bithumb)</option>
               </select>
             </label>
-            <label className="control">
-              <span>타임프레임</span>
-              <select value={unit} onChange={(event) => setUnit(Number(event.target.value))}>
-                {[1, 3, 5, 10, 15, 30, 60, 240].map((item) => (
-                  <option key={item} value={item}>{`${item}m`}</option>
-                ))}
-              </select>
-            </label>
-            <label className="control min-w-[190px]">
-              <span>전략</span>
-              <select value={strategy} onChange={(event) => setStrategy(event.target.value as Strategy)}>
-                {Object.entries(STRATEGY_LABELS).map(([value, label]) => (
-                  <option key={value} value={value}>{label}</option>
-                ))}
-              </select>
-            </label>
-            <button onClick={simulatePaperTrading} disabled={paperLoading} className="ml-auto inline-flex h-10 items-center gap-2 border border-terminal-cyan bg-transparent px-4 text-sm font-semibold text-terminal-cyan transition hover:bg-[#0d2d33] disabled:cursor-not-allowed disabled:opacity-60">
+            <div className="search-box">
+              <Search className="h-4 w-4" />
+              <input placeholder="코인 심볼 또는 전략 검색" />
+            </div>
+          </div>
+          <div className="topbar-actions">
+            <button onClick={simulatePaperTrading} disabled={paperLoading} className="ghost-button">
               <RefreshCw className="h-4 w-4" />
-              최근 캔들 시뮬레이션 실행
+              시뮬레이션
             </button>
-            <button onClick={startLivePaperTrading} disabled={paperLoading || (paper.status === "RUNNING" && paper.mode === "LIVE")} className="inline-flex h-10 items-center gap-2 border border-terminal-green bg-terminal-green px-4 text-sm font-semibold text-black transition hover:bg-[#4ff0ad] disabled:cursor-not-allowed disabled:opacity-60">
+            <button onClick={startLivePaperTrading} disabled={paperLoading || (paper.status === "RUNNING" && paper.mode === "LIVE")} className="success-button">
               <Play className="h-4 w-4" />
-              실시간 페이퍼 시작
+              페이퍼 시작
             </button>
-            <button onClick={stopLivePaperTrading} disabled={paperLoading || paper.status !== "RUNNING" || paper.mode !== "LIVE"} className="inline-flex h-10 items-center gap-2 border border-terminal-red bg-transparent px-4 text-sm font-semibold text-terminal-red transition hover:bg-[#31131d] disabled:cursor-not-allowed disabled:opacity-60">
+            <button onClick={stopLivePaperTrading} disabled={paperLoading || paper.status !== "RUNNING" || paper.mode !== "LIVE"} className="danger-ghost-button">
               <PauseCircle className="h-4 w-4" />
-              실시간 페이퍼 중지
+              중지
             </button>
+            <button className="icon-button has-alert" title="알림" onClick={() => showView("alerts")}>
+              <Bell className="h-5 w-5" />
+            </button>
+            <div className="user-chip">
+              <UserCircle className="h-5 w-5" />
+              <span>Trader</span>
+            </div>
           </div>
         </header>
+        <div className={`mode-strip ${topStatusTone}`}>
+          <div>
+            <strong>{liveModeLabel(currentLiveMode)}</strong>
+            <span>실주문은 미리보기, Risk Manager, 최종 확인 문구를 통과한 수동 요청만 허용됩니다.</span>
+          </div>
+          <button onClick={() => void emergencyStopLiveTrading()} className="emergency-button">
+            <Power className="h-4 w-4" />
+            긴급 정지
+          </button>
+        </div>
+        <div className="app-content">
 
-        <section className="border-b border-terminal-line bg-[#080d14] px-4 py-4">
+        {activeView === "dashboard" && (
+          <section className="screen-grid dashboard-screen">
+            <div className="screen-kpis">
+              <MetricCard icon={<Wallet className="h-5 w-5" />} label="총자산 (KRW)" value={formatKrw(estimatedPortfolioTotal)} tone="cyan" />
+              <MetricCard icon={<TrendingUp className="h-5 w-5" />} label="오늘 수익 (KRW)" value={formatKrw(riskState?.daily_total_pnl ?? totalPnl)} tone={pnlTone(riskState?.daily_total_pnl ?? totalPnl)} />
+              <MetricCard icon={<PieChart className="h-5 w-5" />} label="누적 수익률" value={formatPercent(balance?.total_return ?? forwardBalance?.total_return)} tone={pnlTone(balance?.total_return ?? forwardBalance?.total_return)} />
+              <MetricCard icon={<Bot className="h-5 w-5" />} label="활성 전략 수" value={`${candidateStrategies.length || 0}개`} tone="amber" />
+              <MetricCard icon={<Target className="h-5 w-5" />} label="승률 (7D)" value={formatPercent(metrics?.win_rate ?? forwardMetrics?.win_rate)} />
+            </div>
+            <div className="dashboard-main">
+              <div className="terminal-panel chart-panel-large">
+                <div className="market-strip">
+                  <div>
+                    <span className="coin-dot">₿</span>
+                    <strong>BTC/KRW</strong>
+                    <b className="mono-num text-terminal-green">{latestDisplayCandle ? formatKrw(latestDisplayCandle.close) : "-"}</b>
+                  </div>
+                  <div className="segmented">
+                    {[1, 15, 60, 240].map((item) => (
+                      <button key={item} onClick={() => setUnit(item)} className={unit === item ? "is-active" : ""}>{formatTimeframe(item)}</button>
+                    ))}
+                  </div>
+                </div>
+                <ChartPanel candles={displayCandles} signals={chartSignals} />
+              </div>
+              <aside className="right-stack">
+                <div className="terminal-panel bot-card">
+                  <div className="panel-card-header">
+                    <span className="panel-title"><Bot className="h-4 w-4" />봇 상태</span>
+                    <StatusBadge value={isLiveStrategyOn || isAutoPilotOn ? "자동매매 ON" : "대기"} tone={isLiveStrategyOn || isAutoPilotOn ? "green" : "amber"} />
+                  </div>
+                  <div className="bot-avatar"><Bot className="h-10 w-10" /></div>
+                  <div className="metric-list">
+                    <span>리스크 레벨 <b>{riskState?.status ?? "-"}</b></span>
+                    <span>오늘 PnL <b className={toneClass(pnlTone(riskState?.daily_total_pnl ?? 0))}>{formatKrw(riskState?.daily_total_pnl)}</b></span>
+                    <span>승률 <b>{formatPercent(metrics?.win_rate ?? forwardMetrics?.win_rate)}</b></span>
+                    <span>현재 전략 <b>{liveStrategyCandidate ? STRATEGY_BADGES[liveStrategyCandidate.strategy] : STRATEGY_BADGES[displayedStrategy]}</b></span>
+                  </div>
+                </div>
+                <div className="terminal-panel danger-panel">
+                  <div className="panel-card-header">
+                    <span className="panel-title"><Wallet className="h-4 w-4" />포지션 / 주문 현황</span>
+                    <StatusBadge value={liveStrategyPosition?.status ?? "NO POSITION"} tone={liveStrategyPosition?.status === "OPEN" ? "green" : "neutral"} />
+                  </div>
+                  <div className="metric-list">
+                    <span>포지션 <b>BTC/KRW</b></span>
+                    <span>진입가 <b>{formatKrw(liveStrategyPosition?.entry_price)}</b></span>
+                    <span>현재가 <b>{formatKrw(liveStrategyPosition?.current_price)}</b></span>
+                    <span>평가손익 <b className={toneClass(pnlTone(liveStrategyPosition?.unrealized_pnl ?? 0))}>{formatKrw(liveStrategyPosition?.unrealized_pnl)}</b></span>
+                    <span>Stop Loss <b className="text-terminal-red">{formatKrw(liveStrategyPosition?.stop_loss_price)}</b></span>
+                    <span>Take Profit <b className="text-terminal-green">{formatKrw(liveStrategyPosition?.take_profit_price)}</b></span>
+                  </div>
+                  <button onClick={() => void emergencyStopLiveTrading()} className="mt-4 w-full emergency-button justify-center">긴급 정지 실행</button>
+                </div>
+                <div className="terminal-panel">
+                  <div className="panel-card-header"><span className="panel-title"><Gauge className="h-4 w-4" />신호 분석 (BTC/KRW)</span><span className="panel-subtitle">업데이트 {formatKstShort(chartUpdatedAt)}</span></div>
+                  <div className="signal-grid">
+                    <MetricCard label="RSI (14)" value={metrics?.last_signal ?? "-"} tone="cyan" />
+                    <MetricCard label="MACD" value={paper.last_signal ?? "-"} tone={paper.last_signal === "BUY" ? "green" : paper.last_signal === "SELL" ? "red" : "neutral"} />
+                    <MetricCard label="거래량" value={latestDisplayCandle ? formatKrw(latestDisplayCandle.close * latestDisplayCandle.volume) : "-"} />
+                    <MetricCard label="변동성" value={`${formatDecimal(riskState?.daily_loss_percent)}%`} tone="amber" />
+                  </div>
+                </div>
+              </aside>
+            </div>
+            <div className="dashboard-bottom">
+              <div className="terminal-panel">
+                <div className="panel-card-header"><span className="panel-title"><History className="h-4 w-4" />최근 거래 내역</span><button onClick={() => setActiveView("trades")} className="tiny-link">전체 보기</button></div>
+                <div className="table-scroll max-h-64 overflow-auto">
+                  <table className="ops-table w-full min-w-[780px] text-left text-sm">
+                    <thead><tr><th className="px-3 py-2">시간</th><th className="px-3 py-2">종목</th><th className="px-3 py-2">방향</th><th className="px-3 py-2 text-right">가격</th><th className="px-3 py-2">상태</th></tr></thead>
+                    <tbody>{liveOrders.slice(0, 6).map((order) => (
+                      <tr key={order.request_id} className="border-t border-terminal-line">
+                        <td className="px-3 py-2 text-slate-400">{formatKstShort(order.created_at)}</td><td className="px-3 py-2 font-semibold">{order.market}</td><td className="px-3 py-2"><SideBadge side={order.side} /></td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.price ?? undefined)}</td><td className="px-3 py-2"><StatusBadge value={formatLiveOrderStatus(order.status)} tone={order.status === "FILLED" ? "green" : order.status === "FAILED" || order.status === "BLOCKED" ? "red" : "amber"} /></td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="terminal-panel">
+                <div className="panel-card-header"><span className="panel-title"><Bell className="h-4 w-4" />시스템 로그</span><button onClick={() => setActiveView("alerts")} className="tiny-link">알림로그</button></div>
+                <div className="log-list">
+                  {(riskDashboard?.risk_logs ?? []).slice(0, 6).map((log) => (
+                    <span key={log.id}><i className={log.allowed ? "ok" : "warn"} />{formatKstShort(log.created_at)} · {log.block_code ?? "RISK_CHECK"} · {log.block_reason ?? "정상"}</span>
+                  ))}
+                  {(riskDashboard?.risk_logs ?? []).length === 0 && <span><i className="ok" />최근 리스크 로그 없음</span>}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activeView === "auto-trade" && (
+          <section className="screen-grid auto-screen">
+            <div className="auto-status terminal-panel">
+              <div className="status-orb"><Bot className="h-12 w-12" /></div>
+              <div>
+                <h2>{isLiveStrategyOn || isAutoPilotOn ? "자동매매 실행 중" : "자동매매 대기 중"}</h2>
+                <p>봇이 KRW-BTC 기준 전략과 주문 안전장치를 모니터링합니다.</p>
+                <StatusBadge value={riskState?.status ?? "대기"} tone={riskState?.status === "OK" ? "green" : "amber"} />
+              </div>
+              <div className="auto-switch">
+                <span>자동매매 전체 제어</span>
+                <button onClick={() => void toggleLiveStrategy()} disabled={liveStrategyLoading || (!isLiveStrategyOn && !liveStrategyCandidate)} className={isLiveStrategyOn ? "danger-ghost-button" : "success-button"}>{isLiveStrategyOn ? "OFF" : "ON"}</button>
+              </div>
+              <div className="mode-toggle"><button>모의매매</button><button className="is-live">실거래</button></div>
+              <MetricCard icon={<TrendingUp className="h-5 w-5" />} label="일 손익 (KRW)" value={formatKrw(riskState?.daily_total_pnl)} tone={pnlTone(riskState?.daily_total_pnl)} />
+              <MetricCard icon={<DollarSign className="h-5 w-5" />} label="누적 손익 (KRW)" value={formatKrw(totalPnl)} tone={pnlTone(totalPnl)} />
+            </div>
+            <div className="strategy-run-list">
+              {[liveStrategyCandidate, autoPilotCandidate, candidateStrategies[0], candidateStrategies[1]].filter(Boolean).map((candidate, index) => (
+                <div key={`${candidate?.id}-${index}`} className="strategy-run-card terminal-panel">
+                  <div><strong>{candidate ? STRATEGY_LABELS[candidate.strategy] : "KRW 모멘텀 전략"}</strong><span>{candidate?.market ?? "KRW-BTC"} · {formatTimeframe(candidate?.unit)}</span></div>
+                  <StatusBadge value={index < 2 && (isLiveStrategyOn || isAutoPilotOn) ? "실행 중" : "대기"} tone={index < 2 && (isLiveStrategyOn || isAutoPilotOn) ? "green" : "amber"} />
+                  <b className={toneClass(pnlTone(candidate?.backtest_total_return ?? 0))}>{formatPercent(candidate?.backtest_total_return)}</b>
+                </div>
+              ))}
+            </div>
+            <div className="auto-grid">
+              <div className="terminal-panel">
+                <div className="panel-card-header"><span className="panel-title"><Activity className="h-4 w-4" />활성 심볼 모니터링</span><span className="panel-subtitle">KRW 마켓</span></div>
+                <table className="ops-table w-full min-w-[720px] text-left text-sm"><thead><tr><th className="px-3 py-2">심볼</th><th className="px-3 py-2">전략</th><th className="px-3 py-2">상태</th><th className="px-3 py-2 text-right">가격</th><th className="px-3 py-2">신호</th></tr></thead><tbody>
+                  {["BTC/KRW", "ETH/KRW", "SOL/KRW", "XRP/KRW", "ADA/KRW"].map((symbol, index) => (
+                    <tr key={symbol} className="border-t border-terminal-line"><td className="px-3 py-2 font-semibold">{symbol}</td><td className="px-3 py-2">{index % 2 ? "AI 추세추종" : "KRW 모멘텀"}</td><td className="px-3 py-2"><StatusBadge value={index === 4 ? "대기" : "모니터링"} tone={index === 4 ? "amber" : "cyan"} /></td><td className="mono-num px-3 py-2 text-right">{index === 0 && latestDisplayCandle ? formatKrw(latestDisplayCandle.close) : "-"}</td><td className="px-3 py-2"><StatusBadge value={index % 3 === 0 ? "매수" : "관망"} tone={index % 3 === 0 ? "green" : "neutral"} /></td></tr>
+                  ))}
+                </tbody></table>
+              </div>
+              <div className="terminal-panel">
+                <div className="panel-card-header"><span className="panel-title"><BarChart3 className="h-4 w-4" />BTC/KRW 차트</span><span className="panel-subtitle">{formatTimeframe(unit)}</span></div>
+                <ChartPanel candles={displayCandles} signals={chartSignals} />
+              </div>
+              <div className="terminal-panel danger-panel">
+                <div className="panel-card-header"><span className="panel-title"><AlertTriangle className="h-4 w-4" />긴급 정지</span><StatusBadge value={liveStatus?.emergency_stop ? "ACTIVE" : "READY"} tone={liveStatus?.emergency_stop ? "red" : "green"} /></div>
+                <p className="mb-4 text-sm text-slate-400">모든 전략과 주문 후보를 즉시 중단합니다.</p>
+                <button onClick={() => void emergencyStopLiveTrading()} className="w-full emergency-button justify-center">긴급 정지 실행</button>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activeView === "strategies" && (
+          <section className="strategy-screen screen-grid">
+            <aside className="terminal-panel strategy-list-panel">
+              <div className="panel-card-header"><span className="panel-title"><ClipboardList className="h-4 w-4" />전략 목록</span><button onClick={runStrategyValidation} disabled={validationLoading} className="ghost-button"><Plus className="h-4 w-4" />새 전략</button></div>
+              <div className="search-box compact"><Search className="h-4 w-4" /><input placeholder="전략 검색" /></div>
+              <div className="segmented w-full"><button className="is-active">전체</button><button>활성</button><button>비활성</button></div>
+              <div className="strategy-cards">
+                {strategyCardRows.map((item, index) => {
+                  const strategyName = item.strategy;
+                  return (
+                    <button key={item.key} className={`strategy-list-card ${index === 0 ? "is-selected" : ""}`}>
+                      <div><strong>{STRATEGY_LABELS[strategyName]}</strong><span>BTC · {formatTimeframe(item.unit)} · {STRATEGY_BADGES[strategyName]}</span></div>
+                      <StatusBadge value={index < 2 ? "활성" : "비활성"} tone={index < 2 ? "green" : "neutral"} />
+                      <b className={toneClass(pnlTone(item.returnValue))}>{formatPercent(item.returnValue)}</b>
+                    </button>
+                  );
+                })}
+              </div>
+            </aside>
+            <main className="terminal-panel strategy-editor-panel">
+              <div className="panel-card-header"><span className="panel-title"><SlidersHorizontal className="h-4 w-4" />전략 편집</span><StatusBadge value="활성" tone="green" /></div>
+              <div className="form-grid">
+                <label className="control"><span>전략 이름</span><input value={`${STRATEGY_LABELS[strategy]} v2.1`} readOnly /></label>
+                <label className="control"><span>타임프레임</span><select value={unit} onChange={(event) => setUnit(Number(event.target.value))}>{[1, 5, 15, 60].map((item) => <option key={item} value={item}>{formatTimeframe(item)}</option>)}</select></label>
+                <label className="control"><span>전략 유형</span><select value={strategy} onChange={(event) => setStrategy(event.target.value as Strategy)}>{Object.entries(STRATEGY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              </div>
+              <div className="editor-grid">
+                <div className="rule-box"><h3>진입 조건</h3>{Object.entries(settings).slice(0, 3).map(([key, value]) => <NumberField key={key} label={formatFieldLabel(key)} value={value} step={key === "k" ? "0.1" : "1"} onChange={(next) => setSettings((prev) => ({ ...prev, [key]: next }))} />)}</div>
+                <div className="rule-box"><h3>필터 조건</h3><MetricCard label="거래량 (24h)" value="> 1,000,000,000" /><MetricCard label="ATR(14)" value="현재가의 1.5%" /><MetricCard label="변동성" value="< 5%" /></div>
+                <div className="rule-box"><h3>리스크 관리</h3>{Object.entries(backtestRisk).slice(0, 4).map(([key, value]) => <NumberField key={key} label={formatFieldLabel(key)} value={value} step={key.includes("rate") ? "0.0001" : "100000"} onChange={(next) => setBacktestRisk((prev) => ({ ...prev, [key]: next }))} />)}</div>
+                <div className="rule-box"><h3>자본 할당</h3>{Object.entries(paperRisk).slice(0, 4).map(([key, value]) => <NumberField key={key} label={formatFieldLabel(key)} value={value} step={key.includes("rate") ? "0.0001" : "10000"} onChange={(next) => setPaperRisk((prev) => ({ ...prev, [key]: next }))} />)}</div>
+              </div>
+            </main>
+            <aside className="strategy-side">
+              <div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><TrendingUp className="h-4 w-4" />전략 성과 (실거래)</span></div><div className="metric-grid-2"><MetricCard icon={<TrendingUp className="h-5 w-5" />} label="총 수익률" value={formatPercent(metrics?.total_return)} tone={pnlTone(metrics?.total_return)} /><MetricCard icon={<Target className="h-5 w-5" />} label="승률" value={formatPercent(metrics?.win_rate)} /><MetricCard icon={<History className="h-5 w-5" />} label="총 거래 수" value={`${metrics?.trade_count ?? 0}건`} /><MetricCard icon={<AlertTriangle className="h-5 w-5" />} label="MDD" value={formatPercent(metrics?.mdd)} tone="red" /></div><BacktestEquityGraph points={result?.equity_curve ?? []} /></div>
+              <div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><TestTube2 className="h-4 w-4" />백테스트 요약</span></div><div className="metric-grid-2"><MetricCard label="CAGR" value={formatPercent(metrics?.total_return)} tone="green" /><MetricCard label="Profit Factor" value={formatDecimal(metrics?.profit_factor)} /><MetricCard label="Sharpe" value={formatDecimal(metrics?.score)} /><MetricCard label="평균 보유" value={formatHoldingTime(metrics?.average_holding_time_minutes)} /></div></div>
+              <div className="action-row"><button className="success-button"><Save className="h-4 w-4" />저장</button><button className="ghost-button"><Copy className="h-4 w-4" />복제</button><button className="danger-ghost-button"><AlertTriangle className="h-4 w-4" />비활성화</button><button onClick={runBacktest} className="ghost-button"><TestTube2 className="h-4 w-4" />실행 테스트</button></div>
+            </aside>
+          </section>
+        )}
+
+        {activeView === "portfolio" && (
+          <section className="portfolio-screen screen-grid">
+            <div className="screen-kpis"><MetricCard icon={<Wallet className="h-5 w-5" />} label="총 자산" value={formatKrw(estimatedPortfolioTotal)} tone="cyan" /><MetricCard icon={<TrendingUp className="h-5 w-5" />} label="일간 손익" value={formatKrw(riskState?.daily_total_pnl)} tone={pnlTone(riskState?.daily_total_pnl)} /><MetricCard icon={<PieChart className="h-5 w-5" />} label="총 수익률" value={formatPercent(balance?.total_return ?? forwardBalance?.total_return)} tone={pnlTone(balance?.total_return ?? forwardBalance?.total_return)} /><MetricCard icon={<DollarSign className="h-5 w-5" />} label="현금 비중" value={estimatedPortfolioTotal ? `${formatDecimal(((liveKrw?.balance ?? balance?.cash_krw ?? 0) / estimatedPortfolioTotal) * 100)}%` : "-"} /><MetricCard icon={<ShieldCheck className="h-5 w-5" />} label="분산 점수" value={riskState?.balance_mismatch_detected ? "검토" : "양호"} tone={riskState?.balance_mismatch_detected ? "red" : "green"} /></div>
+            <div className="portfolio-layout">
+              <div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><PieChart className="h-4 w-4" />포트폴리오 구성</span></div><div className="donut-wrap"><div className="donut-chart" /><div className="donut-center"><span>총 자산</span><b>{formatKrw(estimatedPortfolioTotal)}</b></div></div><div className="legend-list"><span><i className="bg-[#f59e0b]" />BTC <b>{formatNumber(liveBtc?.balance ?? position?.btc_quantity)}</b></span><span><i className="bg-[#6366f1]" />ETH <b>{formatNumber(liveEth?.balance)}</b></span><span><i className="bg-[#38bdf8]" />KRW <b>{formatKrw(liveKrw?.balance ?? balance?.cash_krw)}</b></span></div></div>
+              <div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><LineChart className="h-4 w-4" />포트폴리오 자산 추이</span><div className="segmented"><button>1일</button><button>7일</button><button className="is-active">30일</button><button>전체</button></div></div><PnlGraph points={equityPoints.length ? equityPoints : forwardEquityPoints} initialCash={balance?.initial_cash ?? DEFAULT_PAPER_RISK.initial_cash} /><div className="summary-strip"><MetricCard label="기간 시작" value={formatKrw(balance?.initial_cash ?? forwardBalance?.initial_cash)} /><MetricCard label="기간 종료" value={formatKrw(estimatedPortfolioTotal)} /><MetricCard label="변동액" value={formatKrw(totalPnl)} tone={pnlTone(totalPnl)} /><MetricCard label="수익률" value={formatPercent(balance?.total_return ?? forwardBalance?.total_return)} tone={pnlTone(balance?.total_return ?? forwardBalance?.total_return)} /></div></div>
+              <aside className="right-stack"><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><RefreshCw className="h-4 w-4" />리밸런싱 제안</span><span className="panel-subtitle">업데이트 {formatKstShort(chartUpdatedAt)}</span></div><table className="ops-table w-full text-sm"><tbody>{["BTC", "ETH", "KRW", "기타"].map((asset, idx) => <tr key={asset} className="border-t border-terminal-line"><td className="px-2 py-2">{asset}</td><td className="px-2 py-2 text-right">{[56, 20, 13, 11][idx]}%</td><td className={`px-2 py-2 text-right ${idx === 1 ? "text-terminal-green" : "text-terminal-red"}`}>{idx === 1 ? "+조정" : "-조정"}</td></tr>)}</tbody></table><button className="mt-3 w-full ghost-button justify-center"><TestTube2 className="h-4 w-4" />시뮬레이션 실행</button></div><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><ShieldCheck className="h-4 w-4" />위험 노출 현황</span></div><div className="metric-grid-2"><MetricCard label="VaR" value={`${formatDecimal(riskState?.daily_loss_percent)}%`} /><MetricCard label="최대 낙폭" value={formatPercent(metrics?.mdd)} tone="red" /><MetricCard label="샤프" value={formatDecimal(metrics?.score)} /><MetricCard label="변동성" value={riskState?.volatility_block_enabled ? "ON" : "OFF"} tone="amber" /></div></div></aside>
+            </div>
+          </section>
+        )}
+
+        {activeView === "trades" && (
+          <section className="trades-screen screen-grid">
+            <div className="screen-kpis"><MetricCard icon={<History className="h-5 w-5" />} label="전체 거래" value={`${liveOrders.length + paperOrders.length}건`} /><MetricCard icon={<Target className="h-5 w-5" />} label="승률" value={formatPercent(metrics?.win_rate ?? forwardMetrics?.win_rate)} /><MetricCard icon={<TrendingUp className="h-5 w-5" />} label="실현 손익" value={formatKrw(balance?.realized_pnl ?? riskState?.daily_realized_pnl)} tone={pnlTone(balance?.realized_pnl ?? riskState?.daily_realized_pnl)} /><MetricCard icon={<Gauge className="h-5 w-5" />} label="평균 보유 시간" value={formatHoldingTime(metrics?.average_holding_time_minutes)} /><MetricCard icon={<DollarSign className="h-5 w-5" />} label="총 수수료" value={formatKrw((result?.orders ?? []).reduce((sum, order) => sum + (order.fee ?? 0), 0))} /></div>
+            <div className="trades-layout"><div className="terminal-panel"><div className="filter-bar"><button className="ghost-button"><Filter className="h-4 w-4" />코인 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />전략 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />상태 전체</button><div className="search-box compact"><Search className="h-4 w-4" /><input placeholder="종목/전략명 검색" /></div><button className="ghost-button"><Download className="h-4 w-4" />CSV 내보내기</button></div><div className="table-scroll max-h-[620px] overflow-auto"><table className="ops-table w-full min-w-[1080px] text-left text-sm"><thead><tr><th className="px-3 py-2">종목</th><th className="px-3 py-2">전략명</th><th className="px-3 py-2">진입시간</th><th className="px-3 py-2 text-right">진입가</th><th className="px-3 py-2 text-right">수량</th><th className="px-3 py-2 text-right">손익금</th><th className="px-3 py-2">상태</th></tr></thead><tbody>{liveOrders.slice(0, 16).map((order) => <tr key={order.request_id} className="border-t border-terminal-line"><td className="px-3 py-2 font-semibold">{order.market}</td><td className="px-3 py-2">{order.strategy_name ?? "-"}</td><td className="px-3 py-2 text-slate-400">{formatKstShort(order.created_at)}</td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.price ?? undefined)}</td><td className="mono-num px-3 py-2 text-right">{formatNumber(order.executed_volume)}</td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.filled_amount_krw)}</td><td className="px-3 py-2"><StatusBadge value={formatLiveOrderStatus(order.status)} tone={order.status === "FILLED" ? "green" : order.status === "FAILED" || order.status === "BLOCKED" ? "red" : "amber"} /></td></tr>)}</tbody></table></div></div><aside className="terminal-panel trade-detail-panel"><div className="panel-card-header"><span className="panel-title"><FileText className="h-4 w-4" />거래 상세</span><StatusBadge value={latestLiveOrder ? formatLiveOrderStatus(latestLiveOrder.status) : "-"} tone={latestLiveOrder?.status === "FILLED" ? "green" : latestLiveOrder ? "amber" : "neutral"} /></div><div className="metric-list"><span>종목 <b>{latestLiveOrder?.market ?? "-"}</b></span><span>주문유형 <b>{latestLiveOrder?.order_type ?? "-"}</b></span><span>주문 UUID <b>{latestLiveOrder?.order_uuid ? `${latestLiveOrder.order_uuid.slice(0, 12)}...` : "-"}</b></span><span>체결 금액 <b>{formatKrw(latestLiveOrder?.filled_amount_krw)}</b></span><span>Risk <b>{formatRiskStatus(latestLiveOrder?.risk_result)}</b></span></div><div className="timeline-list"><span>신호 발생</span><span>주문 제출</span><span>체결/대기</span><span>정산 기록</span></div></aside></div>
+          </section>
+        )}
+
+        {activeView === "backtest" && (
+          <section className="backtest-screen screen-grid">
+            <div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><TestTube2 className="h-4 w-4" />백테스트 설정</span><div className="action-row"><button className="ghost-button"><Download className="h-4 w-4" />설정 불러오기</button><button className="ghost-button"><Save className="h-4 w-4" />설정 저장</button><button onClick={runBacktest} disabled={loading} className="success-button"><Play className="h-4 w-4" />백테스트 실행</button></div></div><div className="form-grid dense"><label className="control"><span>전략 선택</span><select value={strategy} onChange={(event) => setStrategy(event.target.value as Strategy)}>{Object.entries(STRATEGY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="control"><span>코인/마켓</span><select value={market} disabled><option>KRW-BTC</option></select></label><label className="control"><span>시간 프레임</span><select value={unit} onChange={(event) => setUnit(Number(event.target.value))}>{[1, 5, 15, 60].map((item) => <option key={item} value={item}>{formatTimeframe(item)}</option>)}</select></label><label className="control"><span>기간 시작</span><input type="datetime-local" value={startDateKst} onChange={(event) => setStartDateKst(event.target.value)} /></label><label className="control"><span>기간 종료</span><input type="datetime-local" value={endDateKst} onChange={(event) => setEndDateKst(event.target.value)} /></label></div></div>
+            <div className="screen-kpis"><MetricCard icon={<TrendingUp className="h-5 w-5" />} label="누적 수익률" value={formatPercent(metrics?.total_return)} tone={pnlTone(metrics?.total_return)} /><MetricCard icon={<AlertTriangle className="h-5 w-5" />} label="최대 낙폭" value={formatPercent(metrics?.mdd)} tone="red" /><MetricCard icon={<Gauge className="h-5 w-5" />} label="샤프 비율" value={formatDecimal(metrics?.score)} /><MetricCard icon={<Target className="h-5 w-5" />} label="승률" value={formatPercent(metrics?.win_rate)} /><MetricCard icon={<DollarSign className="h-5 w-5" />} label="수익 팩터" value={formatDecimal(metrics?.profit_factor)} /><MetricCard icon={<History className="h-5 w-5" />} label="총 거래 수" value={`${metrics?.trade_count ?? 0}`} /></div>
+            <div className="backtest-layout"><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><LineChart className="h-4 w-4" />자산 곡선 & Drawdown</span><div className="segmented"><button>1개월</button><button>3개월</button><button>1년</button><button className="is-active">전체</button></div></div><BacktestEquityGraph points={result?.equity_curve ?? []} /></div><aside className="right-stack"><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><SlidersHorizontal className="h-4 w-4" />전략 파라미터 요약</span></div><div className="metric-list">{Object.entries(settings).map(([key, value]) => <span key={key}>{formatFieldLabel(key)} <b>{String(value)}</b></span>)}</div></div><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><CheckCircle2 className="h-4 w-4" />최근 실행 정보</span></div><div className="metric-list"><span>최근 실행 <b>{formatKstShort(chartUpdatedAt)}</b></span><span>데이터 범위 <b>{startDateKst} ~ {endDateKst}</b></span><span>데이터 수 <b>{displayCandles.length}개</b></span><span>상태 <b className="text-terminal-green">완료</b></span></div></div></aside></div>
+          </section>
+        )}
+
+        {activeView === "alerts" && (
+          <section className="alerts-screen screen-grid">
+            <div className="screen-kpis"><MetricCard icon={<Bell className="h-5 w-5" />} label="오늘 전체 알림" value={`${riskDashboard?.risk_logs?.length ?? 0}`} /><MetricCard icon={<FileText className="h-5 w-5" />} label="안 읽은 알림" value={`${(riskDashboard?.risk_logs ?? []).filter((log) => !log.allowed).length}`} tone="amber" /><MetricCard icon={<AlertTriangle className="h-5 w-5" />} label="치명적 이슈" value={`${(riskDashboard?.risk_logs ?? []).filter((log) => !log.allowed).length}`} tone="red" /><MetricCard icon={<Activity className="h-5 w-5" />} label="API 상태" value={liveStatus?.broker_status ?? "-"} tone={liveStatus?.broker_status === "READY_READ_ONLY" || liveStatus?.broker_status === "READY" ? "green" : "amber"} /></div>
+            <div className="alerts-layout"><div className="terminal-panel"><div className="filter-bar"><button className="ghost-button"><Filter className="h-4 w-4" />로그 유형 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />심각도 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />상태 전체</button><div className="search-box compact"><Search className="h-4 w-4" /><input placeholder="메시지 또는 주문ID 검색" /></div><button onClick={() => void fetchRiskDashboard()} className="ghost-button"><RefreshCw className="h-4 w-4" />새로고침</button></div><table className="ops-table w-full min-w-[900px] text-left text-sm"><thead><tr><th className="px-3 py-2">시간</th><th className="px-3 py-2">심각도</th><th className="px-3 py-2">유형</th><th className="px-3 py-2">출처</th><th className="px-3 py-2">메시지</th><th className="px-3 py-2">상태</th></tr></thead><tbody>{(riskDashboard?.risk_logs ?? []).slice(0, 20).map((log) => <tr key={log.id} className={`border-t border-terminal-line ${!log.allowed ? "is-alert-row" : ""}`}><td className="px-3 py-2 text-slate-400">{formatKstShort(log.created_at)}</td><td className="px-3 py-2"><StatusBadge value={log.risk_level} tone={log.allowed ? "green" : "red"} /></td><td className="px-3 py-2">{log.block_code ?? "RISK_CHECK"}</td><td className="px-3 py-2">Risk Manager</td><td className="px-3 py-2">{log.block_reason ?? "정상"}</td><td className="px-3 py-2">{log.allowed ? "읽음" : "미해결"}</td></tr>)}</tbody></table></div><aside className="terminal-panel alert-detail-panel"><div className="panel-card-header"><span className="panel-title"><AlertTriangle className="h-4 w-4" />{latestRiskLog?.block_code ?? "선택 알림"}</span><StatusBadge value={latestRiskLog?.allowed ? "읽음" : "미해결"} tone={latestRiskLog?.allowed ? "green" : "red"} /></div><div className="metric-list"><span>발생 시간 <b>{formatKstShort(latestRiskLog?.created_at)}</b></span><span>상세 메시지 <b>{latestRiskLog?.block_reason ?? "-"}</b></span><span>영향 범위 <b>주문 생성, 자동매매</b></span><span>최근 API 상태 <b>{liveStatus?.broker_status ?? "-"}</b></span></div><div className="action-row"><button className="ghost-button"><CheckCircle2 className="h-4 w-4" />읽음 처리</button><button className="ghost-button"><RefreshCw className="h-4 w-4" />재시도</button><button className="danger-ghost-button"><AlertTriangle className="h-4 w-4" />알림 무시</button></div></aside></div>
+          </section>
+        )}
+
+        {activeView === "settings" && (
+          <section className="settings-screen screen-grid">
+            <aside className="terminal-panel settings-nav"><button className="is-selected"><Settings className="h-4 w-4" />일반</button><button><Link className="h-4 w-4" />거래소 API</button><button><ShieldCheck className="h-4 w-4" />리스크 관리</button><button><Bell className="h-4 w-4" />알림</button><button><Lock className="h-4 w-4" />보안</button></aside>
+            <main className="terminal-panel settings-form"><div className="panel-card-header"><span className="panel-title"><Settings className="h-4 w-4" />환경설정</span><button className="success-button"><Save className="h-4 w-4" />저장</button></div><div className="settings-row"><span><ShieldCheck className="h-4 w-4" />실거래 허용</span><StatusBadge value={liveStatus?.live_trading_enabled ? "활성" : "비활성"} tone={liveStatus?.live_trading_enabled ? "amber" : "neutral"} /></div><div className="settings-row"><span><Bot className="h-4 w-4" />자동매매 기본 모드</span><div className="segmented"><button>모니터링</button><button>페이퍼</button><button className="is-active">실거래</button></div></div><div className="settings-row"><span><Target className="h-4 w-4" />기본 거래쌍</span><select value={market} disabled><option>KRW-BTC</option></select></div><div className="settings-row"><span><DollarSign className="h-4 w-4" />표시 통화</span><select><option>KRW (원)</option></select></div><div className="settings-row"><span><Settings className="h-4 w-4" />테마 모드</span><div className="segmented"><button>시스템</button><button>라이트</button><button className="is-active">다크</button></div></div><div className="settings-row"><span><Gauge className="h-4 w-4" />시간대</span><select><option>(UTC+09:00) 서울</option></select></div><div className="settings-row"><span><Bell className="h-4 w-4" />앱 내 알림</span><StatusBadge value="활성" tone="green" /></div><div className="settings-row"><span><FileText className="h-4 w-4" />주문 유형 기본값</span><select><option>지정가 (Limit)</option></select></div></main>
+            <aside className="right-stack"><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><Activity className="h-4 w-4" />시스템 상태</span><StatusBadge value="정상 운영 중" tone="green" /></div><div className="metric-list"><span>서버 시간 <b>{formatKstShort(new Date().toISOString())}</b></span><span>API Key Loaded <b>{liveStatus?.api_key_loaded ? "YES" : "NO"}</b></span><span>Risk Manager <b>{liveStatus?.risk_manager_status ?? "-"}</b></span></div></div><div className="terminal-panel"><div className="panel-card-header"><span className="panel-title"><Link className="h-4 w-4" />연결 상태</span></div><div className="metric-list"><span>업비트 <b>{liveExchange === "upbit" ? liveStatus?.broker_status ?? "-" : "대기"}</b></span><span>빗썸 <b>{liveExchange === "bithumb" ? liveStatus?.broker_status ?? "-" : "대기"}</b></span><span>Telegram <b>미연결</b></span><span>Discord <b>미연결</b></span></div></div><div className="terminal-panel danger-panel"><button onClick={() => void fetchLiveBalances()} className="w-full ghost-button justify-center"><RefreshCw className="h-4 w-4" />테스트 연결</button><button onClick={() => void emergencyStopLiveTrading()} className="mt-3 w-full emergency-button justify-center"><Power className="h-4 w-4" />긴급 정지</button></div></aside>
+          </section>
+        )}
+
+        <section id="dashboard" className={viewSection("__legacy__", "dashboard-hero")}>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5">
+            <MetricCard label="총자산 (KRW)" value={formatKrw(estimatedPortfolioTotal)} tone="cyan" />
+            <MetricCard label="오늘 손익" value={formatKrw(riskState?.daily_total_pnl ?? totalPnl)} tone={pnlTone(riskState?.daily_total_pnl ?? totalPnl)} />
+            <MetricCard label="누적 수익률" value={formatPercent(balance?.total_return ?? forwardBalance?.total_return)} tone={pnlTone(balance?.total_return ?? forwardBalance?.total_return)} />
+            <MetricCard label="활성 전략 수" value={`${candidateStrategies.length || 0}개`} tone="amber" />
+            <MetricCard label="승률" value={formatPercent(metrics?.win_rate ?? forwardMetrics?.win_rate)} />
+          </div>
+          <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+            <div className="panel-card">
+              <div className="panel-card-header">
+                <div>
+                  <span className="panel-title">BTC/KRW 차트</span>
+                  <span className="panel-subtitle">{displayCandles.length}개 캔들 · {formatTimeframe(unit)}</span>
+                </div>
+                <div className="segmented">
+                  {[1, 15, 60, 240].map((item) => (
+                    <button key={item} onClick={() => setUnit(item)} className={unit === item ? "is-active" : ""}>{formatTimeframe(item)}</button>
+                  ))}
+                </div>
+              </div>
+              <ChartPanel candles={displayCandles} signals={chartSignals} />
+            </div>
+            <aside className="space-y-4">
+              <div className="panel-card">
+                <div className="panel-card-header">
+                  <span className="panel-title">봇 상태</span>
+                  <StatusBadge value={isLiveStrategyOn || isAutoPilotOn ? "자동매매 ON" : "대기"} tone={isLiveStrategyOn || isAutoPilotOn ? "green" : "amber"} />
+                </div>
+                <div className="metric-list">
+                  <span>리스크 레벨 <b className={toneClass(topStatusTone)}>{riskState?.status ?? "-"}</b></span>
+                  <span>오늘 PnL <b className={toneClass(pnlTone(riskState?.daily_total_pnl ?? 0))}>{formatKrw(riskState?.daily_total_pnl)}</b></span>
+                  <span>현재 전략 <b>{liveStrategyCandidate ? STRATEGY_LABELS[liveStrategyCandidate.strategy] : STRATEGY_LABELS[displayedStrategy]}</b></span>
+                  <span>오픈 주문 <b>{openLiveOrders.length}</b></span>
+                </div>
+              </div>
+              <div className="panel-card danger-panel">
+                <div className="panel-card-header">
+                  <span className="panel-title">포지션 / 주문 현황</span>
+                  <StatusBadge value={liveStrategyPosition?.status ?? "NO POSITION"} tone={liveStrategyPosition?.status === "OPEN" ? "green" : "neutral"} />
+                </div>
+                <div className="metric-list">
+                  <span>진입가 <b>{formatKrw(liveStrategyPosition?.entry_price)}</b></span>
+                  <span>현재가 <b>{formatKrw(liveStrategyPosition?.current_price)}</b></span>
+                  <span>평가손익 <b className={toneClass(pnlTone(liveStrategyPosition?.unrealized_pnl ?? 0))}>{formatKrw(liveStrategyPosition?.unrealized_pnl)}</b></span>
+                  <span>Stop Loss <b className="text-terminal-red">{formatKrw(liveStrategyPosition?.stop_loss_price)}</b></span>
+                  <span>Take Profit <b className="text-terminal-green">{formatKrw(liveStrategyPosition?.take_profit_price)}</b></span>
+                </div>
+                <button onClick={() => void emergencyStopLiveTrading()} className="mt-4 w-full emergency-button justify-center">긴급 정지 실행</button>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="auto-trade" className={viewSection("__legacy__", "border-b border-terminal-line bg-[#080d14] px-4 py-4")}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Auto Live Pilot / 빗썸 소액 자동주문 파일럿</h2>
@@ -1952,6 +2526,9 @@ function App() {
             <MetricCard label="Last Order Time" value={formatKstShort(autoSession?.last_order_time_utc ?? undefined)} title={formatKstDateTime(autoSession?.last_order_time_utc ?? undefined)} />
             <MetricCard label="Last Order UUID" value={autoSession?.last_order_uuid ? `${autoSession.last_order_uuid.slice(0, 8)}...` : "-"} title={autoSession?.last_order_uuid ?? undefined} />
             <MetricCard label="Auto Cancel" value={`${autoPilot?.auto_cancel_after_seconds ?? 60}s`} />
+            <MetricCard label="Partial Fill Policy" value={autoPilot?.partial_fill_policy ?? "-"} tone="amber" />
+            <MetricCard label="Restart Policy" value={autoPilot?.restart_policy ?? "-"} tone="amber" />
+            <MetricCard label="Recovery Event" value={autoPilot?.recent_recovery_events?.[0]?.event_type ?? "-"} title={autoPilot?.recent_recovery_events?.[0]?.message} tone={autoPilot?.recent_recovery_events?.[0]?.severity === "ERROR" ? "red" : autoPilot?.recent_recovery_events?.[0]?.severity === "WARNING" ? "amber" : "neutral"} />
           </section>
           <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,180px)_auto]">
             <label className="control">
@@ -1986,7 +2563,7 @@ function App() {
           </div>
         </section>
 
-        <section className="border-b border-terminal-line bg-[#071016] px-4 py-4">
+        <section className={viewSection("__legacy__", "border-b border-terminal-line bg-[#071016] px-4 py-4")}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Auto Live Strategy / Controlled Strategy Pilot</h2>
@@ -2017,6 +2594,9 @@ function App() {
             <MetricCard label="Last Order Status" value={liveStrategySession?.last_order_status ?? "-"} />
             <MetricCard label="Last Candle" value={formatKstShort(liveStrategySession?.last_processed_candle_time_utc ?? undefined)} title={formatKstDateTime(liveStrategySession?.last_processed_candle_time_utc ?? undefined)} />
             <MetricCard label="Flow" value={liveStrategyFlow} tone={liveStrategyFlow === "BLOCKED" ? "red" : liveStrategyFlow.includes("CANCELED") || liveStrategyFlow.includes("POSITION") ? "green" : "cyan"} />
+            <MetricCard label="Partial Fill Policy" value={liveStrategy?.partial_fill_policy ?? "-"} tone="amber" />
+            <MetricCard label="Restart Policy" value={liveStrategy?.restart_policy ?? "-"} tone="amber" />
+            <MetricCard label="Recovery Event" value={liveStrategy?.recent_recovery_events?.[0]?.event_type ?? "-"} title={liveStrategy?.recent_recovery_events?.[0]?.message} tone={liveStrategy?.recent_recovery_events?.[0]?.severity === "ERROR" ? "red" : liveStrategy?.recent_recovery_events?.[0]?.severity === "WARNING" ? "amber" : "neutral"} />
           </section>
 
           <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
@@ -2053,10 +2633,27 @@ function App() {
             <MetricCard label="Unrealized PnL" value={formatKrw(liveStrategyPosition?.unrealized_pnl)} tone={pnlTone(liveStrategyPosition?.unrealized_pnl ?? 0)} />
             <MetricCard label="Stop Loss" value={formatKrw(liveStrategyPosition?.stop_loss_price)} tone="red" />
             <MetricCard label="Take Profit" value={formatKrw(liveStrategyPosition?.take_profit_price)} tone="green" />
+            <MetricCard label="Holding Since" value={formatKstShort(liveStrategyPosition?.opened_at)} title={formatKstDateTime(liveStrategyPosition?.opened_at)} />
+            <MetricCard label="Exit Reason" value={liveExitCandidate?.reason ?? "-"} tone={liveExitCandidate ? "amber" : "neutral"} />
+            <MetricCard label="Exit Status" value={liveExitCandidate?.status ?? "-"} tone={liveExitCandidate?.status === "COMPLETED" ? "green" : liveExitCandidate?.status === "BLOCKED" ? "red" : liveExitCandidate ? "amber" : "neutral"} />
+            <MetricCard label="Expected Exit Price" value={formatKrw(liveExitCandidate?.target_exit_price)} />
+            <MetricCard label="Expected PnL" value={formatKrw(liveExitCandidate?.expected_pnl)} tone={pnlTone(liveExitCandidate?.expected_pnl ?? 0)} />
+            <MetricCard label="Exit Risk Result" value={liveExitCandidate?.risk_result ?? "-"} tone={liveExitCandidate?.risk_result?.startsWith("BLOCKED") ? "red" : "neutral"} />
           </section>
+          <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-[repeat(5,minmax(0,auto))_minmax(0,1fr)]">
+            <button onClick={() => void approveExitCandidate()} disabled={liveStrategyLoading || !liveExitCandidate || liveExitCandidate.status !== "PENDING"} className="inline-flex h-9 items-center justify-center border border-terminal-green px-3 text-xs font-semibold text-terminal-green hover:bg-[#10331f] disabled:opacity-50">Approve Exit Candidate</button>
+            <button onClick={() => void rejectExitCandidate()} disabled={liveStrategyLoading || !liveExitCandidate || !["PENDING", "APPROVED"].includes(liveExitCandidate.status)} className="inline-flex h-9 items-center justify-center border border-terminal-amber px-3 text-xs font-semibold text-terminal-amber hover:bg-[#2c2412] disabled:opacity-50">Reject Exit Candidate</button>
+            <button onClick={() => void createExitPreview()} disabled={liveStrategyLoading || !liveExitCandidate || liveExitCandidate.status !== "APPROVED"} className="inline-flex h-9 items-center justify-center border border-terminal-cyan px-3 text-xs font-semibold text-terminal-cyan hover:bg-[#0d2d33] disabled:opacity-50">Create Exit Preview</button>
+            <button onClick={() => void submitExitOrder()} disabled={liveStrategyLoading || !exitPreviewRequestId || exitPlaceConfirmation !== "SUBMIT LIMIT EXIT ORDER"} className="inline-flex h-9 items-center justify-center border border-terminal-red px-3 text-xs font-semibold text-terminal-red hover:bg-[#331018] disabled:opacity-50">Submit Limit Exit Order</button>
+            <button onClick={() => void cancelExitOrder()} disabled={liveStrategyLoading || !exitPreviewRequestId} className="inline-flex h-9 items-center justify-center border border-terminal-amber px-3 text-xs font-semibold text-terminal-amber hover:bg-[#2c2412] disabled:opacity-50">Cancel Exit Order</button>
+            <label className="control min-w-[250px]">
+              <span>Exit Submit Confirmation</span>
+              <input value={exitPlaceConfirmation} onChange={(event) => setExitPlaceConfirmation(event.target.value)} placeholder="SUBMIT LIMIT EXIT ORDER" />
+            </label>
+          </div>
         </section>
 
-        <section className="border-b border-terminal-line bg-terminal-bg px-4 py-4">
+        <section id="settings" className={viewSection("__legacy__", "border-b border-terminal-line bg-terminal-bg px-4 py-4")}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Live Safety Panel / 실거래 안전장치</h2>
@@ -2096,6 +2693,20 @@ function App() {
             <MetricCard label="Max Live Order" value={formatKrw(liveStatus?.max_live_order_krw)} tone="amber" />
             <MetricCard label="Daily Loss Limit" value={`${formatDecimal(liveStatus?.daily_loss_limit_percent)}%`} tone="amber" />
             <MetricCard label="Last Live Order" value={formatKstShort(liveStatus?.last_live_order_time)} title={formatKstDateTime(liveStatus?.last_live_order_time)} />
+            <MetricCard label="Risk Status" value={riskState?.status ?? "-"} tone={riskState?.status === "OK" ? "green" : riskState?.status === "BLOCKED" || riskState?.status === "EMERGENCY_STOPPED" ? "red" : "amber"} />
+            <MetricCard label="Today Realized PnL" value={formatKrw(riskState?.daily_realized_pnl)} tone={pnlTone(riskState?.daily_realized_pnl ?? 0)} />
+            <MetricCard label="Today Unrealized PnL" value={formatKrw(riskState?.daily_unrealized_pnl)} tone={pnlTone(riskState?.daily_unrealized_pnl ?? 0)} />
+            <MetricCard label="Daily Loss %" value={`${formatDecimal(riskState?.daily_loss_percent)}%`} tone={(riskState?.daily_loss_percent ?? 0) > 0 ? "amber" : "neutral"} />
+            <MetricCard label="Daily Orders" value={`${riskState?.daily_order_count ?? 0}`} />
+            <MetricCard label="Entry / Exit Today" value={`${riskState?.daily_entry_count ?? 0}/${riskState?.daily_exit_count ?? 0}`} />
+            <MetricCard label="Consecutive Losses" value={`${riskState?.consecutive_loss_count ?? 0}`} tone={(riskState?.consecutive_loss_count ?? 0) > 0 ? "amber" : "neutral"} />
+            <MetricCard label="Open Orders" value={`${riskState?.open_order_count ?? 0}`} tone={(riskState?.open_order_count ?? 0) > 0 ? "amber" : "neutral"} />
+            <MetricCard label="Open Positions" value={`${riskState?.open_position_count ?? 0}`} tone={(riskState?.open_position_count ?? 0) > 0 ? "amber" : "neutral"} />
+            <MetricCard label="Cooldown Remaining" value={`${riskDashboard?.risk_logs?.[0]?.block_code === "BLOCKED_COOLDOWN" ? "ACTIVE" : "0s"}`} tone={riskDashboard?.risk_logs?.[0]?.block_code === "BLOCKED_COOLDOWN" ? "amber" : "neutral"} />
+            <MetricCard label="Balance Mismatch" value={riskState?.balance_mismatch_detected ? "YES" : "NO"} tone={riskState?.balance_mismatch_detected ? "red" : "green"} />
+            <MetricCard label="Partial Fill" value={riskState?.partial_fill_detected ? "YES" : "NO"} tone={riskState?.partial_fill_detected ? "red" : "green"} />
+            <MetricCard label="Volatility Filter" value={riskState?.volatility_block_enabled ? "ON" : "OFF"} />
+            <MetricCard label="Low Volume Filter" value={riskState?.low_volume_block_enabled ? "ON" : "OFF"} />
           </section>
 
           <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
@@ -2296,8 +2907,12 @@ function App() {
                 <MetricCard label="주문 후 KRW" value={formatKrw(livePreview.estimated_post_krw_balance)} />
                 <MetricCard label="주문 후 코인" value={formatNumber(livePreview.estimated_post_asset_balance)} />
                 <MetricCard label="Risk Result" value={formatRiskStatus(livePreview.risk_result)} tone={livePreview.allowed ? "green" : "red"} />
+                <MetricCard label="Risk Level" value={livePreview.risk_level ?? "-"} tone={livePreview.risk_level === "BLOCKED" ? "red" : livePreview.risk_level === "MEDIUM" || livePreview.risk_level === "HIGH" ? "amber" : "green"} />
+                <MetricCard label="Block Code" value={livePreview.block_code ?? "-"} tone={livePreview.block_code ? "red" : "neutral"} />
+                <MetricCard label="Max Allowed KRW" value={formatKrw(livePreview.max_allowed_order_krw)} tone="amber" />
                 <MetricCard label="Order Chance" value={livePreview.order_chance_status ?? "-"} tone={livePreview.order_chance_status === "SUCCESS" ? "green" : livePreview.order_chance_status === "FAILED" ? "red" : "amber"} title={livePreview.order_chance_error ?? undefined} />
-                <MetricCard label="차단 사유" value={formatRiskStatus(livePreview.blocked_reason)} tone={livePreview.allowed ? "neutral" : "red"} />
+                <MetricCard label="차단 사유" value={formatRiskStatus(livePreview.block_reason ?? livePreview.blocked_reason)} tone={livePreview.allowed ? "neutral" : "red"} />
+                <MetricCard label="Risk Checks" value={livePreview.checks ? `${Object.values(livePreview.checks).filter((check) => check.allowed === false).length} blocked` : "-"} title={livePreview.checks ? Object.entries(livePreview.checks).map(([key, check]) => `${key}:${check.allowed === false ? check.code ?? "BLOCKED" : "OK"}`).join(" | ") : undefined} />
               </div>
               <div className="space-y-3 border-t border-terminal-line p-4">
                 <ConfirmationField
@@ -2318,7 +2933,7 @@ function App() {
           </div>
         )}
 
-        <section className="border-b border-terminal-line bg-[#070b12] px-4 py-4">
+        <section id="backtest" className={viewSection("__legacy__", "border-b border-terminal-line bg-[#070b12] px-4 py-4")}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">백테스트 실험실</h2>
@@ -2400,7 +3015,7 @@ function App() {
           </div>
         </section>
 
-        <section className="border-b border-terminal-line bg-terminal-bg px-4 py-4">
+        <section id="strategies" className={viewSection("__legacy__", "border-b border-terminal-line bg-terminal-bg px-4 py-4")}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Parameter Sweep / 전략 검증</h2>
@@ -2532,7 +3147,7 @@ function App() {
           </div>
         </section>
 
-        <section className="border-b border-terminal-line bg-terminal-bg px-4 py-4">
+        <section className={viewSection("__legacy__", "border-b border-terminal-line bg-terminal-bg px-4 py-4")}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Forward Paper Test / 후보 전략 실시간 검증</h2>
@@ -2727,7 +3342,7 @@ function App() {
           </div>
         </section>
 
-        <section className="grid grid-cols-1 gap-3 px-4 pt-4 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-8">
+        <section className={viewSection("__legacy__", "grid grid-cols-1 gap-3 px-4 pt-4 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-8")}>
           <MetricCard label="모드" value={paperMode} tone="cyan" />
           <MetricCard label="세션 상태" value={<StatusBadge value={formatSessionStatus(sessionStatus)} tone={statusTone(sessionStatus)} />} tone={statusTone(sessionStatus)} title={sessionStatus} />
           <MetricCard label="마켓" value={paper.market ?? market} />
@@ -2744,7 +3359,7 @@ function App() {
           <MetricCard label="리스크 상태" value={<StatusBadge value={formatRiskStatus(riskStatus)} tone={riskStatus === "ACTIVE" ? "green" : "amber"} />} tone={riskStatus === "ACTIVE" ? "green" : "amber"} title={riskStatus} />
         </section>
 
-        <section className="grid grid-cols-1 gap-3 px-4 pt-4 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-7">
+        <section className={viewSection("__legacy__", "grid grid-cols-1 gap-3 px-4 pt-4 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-7")}>
           <MetricCard label="가상 원화 잔고" value={formatKrw(balance?.cash_krw)} />
           <MetricCard label="현재 보유 수량" value={formatNumber(position?.btc_quantity)} tone="cyan" />
           <MetricCard label="평균 매수가" value={formatKrw(position?.avg_buy_price)} />
@@ -2754,7 +3369,7 @@ function App() {
           <MetricCard label="총 수익률" value={formatPercent(balance?.total_return)} tone={pnlTone(balance?.total_return)} />
         </section>
 
-        <section className="grid flex-1 grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <section className={viewSection("__legacy__", "grid flex-1 grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(0,1fr)_340px]")}>
           <div className="border border-terminal-line bg-terminal-panel">
             <div className="flex items-center justify-between border-b border-terminal-line px-4 py-3">
               <div className="flex items-center gap-2">
@@ -2829,7 +3444,7 @@ function App() {
           </aside>
         </section>
 
-        <section className="grid grid-cols-1 gap-4 px-4 pb-4 xl:grid-cols-[minmax(0,1fr)_520px]">
+        <section className={viewSection("__legacy__", "grid grid-cols-1 gap-4 px-4 pb-4 xl:grid-cols-[minmax(0,1fr)_520px]")}>
           <div className="space-y-4">
             <div className="border border-terminal-line bg-terminal-panel">
               <div className="flex items-center justify-between border-b border-terminal-line px-4 py-3">
@@ -3027,6 +3642,169 @@ function App() {
             </div>
           </div>
         </section>
+
+        <section id="portfolio" className={viewSection("__legacy__", "border-b border-terminal-line bg-terminal-bg px-4 py-4")}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">포트폴리오</h2>
+              <p className="text-xs text-slate-500">실계좌 잔고가 있으면 거래소 기준으로, 없으면 페이퍼 평가자산 기준으로 표시합니다.</p>
+            </div>
+            <button onClick={() => void fetchLiveBalances()} disabled={liveLoading} className="ghost-button">
+              <RefreshCw className="h-4 w-4" />
+              잔고 새로고침
+            </button>
+          </div>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[420px_minmax(0,1fr)_420px]">
+            <div className="panel-card">
+              <div className="panel-card-header">
+                <span className="panel-title">자산 구성</span>
+                <StatusBadge value={activeExchange.toUpperCase()} tone="cyan" />
+              </div>
+              <div className="donut-wrap">
+                <div className="donut-chart" />
+                <div className="donut-center">
+                  <span>총 자산</span>
+                  <b>{formatKrw(estimatedPortfolioTotal)}</b>
+                </div>
+              </div>
+              <div className="legend-list">
+                <span><i className="bg-[#f59e0b]" />BTC <b>{formatNumber(liveBtc?.balance ?? position?.btc_quantity)}</b></span>
+                <span><i className="bg-[#6366f1]" />ETH <b>{formatNumber(liveEth?.balance)}</b></span>
+                <span><i className="bg-[#38bdf8]" />KRW <b>{formatKrw(liveKrw?.balance ?? balance?.cash_krw)}</b></span>
+              </div>
+            </div>
+            <div className="panel-card">
+              <div className="panel-card-header">
+                <span className="panel-title">포트폴리오 자산 추이</span>
+                <div className="segmented"><button className="is-active">30일</button><button>90일</button><button>전체</button></div>
+              </div>
+              <PnlGraph points={equityPoints.length ? equityPoints : forwardEquityPoints} initialCash={balance?.initial_cash ?? DEFAULT_PAPER_RISK.initial_cash} />
+              <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+                <MetricCard label="기간 시작" value={formatKrw(balance?.initial_cash ?? forwardBalance?.initial_cash)} />
+                <MetricCard label="기간 종료" value={formatKrw(estimatedPortfolioTotal)} />
+                <MetricCard label="변동액" value={formatKrw(totalPnl)} tone={pnlTone(totalPnl)} />
+                <MetricCard label="수익률" value={formatPercent(balance?.total_return ?? forwardBalance?.total_return)} tone={pnlTone(balance?.total_return ?? forwardBalance?.total_return)} />
+              </div>
+            </div>
+            <div className="panel-card">
+              <div className="panel-card-header">
+                <span className="panel-title">위험 노출 현황</span>
+                <StatusBadge value={riskState?.balance_mismatch_detected ? "BALANCE MISMATCH" : "정상"} tone={riskState?.balance_mismatch_detected ? "red" : "green"} />
+              </div>
+              <div className="metric-list">
+                <span>일 손실률 <b className="text-terminal-amber">{formatDecimal(riskState?.daily_loss_percent)}%</b></span>
+                <span>연속 손실 <b>{riskState?.consecutive_loss_count ?? 0}</b></span>
+                <span>열린 주문 <b>{riskState?.open_order_count ?? 0}</b></span>
+                <span>부분 체결 <b className={riskState?.partial_fill_detected ? "text-terminal-red" : "text-terminal-green"}>{riskState?.partial_fill_detected ? "감지" : "없음"}</b></span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="trades" className={viewSection("__legacy__", "border-b border-terminal-line bg-[#070b12] px-4 py-4")}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">거래내역</h2>
+              <p className="text-xs text-slate-500">LiveOrderLog와 PaperBroker 로그를 분리해 조회합니다.</p>
+            </div>
+            <button onClick={() => void fetchLiveOrders()} className="ghost-button">
+              <RefreshCw className="h-4 w-4" />
+              주문 새로고침
+            </button>
+          </div>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+            <div className="panel-card">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-5">
+                <MetricCard label="전체 거래" value={`${liveOrders.length + paperOrders.length}건`} />
+                <MetricCard label="실거래 체결" value={`${filledLiveOrders.length}건`} tone="green" />
+                <MetricCard label="오픈 주문" value={`${openLiveOrders.length}건`} tone={openLiveOrders.length ? "amber" : "neutral"} />
+                <MetricCard label="페이퍼 주문" value={`${paperOrders.length}건`} tone="cyan" />
+                <MetricCard label="실현 손익" value={formatKrw(balance?.realized_pnl ?? riskState?.daily_realized_pnl)} tone={pnlTone(balance?.realized_pnl ?? riskState?.daily_realized_pnl)} />
+              </div>
+              <div className="mt-4 table-scroll max-h-80 overflow-auto">
+                <table className="ops-table min-w-[920px] w-full text-left text-sm">
+                  <thead className="sticky top-0 z-10 bg-terminal-panel2 text-xs text-slate-500">
+                    <tr><th className="px-3 py-2">시간</th><th className="px-3 py-2">종목</th><th className="px-3 py-2">방향</th><th className="px-3 py-2 text-right">가격</th><th className="px-3 py-2 text-right">금액</th><th className="px-3 py-2">상태</th><th className="px-3 py-2">리스크</th></tr>
+                  </thead>
+                  <tbody>
+                    {liveOrders.slice(0, 12).map((order) => (
+                      <tr key={`trade-${order.request_id}`} className="border-t border-terminal-line">
+                        <td className="nowrap px-3 py-2 text-slate-400">{formatKstShort(order.created_at)}</td>
+                        <td className="px-3 py-2 font-semibold">{order.market}</td>
+                        <td className="px-3 py-2"><SideBadge side={order.side} /></td>
+                        <td className="mono-num px-3 py-2 text-right">{formatKrw(order.price ?? undefined)}</td>
+                        <td className="mono-num px-3 py-2 text-right">{formatKrw(order.amount_krw ?? undefined)}</td>
+                        <td className="px-3 py-2"><StatusBadge value={formatLiveOrderStatus(order.status)} tone={order.status === "FAILED" || order.status === "BLOCKED" ? "red" : order.status === "FILLED" ? "green" : "amber"} /></td>
+                        <td className="px-3 py-2"><StatusBadge value={formatRiskStatus(order.risk_result)} tone={order.risk_result === "ALLOWED" ? "green" : "red"} /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div className="panel-card">
+              <div className="panel-card-header"><span className="panel-title">거래 상세</span><StatusBadge value={latestLiveOrder ? formatLiveOrderStatus(latestLiveOrder.status) : "-"} tone={latestLiveOrder?.status === "FILLED" ? "green" : latestLiveOrder ? "amber" : "neutral"} /></div>
+              <div className="metric-list">
+                <span>거래소 <b>{latestLiveOrder?.exchange?.toUpperCase() ?? "-"}</b></span>
+                <span>주문 UUID <b>{latestLiveOrder?.order_uuid ? `${latestLiveOrder.order_uuid.slice(0, 12)}...` : "-"}</b></span>
+                <span>체결 수량 <b>{formatNumber(latestLiveOrder?.executed_volume)}</b></span>
+                <span>체결 금액 <b>{formatKrw(latestLiveOrder?.filled_amount_krw)}</b></span>
+                <span>오류 <b className="text-terminal-red">{latestLiveOrder?.error_message ?? "-"}</b></span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="alerts" className={viewSection("__legacy__", "border-b border-terminal-line bg-terminal-bg px-4 py-4")}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">알림로그</h2>
+              <p className="text-xs text-slate-500">API 오류, 주문 실패, Risk Block, 복구 이벤트를 운영 로그로 확인합니다.</p>
+            </div>
+            <button onClick={() => void fetchRiskDashboard()} className="ghost-button">
+              <RefreshCw className="h-4 w-4" />
+              새로고침
+            </button>
+          </div>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+            <div className="panel-card">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+                <MetricCard label="Risk 로그" value={`${riskDashboard?.risk_logs?.length ?? 0}건`} tone="amber" />
+                <MetricCard label="차단 상태" value={riskState?.status ?? "-"} tone={riskState?.status === "OK" ? "green" : "red"} />
+                <MetricCard label="잔고 불일치" value={riskState?.balance_mismatch_detected ? "감지" : "없음"} tone={riskState?.balance_mismatch_detected ? "red" : "green"} />
+                <MetricCard label="최근 API 상태" value={liveStatus?.broker_status ?? "-"} tone={liveStatus?.broker_status === "READY" ? "green" : "amber"} />
+              </div>
+              <div className="mt-4 table-scroll max-h-80 overflow-auto">
+                <table className="ops-table min-w-[840px] w-full text-left text-sm">
+                  <thead className="sticky top-0 z-10 bg-terminal-panel2 text-xs text-slate-500">
+                    <tr><th className="px-3 py-2">시간</th><th className="px-3 py-2">심각도</th><th className="px-3 py-2">유형</th><th className="px-3 py-2">메시지</th><th className="px-3 py-2">상태</th></tr>
+                  </thead>
+                  <tbody>
+                    {(riskDashboard?.risk_logs ?? []).slice(0, 20).map((log) => (
+                      <tr key={log.id} className="border-t border-terminal-line">
+                        <td className="nowrap px-3 py-2 text-slate-400">{formatKstShort(log.created_at)}</td>
+                        <td className="px-3 py-2"><StatusBadge value={log.risk_level} tone={log.allowed ? "green" : "red"} /></td>
+                        <td className="px-3 py-2">{log.block_code ?? "RISK_CHECK"}</td>
+                        <td className="max-w-[420px] truncate px-3 py-2 text-slate-300" title={log.block_reason ?? ""}>{log.block_reason ?? "-"}</td>
+                        <td className="px-3 py-2">{log.allowed ? "읽음" : "미해결"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div className="panel-card danger-panel">
+              <div className="panel-card-header"><span className="panel-title">선택 알림 상세</span><StatusBadge value={latestRiskLog?.allowed ? "해결" : "미해결"} tone={latestRiskLog?.allowed ? "green" : "red"} /></div>
+              <div className="metric-list">
+                <span>발생 시간 <b>{formatKstShort(latestRiskLog?.created_at)}</b></span>
+                <span>차단 코드 <b>{latestRiskLog?.block_code ?? "-"}</b></span>
+                <span>상세 메시지 <b className="text-terminal-amber">{latestRiskLog?.block_reason ?? "최근 리스크 로그가 없습니다"}</b></span>
+                <span>영향 범위 <b>주문 생성 / 자동매매 재개</b></span>
+              </div>
+            </div>
+          </div>
+        </section>
+        </div>
       </div>
     </main>
   );

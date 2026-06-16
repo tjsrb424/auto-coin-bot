@@ -30,6 +30,16 @@ from app.live_broker import BithumbBroker, LiveBrokerError, LiveTradingConfig, e
 from app.live_broker import _available_balance  # internal helper, kept server-side only
 from app.live_broker import get_live_broker, masked_exchange_request
 from app.live_broker import is_emergency_stopped
+from app.live_recovery import (
+    auto_order_recovery_block_reason,
+    is_timeout_exception,
+    normalize_exchange_order,
+    apply_reconciled_order_status,
+    reconcile_order_log,
+    log_recovery_event,
+    recent_recovery_events,
+)
+from app.risk_manager import check_order_risk
 from app.strategies import apply_strategy
 from app.upbit import fetch_minute_candles
 
@@ -88,6 +98,9 @@ def auto_live_pilot_status() -> dict:
         "max_orders_per_day": config.max_orders_per_day,
         "auto_cancel_after_seconds": config.cancel_after_seconds,
         "order_type": config.order_type,
+        "partial_fill_policy": "PAUSE_AND_CANCEL_REMAINDER",
+        "restart_policy": "RUNNING_SESSIONS_START_AS_LIVE_PAUSED",
+        "recent_recovery_events": recent_recovery_events(10),
     }
 
 
@@ -228,6 +241,9 @@ async def _precheck_block_reason(session: dict, config: AutoLivePilotConfig, liv
         return "BLOCKED_DAILY_ORDER_COUNT"
     if has_open_auto_live_order("bithumb", "KRW-BTC"):
         return "BLOCKED_OPEN_ORDER_EXISTS"
+    recovery_block = await auto_order_recovery_block_reason("bithumb", "KRW-BTC")
+    if recovery_block:
+        return recovery_block
     last_order_time = session.get("last_order_time_utc")
     if last_order_time and _seconds_since(last_order_time) < config.cooldown_seconds:
         return "BLOCKED_COOLDOWN"
@@ -272,6 +288,24 @@ async def _submit_pilot_order(session: dict, candidate: dict, candle: dict, sign
         recent_duplicate=False,
         market_snapshot={"price": current_price, "range_rate": range_rate, "volume": float(candle["candle_acc_trade_volume"])},
     )
+    risk = check_order_risk(
+        order=order,
+        purpose="ENTRY",
+        base_result=risk,
+        mode="AUTO_STRATEGY_RUNNING",
+        session_id=int(session["id"]),
+        candidate_strategy_id=session.get("candidate_strategy_id"),
+        candle_time_utc=candle["candle_time_utc"],
+        signal=(signal or {}).get("signal"),
+        market_snapshot={
+            "price": current_price,
+            "range_rate": range_rate,
+            "volume": float(candle["candle_acc_trade_volume"]),
+            "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
+            "complete": True,
+        },
+        is_auto=True,
+    )
     if not risk["allowed"]:
         _insert_blocked_log(session, risk["risk_result"], risk.get("blocked_reason"), candle["candle_time_utc"], signal, order, risk)
         update_auto_live_pilot_session(int(session["id"]), {"status": "STOPPED", "last_order_status": "BLOCKED", "stopped_at": _utc_now()})
@@ -306,7 +340,45 @@ async def _submit_pilot_order(session: dict, candidate: dict, candle: dict, sign
                 "last_order_status": "SUBMITTED",
             },
         )
+        latest_log = get_live_order_log(request_id)
+        if latest_log is not None and order_uuid:
+            reconciled = await reconcile_order_log(latest_log, source="POST_SUBMIT_STATUS_RECHECK")
+            if reconciled:
+                session_updates: dict[str, Any] = {"last_order_status": reconciled.status}
+                if reconciled.status == "FILLED":
+                    session_updates.update({"status": "STOPPED", "stopped_at": _utc_now()})
+                elif reconciled.status == "PARTIALLY_FILLED":
+                    session_updates.update({"status": "LIVE_PAUSED", "auto_enabled": False})
+                update_auto_live_pilot_session(int(session["id"]), session_updates)
     except Exception as exc:
+        if is_timeout_exception(exc):
+            update_live_order_log(
+                request_id,
+                {
+                    "status": "SUBMITTED",
+                    "risk_result": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                    "exchange_request_payload_masked": masked_exchange_request(order),
+                    "error_message": "Exchange request timed out; order status must be reconciled before any retry.",
+                },
+            )
+            update_auto_live_pilot_session(
+                int(session["id"]),
+                {
+                    "status": "LIVE_PAUSED",
+                    "auto_enabled": False,
+                    "last_order_status": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                    "last_order_time_utc": _utc_now(),
+                },
+            )
+            log_recovery_event(
+                "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                "ERROR",
+                "Auto live pilot order timed out. Re-ordering is blocked until reconciliation.",
+                session_id=int(session["id"]),
+                request_id=request_id,
+                payload={"market": "KRW-BTC", "candle_time_utc": candle["candle_time_utc"]},
+            )
+            return
         update_live_order_log(request_id, {"status": "FAILED", "risk_result": "BLOCKED_API_RESPONSE_ERROR", "error_message": str(exc)})
         update_auto_live_pilot_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "stopped_at": _utc_now()})
 
@@ -316,10 +388,33 @@ async def _manage_open_order(session: dict, config: AutoLivePilotConfig) -> None
     broker = BithumbBroker()
     try:
         status = await broker.get_order(order_uuid)
-        state = str(status.get("state") or status.get("status") or "").lower()
-        if state in {"done", "filled"}:
-            _update_order_by_uuid(order_uuid, "FILLED", status)
+        reconciled = normalize_exchange_order(status)
+        log = _canonical_order_log_by_uuid(order_uuid)
+        if log is not None:
+            apply_reconciled_order_status(log, reconciled, "ORDER_STATUS_RECONCILIATION")
+        if reconciled.status == "FILLED":
             update_auto_live_pilot_session(int(session["id"]), {"status": "STOPPED", "last_order_status": "FILLED", "stopped_at": _utc_now()})
+            return
+        if reconciled.status == "PARTIALLY_FILLED":
+            try:
+                cancel_response = await broker.cancel_order(order_uuid)
+                _update_order_by_uuid(order_uuid, "PARTIALLY_FILLED", {**status, "cancel_remaining_response": cancel_response})
+            except Exception as cancel_exc:
+                log_recovery_event(
+                    "PARTIAL_FILL_CANCEL_FAILED",
+                    "ERROR",
+                    "Auto live pilot partial fill residual cancel failed.",
+                    session_id=int(session["id"]),
+                    order_uuid=order_uuid,
+                    payload={"error": str(cancel_exc)},
+                )
+            update_auto_live_pilot_session(
+                int(session["id"]),
+                {"status": "LIVE_PAUSED", "auto_enabled": False, "last_order_status": "PARTIALLY_FILLED", "stopped_at": _utc_now()},
+            )
+            return
+        if reconciled.status == "CANCELED":
+            update_auto_live_pilot_session(int(session["id"]), {"status": "STOPPED", "last_order_status": "CANCELED", "stopped_at": _utc_now()})
             return
         if _seconds_since(str(session.get("last_order_time_utc") or _utc_now())) >= config.cancel_after_seconds:
             cancel_response = await broker.cancel_order(order_uuid)
@@ -329,8 +424,15 @@ async def _manage_open_order(session: dict, config: AutoLivePilotConfig) -> None
         _update_order_by_uuid(order_uuid, "WAITING", status)
         update_auto_live_pilot_session(int(session["id"]), {"status": "RUNNING", "last_order_status": "WAITING"})
     except Exception as exc:
-        _update_order_by_uuid(order_uuid, "FAILED", {"error": str(exc)})
-        update_auto_live_pilot_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "stopped_at": _utc_now()})
+        log_recovery_event(
+            "API_ERROR",
+            "ERROR",
+            "Auto live pilot order status reconciliation failed.",
+            session_id=int(session["id"]),
+            order_uuid=order_uuid,
+            payload={"error": str(exc)},
+        )
+        update_auto_live_pilot_session(int(session["id"]), {"status": "LIVE_PAUSED", "auto_enabled": False, "last_order_status": "RECONCILIATION_FAILED"})
 
 
 def _insert_blocked_log(session: dict, risk_result: str, message: str | None, candle_time_utc: str | None, signal: dict | None, order: dict | None = None, preview: dict | None = None) -> None:
@@ -387,9 +489,30 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
                     request_id = item["request_id"]
                     break
     if request_id:
-        update_live_order_log(request_id, {"status": status, "exchange_response_payload": response, "order_uuid": order_uuid})
-        if status in {"WAITING", "CANCELED", "FILLED", "FAILED"}:
+        reconciled = normalize_exchange_order(response)
+        update_live_order_log(
+            request_id,
+            {
+                "status": status,
+                "exchange_response_payload": response,
+                "order_uuid": order_uuid,
+                "executed_volume": reconciled.executed_volume,
+                "remaining_volume": reconciled.remaining_volume,
+                "filled_amount_krw": reconciled.filled_amount_krw,
+                "paid_fee": reconciled.paid_fee,
+            },
+        )
+        if status in {"WAITING", "PARTIALLY_FILLED", "CANCELED", "FILLED", "FAILED"}:
             _insert_order_status_event(request_id, order_uuid, status, response)
+
+
+def _canonical_order_log_by_uuid(order_uuid: str) -> dict | None:
+    from app.database import load_live_order_logs
+
+    for item in load_live_order_logs(300, include_canonical_with_events=True):
+        if item.get("order_uuid") == order_uuid and not _is_auto_order_event_request(str(item.get("request_id", ""))):
+            return item
+    return None
 
 
 def _insert_order_status_event(request_id: str, order_uuid: str, status: str, response: dict) -> None:

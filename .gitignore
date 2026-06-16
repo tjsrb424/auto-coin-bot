@@ -9,6 +9,8 @@ __pycache__/
 .env.*
 !.env.example
 .codex-*.log
+dev-server*.log
+api-server*.log
 *.tsbuildinfo
 vite.config.js
 vite.config.d.ts

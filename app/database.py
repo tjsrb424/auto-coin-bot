@@ -287,6 +287,18 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 error_message TEXT,
                 order_uuid TEXT,
+                executed_volume REAL NOT NULL DEFAULT 0,
+                remaining_volume REAL NOT NULL DEFAULT 0,
+                filled_amount_krw REAL NOT NULL DEFAULT 0,
+                paid_fee REAL NOT NULL DEFAULT 0,
+                position_id INTEGER,
+                exit_candidate_id INTEGER,
+                order_purpose TEXT NOT NULL DEFAULT 'ENTRY',
+                exit_reason TEXT,
+                expected_pnl REAL NOT NULL DEFAULT 0,
+                actual_pnl REAL,
+                is_auto_exit INTEGER NOT NULL DEFAULT 0,
+                manual_confirmed INTEGER NOT NULL DEFAULT 0,
                 strategy_name TEXT,
                 signal_reason TEXT,
                 candle_time_utc TEXT,
@@ -347,6 +359,33 @@ def init_db() -> None:
                 FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
             );
 
+            CREATE TABLE IF NOT EXISTS exit_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                candidate_strategy_id INTEGER NOT NULL,
+                strategy_name TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                current_price REAL NOT NULL,
+                target_exit_price REAL NOT NULL,
+                volume REAL NOT NULL,
+                expected_amount_krw REAL NOT NULL,
+                expected_fee REAL NOT NULL,
+                expected_pnl REAL NOT NULL,
+                risk_result TEXT NOT NULL,
+                signal_time_utc TEXT,
+                candle_time_utc TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(position_id) REFERENCES live_positions(id),
+                FOREIGN KEY(session_id) REFERENCES live_strategy_sessions(id),
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
+            );
+
             CREATE TABLE IF NOT EXISTS live_signal_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
@@ -394,6 +433,64 @@ def init_db() -> None:
                 message TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS live_recovery_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT NOT NULL DEFAULT 'KRW-BTC',
+                session_id INTEGER,
+                request_id TEXT,
+                order_uuid TEXT,
+                message TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS risk_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                date_kst TEXT NOT NULL,
+                status TEXT NOT NULL,
+                daily_realized_pnl REAL NOT NULL DEFAULT 0,
+                daily_unrealized_pnl REAL NOT NULL DEFAULT 0,
+                daily_total_pnl REAL NOT NULL DEFAULT 0,
+                daily_loss_percent REAL NOT NULL DEFAULT 0,
+                daily_order_count INTEGER NOT NULL DEFAULT 0,
+                daily_entry_count INTEGER NOT NULL DEFAULT 0,
+                daily_exit_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_loss_count INTEGER NOT NULL DEFAULT 0,
+                open_order_count INTEGER NOT NULL DEFAULT 0,
+                open_position_count INTEGER NOT NULL DEFAULT 0,
+                last_order_time_utc TEXT,
+                last_loss_time_utc TEXT,
+                emergency_stop_enabled INTEGER NOT NULL DEFAULT 0,
+                balance_mismatch_detected INTEGER NOT NULL DEFAULT 0,
+                partial_fill_detected INTEGER NOT NULL DEFAULT 0,
+                volatility_block_enabled INTEGER NOT NULL DEFAULT 0,
+                low_volume_block_enabled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(exchange, market, date_kst)
+            );
+
+            CREATE TABLE IF NOT EXISTS risk_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                session_id INTEGER,
+                position_id INTEGER,
+                order_candidate_id TEXT,
+                order_log_id INTEGER,
+                risk_level TEXT NOT NULL,
+                allowed INTEGER NOT NULL,
+                block_code TEXT,
+                block_reason TEXT,
+                checks_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         _ensure_column(conn, "paper_sessions", "mode", "TEXT NOT NULL DEFAULT 'SIMULATION'")
@@ -412,6 +509,18 @@ def init_db() -> None:
         _ensure_column(conn, "live_order_logs", "session_id", "INTEGER")
         _ensure_column(conn, "live_order_logs", "candidate_strategy_id", "INTEGER")
         _ensure_column(conn, "live_order_logs", "order_uuid", "TEXT")
+        _ensure_column(conn, "live_order_logs", "executed_volume", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_order_logs", "remaining_volume", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_order_logs", "filled_amount_krw", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_order_logs", "paid_fee", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_order_logs", "position_id", "INTEGER")
+        _ensure_column(conn, "live_order_logs", "exit_candidate_id", "INTEGER")
+        _ensure_column(conn, "live_order_logs", "order_purpose", "TEXT NOT NULL DEFAULT 'ENTRY'")
+        _ensure_column(conn, "live_order_logs", "exit_reason", "TEXT")
+        _ensure_column(conn, "live_order_logs", "expected_pnl", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_order_logs", "actual_pnl", "REAL")
+        _ensure_column(conn, "live_order_logs", "is_auto_exit", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_order_logs", "manual_confirmed", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "live_order_logs", "strategy_name", "TEXT")
         _ensure_column(conn, "live_order_logs", "signal_reason", "TEXT")
         _ensure_column(conn, "live_order_logs", "candle_time_utc", "TEXT")
@@ -1007,9 +1116,12 @@ def insert_live_order_log(log: dict) -> int:
                 request_id, session_id, candidate_strategy_id, exchange, market, side, order_type, price, volume, amount_krw,
                 fee_estimate, risk_result, order_preview_payload,
                 exchange_request_payload_masked, exchange_response_payload,
-                status, error_message, order_uuid, strategy_name, signal_reason,
+                status, error_message, order_uuid, executed_volume, remaining_volume,
+                filled_amount_krw, paid_fee, position_id, exit_candidate_id, order_purpose,
+                exit_reason, expected_pnl, actual_pnl, is_auto_exit, manual_confirmed,
+                strategy_name, signal_reason,
                 candle_time_utc, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 log["request_id"],
@@ -1030,6 +1142,18 @@ def insert_live_order_log(log: dict) -> int:
                 log["status"],
                 log.get("error_message"),
                 log.get("order_uuid"),
+                log.get("executed_volume", 0.0),
+                log.get("remaining_volume", 0.0),
+                log.get("filled_amount_krw", 0.0),
+                log.get("paid_fee", 0.0),
+                log.get("position_id"),
+                log.get("exit_candidate_id"),
+                log.get("order_purpose", "ENTRY"),
+                log.get("exit_reason"),
+                log.get("expected_pnl", 0.0),
+                log.get("actual_pnl"),
+                1 if log.get("is_auto_exit", False) else 0,
+                1 if log.get("manual_confirmed", False) else 0,
                 log.get("strategy_name"),
                 log.get("signal_reason"),
                 log.get("candle_time_utc"),
@@ -1058,6 +1182,18 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
                 session_id = ?,
                 candidate_strategy_id = ?,
                 order_uuid = ?,
+                executed_volume = ?,
+                remaining_volume = ?,
+                filled_amount_krw = ?,
+                paid_fee = ?,
+                position_id = ?,
+                exit_candidate_id = ?,
+                order_purpose = ?,
+                exit_reason = ?,
+                expected_pnl = ?,
+                actual_pnl = ?,
+                is_auto_exit = ?,
+                manual_confirmed = ?,
                 strategy_name = ?,
                 signal_reason = ?,
                 candle_time_utc = ?,
@@ -1073,6 +1209,18 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
                 merged.get("session_id"),
                 merged.get("candidate_strategy_id"),
                 merged.get("order_uuid"),
+                merged.get("executed_volume", 0.0),
+                merged.get("remaining_volume", 0.0),
+                merged.get("filled_amount_krw", 0.0),
+                merged.get("paid_fee", 0.0),
+                merged.get("position_id"),
+                merged.get("exit_candidate_id"),
+                merged.get("order_purpose", "ENTRY"),
+                merged.get("exit_reason"),
+                merged.get("expected_pnl", 0.0),
+                merged.get("actual_pnl"),
+                1 if merged.get("is_auto_exit", False) else 0,
+                1 if merged.get("manual_confirmed", False) else 0,
                 merged.get("strategy_name"),
                 merged.get("signal_reason"),
                 merged.get("candle_time_utc"),
@@ -1213,11 +1361,216 @@ def insert_live_mode_event(event_type: str, mode: str, message: str) -> int:
         return int(cursor.lastrowid)
 
 
+def insert_live_recovery_event(event: dict) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO live_recovery_events (
+                event_type, severity, exchange, market, session_id,
+                request_id, order_uuid, message, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["event_type"],
+                event.get("severity", "INFO"),
+                event.get("exchange", "bithumb"),
+                event.get("market", "KRW-BTC"),
+                event.get("session_id"),
+                event.get("request_id"),
+                event.get("order_uuid"),
+                event.get("message", ""),
+                json.dumps(event.get("payload", {}), ensure_ascii=False),
+                _utc_now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_live_recovery_events(limit: int = 100) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_recovery_events
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    events = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        events.append(item)
+    return events
+
+
+def upsert_risk_state(state: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM risk_states
+            WHERE exchange = ? AND market = ? AND date_kst = ?
+            """,
+            (state["exchange"], state["market"], state["date_kst"]),
+        ).fetchone()
+        values = {
+            "status": state["status"],
+            "daily_realized_pnl": state.get("daily_realized_pnl", 0.0),
+            "daily_unrealized_pnl": state.get("daily_unrealized_pnl", 0.0),
+            "daily_total_pnl": state.get("daily_total_pnl", 0.0),
+            "daily_loss_percent": state.get("daily_loss_percent", 0.0),
+            "daily_order_count": state.get("daily_order_count", 0),
+            "daily_entry_count": state.get("daily_entry_count", 0),
+            "daily_exit_count": state.get("daily_exit_count", 0),
+            "consecutive_loss_count": state.get("consecutive_loss_count", 0),
+            "open_order_count": state.get("open_order_count", 0),
+            "open_position_count": state.get("open_position_count", 0),
+            "last_order_time_utc": state.get("last_order_time_utc"),
+            "last_loss_time_utc": state.get("last_loss_time_utc"),
+            "emergency_stop_enabled": 1 if state.get("emergency_stop_enabled", False) else 0,
+            "balance_mismatch_detected": 1 if state.get("balance_mismatch_detected", False) else 0,
+            "partial_fill_detected": 1 if state.get("partial_fill_detected", False) else 0,
+            "volatility_block_enabled": 1 if state.get("volatility_block_enabled", False) else 0,
+            "low_volume_block_enabled": 1 if state.get("low_volume_block_enabled", False) else 0,
+            "updated_at": now_utc,
+        }
+        if row:
+            columns = ", ".join(f"{key} = ?" for key in values)
+            conn.execute(
+                f"UPDATE risk_states SET {columns} WHERE id = ?",
+                [*values.values(), row["id"]],
+            )
+            return int(row["id"])
+        cursor = conn.execute(
+            """
+            INSERT INTO risk_states (
+                exchange, market, date_kst, status, daily_realized_pnl,
+                daily_unrealized_pnl, daily_total_pnl, daily_loss_percent,
+                daily_order_count, daily_entry_count, daily_exit_count,
+                consecutive_loss_count, open_order_count, open_position_count,
+                last_order_time_utc, last_loss_time_utc, emergency_stop_enabled,
+                balance_mismatch_detected, partial_fill_detected,
+                volatility_block_enabled, low_volume_block_enabled,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state["exchange"],
+                state["market"],
+                state["date_kst"],
+                values["status"],
+                values["daily_realized_pnl"],
+                values["daily_unrealized_pnl"],
+                values["daily_total_pnl"],
+                values["daily_loss_percent"],
+                values["daily_order_count"],
+                values["daily_entry_count"],
+                values["daily_exit_count"],
+                values["consecutive_loss_count"],
+                values["open_order_count"],
+                values["open_position_count"],
+                values["last_order_time_utc"],
+                values["last_loss_time_utc"],
+                values["emergency_stop_enabled"],
+                values["balance_mismatch_detected"],
+                values["partial_fill_detected"],
+                values["volatility_block_enabled"],
+                values["low_volume_block_enabled"],
+                now_utc,
+                now_utc,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_latest_risk_state(exchange: str = "bithumb", market: str = "KRW-BTC") -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM risk_states
+            WHERE exchange = ? AND market = ?
+            ORDER BY date_kst DESC, updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange, market),
+        ).fetchone()
+    if row is None:
+        return None
+    return _normalize_risk_state(dict(row))
+
+
+def insert_risk_log(log: dict) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO risk_logs (
+                exchange, market, session_id, position_id, order_candidate_id,
+                order_log_id, risk_level, allowed, block_code, block_reason,
+                checks_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                log["exchange"],
+                log["market"],
+                log.get("session_id"),
+                log.get("position_id"),
+                log.get("order_candidate_id"),
+                log.get("order_log_id"),
+                log.get("risk_level", "LOW"),
+                1 if log.get("allowed", False) else 0,
+                log.get("block_code"),
+                log.get("block_reason"),
+                json.dumps(log.get("checks", {}), ensure_ascii=False),
+                _utc_now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_risk_logs(limit: int = 100, exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM risk_logs
+            WHERE exchange = ? AND market = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (exchange, market, limit),
+        ).fetchall()
+    logs = []
+    for row in rows:
+        item = dict(row)
+        item["allowed"] = bool(item.get("allowed"))
+        item["checks"] = json.loads(item.pop("checks_json") or "{}")
+        logs.append(item)
+    return logs
+
+
+def _normalize_risk_state(row: dict) -> dict:
+    for key in (
+        "emergency_stop_enabled",
+        "balance_mismatch_detected",
+        "partial_fill_detected",
+        "volatility_block_enabled",
+        "low_volume_block_enabled",
+    ):
+        row[key] = bool(row.get(key))
+    return row
+
+
 def _normalize_live_order_log(row: dict) -> dict:
     row["exchange"] = row.get("exchange") or "upbit"
     row["order_preview_payload"] = json.loads(row.get("order_preview_payload") or "{}")
     row["exchange_request_payload_masked"] = json.loads(row.get("exchange_request_payload_masked") or "{}")
     row["exchange_response_payload"] = json.loads(row.get("exchange_response_payload") or "{}")
+    row["is_auto_exit"] = bool(row.get("is_auto_exit"))
+    row["manual_confirmed"] = bool(row.get("manual_confirmed"))
     return row
 
 
@@ -1285,6 +1638,24 @@ def load_running_live_strategy_sessions() -> list[dict]:
             """
         ).fetchall()
     return [_normalize_live_strategy_session(dict(row)) for row in rows]
+
+
+def pause_running_live_strategy_sessions_on_startup() -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        before = conn.total_changes
+        conn.execute(
+            """
+            UPDATE live_strategy_sessions
+            SET status = 'LIVE_PAUSED',
+                auto_enabled = 0,
+                last_risk_result = 'SERVER_RESTART_LIVE_PAUSED',
+                updated_at = ?
+            WHERE status = 'RUNNING'
+            """,
+            (now_utc,),
+        )
+        return conn.total_changes - before
 
 
 def update_live_strategy_session(session_id: int, updates: dict) -> None:
@@ -1407,7 +1778,7 @@ def load_open_live_position(session_id: int | None = None, exchange: str = "bith
             SELECT * FROM live_positions
             WHERE exchange = ?
               AND market = ?
-              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'CLOSING')
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
               {session_filter}
             ORDER BY created_at DESC, id DESC
             LIMIT 1
@@ -1415,6 +1786,28 @@ def load_open_live_position(session_id: int | None = None, exchange: str = "bith
             params,
         ).fetchone()
     return dict(row) if row else None
+
+
+def load_live_position(position_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM live_positions WHERE id = ?", (position_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def load_open_live_positions(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_positions
+            WHERE exchange = ?
+              AND market = ?
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+            ORDER BY created_at DESC, id DESC
+            """,
+            (exchange, market),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def update_live_position(position_id: int, updates: dict) -> None:
@@ -1434,6 +1827,154 @@ def update_live_position(position_id: int, updates: dict) -> None:
     params = list(values.values()) + [position_id]
     with get_connection() as conn:
         conn.execute(f"UPDATE live_positions SET {columns} WHERE id = ?", params)
+
+
+def create_exit_candidate(candidate: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO exit_candidates (
+                position_id, session_id, exchange, market, candidate_strategy_id,
+                strategy_name, reason, status, entry_price, current_price,
+                target_exit_price, volume, expected_amount_krw, expected_fee,
+                expected_pnl, risk_result, signal_time_utc, candle_time_utc,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                candidate["position_id"],
+                candidate["session_id"],
+                candidate["exchange"],
+                candidate["market"],
+                candidate["candidate_strategy_id"],
+                candidate["strategy_name"],
+                candidate["reason"],
+                candidate.get("status", "PENDING"),
+                candidate["entry_price"],
+                candidate["current_price"],
+                candidate["target_exit_price"],
+                candidate["volume"],
+                candidate["expected_amount_krw"],
+                candidate["expected_fee"],
+                candidate["expected_pnl"],
+                candidate.get("risk_result", "EXIT_CANDIDATE"),
+                candidate.get("signal_time_utc"),
+                candidate.get("candle_time_utc"),
+                now_utc,
+                now_utc,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_exit_candidate(candidate_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM exit_candidates WHERE id = ?", (candidate_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def load_latest_exit_candidate(position_id: int | None = None, session_id: int | None = None) -> dict | None:
+    clauses = []
+    params: list[object] = []
+    if position_id is not None:
+        clauses.append("position_id = ?")
+        params.append(position_id)
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM exit_candidates
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def load_active_exit_candidate(position_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM exit_candidates
+            WHERE position_id = ?
+              AND status IN ('PENDING', 'APPROVED', 'SUBMITTED')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (position_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_exit_candidate(candidate_id: int, updates: dict) -> None:
+    allowed = {
+        "status",
+        "current_price",
+        "target_exit_price",
+        "expected_amount_krw",
+        "expected_fee",
+        "expected_pnl",
+        "risk_result",
+    }
+    values = {key: value for key, value in updates.items() if key in allowed}
+    if not values:
+        return
+    values["updated_at"] = _utc_now()
+    columns = ", ".join(f"{key} = ?" for key in values)
+    params = list(values.values()) + [candidate_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE exit_candidates SET {columns} WHERE id = ?", params)
+
+
+def has_open_exit_order(position_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM live_order_logs
+            WHERE position_id = ?
+              AND order_purpose = 'EXIT'
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
+              AND request_id NOT LIKE '%-submitted%'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            LIMIT 1
+            """,
+            (position_id,),
+        ).fetchone()
+    return row is not None
+
+
+def count_exit_retries(exit_candidate_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM live_order_logs
+            WHERE exit_candidate_id = ?
+              AND order_purpose = 'EXIT'
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'FAILED')
+              AND request_id NOT LIKE '%-submitted%'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            """,
+            (exit_candidate_id,),
+        ).fetchone()
+    return int(row["count"] if row else 0)
 
 
 def count_live_strategy_orders_today(exchange: str, market: str) -> int:
@@ -1499,6 +2040,53 @@ def has_open_live_strategy_order(exchange: str, market: str) -> bool:
             (exchange, market),
         ).fetchone()
     return row is not None
+
+
+def has_unresolved_live_order(exchange: str, market: str) -> bool:
+    return bool(load_reconcilable_live_order_logs(exchange, market))
+
+
+def load_reconcilable_live_order_logs(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND market = ?
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
+              AND request_id NOT LIKE '%-submitted%'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            ORDER BY updated_at ASC, id ASC
+            """,
+            (exchange, market),
+        ).fetchall()
+    return [_normalize_live_order_log(dict(row)) for row in rows]
+
+
+def get_live_order_log_by_uuid(order_uuid: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM live_order_logs
+            WHERE order_uuid = ?
+              AND request_id NOT LIKE '%-submitted%'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (order_uuid,),
+        ).fetchone()
+    return _normalize_live_order_log(dict(row)) if row else None
 
 
 def _normalize_live_strategy_session(row: dict) -> dict:
@@ -1567,6 +2155,24 @@ def load_running_auto_live_pilot_sessions() -> list[dict]:
     return [_normalize_auto_live_pilot_session(dict(row)) for row in rows]
 
 
+def pause_running_auto_live_pilot_sessions_on_startup() -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        before = conn.total_changes
+        conn.execute(
+            """
+            UPDATE auto_live_pilot_sessions
+            SET status = 'LIVE_PAUSED',
+                auto_enabled = 0,
+                last_order_status = COALESCE(last_order_status, 'SERVER_RESTART_LIVE_PAUSED'),
+                updated_at = ?
+            WHERE status = 'RUNNING'
+            """,
+            (now_utc,),
+        )
+        return conn.total_changes - before
+
+
 def update_auto_live_pilot_session(session_id: int, updates: dict) -> None:
     allowed = {
         "status",
@@ -1626,7 +2232,7 @@ def has_live_order_for_candle(exchange: str, market: str, candle_time_utc: str) 
               AND market = ?
               AND candle_time_utc = ?
               AND strategy_name IS NOT NULL
-              AND status IN ('SUBMITTED', 'WAITING', 'CANCELED', 'FILLED')
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED', 'CANCELED', 'FILLED', 'FAILED')
               AND request_id NOT LIKE '%-submitted%'
               AND request_id NOT LIKE '%-waiting-%'
               AND request_id NOT LIKE '%-canceled-%'
@@ -1647,9 +2253,10 @@ def has_open_auto_live_order(exchange: str, market: str) -> bool:
             WHERE exchange = ?
               AND market = ?
               AND strategy_name IS NOT NULL
-              AND status IN ('SUBMITTED', 'WAITING')
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
               AND request_id NOT LIKE '%-submitted%'
               AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
               AND request_id NOT LIKE '%-canceled-%'
               AND request_id NOT LIKE '%-filled-%'
               AND request_id NOT LIKE '%-failed-%'

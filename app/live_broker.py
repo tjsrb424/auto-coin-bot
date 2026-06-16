@@ -330,8 +330,8 @@ class BithumbBroker(BaseJwtBroker):
         client_order_id = order.get("client_order_id") or order.get("request_id")
         if client_order_id:
             payload["client_order_id"] = str(client_order_id)[:36]
-        if payload["side"] != "bid" or payload["ord_type"] != "limit":
-            raise LiveBrokerError("Bithumb Auto Live Pilot only allows limit bid orders.")
+        if payload["side"] not in {"bid", "ask"} or payload["ord_type"] != "limit":
+            raise LiveBrokerError("Bithumb live orders only allow limit bid/ask orders.")
         result = await self._request("POST", "/v1/orders", payload)
         return result if isinstance(result, dict) else {"raw": result}
 

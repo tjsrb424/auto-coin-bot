@@ -41,6 +41,22 @@ from app.live_broker import (
     is_emergency_stopped,
     masked_exchange_request,
 )
+from app.live_recovery import (
+    auto_order_recovery_block_reason,
+    is_timeout_exception,
+    normalize_exchange_order,
+    reconcile_order_log,
+    log_recovery_event,
+    recent_recovery_events,
+)
+from app.live_exit import (
+    LiveExitConfig,
+    create_exit_candidate_for_position,
+    live_exit_status,
+    manage_exit_order_timeout,
+    maybe_create_price_exit_candidate,
+)
+from app.risk_manager import check_order_risk
 from app.strategies import apply_strategy
 from app.upbit import fetch_minute_candles
 
@@ -104,9 +120,14 @@ def live_strategy_status() -> dict:
         config.allowed_exchange,
         config.allowed_market,
     )
+    exit_state = live_exit_status(
+        int(session["id"]) if session else None,
+        int(open_position["id"]) if open_position else None,
+    )
     return {
         "session": session,
         "position": open_position,
+        **exit_state,
         "exchange": config.allowed_exchange,
         "market": config.allowed_market,
         "current_mode": _mode(session),
@@ -122,6 +143,9 @@ def live_strategy_status() -> dict:
         "entry_price_offset_percent": config.entry_price_offset_percent,
         "exit_enabled": config.exit_enabled,
         "market_order_enabled": config.market_order_enabled,
+        "partial_fill_policy": "PAUSE_AND_CANCEL_REMAINDER",
+        "restart_policy": "RUNNING_SESSIONS_START_AS_LIVE_PAUSED",
+        "recent_recovery_events": recent_recovery_events(10),
     }
 
 
@@ -224,6 +248,11 @@ async def _process_session(session: dict) -> None:
         await _manage_open_order(session, config)
         return
 
+    position = load_open_live_position(int(session["id"]), config.allowed_exchange, config.allowed_market)
+    if position:
+        await _process_open_position(session, position, config)
+        return
+
     blocked = await _precheck_block_reason(session, config, live_config)
     if blocked:
         _insert_blocked_log(session, blocked, blocked, None, None)
@@ -289,6 +318,50 @@ async def _process_session(session: dict) -> None:
     await _submit_entry_order(session, candidate, latest, signal, config, live_config)
 
 
+async def _process_open_position(session: dict, position: dict, config: LiveStrategyConfig) -> None:
+    await manage_exit_order_timeout(position, LiveExitConfig.from_env())
+    candidate = load_candidate_strategy(int(session["candidate_strategy_id"]))
+    if candidate is None:
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_DUPLICATE_SIGNAL"})
+        return
+
+    fresh = await fetch_minute_candles(market=config.allowed_market, unit=int(candidate["unit"]), count=300)
+    insert_candles(fresh)
+    candles = load_candles(config.allowed_market, int(candidate["unit"]), 300)
+    latest = latest_completed_candle(candles, int(candidate["unit"])) if config.require_completed_candle else (candles[-1] if candles else None)
+    if latest is None:
+        return
+    candle_time = latest["candle_time_utc"]
+    current_price = float(latest["trade_price"])
+    exit_candidate = maybe_create_price_exit_candidate(position, current_price, candle_time)
+    signal = _latest_signal(candidate, candles, candle_time)
+    insert_live_signal_log(
+        {
+            "session_id": session["id"],
+            "exchange": session["exchange"],
+            "market": session["market"],
+            "candidate_strategy_id": session["candidate_strategy_id"],
+            "strategy_name": session["strategy_name"],
+            "signal": signal["signal"],
+            "confidence": 1.0,
+            "reason": signal["reason"],
+            "candle_time_utc": candle_time,
+        }
+    )
+    if signal["signal"] == "SELL" and exit_candidate is None:
+        exit_candidate = create_exit_candidate_for_position(position, "STRATEGY_SELL", current_price, candle_time)
+    update_live_strategy_session(
+        int(session["id"]),
+        {
+            "status": "PAUSED" if exit_candidate else "RUNNING",
+            "last_signal": signal["signal"],
+            "last_signal_time_utc": candle_time,
+            "last_processed_candle_time_utc": candle_time,
+            "last_risk_result": str(exit_candidate["reason"]) + "_EXIT_CANDIDATE" if exit_candidate else "POSITION_OPEN",
+        },
+    )
+
+
 async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> str | None:
     if is_emergency_stopped():
         return "BLOCKED_EMERGENCY_STOP"
@@ -314,6 +387,9 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_OPEN_ORDER_EXISTS"
     if load_open_live_position(None, "bithumb", "KRW-BTC"):
         return "BLOCKED_OPEN_POSITION_EXISTS"
+    recovery_block = await auto_order_recovery_block_reason("bithumb", "KRW-BTC")
+    if recovery_block:
+        return recovery_block
     last_order_time = session.get("last_order_time_utc")
     if last_order_time and _seconds_since(str(last_order_time)) < config.cooldown_seconds:
         return "BLOCKED_COOLDOWN"
@@ -365,6 +441,24 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         risk["allowed"] = False
         risk["risk_result"] = "BLOCKED_MAX_ORDER_AMOUNT"
         risk["blocked_reason"] = "BLOCKED_MAX_ORDER_AMOUNT"
+    risk = check_order_risk(
+        order=order,
+        purpose="ENTRY",
+        base_result=risk,
+        mode="AUTO_STRATEGY_RUNNING",
+        session_id=int(session["id"]),
+        candidate_strategy_id=int(session["candidate_strategy_id"]),
+        candle_time_utc=candle["candle_time_utc"],
+        signal=(signal or {}).get("signal"),
+        market_snapshot={
+            "price": current_price,
+            "range_rate": range_rate,
+            "volume": float(candle["candle_acc_trade_volume"]),
+            "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
+            "complete": True,
+        },
+        is_auto=True,
+    )
     if not risk["allowed"]:
         _insert_blocked_log(session, str(risk["risk_result"]), risk.get("blocked_reason"), candle["candle_time_utc"], signal, order, risk)
         update_live_strategy_session(int(session["id"]), {"last_risk_result": str(risk["risk_result"]), "last_order_status": "BLOCKED"})
@@ -400,7 +494,54 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
                 "last_risk_result": "ALLOWED",
             },
         )
+        latest_log = get_live_order_log(request_id)
+        if latest_log is not None and order_uuid:
+            reconciled = await reconcile_order_log(latest_log, source="POST_SUBMIT_STATUS_RECHECK")
+            if reconciled:
+                updates: dict[str, Any] = {"last_order_status": reconciled.status}
+                if reconciled.status == "FILLED":
+                    position_id = _create_position_from_order(session, reconciled.raw, config)
+                    updates.update(
+                        {
+                            "status": "RUNNING",
+                            "auto_enabled": True,
+                            "current_open_order_uuid": None,
+                            "current_position_id": position_id,
+                            "last_risk_result": "POSITION_OPEN_SYNCED",
+                        }
+                    )
+                elif reconciled.status == "PARTIALLY_FILLED":
+                    updates.update({"status": "PAUSED", "auto_enabled": False, "last_risk_result": "BLOCKED_PARTIAL_FILL_REQUIRES_RECOVERY"})
+                update_live_strategy_session(int(session["id"]), updates)
     except Exception as exc:
+        if is_timeout_exception(exc):
+            update_live_order_log(
+                request_id,
+                {
+                    "status": "SUBMITTED",
+                    "risk_result": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                    "exchange_request_payload_masked": masked_exchange_request(order),
+                    "error_message": "Exchange request timed out; order status must be reconciled before any retry.",
+                },
+            )
+            update_live_strategy_session(
+                int(session["id"]),
+                {
+                    "status": "PAUSED",
+                    "auto_enabled": False,
+                    "last_order_status": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                    "last_risk_result": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                },
+            )
+            log_recovery_event(
+                "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                "ERROR",
+                "Live strategy order timed out. Re-ordering is blocked until reconciliation.",
+                session_id=int(session["id"]),
+                request_id=request_id,
+                payload={"market": "KRW-BTC", "candle_time_utc": candle["candle_time_utc"]},
+            )
+            return
         update_live_order_log(request_id, {"status": "FAILED", "risk_result": "BLOCKED_API_RESPONSE_ERROR", "error_message": str(exc)})
         update_live_strategy_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "last_risk_result": "BLOCKED_API_RESPONSE_ERROR"})
 
@@ -426,11 +567,12 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
         return session
 
     state = str(status.get("state") or status.get("status") or "").lower()
-    executed_volume = _float(status.get("executed_volume"))
-    remaining_volume = _float(status.get("remaining_volume"))
+    reconciled = normalize_exchange_order(status)
+    executed_volume = reconciled.executed_volume
+    remaining_volume = reconciled.remaining_volume
     session_id = int(session["id"])
 
-    if executed_volume > 0 and remaining_volume > 0:
+    if reconciled.status == "PARTIALLY_FILLED":
         _update_order_by_uuid(order_uuid, "PARTIALLY_FILLED", status)
         update_live_strategy_session(
             session_id,
@@ -445,8 +587,8 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
         update_live_strategy_session(
             session_id,
             {
-                "status": "PAUSED",
-                "auto_enabled": False,
+                "status": "RUNNING",
+                "auto_enabled": True,
                 "current_open_order_uuid": None,
                 "current_position_id": position_id,
                 "last_order_status": "FILLED",
@@ -482,22 +624,35 @@ async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
     try:
         status = await broker.get_order(order_uuid)
         state = str(status.get("state") or status.get("status") or "").lower()
-        executed_volume = _float(status.get("executed_volume"))
-        remaining_volume = _float(status.get("remaining_volume"))
-        if executed_volume > 0 and remaining_volume > 0:
+        reconciled = normalize_exchange_order(status)
+        executed_volume = reconciled.executed_volume
+        remaining_volume = reconciled.remaining_volume
+        if reconciled.status == "PARTIALLY_FILLED":
             _update_order_by_uuid(order_uuid, "PARTIALLY_FILLED", status)
+            try:
+                cancel_response = await broker.cancel_order(order_uuid)
+                _update_order_by_uuid(order_uuid, "PARTIALLY_FILLED", {**status, "cancel_remaining_response": cancel_response})
+            except Exception as cancel_exc:
+                log_recovery_event(
+                    "PARTIAL_FILL_CANCEL_FAILED",
+                    "ERROR",
+                    "Live strategy partial fill residual cancel failed.",
+                    session_id=int(session["id"]),
+                    order_uuid=order_uuid,
+                    payload={"error": str(cancel_exc)},
+                )
             update_live_strategy_session(
                 int(session["id"]),
-                {"status": "PAUSED", "last_order_status": "PARTIALLY_FILLED", "last_risk_result": "BLOCKED_PARTIAL_FILL_UNSUPPORTED"},
+                {"status": "PAUSED", "auto_enabled": False, "last_order_status": "PARTIALLY_FILLED", "last_risk_result": "BLOCKED_PARTIAL_FILL_REQUIRES_RECOVERY"},
             )
             return
-        if state in {"done", "filled"} or (executed_volume > 0 and remaining_volume <= 0):
+        if reconciled.status == "FILLED" or state in {"done", "filled"} or (executed_volume > 0 and remaining_volume <= 0):
             _update_order_by_uuid(order_uuid, "FILLED", status)
             position_id = _create_position_from_order(session, status, config)
             update_live_strategy_session(
                 int(session["id"]),
                 {
-                    "status": "PAUSED",
+                    "status": "RUNNING",
                     "current_open_order_uuid": None,
                     "current_position_id": position_id,
                     "last_order_status": "FILLED",
@@ -506,7 +661,19 @@ async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
             )
             return
         if _seconds_since(str(session.get("last_order_time_utc") or _utc_now())) >= config.cancel_unfilled_after_seconds:
-            cancel_response = await broker.cancel_order(order_uuid)
+            try:
+                cancel_response = await broker.cancel_order(order_uuid)
+            except Exception as cancel_exc:
+                log_recovery_event(
+                    "ORDER_CANCEL_FAILED",
+                    "ERROR",
+                    "Live strategy unfilled order cancel failed.",
+                    session_id=int(session["id"]),
+                    order_uuid=order_uuid,
+                    payload={"error": str(cancel_exc)},
+                )
+                update_live_strategy_session(int(session["id"]), {"status": "PAUSED", "auto_enabled": False, "last_order_status": "CANCEL_FAILED", "last_risk_result": "ORDER_CANCEL_FAILED"})
+                return
             _update_order_by_uuid(order_uuid, "CANCELED", cancel_response)
             update_live_strategy_session(
                 int(session["id"]),
@@ -523,8 +690,15 @@ async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
         _update_order_by_uuid(order_uuid, "WAITING", status)
         update_live_strategy_session(int(session["id"]), {"status": "RUNNING", "last_order_status": "WAITING", "last_risk_result": "WAITING"})
     except Exception as exc:
-        _update_order_by_uuid(order_uuid, "FAILED", {"error": str(exc)})
-        update_live_strategy_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "last_risk_result": "BLOCKED_API_RESPONSE_ERROR"})
+        log_recovery_event(
+            "API_ERROR",
+            "ERROR",
+            "Live strategy order status reconciliation failed.",
+            session_id=int(session["id"]),
+            order_uuid=order_uuid,
+            payload={"error": str(exc)},
+        )
+        update_live_strategy_session(int(session["id"]), {"status": "PAUSED", "auto_enabled": False, "last_order_status": "RECONCILIATION_FAILED", "last_risk_result": "BLOCKED_API_RESPONSE_ERROR"})
 
 
 async def _handle_emergency(session: dict) -> None:
@@ -535,6 +709,9 @@ async def _handle_emergency(session: dict) -> None:
             _update_order_by_uuid(str(order_uuid), "CANCELED", response)
         except Exception as exc:
             _update_order_by_uuid(str(order_uuid), "FAILED", {"error": str(exc)})
+    position = load_open_live_position(int(session["id"]), session.get("exchange", "bithumb"), session.get("market", "KRW-BTC"))
+    if position:
+        update_live_position(int(position["id"]), {"status": "MANUAL_REVIEW_REQUIRED"})
     update_live_strategy_session(
         int(session["id"]),
         {
@@ -624,7 +801,19 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
             break
     if request_id is None:
         return
-    update_live_order_log(request_id, {"status": status, "exchange_response_payload": response, "order_uuid": order_uuid})
+    reconciled = normalize_exchange_order(response)
+    update_live_order_log(
+        request_id,
+        {
+            "status": status,
+            "exchange_response_payload": response,
+            "order_uuid": order_uuid,
+            "executed_volume": reconciled.executed_volume,
+            "remaining_volume": reconciled.remaining_volume,
+            "filled_amount_krw": reconciled.filled_amount_krw,
+            "paid_fee": reconciled.paid_fee,
+        },
+    )
     if status in {"WAITING", "PARTIALLY_FILLED", "CANCELED", "FILLED", "FAILED"}:
         _insert_order_status_event(request_id, order_uuid, status, response)
 

@@ -26,10 +26,12 @@ from app.database import (
     create_live_paper_session,
     get_last_live_order_time,
     get_live_order_log,
+    has_unresolved_live_order,
     has_recent_live_order,
     init_db,
     insert_live_mode_event,
     insert_live_order_log,
+    insert_risk_log,
     insert_candles,
     load_candidate_strategy,
     load_latest_live_paper_session,
@@ -67,6 +69,23 @@ from app.live_broker import (
     reset_live_runtime_state,
     trigger_emergency_stop,
 )
+from app.live_recovery import (
+    is_timeout_exception,
+    log_recovery_event,
+    recent_recovery_events,
+    reconcile_balances,
+    reconcile_order_log,
+    run_startup_live_recovery_async,
+    sync_open_orders,
+)
+from app.live_exit import (
+    approve_exit_candidate,
+    cancel_exit_order,
+    create_exit_order_preview,
+    reject_exit_candidate,
+    submit_exit_order,
+)
+from app.risk_manager import check_order_risk, compute_risk_state, get_risk_dashboard
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
     cancel_live_strategy_open_order,
@@ -230,12 +249,32 @@ class LiveStrategyPilotStartRequest(BaseModel):
     order_confirmation: str = ""
 
 
+class ExitCandidateActionRequest(BaseModel):
+    candidate_id: int
+
+
+class ExitOrderPreviewRequest(BaseModel):
+    exit_candidate_id: int
+    manual_confirmed: bool = False
+
+
+class ExitOrderSubmitRequest(BaseModel):
+    request_id: str
+    final_confirmation: str = ""
+
+
+class ExitOrderCancelRequest(BaseModel):
+    request_id: str
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     load_server_env()
     init_db()
     reset_live_runtime_state()
     insert_live_mode_event("SERVER_START", current_live_mode(), "?쒕쾭 ?쒖옉 ???ㅺ굅??紐⑤뱶???먮룞 ?좉툑 ?곹깭濡?珥덇린?붾릺?덉뒿?덈떎.")
+    recovery_result = await run_startup_live_recovery_async()
+    logger.info("[live-recovery] startup recovery result=%s", recovery_result)
     stopped_forward_sessions = pause_running_forward_sessions_on_startup()
     if stopped_forward_sessions:
         logger.info(
@@ -632,6 +671,18 @@ def lock_live_trading_endpoint() -> dict:
 def emergency_stop_live_trading() -> dict:
     mode = trigger_emergency_stop()
     insert_live_mode_event("EMERGENCY_STOP", mode, "Emergency Stop???쒖꽦?붾릺??紐⑤뱺 ?ㅺ굅??二쇰Ц ?꾨낫瑜?李⑤떒?⑸땲??")
+    compute_risk_state("bithumb", DEFAULT_MARKET)
+    insert_risk_log(
+        {
+            "exchange": "bithumb",
+            "market": DEFAULT_MARKET,
+            "risk_level": "BLOCKED",
+            "allowed": False,
+            "block_code": "BLOCKED_EMERGENCY_STOP",
+            "block_reason": "Emergency Stop enabled.",
+            "checks": {"mode_check": {"allowed": False, "code": "BLOCKED_EMERGENCY_STOP"}},
+        }
+    )
     return {**_live_status(), "message": "Emergency Stop ?쒖꽦?? ?먮룞 泥?궛? ?ㅽ뻾?섏? ?딆뒿?덈떎."}
 
 
@@ -639,6 +690,7 @@ def emergency_stop_live_trading() -> dict:
 def reset_live_emergency(payload: LiveEmergencyResetRequest) -> dict:
     ok, mode, message = reset_emergency_stop(payload.confirmation)
     insert_live_mode_event("RESET_EMERGENCY" if ok else "RESET_EMERGENCY_BLOCKED", mode, message)
+    compute_risk_state("bithumb", DEFAULT_MARKET)
     return {**_live_status(), "ok": ok, "message": message}
 
 
@@ -696,6 +748,15 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
         preview["allowed"] = False
         preview["risk_result"] = "BLOCKED_API_RESPONSE_ERROR"
         preview["blocked_reason"] = order_chance_error or order_chance_status
+    preview = check_order_risk(
+        order=order,
+        purpose="ENTRY" if payload.side == "BUY" else "EXIT",
+        base_result=preview,
+        mode=current_live_mode(),
+        market_snapshot=snapshot,
+        manual_confirmed=False,
+        is_auto=False,
+    )
     preview["request_id"] = request_id
     preview["balance_fetch_status"] = balance_status
     preview["balance_error"] = balance_error
@@ -721,6 +782,8 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
             "exchange_response_payload": {},
             "status": "PREVIEWED" if preview["allowed"] else "BLOCKED",
             "error_message": preview.get("blocked_reason") or balance_error,
+            "order_purpose": "ENTRY" if payload.side == "BUY" else "EXIT",
+            "manual_confirmed": False,
         }
     )
     return {"request_id": request_id, "preview": preview, "status": "PREVIEWED" if preview["allowed"] else "BLOCKED", **_live_status(exchange)}
@@ -751,6 +814,16 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
         "volume": preview_log["volume"],
     }
     config = LiveTradingConfig.for_exchange(str(order_payload["exchange"]))
+    if has_unresolved_live_order(str(order_payload["exchange"]), preview_log["market"]):
+        update_live_order_log(
+            payload.request_id,
+            {
+                "status": "BLOCKED",
+                "risk_result": "BLOCKED_UNRESOLVED_LIVE_ORDER",
+                "error_message": "Existing live order must be reconciled before placing another order.",
+            },
+        )
+        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": "BLOCKED_UNRESOLVED_LIVE_ORDER", **_live_status(str(order_payload["exchange"]))}
     balances, balance_status, balance_error = await _safe_live_balances_for_exchange(str(order_payload["exchange"]))
     snapshot = await _market_snapshot(preview_log["market"])
     final_risk = evaluate_live_order_risk(
@@ -766,6 +839,15 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
         final_risk["allowed"] = False
         final_risk["risk_result"] = "BLOCKED_API_RESPONSE_ERROR"
         final_risk["blocked_reason"] = balance_error or balance_status
+    final_risk = check_order_risk(
+        order=order_payload,
+        purpose="ENTRY" if str(order_payload["side"]).upper() == "BUY" else "EXIT",
+        base_result=final_risk,
+        mode=current_live_mode(),
+        market_snapshot=snapshot,
+        manual_confirmed=True,
+        is_auto=False,
+    )
     if not final_risk["allowed"]:
         update_live_order_log(
             payload.request_id,
@@ -781,6 +863,7 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
     try:
         masked_request = masked_exchange_request(order_payload)
         exchange_response = await broker.place_order(order_payload)
+        order_uuid = str(exchange_response.get("uuid") or exchange_response.get("order_id") or exchange_response.get("id") or "")
         update_live_order_log(
             payload.request_id,
             {
@@ -788,11 +871,49 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
                 "risk_result": "ALLOWED",
                 "exchange_request_payload_masked": masked_request,
                 "exchange_response_payload": exchange_response,
+                "order_uuid": order_uuid or preview_log.get("order_uuid"),
                 "error_message": None,
             },
         )
-        return {"request_id": payload.request_id, "status": "SUBMITTED", "exchange_response": exchange_response, **_live_status(str(order_payload["exchange"]))}
+        reconciled = None
+        latest_log = get_live_order_log(payload.request_id)
+        if latest_log is not None and order_uuid:
+            reconciled = await reconcile_order_log(latest_log, source="MANUAL_POST_SUBMIT_STATUS_RECHECK")
+        final_log = get_live_order_log(payload.request_id)
+        return {
+            "request_id": payload.request_id,
+            "status": final_log["status"] if final_log else "SUBMITTED",
+            "exchange_response": exchange_response,
+            "reconciled_status": reconciled.status if reconciled else None,
+            **_live_status(str(order_payload["exchange"])),
+        }
     except Exception as exc:
+        if is_timeout_exception(exc):
+            update_live_order_log(
+                payload.request_id,
+                {
+                    "status": "SUBMITTED",
+                    "risk_result": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                    "exchange_request_payload_masked": masked_exchange_request(order_payload),
+                    "exchange_response_payload": {},
+                    "error_message": "Exchange request timed out; order status must be reconciled before any retry.",
+                },
+            )
+            log_recovery_event(
+                "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                "ERROR",
+                "Manual live order timed out. Re-ordering is blocked until reconciliation.",
+                exchange=str(order_payload["exchange"]),
+                market=preview_log["market"],
+                request_id=payload.request_id,
+            )
+            return {
+                "request_id": payload.request_id,
+                "status": "SUBMITTED",
+                "risk_result": "ORDER_STATUS_UNKNOWN_TIMEOUT",
+                "error_message": "Exchange request timed out; status reconciliation is required.",
+                **_live_status(str(order_payload["exchange"])),
+            }
         update_live_order_log(
             payload.request_id,
             {
@@ -808,7 +929,28 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
 
 @app.get("/api/live-orders")
 def list_live_orders() -> dict:
-    return {"orders": load_live_order_logs(), **_live_status()}
+    return {"orders": load_live_order_logs(), "recovery_events": recent_recovery_events(), **_live_status()}
+
+
+@app.get("/api/live-recovery/status")
+async def live_recovery_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    balance_status = await reconcile_balances(exchange, DEFAULT_MARKET)
+    return {
+        "exchange": exchange,
+        "market": DEFAULT_MARKET,
+        "balance_reconciliation": balance_status,
+        "recent_events": recent_recovery_events(),
+    }
+
+
+@app.post("/api/live-recovery/sync-open-orders")
+async def sync_live_open_orders(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    return {"sync": await sync_open_orders(exchange, DEFAULT_MARKET), "recent_events": recent_recovery_events()}
+
+
+@app.get("/api/risk/status")
+def risk_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    return get_risk_dashboard(exchange, DEFAULT_MARKET)
 
 
 @app.get("/api/auto-live-pilot/status")
@@ -858,6 +1000,31 @@ def stop_live_strategy_pilot_endpoint() -> dict:
 @app.post("/api/live-strategy-pilot/cancel-open-order")
 def cancel_live_strategy_open_order_endpoint() -> dict:
     return cancel_live_strategy_open_order()
+
+
+@app.post("/api/live-exit-candidates/approve")
+def approve_live_exit_candidate_endpoint(payload: ExitCandidateActionRequest) -> dict:
+    return approve_exit_candidate(payload.candidate_id)
+
+
+@app.post("/api/live-exit-candidates/reject")
+def reject_live_exit_candidate_endpoint(payload: ExitCandidateActionRequest) -> dict:
+    return reject_exit_candidate(payload.candidate_id)
+
+
+@app.post("/api/live-exit-orders/preview")
+async def preview_live_exit_order_endpoint(payload: ExitOrderPreviewRequest) -> dict:
+    return await create_exit_order_preview(payload.exit_candidate_id, manual_confirmed=payload.manual_confirmed, is_auto_exit=False)
+
+
+@app.post("/api/live-exit-orders/submit")
+async def submit_live_exit_order_endpoint(payload: ExitOrderSubmitRequest) -> dict:
+    return await submit_exit_order(payload.request_id, final_confirmation=payload.final_confirmation)
+
+
+@app.post("/api/live-exit-orders/cancel")
+async def cancel_live_exit_order_endpoint(payload: ExitOrderCancelRequest) -> dict:
+    return await cancel_exit_order(payload.request_id)
 
 
 @app.post("/api/forward-paper/start")
