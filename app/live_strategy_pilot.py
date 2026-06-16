@@ -97,6 +97,8 @@ def live_strategy_status() -> dict:
     config = LiveStrategyConfig.from_env()
     live_config = LiveTradingConfig.for_exchange(config.allowed_exchange)
     session = load_latest_live_strategy_session()
+    if session and session.get("current_open_order_uuid"):
+        session = _sync_live_strategy_order_status(session, config)
     open_position = load_open_live_position(
         int(session["id"]) if session else None,
         config.allowed_exchange,
@@ -401,6 +403,77 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
     except Exception as exc:
         update_live_order_log(request_id, {"status": "FAILED", "risk_result": "BLOCKED_API_RESPONSE_ERROR", "error_message": str(exc)})
         update_live_strategy_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "last_risk_result": "BLOCKED_API_RESPONSE_ERROR"})
+
+
+def _sync_live_strategy_order_status(session: dict, config: LiveStrategyConfig) -> dict:
+    try:
+        return asyncio.run(_sync_live_strategy_order_status_async(session, config))
+    except RuntimeError:
+        return session
+    except Exception as exc:
+        logger.warning("[live-strategy] order sync failed session_id=%s error=%s", session.get("id"), exc)
+        return session
+
+
+async def _sync_live_strategy_order_status_async(session: dict, config: LiveStrategyConfig) -> dict:
+    order_uuid = str(session.get("current_open_order_uuid") or "")
+    if not order_uuid:
+        return session
+    try:
+        status = await BithumbBroker().get_order(order_uuid)
+    except Exception as exc:
+        logger.warning("[live-strategy] order status fetch failed order_uuid=%s error=%s", order_uuid, exc)
+        return session
+
+    state = str(status.get("state") or status.get("status") or "").lower()
+    executed_volume = _float(status.get("executed_volume"))
+    remaining_volume = _float(status.get("remaining_volume"))
+    session_id = int(session["id"])
+
+    if executed_volume > 0 and remaining_volume > 0:
+        _update_order_by_uuid(order_uuid, "PARTIALLY_FILLED", status)
+        update_live_strategy_session(
+            session_id,
+            {"status": "PAUSED", "last_order_status": "PARTIALLY_FILLED", "last_risk_result": "BLOCKED_PARTIAL_FILL_UNSUPPORTED"},
+        )
+        return load_latest_live_strategy_session() or session
+
+    if state in {"done", "filled"} or (executed_volume > 0 and remaining_volume <= 0):
+        _update_order_by_uuid(order_uuid, "FILLED", status)
+        open_position = load_open_live_position(session_id, session.get("exchange", config.allowed_exchange), session.get("market", config.allowed_market))
+        position_id = int(open_position["id"]) if open_position else _create_position_from_order(session, status, config)
+        update_live_strategy_session(
+            session_id,
+            {
+                "status": "PAUSED",
+                "auto_enabled": False,
+                "current_open_order_uuid": None,
+                "current_position_id": position_id,
+                "last_order_status": "FILLED",
+                "last_risk_result": "POSITION_OPEN_SYNCED",
+            },
+        )
+        return load_latest_live_strategy_session() or session
+
+    if state in {"cancel", "canceled", "cancelled"}:
+        _update_order_by_uuid(order_uuid, "CANCELED", status)
+        update_live_strategy_session(
+            session_id,
+            {
+                "auto_enabled": False,
+                "current_open_order_uuid": None,
+                "last_order_status": "CANCELED",
+                "last_risk_result": "ORDER_CANCELED_SYNCED",
+            },
+        )
+        return load_latest_live_strategy_session() or session
+
+    if state in {"wait", "waiting"}:
+        _update_order_by_uuid(order_uuid, "WAITING", status)
+        update_live_strategy_session(session_id, {"last_order_status": "WAITING", "last_risk_result": "WAITING_SYNCED"})
+        return load_latest_live_strategy_session() or session
+
+    return session
 
 
 async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
