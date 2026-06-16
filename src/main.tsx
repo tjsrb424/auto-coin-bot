@@ -1091,6 +1091,7 @@ function App() {
   const [liveError, setLiveError] = React.useState<string | null>(null);
   const [autoPilotError, setAutoPilotError] = React.useState<string | null>(null);
   const [liveStrategyError, setLiveStrategyError] = React.useState<string | null>(null);
+  const balanceRefreshEventsRef = React.useRef<Set<string>>(new Set());
 
   React.useEffect(() => {
     setSettings(strategySettings[strategy]);
@@ -1176,6 +1177,19 @@ function App() {
     }
   }, [liveExchange]);
 
+  const refreshLiveBalancesSilently = React.useCallback(async () => {
+    try {
+      const params = new URLSearchParams({ exchange: liveExchange });
+      const response = await fetch(`${API_BASE}/api/live/balances?${params.toString()}`);
+      if (!response.ok) return;
+      const body = (await response.json()) as LiveBalances;
+      setLiveBalances(body);
+      setLiveStatus(body);
+    } catch {
+      // Silent refresh should not interrupt the trading dashboard.
+    }
+  }, [liveExchange]);
+
   const fetchLiveOrderChance = React.useCallback(async () => {
     setLiveLoading(true);
     setLiveError(null);
@@ -1242,12 +1256,13 @@ function App() {
       setAutoPilot(body);
       if (!body.ok) setAutoPilotError(body.message ?? "Auto Pilot 시작이 차단되었습니다.");
       await fetchLiveOrders();
+      await refreshLiveBalancesSilently();
     } catch (err) {
       setAutoPilotError(err instanceof Error ? err.message : "Auto Pilot 시작 오류가 발생했습니다.");
     } finally {
       setAutoPilotLoading(false);
     }
-  }, [autoPilot?.max_auto_order_krw, autoPilot?.min_auto_order_krw, autoPilotAmount, autoPilotCandidateId, fetchLiveOrders]);
+  }, [autoPilot?.max_auto_order_krw, autoPilot?.min_auto_order_krw, autoPilotAmount, autoPilotCandidateId, fetchLiveOrders, refreshLiveBalancesSilently]);
 
   const stopAutoPilot = React.useCallback(async () => {
     setAutoPilotLoading(true);
@@ -1268,10 +1283,11 @@ function App() {
       setAutoPilot(body);
       if (!body.ok) setAutoPilotError(body.message ?? "오픈 주문 취소에 실패했습니다.");
       await fetchLiveOrders();
+      await refreshLiveBalancesSilently();
     } finally {
       setAutoPilotLoading(false);
     }
-  }, [fetchLiveOrders]);
+  }, [fetchLiveOrders, refreshLiveBalancesSilently]);
 
   const toggleAutoPilot = React.useCallback(async () => {
     if (autoPilot?.session?.status === "RUNNING" || autoPilot?.session?.status === "READY") {
@@ -1299,12 +1315,13 @@ function App() {
       setLiveStrategy(body);
       if (!body.ok) setLiveStrategyError(body.message ?? "Auto Strategy start blocked.");
       await fetchLiveOrders();
+      await refreshLiveBalancesSilently();
     } catch (err) {
       setLiveStrategyError(err instanceof Error ? err.message : "Auto Strategy start failed.");
     } finally {
       setLiveStrategyLoading(false);
     }
-  }, [fetchLiveOrders, liveStrategyCandidateId]);
+  }, [fetchLiveOrders, liveStrategyCandidateId, refreshLiveBalancesSilently]);
 
   const stopLiveStrategy = React.useCallback(async () => {
     setLiveStrategyLoading(true);
@@ -1325,10 +1342,11 @@ function App() {
       setLiveStrategy(body);
       if (!body.ok) setLiveStrategyError(body.message ?? "Cancel open Auto Strategy order failed.");
       await fetchLiveOrders();
+      await refreshLiveBalancesSilently();
     } finally {
       setLiveStrategyLoading(false);
     }
-  }, [fetchLiveOrders]);
+  }, [fetchLiveOrders, refreshLiveBalancesSilently]);
 
   const toggleLiveStrategy = React.useCallback(async () => {
     const status = liveStrategy?.session?.status;
@@ -1378,7 +1396,8 @@ function App() {
     const response = await fetch(`${API_BASE}/api/live-trading/emergency-stop`, { method: "POST" });
     if (response.ok) setLiveStatus(await response.json());
     await fetchLiveOrders();
-  }, [fetchLiveOrders]);
+    await refreshLiveBalancesSilently();
+  }, [fetchLiveOrders, refreshLiveBalancesSilently]);
 
   const resetEmergencyStop = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1397,12 +1416,13 @@ function App() {
         setLiveEmergencyResetConfirmation("");
       }
       await fetchLiveOrders();
+      await refreshLiveBalancesSilently();
     } catch (err) {
       setLiveError(err instanceof Error ? err.message : "알 수 없는 Emergency Stop 해제 오류가 발생했습니다.");
     } finally {
       setLiveLoading(false);
     }
-  }, [fetchLiveOrders, liveEmergencyResetConfirmation]);
+  }, [fetchLiveOrders, liveEmergencyResetConfirmation, refreshLiveBalancesSilently]);
 
   const previewLiveOrder = React.useCallback(async () => {
     setLiveLoading(true);
@@ -1442,6 +1462,7 @@ function App() {
         setLiveError(body.error_message ?? body.message ?? "실주문이 차단되었거나 실패했습니다.");
       }
       await fetchLiveOrders();
+      await refreshLiveBalancesSilently();
       setLivePreview(null);
       setLivePlaceConfirmation("");
     } catch (err) {
@@ -1449,7 +1470,7 @@ function App() {
     } finally {
       setLiveLoading(false);
     }
-  }, [fetchLiveOrders, livePlaceConfirmation, livePreview]);
+  }, [fetchLiveOrders, livePlaceConfirmation, livePreview, refreshLiveBalancesSilently]);
 
   const runBacktestSet = React.useCallback(async (strategies: Strategy[]) => {
     setLoading(true);
@@ -1692,6 +1713,43 @@ function App() {
     }, 15000);
     return () => window.clearInterval(intervalId);
   }, [fetchAutoPilotStatus, fetchLiveOrders, fetchLiveStatus, fetchLiveStrategyStatus, liveExchange]);
+
+  React.useEffect(() => {
+    const balanceImpactingStatuses = new Set(["SUBMITTED", "WAITING", "PARTIALLY_FILLED", "FILLED", "CANCELED"]);
+    const events = [
+      {
+        source: "auto",
+        sessionId: autoPilot?.session?.id,
+        uuid: autoPilot?.session?.last_order_uuid,
+        status: autoPilot?.session?.last_order_status,
+        time: autoPilot?.session?.last_order_time_utc,
+      },
+      {
+        source: "strategy",
+        sessionId: liveStrategy?.session?.id,
+        uuid: liveStrategy?.session?.current_open_order_uuid,
+        status: liveStrategy?.session?.last_order_status,
+        time: liveStrategy?.session?.last_order_time_utc,
+      },
+    ];
+    for (const event of events) {
+      if (!event.status || !balanceImpactingStatuses.has(event.status)) continue;
+      const key = `${event.source}:${event.sessionId ?? "none"}:${event.uuid ?? "none"}:${event.status}:${event.time ?? ""}`;
+      if (balanceRefreshEventsRef.current.has(key)) continue;
+      balanceRefreshEventsRef.current.add(key);
+      void refreshLiveBalancesSilently();
+    }
+  }, [
+    autoPilot?.session?.id,
+    autoPilot?.session?.last_order_status,
+    autoPilot?.session?.last_order_time_utc,
+    autoPilot?.session?.last_order_uuid,
+    liveStrategy?.session?.current_open_order_uuid,
+    liveStrategy?.session?.id,
+    liveStrategy?.session?.last_order_status,
+    liveStrategy?.session?.last_order_time_utc,
+    refreshLiveBalancesSilently,
+  ]);
 
   React.useEffect(() => {
     void fetchChartCandles();

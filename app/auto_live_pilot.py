@@ -295,6 +295,7 @@ async def _submit_pilot_order(session: dict, candidate: dict, candle: dict, sign
                 "exchange_response_payload": response,
             },
         )
+        _insert_order_status_event(request_id, order_uuid, "SUBMITTED", response)
         update_auto_live_pilot_session(
             int(session["id"]),
             {
@@ -375,7 +376,7 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
     if latest and latest.get("last_order_uuid") == order_uuid:
         from app.database import load_live_order_logs
 
-        logs = load_live_order_logs(200)
+        logs = load_live_order_logs(200, include_canonical_with_events=True)
         for item in logs:
             if item.get("order_uuid") == order_uuid and not _is_auto_order_event_request(str(item.get("request_id", ""))):
                 request_id = item["request_id"]
@@ -387,27 +388,40 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
                     break
     if request_id:
         update_live_order_log(request_id, {"status": status, "exchange_response_payload": response, "order_uuid": order_uuid})
-        current = get_live_order_log(request_id)
-        if current is not None and status in {"WAITING", "CANCELED", "FILLED", "FAILED"}:
-            event_payload = {
-                **current,
-                "request_id": f"{request_id}-{status.lower()}-{uuid.uuid4().hex[:8]}",
-                "status": status,
-                "exchange_response_payload": response,
-                "order_uuid": order_uuid,
-                "error_message": current.get("error_message") if status == "FAILED" else None,
-            }
-            insert_live_order_log(event_payload)
+        if status in {"WAITING", "CANCELED", "FILLED", "FAILED"}:
+            _insert_order_status_event(request_id, order_uuid, status, response)
+
+
+def _insert_order_status_event(request_id: str, order_uuid: str, status: str, response: dict) -> None:
+    current = get_live_order_log(request_id)
+    if current is None or _has_recent_status_event(order_uuid, status):
+        return
+    event_payload = {
+        **current,
+        "request_id": f"{request_id}-{status.lower()}-{uuid.uuid4().hex[:8]}",
+        "status": status,
+        "exchange_response_payload": response,
+        "order_uuid": order_uuid,
+        "error_message": current.get("error_message") if status == "FAILED" else None,
+    }
+    insert_live_order_log(event_payload)
 
 
 def _is_auto_order_event_request(request_id: str) -> bool:
     return (
-        request_id.endswith("-submitted")
+        "-submitted-" in request_id
         or "-waiting-" in request_id
         or "-canceled-" in request_id
         or "-filled-" in request_id
         or "-failed-" in request_id
     )
+
+
+def _has_recent_status_event(order_uuid: str, status: str) -> bool:
+    for item in load_live_order_logs(50, include_canonical_with_events=True):
+        if item.get("order_uuid") == order_uuid and item.get("status") == status and _is_auto_order_event_request(str(item.get("request_id", ""))):
+            return True
+    return False
 
 
 def _latest_signal(candidate: dict, candles: list[dict], candle_time_utc: str) -> dict:

@@ -1093,11 +1093,76 @@ def get_live_order_log(request_id: str) -> dict | None:
     return _normalize_live_order_log(dict(row))
 
 
-def load_live_order_logs(limit: int = 100) -> list[dict]:
+def load_live_order_logs(limit: int = 100, include_canonical_with_events: bool = False) -> list[dict]:
+    if include_canonical_with_events:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM live_order_logs
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_normalize_live_order_log(dict(row)) for row in rows]
+
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT * FROM live_order_logs
+            SELECT *
+            FROM live_order_logs AS log
+            WHERE NOT (
+                log.order_uuid IS NOT NULL
+                AND log.request_id NOT LIKE '%-submitted%'
+                AND log.request_id NOT LIKE '%-waiting-%'
+                AND log.request_id NOT LIKE '%-partial%'
+                AND log.request_id NOT LIKE '%-canceled-%'
+                AND log.request_id NOT LIKE '%-filled-%'
+                AND log.request_id NOT LIKE '%-failed-%'
+                AND EXISTS (
+                    SELECT 1
+                    FROM live_order_logs AS event_log
+                    WHERE event_log.order_uuid = log.order_uuid
+                      AND (
+                          event_log.request_id LIKE '%-submitted%'
+                          OR event_log.request_id LIKE '%-waiting-%'
+                          OR event_log.request_id LIKE '%-partial%'
+                          OR event_log.request_id LIKE '%-canceled-%'
+                          OR event_log.request_id LIKE '%-filled-%'
+                          OR event_log.request_id LIKE '%-failed-%'
+                    )
+                )
+            )
+            AND NOT (
+                log.order_uuid IS NOT NULL
+                AND (
+                    log.request_id LIKE '%-submitted%'
+                    OR log.request_id LIKE '%-waiting-%'
+                    OR log.request_id LIKE '%-partial%'
+                    OR log.request_id LIKE '%-canceled-%'
+                    OR log.request_id LIKE '%-filled-%'
+                    OR log.request_id LIKE '%-failed-%'
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM live_order_logs AS newer_event
+                    WHERE newer_event.order_uuid = log.order_uuid
+                      AND newer_event.status = log.status
+                      AND (
+                          newer_event.request_id LIKE '%-submitted%'
+                          OR newer_event.request_id LIKE '%-waiting-%'
+                          OR newer_event.request_id LIKE '%-partial%'
+                          OR newer_event.request_id LIKE '%-canceled-%'
+                          OR newer_event.request_id LIKE '%-filled-%'
+                          OR newer_event.request_id LIKE '%-failed-%'
+                      )
+                      AND (
+                          newer_event.created_at > log.created_at
+                          OR (newer_event.created_at = log.created_at AND newer_event.id > log.id)
+                      )
+                )
+            )
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
@@ -1539,7 +1604,7 @@ def count_auto_live_orders_today(exchange: str, market: str) -> int:
               AND market = ?
               AND strategy_name IS NOT NULL
               AND status IN ('SUBMITTED', 'WAITING', 'CANCELED', 'FILLED')
-              AND request_id NOT LIKE '%-submitted'
+              AND request_id NOT LIKE '%-submitted%'
               AND request_id NOT LIKE '%-waiting-%'
               AND request_id NOT LIKE '%-canceled-%'
               AND request_id NOT LIKE '%-filled-%'
@@ -1562,7 +1627,7 @@ def has_live_order_for_candle(exchange: str, market: str, candle_time_utc: str) 
               AND candle_time_utc = ?
               AND strategy_name IS NOT NULL
               AND status IN ('SUBMITTED', 'WAITING', 'CANCELED', 'FILLED')
-              AND request_id NOT LIKE '%-submitted'
+              AND request_id NOT LIKE '%-submitted%'
               AND request_id NOT LIKE '%-waiting-%'
               AND request_id NOT LIKE '%-canceled-%'
               AND request_id NOT LIKE '%-filled-%'
@@ -1583,7 +1648,7 @@ def has_open_auto_live_order(exchange: str, market: str) -> bool:
               AND market = ?
               AND strategy_name IS NOT NULL
               AND status IN ('SUBMITTED', 'WAITING')
-              AND request_id NOT LIKE '%-submitted'
+              AND request_id NOT LIKE '%-submitted%'
               AND request_id NOT LIKE '%-waiting-%'
               AND request_id NOT LIKE '%-canceled-%'
               AND request_id NOT LIKE '%-filled-%'
