@@ -52,9 +52,11 @@ from app.live_recovery import (
 from app.live_exit import (
     LiveExitConfig,
     create_exit_candidate_for_position,
+    create_exit_order_preview,
     live_exit_status,
     manage_exit_order_timeout,
     maybe_create_price_exit_candidate,
+    submit_exit_order,
 )
 from app.risk_manager import check_order_risk
 from app.strategies import apply_strategy
@@ -351,16 +353,67 @@ async def _process_open_position(session: dict, position: dict, config: LiveStra
     )
     if signal["signal"] == "SELL" and exit_candidate is None:
         exit_candidate = create_exit_candidate_for_position(position, "STRATEGY_SELL", current_price, candle_time)
+    auto_exit_result = None
+    if exit_candidate and config.exit_enabled:
+        auto_exit_result = await _submit_auto_exit_candidate(session, exit_candidate)
     update_live_strategy_session(
         int(session["id"]),
         {
-            "status": "PAUSED" if exit_candidate else "RUNNING",
+            "status": "RUNNING" if auto_exit_result and auto_exit_result.get("ok") else ("PAUSED" if exit_candidate else "RUNNING"),
             "last_signal": signal["signal"],
             "last_signal_time_utc": candle_time,
             "last_processed_candle_time_utc": candle_time,
-            "last_risk_result": str(exit_candidate["reason"]) + "_EXIT_CANDIDATE" if exit_candidate else "POSITION_OPEN",
+            "last_risk_result": (
+                "AUTO_EXIT_SUBMITTED"
+                if auto_exit_result and auto_exit_result.get("ok")
+                else (str(exit_candidate["reason"]) + "_EXIT_CANDIDATE" if exit_candidate else "POSITION_OPEN")
+            ),
         },
     )
+
+
+async def _submit_auto_exit_candidate(session: dict, exit_candidate: dict) -> dict:
+    try:
+        if str(exit_candidate.get("status") or "").upper() == "SUBMITTED":
+            return {"ok": True, "status": "SUBMITTED", "risk_result": "AUTO_EXIT_ALREADY_SUBMITTED"}
+        preview = await create_exit_order_preview(int(exit_candidate["id"]), manual_confirmed=True, is_auto_exit=True)
+        if not preview.get("ok"):
+            preview_risk = preview.get("preview") if isinstance(preview.get("preview"), dict) else {}
+            update_live_strategy_session(
+                int(session["id"]),
+                {
+                    "status": "PAUSED",
+                    "last_risk_result": str(preview_risk.get("risk_result") or "AUTO_EXIT_BLOCKED"),
+                    "last_order_status": "BLOCKED",
+                },
+            )
+            return preview
+        request_id = str(preview["request_id"])
+        result = await submit_exit_order(request_id, final_confirmation="SUBMIT LIMIT EXIT ORDER")
+        update_live_strategy_session(
+            int(session["id"]),
+            {
+                "last_risk_result": str(result.get("risk_result") or "AUTO_EXIT_SUBMITTED"),
+                "last_order_status": str(result.get("status") or "SUBMITTED"),
+            },
+        )
+        return result
+    except Exception as exc:
+        logger.exception("[live-strategy] auto exit submit failed session=%s candidate=%s", session.get("id"), exit_candidate.get("id"))
+        update_live_strategy_session(
+            int(session["id"]),
+            {"status": "PAUSED", "last_risk_result": "AUTO_EXIT_FAILED", "last_order_status": "FAILED"},
+        )
+        log_recovery_event(
+            "AUTO_EXIT_FAILED",
+            "ERROR",
+            "Auto exit order submission failed.",
+            exchange=str(exit_candidate.get("exchange") or "bithumb"),
+            market=str(exit_candidate.get("market") or "KRW-BTC"),
+            session_id=int(session["id"]),
+            payload={"exit_candidate_id": exit_candidate.get("id"), "error": str(exc)},
+        )
+        return {"ok": False, "status": "FAILED", "risk_result": "AUTO_EXIT_FAILED", "message": str(exc)}
 
 
 async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> str | None:
