@@ -4,6 +4,8 @@ import { execSync } from "node:child_process";
 import pkg from "./package.json";
 
 const gitCommit = (() => {
+  if (process.env.VITE_APP_COMMIT) return process.env.VITE_APP_COMMIT;
+  if (process.env.APP_COMMIT) return process.env.APP_COMMIT;
   try {
     return execSync("git rev-parse --short HEAD", { encoding: "utf8" }).trim();
   } catch {

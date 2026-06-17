@@ -1392,8 +1392,14 @@ function BotStatusPanel({ data, onOpenAutoTrade }: { data: DashboardData; onOpen
   const ordersToday = data.liveStrategy?.session?.orders_created_today ?? data.autoPilot?.session?.orders_created_today;
   const maxOrders = data.liveStrategy?.session?.max_orders_per_day ?? data.autoPilot?.session?.max_orders_per_day;
   const runtimeState = botRuntimeState(data);
-  const health = data.health;
   const runtime = data.runtimeStatus;
+  const exchangeName = runtime?.exchange ?? data.health?.selected_exchange ?? data.liveStatus?.exchange ?? "bithumb";
+  const orderText = ordersToday == null
+    ? "-"
+    : maxOrders == null || maxOrders === 0
+      ? `${ordersToday} / 무제한`
+      : `${ordersToday} / ${maxOrders}`;
+  const runtimeTone = runtimeState === "RUNNING" ? "ref-positive" : runtimeState === "STOPPED" || runtimeState === "LIVE_DISABLED" ? "ref-negative" : "";
 
   return (
     <RefPanel className="ref-bot-panel">
@@ -1403,28 +1409,18 @@ function BotStatusPanel({ data, onOpenAutoTrade }: { data: DashboardData; onOpen
       </div>
       <div className="ref-bot-body">
         <div className={`ref-bot-face ${autoRunning ? "is-running" : "is-paused"}`}><Bot size={48} /></div>
-        <div className="ref-bot-metrics">
-          <p><span>현재 상태</span><b className={runtimeState === "RUNNING" ? "ref-positive" : runtimeState === "STOPPED" || runtimeState === "LIVE_DISABLED" ? "ref-negative" : ""}>{statusLabel(runtimeState)}</b></p>
-          <p><span>일일 수익</span><strong>{formatSignedKrw(dailyPnl)}</strong></p>
-          <p><span>주문 (오늘)</span><b>{ordersToday == null || maxOrders == null ? "-" : `${ordersToday} / ${maxOrders}`}</b></p>
-          <p><span>현재 전략</span><b>{strategyName}</b></p>
+        <div className="ref-bot-summary">
+          <p>현재 상태</p>
+          <strong className={runtimeTone}>{statusLabel(runtimeState)}</strong>
+          <span>{autoRunning ? "자동매매 실행 중" : "사용자 시작 대기"}</span>
         </div>
       </div>
-      <div className="ref-server-ops">
-        <p><span>APP_ENV</span><b>{runtime?.app_env ?? "-"}</b></p>
-        <p><span>Server</span><b>{health?.server_status ?? "-"}</b></p>
-        <p><span>Database</span><b>{health?.database_status ?? "-"}</b></p>
-        <p><span>Broker</span><b>{health?.broker_status ?? data.liveStatus?.broker_status ?? "-"}</b></p>
-        <p><span>Scheduler</span><b>{health?.scheduler_status ?? "-"}</b></p>
-        <p><span>Risk</span><b>{health?.risk_manager_status ?? data.risk?.risk_state?.status ?? "-"}</b></p>
-        <p><span>Exchange</span><b>{health?.selected_exchange ?? runtime?.exchange ?? "-"}</b></p>
-        <p><span>Runtime</span><b className={runtimeState === "RUNNING" ? "ref-positive" : ""}>{statusLabel(runtimeState)}</b></p>
-        <p><span>Auto</span><b>{runtime?.live_auto_trading_enabled || health?.auto_trading_enabled ? "Enabled" : "Disabled"}</b></p>
-        <p><span>Bal Sync</span><b>{formatKstShort(health?.latest_balance_sync_time)}</b></p>
-        <p><span>Ord Sync</span><b>{formatKstShort(health?.latest_order_sync_time ?? runtime?.last_order_time_utc)}</b></p>
-        <p><span>Started</span><b>{formatKstShort(runtime?.server_started_at)}</b></p>
+      <div className="ref-bot-info-grid">
+        <p><span>거래소</span><b>{exchangeName}</b></p>
+        <p><span>오늘 주문</span><b>{orderText}</b></p>
+        <p><span>현재 전략</span><b>{strategyName}</b></p>
+        <p><span>오늘 손익</span><strong className={(dailyPnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(dailyPnl)}</strong></p>
       </div>
-      <button className="ref-detail-button" onClick={onOpenAutoTrade}>상세 보기 <ChevronRight size={16} /></button>
     </RefPanel>
   );
 }

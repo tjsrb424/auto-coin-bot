@@ -1337,7 +1337,7 @@ body {
   top: 174px;
   width: 540px;
   height: 146px;
-  padding: 13px 17px;
+  padding: 13px 18px;
 }
 
 .ref-panel-title,
@@ -1379,7 +1379,7 @@ body {
 .ref-bot-body {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 15px;
   margin-top: 12px;
 }
 
@@ -1409,53 +1409,75 @@ body {
   box-shadow: 0 0 18px rgba(255, 64, 90, 0.16);
 }
 
-.ref-bot-metrics {
-  display: grid;
-  width: 210px;
-  gap: 4px;
+.ref-bot-summary {
+  display: flex;
+  width: 112px;
+  min-width: 112px;
+  flex-direction: column;
+  gap: 3px;
 }
 
-.ref-bot-metrics p {
-  display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
+.ref-bot-summary p {
   margin: 0;
-  color: #98a7ba;
-  font-size: 12px;
-  line-height: 1.22;
+  color: #8f9db1;
+  font-size: 11px;
+  font-weight: 800;
 }
 
-.ref-bot-metrics b,
-.ref-bot-metrics strong {
+.ref-bot-summary strong {
   color: #e7eef8;
-  font-size: 12px;
-  font-weight: 800;
+  font-size: 20px;
+  font-weight: 950;
+  line-height: 1.05;
   white-space: nowrap;
 }
 
-.ref-server-ops {
+.ref-bot-summary span {
+  overflow: hidden;
+  color: #aeb9c8;
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-bot-info-grid {
   position: absolute;
-  right: 16px;
-  top: 42px;
+  right: 18px;
+  top: 55px;
   display: grid;
-  width: 204px;
-  grid-template-columns: 1fr 1fr;
-  gap: 3px 8px;
+  width: 282px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 10px;
 }
 
-.ref-server-ops p {
+.ref-bot-info-grid p {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
-  gap: 5px;
+  min-width: 0;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
   margin: 0;
-  color: #8797aa;
-  font-size: 9.5px;
-  line-height: 1.1;
+  border: 1px solid rgba(45, 65, 89, 0.72);
+  border-radius: 5px;
+  background: rgba(8, 16, 27, 0.38);
+  padding: 7px 8px;
 }
 
-.ref-server-ops b {
+.ref-bot-info-grid span {
+  color: #8f9db1;
+  font-size: 10.5px;
+  font-weight: 850;
+  white-space: nowrap;
+}
+
+.ref-bot-info-grid b,
+.ref-bot-info-grid strong {
+  min-width: 0;
+  overflow: hidden;
   color: #dbe5f2;
+  font-size: 11.5px;
+  font-weight: 900;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2034,11 +2056,6 @@ body {
   border-collapse: collapse;
   color: #c7d1df;
   font-size: 12px;
-}
-
-.ref-bot-panel .ref-detail-button {
-  right: auto;
-  left: 99px;
 }
 
 .ref-portfolio-rebalance th {
