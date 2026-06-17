@@ -26,6 +26,7 @@ from app.database import (
     load_latest_live_strategy_session,
     load_live_order_logs,
     load_open_live_position,
+    load_open_live_position_for_strategy,
     load_running_live_strategy_sessions,
     update_live_order_log,
     update_live_position,
@@ -255,6 +256,24 @@ async def _process_session(session: dict) -> None:
     position = load_open_live_position(int(session["id"]), config.allowed_exchange, config.allowed_market)
     if position:
         await _process_open_position(session, position, config)
+        return
+
+    strategy_position = load_open_live_position_for_strategy(
+        config.allowed_exchange,
+        config.allowed_market,
+        int(session["candidate_strategy_id"]),
+    )
+    if strategy_position:
+        update_live_strategy_session(
+            int(session["id"]),
+            {
+                "status": "RUNNING",
+                "current_position_id": int(strategy_position["id"]),
+                "last_risk_result": "POSITION_ADOPTED_FROM_STRATEGY",
+                "last_order_status": "POSITION_OPEN",
+            },
+        )
+        await _process_open_position(session, strategy_position, config)
         return
 
     blocked = await _precheck_block_reason(session, config, live_config)
