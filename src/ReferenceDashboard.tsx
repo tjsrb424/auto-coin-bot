@@ -47,6 +47,7 @@ const STAGE_HEIGHT = 941;
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 const MARKET = "KRW-BTC";
 const CHART_UNIT = 15;
+const APP_BUILD_LABEL = `v${__APP_VERSION__} · ${__APP_COMMIT__}`;
 const CHART_TIMEFRAMES = [
   { label: "1m", unit: 1, disabled: false },
   { label: "15m", unit: 15, disabled: false },
@@ -936,6 +937,10 @@ function Sidebar({ activeView, onViewChange }: { activeView: ReferenceView; onVi
           );
         })}
       </nav>
+      <div className="ref-sidebar-footer">
+        <span>Build</span>
+        <b>{APP_BUILD_LABEL}</b>
+      </div>
       <button className="ref-collapse">≪ 메뉴 접기</button>
     </aside>
   );
