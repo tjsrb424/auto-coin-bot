@@ -9,17 +9,21 @@ from typing import Any
 import httpx
 
 from app.database import (
+    create_live_position,
     get_live_order_log_by_uuid,
     has_unresolved_live_order,
     insert_live_recovery_event,
     load_live_recovery_events,
+    load_latest_live_strategy_session,
     load_open_live_positions,
     load_reconcilable_live_order_logs,
     pause_running_auto_live_pilot_sessions_on_startup,
     pause_running_live_strategy_sessions_on_startup,
+    update_live_strategy_session,
     update_live_order_log,
 )
 from app.live_broker import _balance_amount, get_live_broker
+from app.upbit import fetch_tickers
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -245,6 +249,87 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
     return status
 
 
+async def import_exchange_btc_position(exchange: str = "bithumb", market: str = "KRW-BTC", *, confirmation: str) -> dict:
+    if confirmation != "IMPORT BTC POSITION":
+        return {"ok": False, "status": "CONFIRMATION_REQUIRED", "message": "확인 문구 IMPORT BTC POSITION이 필요합니다."}
+
+    session = load_latest_live_strategy_session()
+    if not session or str(session.get("status")) not in {"READY", "RUNNING", "PAUSED", "LIVE_PAUSED"}:
+        return {"ok": False, "status": "NO_LIVE_STRATEGY_SESSION", "message": "편입할 자동매매 전략 세션이 없습니다."}
+    if str(session.get("exchange") or exchange) != exchange or str(session.get("market") or market) != market:
+        return {"ok": False, "status": "SESSION_MARKET_MISMATCH", "message": "현재 자동매매 세션의 거래소/마켓과 일치하지 않습니다."}
+
+    balance_status = await reconcile_balances(exchange, market)
+    if not balance_status.get("blocking"):
+        return {"ok": False, "status": "NO_BALANCE_MISMATCH", "message": "편입할 거래소 BTC 잔고 불일치가 없습니다.", "balance_reconciliation": balance_status}
+
+    internal_btc = _float(balance_status.get("internal_btc_position"))
+    exchange_btc = _float(balance_status.get("exchange_btc_total"))
+    if internal_btc > 0:
+        return {"ok": False, "status": "INTERNAL_POSITION_EXISTS", "message": "이미 내부 포지션이 있어 자동 편입하지 않습니다.", "balance_reconciliation": balance_status}
+    if exchange_btc <= 0:
+        return {"ok": False, "status": "NO_EXCHANGE_BTC", "message": "거래소 BTC 잔고가 없습니다.", "balance_reconciliation": balance_status}
+
+    broker = get_live_broker(exchange)
+    balances = await broker.get_balances()
+    btc_entry = (balances.get("by_currency") or {}).get("BTC", {})
+    avg_buy_price = _float(btc_entry.get("avg_buy_price"))
+    current_price = await _market_price(exchange, market)
+    entry_price = avg_buy_price if avg_buy_price > 0 else current_price
+    if entry_price <= 0 or current_price <= 0:
+        return {"ok": False, "status": "PRICE_UNAVAILABLE", "message": "포지션 편입 기준가를 확인할 수 없습니다.", "balance_reconciliation": balance_status}
+
+    stop_loss_price = entry_price * 0.993
+    take_profit_price = entry_price * 1.01
+    position_id = create_live_position(
+        {
+            "session_id": session["id"],
+            "exchange": exchange,
+            "market": market,
+            "candidate_strategy_id": session["candidate_strategy_id"],
+            "strategy_name": f"{session['strategy_name']} · 거래소잔고편입",
+            "status": "OPEN",
+            "entry_order_uuid": "IMPORTED_EXCHANGE_BALANCE",
+            "entry_price": entry_price,
+            "entry_volume": exchange_btc,
+            "entry_amount_krw": entry_price * exchange_btc,
+            "current_price": current_price,
+            "unrealized_pnl": (current_price - entry_price) * exchange_btc,
+            "realized_pnl": 0.0,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+            "opened_at": _utc_now(),
+        }
+    )
+    update_live_strategy_session(
+        int(session["id"]),
+        {
+            "current_position_id": position_id,
+            "last_risk_result": "IMPORTED_EXCHANGE_BALANCE",
+            "last_order_status": "POSITION_IMPORTED",
+        },
+    )
+    after = await reconcile_balances(exchange, market)
+    payload = {
+        "position_id": position_id,
+        "exchange_btc_total": exchange_btc,
+        "entry_price": entry_price,
+        "current_price": current_price,
+        "balance_reconciliation_before": balance_status,
+        "balance_reconciliation_after": after,
+    }
+    log_recovery_event(
+        "EXCHANGE_BALANCE_IMPORTED",
+        "WARNING",
+        "Exchange BTC balance was imported as an internal live position by explicit admin action.",
+        exchange=exchange,
+        market=market,
+        session_id=int(session["id"]),
+        payload=payload,
+    )
+    return {"ok": after.get("ok", False), "status": "IMPORTED", **payload}
+
+
 async def auto_order_recovery_block_reason(exchange: str = "bithumb", market: str = "KRW-BTC") -> str | None:
     if has_unresolved_live_order(exchange, market):
         return "BLOCKED_UNRESOLVED_LIVE_ORDER"
@@ -252,6 +337,20 @@ async def auto_order_recovery_block_reason(exchange: str = "bithumb", market: st
     if balance.get("blocking"):
         return "BLOCKED_BALANCE_MISMATCH" if balance.get("status") == "BALANCE_MISMATCH" else "BLOCKED_BALANCE_RECONCILIATION_FAILED"
     return None
+
+
+async def _market_price(exchange: str, market: str) -> float:
+    broker = get_live_broker(exchange)
+    base_url = getattr(getattr(broker, "config", None), "base_url", "")
+    try:
+        tickers = await fetch_tickers([market], base_url=base_url) if base_url else await fetch_tickers([market])
+        if tickers:
+            return _float(tickers[0].get("trade_price") or tickers[0].get("tradePrice") or tickers[0].get("close_price"))
+    except Exception:
+        tickers = await fetch_tickers([market])
+        if tickers:
+            return _float(tickers[0].get("trade_price") or tickers[0].get("tradePrice") or tickers[0].get("close_price"))
+    return 0.0
 
 
 def is_timeout_exception(exc: Exception) -> bool:

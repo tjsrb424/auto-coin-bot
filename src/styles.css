@@ -3785,12 +3785,56 @@ body {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin: 19px 0 12px;
+  margin: 12px 0 9px;
   color: var(--ref-green);
 }
 
 .ref-risk-ok b {
   font-size: 18px;
+}
+
+.ref-balance-recovery {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 8px;
+  border: 1px solid rgba(255, 168, 23, 0.34);
+  border-radius: 6px;
+  background: rgba(255, 168, 23, 0.08);
+  padding: 8px;
+}
+
+.ref-balance-recovery span {
+  color: #f6c96b;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.ref-balance-recovery b {
+  color: #f4f7ff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.ref-balance-recovery button {
+  height: 26px;
+  border: 1px solid rgba(139, 92, 255, 0.7);
+  border-radius: 5px;
+  background: rgba(123, 77, 255, 0.24);
+  color: #d9ccff;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.ref-balance-recovery button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.ref-balance-recovery em {
+  color: #ff6f83;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
 }
 
 .ref-auto-risk-row {

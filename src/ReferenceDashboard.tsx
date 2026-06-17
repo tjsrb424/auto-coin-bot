@@ -198,6 +198,20 @@ type LiveOrder = {
   paid_fee?: number;
 };
 
+type RecoveryEvent = {
+  event_type?: string;
+  severity?: string;
+  message?: string;
+  created_at?: string;
+  payload?: {
+    status?: string;
+    internal_btc_position?: number;
+    exchange_btc_total?: number;
+    difference_btc?: number;
+    tolerance_btc?: number;
+  };
+};
+
 type RiskDashboard = {
   risk_state?: {
     status?: string;
@@ -309,6 +323,7 @@ type DashboardData = {
   liveStrategy: LiveStrategyStatus | null;
   runtimeStatus: RuntimeStatus | null;
   health: HealthStatus | null;
+  recoveryEvents: RecoveryEvent[];
   errors: string[];
   updatedAt: string | null;
 };
@@ -394,6 +409,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     liveStrategy: null,
     runtimeStatus: null,
     health: null,
+    recoveryEvents: [],
     errors: [],
     updatedAt: null
   });
@@ -412,7 +428,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
       const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, health] = await Promise.all([
         settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
         settle("실거래 상태", fetchJson<LiveStatus>(`/api/live/status?exchange=${selectedExchange}`)),
-        settle("주문", fetchJson<{ orders?: LiveOrder[] }>("/api/live-orders")),
+        settle("주문", fetchJson<{ orders?: LiveOrder[]; recovery_events?: RecoveryEvent[] }>("/api/live-orders")),
         settle("실시간 페이퍼", fetchJson<PaperSession>("/api/paper-trading/live/latest")),
         settle("Forward Paper", fetchJson<PaperSession>("/api/forward-paper/latest")),
         settle("전략", fetchJson<{ candidates?: Candidate[] }>("/api/candidate-strategies")),
@@ -442,6 +458,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         liveStrategy,
         runtimeStatus,
         health,
+        recoveryEvents: ordersResult?.recovery_events ?? [],
         errors,
         updatedAt: new Date().toISOString()
       });
@@ -2542,14 +2559,43 @@ function AutoWatchPanel({ data }: { data: DashboardData }) {
   );
 }
 
-function AutoRiskPanel({ data }: { data: DashboardData }) {
+function AutoRiskPanel({
+  data,
+  onImportExchangePosition,
+  isImportingPosition,
+  importPositionError
+}: {
+  data: DashboardData;
+  onImportExchangePosition: () => void;
+  isImportingPosition: boolean;
+  importPositionError: string | null;
+}) {
   const risk = data.risk?.risk_state;
   const dailyLoss = Math.abs(risk?.daily_loss_percent ?? 0);
   const maxOrder = data.liveStrategy?.max_order_krw ?? null;
+  const latestRecovery = data.recoveryEvents[0];
+  const latestMismatch = latestRecovery?.event_type === "BALANCE_MISMATCH" ? latestRecovery : undefined;
+  const balanceMismatch = Boolean(
+    !data.liveStrategy?.position
+    && (latestMismatch
+    || data.liveStrategy?.session?.last_risk_result === "BLOCKED_BALANCE_MISMATCH"
+    || data.risk?.risk_state?.balance_mismatch_detected)
+  );
+  const exchangeBtc = latestMismatch?.payload?.exchange_btc_total;
   return (
     <RefPanel className="ref-auto-risk-panel">
       <div className="ref-title-row"><h3>리스크 관리</h3></div>
       <div className="ref-risk-ok"><ShieldCheck size={26} /><b>{risk?.status === "OK" ? "리스크 양호" : statusLabel(risk?.status ?? "WAITING")}</b></div>
+      {balanceMismatch && (
+        <div className="ref-balance-recovery">
+          <span>거래소 BTC 잔고 불일치 감지</span>
+          <b>{exchangeBtc != null ? `${formatNumber(exchangeBtc, 8)} BTC` : "확인 필요"}</b>
+          <button onClick={onImportExchangePosition} disabled={isImportingPosition}>
+            {isImportingPosition ? "편입 중" : "봇 포지션으로 가져오기"}
+          </button>
+          {importPositionError && <em>{importPositionError}</em>}
+        </div>
+      )}
       <div className="ref-auto-risk-row"><span>개정 리스크</span><b>{dailyLoss.toFixed(0)}% / 30%</b></div>
       <div className="ref-auto-bar"><i style={{ width: `${Math.min(dailyLoss / 30 * 100, 100)}%` }} /></div>
       <div className="ref-auto-risk-row"><span>일일 손익 한도</span><b>{formatKrw(maxOrder)}</b></div>
@@ -2712,20 +2758,26 @@ function AutoBottomPanels({ data }: { data: DashboardData }) {
 function AutoTradeView({
   data,
   onToggleAutoTrading,
+  onImportExchangePosition,
   isAutoToggling,
-  autoToggleError
+  autoToggleError,
+  isImportingPosition,
+  importPositionError
 }: {
   data: DashboardData;
   onToggleAutoTrading: () => void;
+  onImportExchangePosition: () => void;
   isAutoToggling: boolean;
   autoToggleError: string | null;
+  isImportingPosition: boolean;
+  importPositionError: string | null;
 }) {
   return (
     <>
       <AutoStatusPanel data={data} onToggle={onToggleAutoTrading} isToggling={isAutoToggling} toggleError={autoToggleError} />
       <AutoStrategyStrip data={data} />
       <AutoWatchPanel data={data} />
-      <AutoRiskPanel data={data} />
+      <AutoRiskPanel data={data} onImportExchangePosition={onImportExchangePosition} isImportingPosition={isImportingPosition} importPositionError={importPositionError} />
       <AutoChartPanel data={data} />
       <AutoRightStack data={data} />
       <AutoBottomPanels data={data} />
@@ -3307,6 +3359,8 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
   const [activeView, setActiveView] = React.useState<ReferenceView>("dashboard");
   const [isAutoToggling, setIsAutoToggling] = React.useState(false);
   const [autoToggleError, setAutoToggleError] = React.useState<string | null>(null);
+  const [isImportingPosition, setIsImportingPosition] = React.useState(false);
+  const [importPositionError, setImportPositionError] = React.useState<string | null>(null);
   const scaledWidth = STAGE_WIDTH * scale;
   const scaledHeight = STAGE_HEIGHT * scale;
   const liveBtc = liveBtcStats(data);
@@ -3355,6 +3409,27 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
     }
   }, [data.candidates, isAutoToggling, isAutoTradingOn, refresh]);
 
+  const importExchangePosition = React.useCallback(async () => {
+    if (isImportingPosition) return;
+    const confirmation = window.prompt("거래소 BTC 잔고를 봇 포지션으로 가져오려면 확인 문구를 입력하세요: IMPORT BTC POSITION")?.trim();
+    if (confirmation !== "IMPORT BTC POSITION") {
+      setImportPositionError("확인 문구가 일치하지 않아 편입을 취소했습니다.");
+      return;
+    }
+    setIsImportingPosition(true);
+    setImportPositionError(null);
+    try {
+      const body = await postJson<{ ok?: boolean; status?: string; message?: string }>("/api/live-recovery/import-exchange-position?exchange=bithumb", { confirmation });
+      if (body.ok === false) throw new Error(body.message ?? body.status ?? "거래소 잔고 편입 실패");
+      await refresh();
+    } catch (err) {
+      setImportPositionError(err instanceof Error ? err.message : "거래소 잔고 편입 실패");
+      await refresh();
+    } finally {
+      setIsImportingPosition(false);
+    }
+  }, [isImportingPosition, refresh]);
+
   return (
     <main className="ref-viewport" style={{ ["--ref-scale" as string]: scale }}>
       <div className="ref-stage-shell" style={{ width: scaledWidth, height: scaledHeight }}>
@@ -3380,8 +3455,11 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
             <AutoTradeView
               data={data}
               onToggleAutoTrading={toggleAutoTrading}
+              onImportExchangePosition={importExchangePosition}
               isAutoToggling={isAutoToggling}
               autoToggleError={autoToggleError}
+              isImportingPosition={isImportingPosition}
+              importPositionError={importPositionError}
             />
           )}
           {activeView === "strategies" && <StrategiesView data={data} refresh={refresh} />}

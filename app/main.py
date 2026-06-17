@@ -84,6 +84,7 @@ from app.live_broker import (
     trigger_emergency_stop,
 )
 from app.live_recovery import (
+    import_exchange_btc_position,
     is_timeout_exception,
     log_recovery_event,
     recent_recovery_events,
@@ -416,6 +417,10 @@ class RuntimeStartRequest(BaseModel):
     candidate_strategy_id: int
     confirmation: str = ""
     order_confirmation: str = ""
+
+
+class ImportExchangePositionRequest(BaseModel):
+    confirmation: str = ""
 
 
 class AdminLoginRequest(BaseModel):
@@ -1309,6 +1314,12 @@ async def live_recovery_status(exchange: str = Query("bithumb", pattern=r"^(bith
 @app.post("/api/live-recovery/sync-open-orders")
 async def sync_live_open_orders(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     return {"sync": await sync_open_orders(exchange, DEFAULT_MARKET), "recent_events": recent_recovery_events()}
+
+
+@app.post("/api/live-recovery/import-exchange-position")
+async def import_exchange_position_endpoint(payload: ImportExchangePositionRequest, exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    result = await import_exchange_btc_position(exchange, DEFAULT_MARKET, confirmation=payload.confirmation)
+    return {**result, "recent_events": recent_recovery_events()}
 
 
 @app.get("/api/risk/status")
