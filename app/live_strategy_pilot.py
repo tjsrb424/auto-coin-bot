@@ -382,7 +382,7 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_MARKET_ORDER_DISABLED"
     if not live_config.api_key_loaded:
         return "BLOCKED_ORDER_CHANCE_FAILED"
-    if count_live_strategy_orders_today("bithumb", "KRW-BTC") >= config.max_orders_per_day:
+    if config.max_orders_per_day > 0 and count_live_strategy_orders_today("bithumb", "KRW-BTC") >= config.max_orders_per_day:
         return "BLOCKED_MAX_ORDERS_PER_DAY"
     if has_open_live_strategy_order("bithumb", "KRW-BTC"):
         return "BLOCKED_OPEN_ORDER_EXISTS"

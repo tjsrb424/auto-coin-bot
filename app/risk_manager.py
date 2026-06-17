@@ -143,9 +143,9 @@ def compute_risk_state(exchange: str = "bithumb", market: str = "KRW-BTC", *, ba
     elif balance_mismatch or partial_fill:
         status = "MANUAL_REVIEW_REQUIRED"
     elif (
-        daily_order_count >= config.max_orders_per_day
-        or daily_entry_count >= config.max_entry_orders_per_day
-        or daily_exit_count >= config.max_exit_orders_per_day
+        (config.max_orders_per_day > 0 and daily_order_count >= config.max_orders_per_day)
+        or (config.max_entry_orders_per_day > 0 and daily_entry_count >= config.max_entry_orders_per_day)
+        or (config.max_exit_orders_per_day > 0 and daily_exit_count >= config.max_exit_orders_per_day)
         or abs(min(total_pnl, 0.0)) >= config.max_daily_loss_krw
         or daily_loss_percent >= config.max_daily_loss_percent
     ):
@@ -267,11 +267,11 @@ def check_order_risk(
     else:
         ok("balance_reconciliation_check")
 
-    if state["daily_order_count"] >= config.max_orders_per_day:
+    if config.max_orders_per_day > 0 and state["daily_order_count"] >= config.max_orders_per_day:
         block("BLOCKED_MAX_ORDERS_PER_DAY", check_name="daily_limit_check")
-    elif purpose == "ENTRY" and state["daily_entry_count"] >= config.max_entry_orders_per_day:
+    elif purpose == "ENTRY" and config.max_entry_orders_per_day > 0 and state["daily_entry_count"] >= config.max_entry_orders_per_day:
         block("BLOCKED_MAX_ENTRY_ORDERS_PER_DAY", check_name="daily_limit_check")
-    elif purpose == "EXIT" and state["daily_exit_count"] >= config.max_exit_orders_per_day:
+    elif purpose == "EXIT" and config.max_exit_orders_per_day > 0 and state["daily_exit_count"] >= config.max_exit_orders_per_day:
         block("BLOCKED_MAX_EXIT_ORDERS_PER_DAY", check_name="daily_limit_check")
     elif abs(min(state["daily_total_pnl"], 0.0)) >= config.max_daily_loss_krw or state["daily_loss_percent"] >= config.max_daily_loss_percent:
         block("BLOCKED_DAILY_LOSS_LIMIT", check_name="daily_limit_check")

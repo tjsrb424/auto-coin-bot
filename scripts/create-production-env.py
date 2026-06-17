@@ -35,7 +35,8 @@ PRODUCTION_DEFAULTS = {
     "MAX_LIVE_ORDER_KRW": "10000",
     "MAX_DAILY_LIVE_LOSS_PERCENT": "1",
     "AUTO_MAX_ORDER_KRW": "10000",
-    "AUTO_MAX_ORDERS_PER_DAY": "1",
+    "AUTO_MAX_ORDERS_PER_DAY": "0",
+    "AUTO_PILOT_MAX_ORDERS_PER_DAY": "0",
     "AUTO_MAX_OPEN_POSITION_COUNT": "1",
     "AUTO_COOLDOWN_SECONDS": "1800",
     "AUTO_REQUIRE_COMPLETED_CANDLE": "true",
@@ -48,8 +49,8 @@ PRODUCTION_DEFAULTS = {
     "AUTO_MARKET_ORDER_ENABLED": "false",
     "RISK_MAX_DAILY_LOSS_PERCENT": "1",
     "RISK_MAX_DAILY_LOSS_KRW": "10000",
-    "RISK_MAX_ORDERS_PER_DAY": "3",
-    "RISK_MAX_ENTRY_ORDERS_PER_DAY": "2",
+    "RISK_MAX_ORDERS_PER_DAY": "0",
+    "RISK_MAX_ENTRY_ORDERS_PER_DAY": "0",
     "RISK_MAX_EXIT_ORDERS_PER_DAY": "3",
     "RISK_MAX_CONSECUTIVE_LOSSES": "2",
     "RISK_MIN_COOLDOWN_SECONDS": "1800",
@@ -105,8 +106,7 @@ def main() -> int:
         print("ADMIN_PASSWORD_HASH is required. Generate one and add it to the source env before running.", file=sys.stderr)
         print("Example: python scripts/create-production-env.py --source .env --output .env.production", file=sys.stderr)
         return 1
-    if not values["SESSION_SECRET"]:
-        values["SESSION_SECRET"] = secrets.token_urlsafe(48)
+    values["SESSION_SECRET"] = values["SESSION_SECRET"] if _is_hex_secret(values["SESSION_SECRET"]) else secrets.token_hex(48)
 
     if output.exists() and not args.yes:
         answer = input(f"{output} already exists. Overwrite? Type YES: ")
@@ -143,7 +143,19 @@ def parse_env(path: Path) -> dict[str, str]:
 
 
 def render_env(values: dict[str, str]) -> str:
-    return "\n".join(f"{key}={value}" for key, value in values.items()) + "\n"
+    return "\n".join(f"{key}={_render_env_value(key, value)}" for key, value in values.items()) + "\n"
+
+
+def _render_env_value(key: str, value: str) -> str:
+    if key == "ADMIN_PASSWORD_HASH" or "$" in value:
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+    return value
+
+
+def _is_hex_secret(value: str) -> bool:
+    if len(value) < 64 or len(value) % 2 != 0:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in value)
 
 
 def hash_password(password: str, *, iterations: int = 240_000) -> str:

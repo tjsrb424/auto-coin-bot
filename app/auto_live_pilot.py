@@ -238,7 +238,7 @@ async def _precheck_block_reason(session: dict, config: AutoLivePilotConfig, liv
         return "BLOCKED_ORDER_TYPE_NOT_ALLOWED"
     if not live_config.api_key_loaded:
         return "BLOCKED_ORDER_CHANCE_FAILED"
-    if count_auto_live_orders_today("bithumb", "KRW-BTC") >= config.max_orders_per_day:
+    if config.max_orders_per_day > 0 and count_auto_live_orders_today("bithumb", "KRW-BTC") >= config.max_orders_per_day:
         return "BLOCKED_DAILY_ORDER_COUNT"
     if has_open_auto_live_order("bithumb", "KRW-BTC"):
         return "BLOCKED_OPEN_ORDER_EXISTS"

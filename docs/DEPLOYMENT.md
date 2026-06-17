@@ -455,7 +455,7 @@ Policy:
 - Exchange: Bithumb
 - Market: `KRW-BTC`
 - Order type: `limit`
-- `AUTO_MAX_ORDERS_PER_DAY=1`
+- `AUTO_MAX_ORDERS_PER_DAY=0` means no daily auto entry order count limit.
 - `AUTO_CANCEL_UNFILLED_AFTER_SECONDS=60`
 - Amount must stay within `AUTO_MAX_ORDER_KRW`
 
