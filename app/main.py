@@ -22,6 +22,7 @@ from app.auto_live_pilot import (
     stop_auto_live_pilot,
 )
 from app.database import (
+    clone_candidate_strategy,
     create_forward_session_from_candidate,
     create_live_paper_session,
     get_last_live_order_time,
@@ -38,6 +39,7 @@ from app.database import (
     load_candles,
     load_candles_between,
     load_candidate_strategies,
+    load_app_settings,
     load_forward_sessions,
     load_latest_forward_session,
     load_live_order_logs,
@@ -47,10 +49,14 @@ from app.database import (
     save_candidate_strategy,
     save_paper_session,
     save_validation_run,
+    set_candidate_strategy_status,
     stop_forward_session,
     stop_latest_live_paper_session,
     stop_latest_paper_session,
     update_live_order_log,
+    update_app_settings,
+    update_candidate_strategy,
+    update_risk_log_resolution,
 )
 from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
@@ -96,7 +102,7 @@ from app.live_strategy_pilot import (
 )
 from app.paper_trading import run_paper_trading
 from app.strategy_validation import run_strategy_validation
-from app.upbit import UpbitClientError, fetch_minute_candles
+from app.upbit import UpbitClientError, fetch_day_candles, fetch_minute_candles
 
 load_server_env()
 
@@ -125,7 +131,7 @@ async def _load_period_candles(market: str, unit: int, start_time_utc: str, end_
     start = _parse_utc(start_time_utc)
     end = _parse_utc(end_time_utc)
     if end <= start:
-        raise ValueError("醫낅즺 ?쒓컙? ?쒖옉 ?쒓컙蹂대떎 ?ㅼ뿬???⑸땲??")
+        raise ValueError("종료 시간은 시작 시간보다 늦어야 합니다.")
     expected_count = ceil((end - start).total_seconds() / (unit * 60)) + 5
     fetch_count = min(max(expected_count, 30), 20000)
     fresh = await fetch_minute_candles(
@@ -142,7 +148,7 @@ async def _load_period_candles(market: str, unit: int, start_time_utc: str, end_
         _format_candle_time(end),
     )
     if len(candles) < 30:
-        raise ValueError("?좏깮??湲곌컙??諛깊뀒?ㅽ듃???꾩슂??罹붾뱾??30媛?誘몃쭔?낅땲??")
+        raise ValueError("선택한 기간의 백테스트에 필요한 캔들이 30개 미만입니다.")
     return candles
 
 
@@ -186,6 +192,8 @@ class StrategyValidationRequest(BaseModel):
 
 
 class CandidateStrategyRequest(BaseModel):
+    name: str | None = None
+    description: str = ""
     strategy: str
     parameters: dict[str, Any]
     unit: int
@@ -199,6 +207,34 @@ class CandidateStrategyRequest(BaseModel):
     backtest_trade_count: int = 0
     backtest_average_trade_pnl: float = 0.0
     warning: str = ""
+    status: str = "ACTIVE"
+
+
+class CandidateStrategyUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    strategy: str | None = None
+    parameters: dict[str, Any] | None = None
+    unit: int | None = None
+    market: str | None = None
+    backtest_period: str | None = None
+    score: float | None = None
+    backtest_total_return: float | None = None
+    backtest_mdd: float | None = None
+    backtest_win_rate: float | None = None
+    backtest_profit_factor: float | None = None
+    backtest_trade_count: int | None = None
+    backtest_average_trade_pnl: float | None = None
+    warning: str | None = None
+    status: str | None = None
+
+
+class CandidateStrategyToggleRequest(BaseModel):
+    status: str | None = None
+
+
+class AppSettingsRequest(BaseModel):
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class ForwardPaperStartRequest(BaseModel):
@@ -272,7 +308,7 @@ async def lifespan(_: FastAPI):
     load_server_env()
     init_db()
     reset_live_runtime_state()
-    insert_live_mode_event("SERVER_START", current_live_mode(), "?쒕쾭 ?쒖옉 ???ㅺ굅??紐⑤뱶???먮룞 ?좉툑 ?곹깭濡?珥덇린?붾릺?덉뒿?덈떎.")
+    insert_live_mode_event("SERVER_START", current_live_mode(), "서버 시작 시 실거래 모드는 자동 잠금 상태로 초기화되었습니다.")
     recovery_result = await run_startup_live_recovery_async()
     logger.info("[live-recovery] startup recovery result=%s", recovery_result)
     stopped_forward_sessions = pause_running_forward_sessions_on_startup()
@@ -351,7 +387,7 @@ async def get_candles(
     count: int = Query(200, ge=1, le=1000),
 ) -> dict:
     try:
-        fresh = await fetch_minute_candles(market=market, unit=unit, count=count)
+        fresh = await fetch_day_candles(market=market, count=count) if unit == 1440 else await fetch_minute_candles(market=market, unit=unit, count=count)
         inserted = insert_candles(fresh)
         candles = load_candles(market, unit, count)
         return {"market": market, "unit": unit, "inserted": inserted, "candles": candles}
@@ -362,7 +398,7 @@ async def get_candles(
 @app.post("/api/backtests")
 async def create_backtest(payload: BacktestRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 0 湲곕낯 ???留덉폆? KRW-BTC留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="기본 지원 마켓은 KRW-BTC입니다.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -398,11 +434,11 @@ async def create_backtest(payload: BacktestRequest) -> dict:
 @app.post("/api/backtests/compare")
 async def compare_backtests(payload: BacktestCompareRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 3 諛깊뀒?ㅽ듃 鍮꾧탳??KRW-BTC留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="백테스트 비교는 KRW-BTC만 지원합니다.")
     allowed = {"ma_cross", "rsi", "volatility_breakout"}
     strategies = [strategy for strategy in payload.strategies if strategy in allowed]
     if not strategies:
-        raise HTTPException(status_code=400, detail="鍮꾧탳???꾨왂???놁뒿?덈떎.")
+        raise HTTPException(status_code=400, detail="비교할 전략이 없습니다.")
     try:
         candles = await _load_period_candles(
             payload.market,
@@ -434,7 +470,7 @@ async def compare_backtests(payload: BacktestCompareRequest) -> dict:
 @app.post("/api/paper-trading/simulate")
 async def simulate_paper_trading(payload: PaperTradingRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 1 湲곕낯 ???留덉폆? KRW-BTC留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="페이퍼 트레이딩은 KRW-BTC만 지원합니다.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -470,7 +506,7 @@ def stop_paper_trading() -> dict:
     if session is None:
         latest = load_latest_paper_session()
         if latest is None:
-            return {"status": "STOPPED", "message": "以묒????섏씠???몃젅?대뵫 ?몄뀡???놁뒿?덈떎."}
+            return {"status": "STOPPED", "message": "중지할 페이퍼 트레이딩 세션이 없습니다."}
         return {**latest, "status": "STOPPED"}
     return session
 
@@ -486,9 +522,9 @@ def latest_paper_trading() -> dict:
 @app.post("/api/strategy-validation/run")
 async def run_validation(payload: StrategyValidationRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 4 ?꾨왂 寃利앹? KRW-BTC留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="전략 검증은 KRW-BTC만 지원합니다.")
     if payload.strategy not in {"ma_cross", "rsi", "volatility_breakout"}:
-        raise HTTPException(status_code=400, detail="吏?먰븯吏 ?딅뒗 ?꾨왂?낅땲??")
+        raise HTTPException(status_code=400, detail="지원하지 않는 전략입니다.")
     try:
         result = await run_strategy_validation(
             market=payload.market,
@@ -517,7 +553,7 @@ async def run_validation(payload: StrategyValidationRequest) -> dict:
 @app.post("/api/candidate-strategies")
 def create_candidate_strategy(payload: CandidateStrategyRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="?꾨낫 ?꾨왂? KRW-BTC留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="후보 전략은 KRW-BTC만 지원합니다.")
     candidate = payload.model_dump()
     candidate_id = save_candidate_strategy(candidate)
     return {"id": candidate_id, **candidate}
@@ -526,6 +562,33 @@ def create_candidate_strategy(payload: CandidateStrategyRequest) -> dict:
 @app.get("/api/candidate-strategies")
 def list_candidate_strategies() -> dict:
     return {"candidates": load_candidate_strategies()}
+
+
+@app.patch("/api/candidate-strategies/{candidate_id}")
+def patch_candidate_strategy(candidate_id: int, payload: CandidateStrategyUpdateRequest) -> dict:
+    updates = {key: value for key, value in payload.model_dump().items() if value is not None}
+    candidate = update_candidate_strategy(candidate_id, updates)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    return {"candidate": candidate}
+
+
+@app.post("/api/candidate-strategies/{candidate_id}/clone")
+def clone_candidate_strategy_endpoint(candidate_id: int) -> dict:
+    candidate = clone_candidate_strategy(candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    return {"candidate": candidate}
+
+
+@app.post("/api/candidate-strategies/{candidate_id}/toggle")
+def toggle_candidate_strategy_endpoint(candidate_id: int, payload: CandidateStrategyToggleRequest) -> dict:
+    current = load_candidate_strategy(candidate_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    next_status = payload.status or ("INACTIVE" if current.get("status") == "ACTIVE" else "ACTIVE")
+    candidate = set_candidate_strategy_status(candidate_id, next_status)
+    return {"candidate": candidate}
 
 
 def _live_status(exchange: str | None = None) -> dict:
@@ -552,7 +615,7 @@ def _live_status(exchange: str | None = None) -> dict:
         "daily_loss_limit_percent": config.max_daily_live_loss_percent,
         "min_order_krw": config.min_order_krw,
         "last_live_order_time": get_last_live_order_time(),
-        "api_key_policy": "API Key???쒕쾭 ?섍꼍蹂?섏뿉?쒕쭔 ?쎌쑝硫? 異쒓툑 沅뚰븳 ?녿뒗 ?ㅻ쭔 ?ъ슜?섏꽭??",
+        "api_key_policy": "API Key는 서버 환경변수에서만 읽으며, 출금 권한이 없는 키만 사용하세요.",
     }
 
 
@@ -576,9 +639,9 @@ async def _market_snapshot(market: str) -> dict | None:
 async def _safe_live_balances() -> tuple[dict, str, str | None]:
     config = LiveTradingConfig.from_env()
     if not config.live_trading_enabled:
-        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "DISABLED", "LIVE_TRADING_ENABLED=false ?낅땲??"
+        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "DISABLED", "LIVE_TRADING_ENABLED=false 입니다."
     if not config.api_key_loaded:
-        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "API_KEY_MISSING", "UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY媛 ?꾩슂?⑸땲??"
+        return {"by_currency": {}, "krw": {"balance": 0, "locked": 0}, "btc": {"balance": 0, "locked": 0}, "eth": {"balance": 0, "locked": 0}}, "API_KEY_MISSING", "UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY가 필요합니다."
     try:
         balances = await LiveBroker().get_balance()
         return balances, "SUCCESS", None
@@ -591,7 +654,7 @@ async def _safe_live_balances_for_exchange(exchange: str | None = None) -> tuple
     config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
     if not config.api_key_loaded:
         prefix = "BITHUMB" if config.exchange == "bithumb" else "UPBIT"
-        return empty, "API_KEY_MISSING", f"{prefix}_ACCESS_KEY/{prefix}_SECRET_KEY媛 ?꾩슂?⑸땲??"
+        return empty, "API_KEY_MISSING", f"{prefix}_ACCESS_KEY/{prefix}_SECRET_KEY가 필요합니다."
     try:
         balances = await get_live_broker(config.exchange).get_balances()
         return balances, "SUCCESS", None
@@ -603,7 +666,7 @@ async def _safe_order_chance(market: str, exchange: str | None = None) -> tuple[
     config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
     if not config.api_key_loaded:
         prefix = "BITHUMB" if config.exchange == "bithumb" else "UPBIT"
-        return {}, "API_KEY_MISSING", f"{prefix}_ACCESS_KEY/{prefix}_SECRET_KEY媛 ?꾩슂?⑸땲??"
+        return {}, "API_KEY_MISSING", f"{prefix}_ACCESS_KEY/{prefix}_SECRET_KEY가 필요합니다."
     try:
         chance = await get_live_broker(config.exchange).get_order_chance(market)
         return chance, "SUCCESS", None
@@ -663,14 +726,14 @@ def arm_live_trading(payload: LiveArmRequest) -> dict:
 @app.post("/api/live-trading/lock")
 def lock_live_trading_endpoint() -> dict:
     mode = lock_live_trading()
-    insert_live_mode_event("LOCK", mode, "?ъ슜?먭? ?ㅺ굅??紐⑤뱶瑜??좉툑 泥섎━?덉뒿?덈떎.")
-    return {**_live_status(), "message": "?ㅺ굅??紐⑤뱶媛 ?좉툑 ?곹깭?낅땲??"}
+    insert_live_mode_event("LOCK", mode, "사용자가 실거래 모드를 잠금 처리했습니다.")
+    return {**_live_status(), "message": "실거래 모드가 잠금 상태입니다."}
 
 
 @app.post("/api/live-trading/emergency-stop")
 def emergency_stop_live_trading() -> dict:
     mode = trigger_emergency_stop()
-    insert_live_mode_event("EMERGENCY_STOP", mode, "Emergency Stop???쒖꽦?붾릺??紐⑤뱺 ?ㅺ굅??二쇰Ц ?꾨낫瑜?李⑤떒?⑸땲??")
+    insert_live_mode_event("EMERGENCY_STOP", mode, "Emergency Stop이 활성화되어 모든 실거래 주문 후보를 차단합니다.")
     compute_risk_state("bithumb", DEFAULT_MARKET)
     insert_risk_log(
         {
@@ -683,7 +746,7 @@ def emergency_stop_live_trading() -> dict:
             "checks": {"mode_check": {"allowed": False, "code": "BLOCKED_EMERGENCY_STOP"}},
         }
     )
-    return {**_live_status(), "message": "Emergency Stop ?쒖꽦?? ?먮룞 泥?궛? ?ㅽ뻾?섏? ?딆뒿?덈떎."}
+    return {**_live_status(), "message": "Emergency Stop 활성화 중에는 자동 청산을 실행하지 않습니다."}
 
 
 @app.post("/api/live-trading/reset-emergency")
@@ -792,12 +855,12 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
 @app.post("/api/live-orders/place")
 async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
     if payload.final_confirmation != "PLACE LIVE ORDER":
-        raise HTTPException(status_code=400, detail="理쒖쥌 ?뺤씤 臾멸뎄 PLACE LIVE ORDER媛 ?꾩슂?⑸땲??")
+        raise HTTPException(status_code=400, detail="최종 확인 문구 PLACE LIVE ORDER가 필요합니다.")
     preview_log = get_live_order_log(payload.request_id)
     if preview_log is None:
-        raise HTTPException(status_code=404, detail="癒쇱? 二쇰Ц 誘몃━蹂닿린瑜??ㅽ뻾?댁빞 ?⑸땲??")
+        raise HTTPException(status_code=404, detail="먼저 주문 미리보기를 실행해야 합니다.")
     if preview_log["status"] != "PREVIEWED" or preview_log["risk_result"] != "ALLOWED":
-        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": preview_log["risk_result"], "message": "Risk Manager媛 二쇰Ц??李⑤떒?덉뒿?덈떎."}
+        return {"request_id": payload.request_id, "status": "BLOCKED", "risk_result": preview_log["risk_result"], "message": "Risk Manager가 주문을 차단했습니다."}
     if current_live_mode() != "LIVE_MANUAL_ONLY":
         live_config = LiveTradingConfig.from_env()
         blocked_result = "BLOCKED_LIVE_DISABLED" if not live_config.live_trading_enabled else "BLOCKED_LIVE_LOCKED"
@@ -953,6 +1016,46 @@ def risk_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dic
     return get_risk_dashboard(exchange, DEFAULT_MARKET)
 
 
+@app.post("/api/alerts/{alert_id}/read")
+def mark_alert_read(alert_id: int) -> dict:
+    alert = update_risk_log_resolution(alert_id, "READ")
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    return {"alert": alert, "dashboard": get_risk_dashboard(alert["exchange"], alert["market"])}
+
+
+@app.post("/api/alerts/{alert_id}/ignore")
+def ignore_alert(alert_id: int) -> dict:
+    alert = update_risk_log_resolution(alert_id, "IGNORE")
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    return {"alert": alert, "dashboard": get_risk_dashboard(alert["exchange"], alert["market"])}
+
+
+@app.post("/api/alerts/{alert_id}/retry")
+async def retry_alert(alert_id: int) -> dict:
+    alert = update_risk_log_resolution(alert_id, "RETRY")
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    compute_risk_state(alert["exchange"], alert["market"])
+    recovery = await sync_open_orders(alert["exchange"], alert["market"])
+    return {
+        "alert": alert,
+        "recovery": recovery,
+        "dashboard": get_risk_dashboard(alert["exchange"], alert["market"]),
+    }
+
+
+@app.get("/api/settings")
+def get_app_settings_endpoint() -> dict:
+    return {"settings": load_app_settings(), **_live_status()}
+
+
+@app.patch("/api/settings")
+def update_app_settings_endpoint(payload: AppSettingsRequest) -> dict:
+    return {"settings": update_app_settings(payload.settings), **_live_status()}
+
+
 @app.get("/api/auto-live-pilot/status")
 def get_auto_live_pilot_status() -> dict:
     return auto_live_pilot_status()
@@ -1031,9 +1134,9 @@ async def cancel_live_exit_order_endpoint(payload: ExitOrderCancelRequest) -> di
 async def start_forward_paper(payload: ForwardPaperStartRequest) -> dict:
     candidate = load_candidate_strategy(payload.candidate_strategy_id)
     if candidate is None:
-        raise HTTPException(status_code=404, detail="?꾨낫 ?꾨왂??李얠쓣 ???놁뒿?덈떎.")
+        raise HTTPException(status_code=404, detail="후보 전략을 찾을 수 없습니다.")
     if candidate["market"] != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Forward Paper??KRW-BTC ?꾨낫 ?꾨왂留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="Forward Paper는 KRW-BTC 후보 전략만 지원합니다.")
     try:
         fresh = await fetch_minute_candles(
             market=candidate["market"],
@@ -1044,7 +1147,7 @@ async def start_forward_paper(payload: ForwardPaperStartRequest) -> dict:
         candles = load_candles(candidate["market"], int(candidate["unit"]), 300)
         latest_candle = latest_completed_candle(candles, int(candidate["unit"]))
         if latest_candle is None:
-            raise HTTPException(status_code=502, detail="Forward Paper瑜??쒖옉???꾩꽦 罹붾뱾???놁뒿?덈떎.")
+            raise HTTPException(status_code=502, detail="Forward Paper를 시작할 완성 캔들이 없습니다.")
         risk = {
             "initial_cash": payload.initial_balance_krw,
             "max_order_amount": 100_000,
@@ -1084,7 +1187,7 @@ def stop_forward_paper(payload: ForwardPaperStopRequest | None = None) -> dict:
     if session is None:
         latest = load_latest_forward_session()
         if latest is None:
-            return {"status": "STOPPED", "mode": "FORWARD_PAPER", "message": "以묒???Forward Paper ?몄뀡???놁뒿?덈떎."}
+            return {"status": "STOPPED", "mode": "FORWARD_PAPER", "message": "중지할 Forward Paper 세션이 없습니다."}
         return {**latest, "status": "STOPPED"}
     logger.info("[paper-forward] session=%s stopped", session["id"])
     return session
@@ -1111,7 +1214,7 @@ async def tick_forward_paper() -> dict:
 @app.post("/api/paper-trading/live/start")
 async def start_live_paper_trading(payload: PaperTradingRequest) -> dict:
     if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="Sprint 2.5 ?ㅼ떆媛??섏씠?쇰뒗 KRW-BTC留?吏?먰빀?덈떎.")
+        raise HTTPException(status_code=400, detail="실시간 페이퍼 트레이딩은 KRW-BTC만 지원합니다.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -1122,7 +1225,7 @@ async def start_live_paper_trading(payload: PaperTradingRequest) -> dict:
         candles = load_candles(payload.market, payload.unit, max(payload.count, 30))
         latest_candle = candles[-1] if candles else None
         if latest_candle is None:
-            raise HTTPException(status_code=502, detail="珥덇린?뷀븷 理쒖떊 罹붾뱾???놁뒿?덈떎.")
+            raise HTTPException(status_code=502, detail="초기화할 최신 캔들이 없습니다.")
         session_id = create_live_paper_session(
             payload.market,
             payload.unit,
@@ -1151,7 +1254,7 @@ def stop_live_paper_trading() -> dict:
     if session is None:
         latest = load_latest_live_paper_session()
         if latest is None:
-            return {"status": "STOPPED", "message": "以묒????ㅼ떆媛??섏씠???몄뀡???놁뒿?덈떎."}
+            return {"status": "STOPPED", "message": "중지할 실시간 페이퍼 세션이 없습니다."}
         return {**latest, "status": "STOPPED"}
     logger.info("[paper-live] session=%s stopped", session["id"])
     return session

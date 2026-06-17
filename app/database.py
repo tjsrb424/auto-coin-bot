@@ -491,6 +491,12 @@ def init_db() -> None:
                 checks_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         _ensure_column(conn, "paper_sessions", "mode", "TEXT NOT NULL DEFAULT 'SIMULATION'")
@@ -505,6 +511,10 @@ def init_db() -> None:
         _ensure_column(conn, "candidate_strategies", "backtest_trade_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "candidate_strategies", "backtest_average_trade_pnl", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "candidate_strategies", "warning", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "candidate_strategies", "name", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "candidate_strategies", "description", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "candidate_strategies", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'")
+        _ensure_column(conn, "candidate_strategies", "updated_at", "TEXT")
         _ensure_column(conn, "live_order_logs", "exchange", "TEXT NOT NULL DEFAULT 'upbit'")
         _ensure_column(conn, "live_order_logs", "session_id", "INTEGER")
         _ensure_column(conn, "live_order_logs", "candidate_strategy_id", "INTEGER")
@@ -524,6 +534,21 @@ def init_db() -> None:
         _ensure_column(conn, "live_order_logs", "strategy_name", "TEXT")
         _ensure_column(conn, "live_order_logs", "signal_reason", "TEXT")
         _ensure_column(conn, "live_order_logs", "candle_time_utc", "TEXT")
+        _ensure_column(conn, "risk_logs", "read_status", "TEXT NOT NULL DEFAULT 'UNREAD'")
+        _ensure_column(conn, "risk_logs", "resolved_at", "TEXT")
+        _ensure_column(conn, "risk_logs", "resolution_action", "TEXT")
+        conn.execute(
+            """
+            UPDATE candidate_strategies
+            SET name = CASE
+                    WHEN name IS NULL OR name = '' THEN strategy || ' · ' || unit || 'm · ' || printf('%.2f', score) || 'pt'
+                    ELSE name
+                END,
+                description = COALESCE(description, ''),
+                status = COALESCE(NULLIF(status, ''), 'ACTIVE'),
+                updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+            """
+        )
         conn.execute(
             """
             UPDATE paper_sessions
@@ -545,11 +570,20 @@ def insert_candles(candles: list[dict]) -> int:
         before = conn.total_changes
         conn.executemany(
             """
-            INSERT OR IGNORE INTO candles (
+            INSERT INTO candles (
                 market, unit, candle_time_utc, candle_time_kst, opening_price,
                 high_price, low_price, trade_price, candle_acc_trade_price,
                 candle_acc_trade_volume, timestamp
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(market, unit, candle_time_utc) DO UPDATE SET
+                candle_time_kst = excluded.candle_time_kst,
+                opening_price = excluded.opening_price,
+                high_price = excluded.high_price,
+                low_price = excluded.low_price,
+                trade_price = excluded.trade_price,
+                candle_acc_trade_price = excluded.candle_acc_trade_price,
+                candle_acc_trade_volume = excluded.candle_acc_trade_volume,
+                timestamp = excluded.timestamp
             """,
             [
                 (
@@ -708,6 +742,7 @@ def save_validation_run(market: str, strategy: str, request: dict, rows: list[di
 
 
 def save_candidate_strategy(candidate: dict) -> int:
+    now_utc = _utc_now()
     with get_connection() as conn:
         cursor = conn.execute(
             """
@@ -715,8 +750,8 @@ def save_candidate_strategy(candidate: dict) -> int:
                 strategy, parameters_json, unit, market, backtest_period, score,
                 backtest_total_return, backtest_mdd, backtest_win_rate,
                 backtest_profit_factor, backtest_trade_count,
-                backtest_average_trade_pnl, warning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                backtest_average_trade_pnl, warning, name, description, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate["strategy"],
@@ -732,6 +767,10 @@ def save_candidate_strategy(candidate: dict) -> int:
                 candidate.get("backtest_trade_count", 0),
                 candidate.get("backtest_average_trade_pnl", 0.0),
                 candidate.get("warning", ""),
+                candidate.get("name") or f"{candidate['strategy']} · {candidate['unit']}m · {float(candidate['score']):.2f}pt",
+                candidate.get("description", ""),
+                candidate.get("status", "ACTIVE"),
+                now_utc,
             ),
         )
         return int(cursor.lastrowid)
@@ -766,6 +805,64 @@ def load_candidate_strategy(candidate_id: int) -> dict | None:
     item = dict(row)
     item["parameters"] = json.loads(item.pop("parameters_json"))
     return item
+
+
+def update_candidate_strategy(candidate_id: int, updates: dict) -> dict | None:
+    current = load_candidate_strategy(candidate_id)
+    if current is None:
+        return None
+    allowed = {
+        "name",
+        "description",
+        "strategy",
+        "parameters",
+        "unit",
+        "market",
+        "backtest_period",
+        "score",
+        "backtest_total_return",
+        "backtest_mdd",
+        "backtest_win_rate",
+        "backtest_profit_factor",
+        "backtest_trade_count",
+        "backtest_average_trade_pnl",
+        "warning",
+        "status",
+    }
+    values = {key: value for key, value in updates.items() if key in allowed}
+    if not values:
+        return current
+    db_values = {}
+    for key, value in values.items():
+        if key == "parameters":
+            db_values["parameters_json"] = json.dumps(value or {}, ensure_ascii=False)
+        else:
+            db_values[key] = value
+    db_values["updated_at"] = _utc_now()
+    columns = ", ".join(f"{key} = ?" for key in db_values)
+    params = list(db_values.values()) + [candidate_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE candidate_strategies SET {columns} WHERE id = ?", params)
+    return load_candidate_strategy(candidate_id)
+
+
+def clone_candidate_strategy(candidate_id: int) -> dict | None:
+    current = load_candidate_strategy(candidate_id)
+    if current is None:
+        return None
+    clone = {
+        **current,
+        "name": f"{current.get('name') or current['strategy']} 복사본",
+        "description": current.get("description", ""),
+        "status": "INACTIVE",
+    }
+    new_id = save_candidate_strategy(clone)
+    return load_candidate_strategy(new_id)
+
+
+def set_candidate_strategy_status(candidate_id: int, status: str) -> dict | None:
+    normalized = "ACTIVE" if status.upper() == "ACTIVE" else "INACTIVE"
+    return update_candidate_strategy(candidate_id, {"status": normalized})
 
 
 def pause_running_forward_sessions_on_startup() -> int:
@@ -1550,6 +1647,87 @@ def load_risk_logs(limit: int = 100, exchange: str = "bithumb", market: str = "K
         item["checks"] = json.loads(item.pop("checks_json") or "{}")
         logs.append(item)
     return logs
+
+
+def update_risk_log_resolution(log_id: int, action: str) -> dict | None:
+    normalized = action.upper()
+    if normalized not in {"READ", "IGNORE", "RETRY"}:
+        normalized = "READ"
+    read_status = "IGNORED" if normalized == "IGNORE" else "READ"
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM risk_logs WHERE id = ?", (log_id,)).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            """
+            UPDATE risk_logs
+            SET read_status = ?,
+                resolved_at = ?,
+                resolution_action = ?
+            WHERE id = ?
+            """,
+            (read_status, _utc_now(), normalized, log_id),
+        )
+        updated = conn.execute("SELECT * FROM risk_logs WHERE id = ?", (log_id,)).fetchone()
+    item = dict(updated)
+    item["allowed"] = bool(item.get("allowed"))
+    item["checks"] = json.loads(item.pop("checks_json") or "{}")
+    return item
+
+
+def load_app_settings() -> dict:
+    with get_connection() as conn:
+        _ensure_app_settings_table(conn)
+        rows = conn.execute("SELECT key, value_json FROM app_settings").fetchall()
+    settings = {}
+    for row in rows:
+        try:
+            settings[row["key"]] = json.loads(row["value_json"])
+        except json.JSONDecodeError:
+            settings[row["key"]] = None
+    return settings
+
+
+def update_app_settings(settings: dict) -> dict:
+    safe_settings = _sanitize_app_settings(settings)
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        _ensure_app_settings_table(conn)
+        for key, value in safe_settings.items():
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(value, ensure_ascii=False), now_utc),
+            )
+    return load_app_settings()
+
+
+def _ensure_app_settings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _sanitize_app_settings(settings: dict) -> dict:
+    blocked_fragments = ("secret", "access_key", "authorization", "jwt", "token", "api_key")
+    safe = {}
+    for key, value in settings.items():
+        lowered = str(key).lower()
+        if any(fragment in lowered for fragment in blocked_fragments):
+            continue
+        safe[key] = value
+    return safe
 
 
 def _normalize_risk_state(row: dict) -> dict:

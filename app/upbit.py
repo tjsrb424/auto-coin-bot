@@ -51,3 +51,42 @@ async def fetch_minute_candles(
                 break
 
     return sorted(collected, key=lambda item: item["candle_date_time_utc"])
+
+
+async def fetch_day_candles(
+    market: str = "KRW-BTC",
+    count: int = 200,
+    to: str | None = None,
+) -> list[dict[str, Any]]:
+    if count < 1 or count > 20000:
+        raise UpbitClientError("캔들 개수는 1~20000 범위여야 합니다.")
+
+    collected: list[dict[str, Any]] = []
+    cursor = to
+    remaining = count
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while remaining > 0:
+            batch_count = min(remaining, 200)
+            params: dict[str, Any] = {"market": market, "count": batch_count}
+            if cursor:
+                params["to"] = cursor
+            response = await client.get(
+                f"{UPBIT_BASE_URL}/v1/candles/days",
+                params=params,
+            )
+            if response.status_code >= 400:
+                raise UpbitClientError(f"업비트 일봉 조회 실패: {response.text}")
+            batch = response.json()
+            if not batch:
+                break
+            for item in batch:
+                item["unit"] = 1440
+            collected.extend(batch)
+            remaining -= len(batch)
+            oldest = min(item["candle_date_time_utc"] for item in batch)
+            cursor = datetime.fromisoformat(oldest).strftime("%Y-%m-%dT%H:%M:%S")
+            if len(batch) < batch_count:
+                break
+
+    return sorted(collected, key=lambda item: item["candle_date_time_utc"])

@@ -121,12 +121,12 @@ body {
 
 .ref-kst-clock {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
-  margin-left: 10px;
+  margin-left: 8px;
   padding-top: 3px;
   color: rgba(145, 159, 181, 0.72);
-  font-size: 12px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
   line-height: 1;
@@ -475,7 +475,29 @@ body {
   display: flex;
   align-items: center;
   gap: 18px;
+  overflow: hidden;
   padding: 0 22px;
+}
+
+.ref-kpi::before {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: translateX(-42%);
+}
+
+.ref-kpi.is-value-up::before {
+  background:
+    linear-gradient(105deg, transparent 0%, rgba(34, 214, 111, 0.04) 30%, rgba(34, 214, 111, 0.28) 50%, rgba(21, 235, 195, 0.08) 68%, transparent 100%);
+  animation: ref-kpi-rise-flash 920ms cubic-bezier(0.2, 0.9, 0.2, 1);
+}
+
+.ref-kpi.is-value-down::before {
+  background:
+    linear-gradient(105deg, transparent 0%, rgba(255, 64, 90, 0.04) 30%, rgba(255, 64, 90, 0.26) 50%, rgba(255, 132, 93, 0.08) 68%, transparent 100%);
+  animation: ref-kpi-fall-flash 920ms cubic-bezier(0.2, 0.9, 0.2, 1);
 }
 
 .kpi-asset { left: 208px; width: 277px; }
@@ -514,6 +536,19 @@ body {
   font-size: 23px;
   font-weight: 850;
   line-height: 1.12;
+  transition: color 180ms ease, filter 180ms ease, text-shadow 180ms ease;
+}
+
+.ref-kpi.is-value-up strong {
+  color: #36f08b;
+  filter: drop-shadow(0 0 10px rgba(34, 214, 111, 0.28));
+  text-shadow: 0 0 18px rgba(34, 214, 111, 0.3);
+}
+
+.ref-kpi.is-value-down strong {
+  color: #ff5a70;
+  filter: drop-shadow(0 0 10px rgba(255, 64, 90, 0.26));
+  text-shadow: 0 0 18px rgba(255, 64, 90, 0.28);
 }
 
 .ref-kpi-sub {
@@ -573,6 +608,34 @@ body {
   100% {
     transform: translateY(-1.15em);
     filter: blur(0);
+  }
+}
+
+@keyframes ref-kpi-rise-flash {
+  0% {
+    opacity: 0;
+    transform: translateX(-46%);
+  }
+  18% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(42%);
+  }
+}
+
+@keyframes ref-kpi-fall-flash {
+  0% {
+    opacity: 0;
+    transform: translateX(-46%);
+  }
+  18% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(42%);
   }
 }
 
@@ -665,6 +728,14 @@ body {
   font-weight: 850;
 }
 
+.ref-market-title strong.ref-negative {
+  color: var(--ref-red);
+}
+
+.ref-market-title strong.ref-positive {
+  color: var(--ref-green);
+}
+
 .ref-market-stats {
   position: absolute;
   left: 362px;
@@ -685,6 +756,14 @@ body {
 .ref-market-stats b {
   color: var(--ref-green);
   font-weight: 800;
+}
+
+.ref-market-stats span.ref-negative b {
+  color: var(--ref-red);
+}
+
+.ref-market-stats span.ref-positive b {
+  color: var(--ref-green);
 }
 
 .ref-market-stats em {
@@ -736,8 +815,13 @@ body {
   color: #f0edff;
 }
 
-.ref-left-tools .is-muted {
+.ref-left-tools .is-muted,
+.ref-left-tools .is-disabled {
   opacity: 0.25;
+}
+
+.ref-left-tools button:disabled {
+  cursor: not-allowed;
 }
 
 .ref-left-tools span {
@@ -764,6 +848,10 @@ body {
 .ref-chart-meta strong {
   color: var(--ref-green);
   font-weight: 800;
+}
+
+.ref-chart-meta strong.ref-negative {
+  color: #ff405a;
 }
 
 .ref-ma-labels {
@@ -819,6 +907,33 @@ body {
   left: 0;
   right: 0;
   height: 1px;
+}
+
+.ref-chart-tooltip {
+  position: absolute;
+  z-index: 7;
+  display: grid;
+  width: 174px;
+  gap: 3px;
+  border: 1px solid rgba(123, 77, 255, 0.46);
+  border-radius: 6px;
+  background: rgba(8, 16, 28, 0.92);
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.28);
+  color: #dce7f5;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.ref-chart-tooltip b {
+  color: #f0edff;
+  font-size: 11px;
+}
+
+.ref-chart-tooltip em {
+  color: #9fb0c6;
+  font-style: normal;
+  font-weight: 800;
 }
 
 .ref-chart-grid {
@@ -1795,6 +1910,11 @@ body {
     transform: translateY(-1.15em);
   }
 
+  .ref-kpi.is-value-up::before,
+  .ref-kpi.is-value-down::before {
+    animation: none;
+  }
+
   .ref-panel:hover,
   .ref-nav-item:hover,
   .ref-signal-card:hover,
@@ -2486,6 +2606,20 @@ body {
   font-size: 13px;
 }
 
+.ref-strategy-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: #dbe5f3;
+  font: inherit;
+  outline: none;
+}
+
+.ref-strategy-search input::placeholder {
+  color: #6f7f94;
+}
+
 .ref-strategy-tabs {
   display: flex;
   gap: 17px;
@@ -2523,6 +2657,10 @@ body {
   background: rgba(12, 23, 36, 0.62);
   padding: 13px 13px;
   text-align: left;
+}
+
+.ref-strategy-list-card:disabled {
+  opacity: 0.72;
 }
 
 .ref-strategy-list-card.is-selected {
@@ -2800,6 +2938,43 @@ body {
   font-size: 12px;
 }
 
+.ref-risk-form.compact {
+  margin-top: 9px;
+  grid-template-columns: 92px minmax(0, 1fr) 74px;
+}
+
+.ref-param-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ref-param-form label {
+  display: grid;
+  gap: 5px;
+  color: #9dadbf;
+  font-size: 11px;
+}
+
+.ref-param-form input {
+  height: 28px;
+  border: 1px solid #26384d;
+  border-radius: 5px;
+  background: rgba(12, 23, 36, 0.72);
+  color: #dbe5f3;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ref-editor-hint {
+  margin-top: 9px;
+  color: #7f8fa4;
+  font-size: 11px;
+  font-weight: 750;
+}
+
 .ref-risk-form i {
   width: 37px;
   height: 22px;
@@ -2989,12 +3164,12 @@ body {
   grid-template-columns: 74px 86px 106px 116px;
   gap: 9px;
   align-items: center;
-  padding: 17px;
+  padding: 14px 17px 22px;
 }
 
 .ref-strategy-actions-panel button {
   display: flex;
-  height: 54px;
+  height: 48px;
   align-items: center;
   justify-content: center;
   gap: 7px;
@@ -3004,6 +3179,10 @@ body {
   color: #dbe5f3;
   font-size: 13px;
   font-weight: 850;
+}
+
+.ref-strategy-actions-panel button:disabled {
+  opacity: 0.55;
 }
 
 .ref-strategy-actions-panel .primary {
@@ -3022,6 +3201,27 @@ body {
   border-color: rgba(43, 149, 255, 0.45);
   background: rgba(43, 149, 255, 0.14);
   color: #58b6ff;
+}
+
+.ref-strategy-actions-panel p {
+  position: absolute;
+  left: 17px;
+  right: 17px;
+  bottom: 6px;
+  overflow: hidden;
+  margin: 0;
+  font-size: 11px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-action-message {
+  color: #22d66f;
+}
+
+.ref-action-error {
+  color: #ff5368;
 }
 
 

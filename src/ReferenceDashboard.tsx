@@ -44,6 +44,13 @@ const STAGE_HEIGHT = 941;
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 const MARKET = "KRW-BTC";
 const CHART_UNIT = 15;
+const CHART_TIMEFRAMES = [
+  { label: "1m", unit: 1, disabled: false },
+  { label: "15m", unit: 15, disabled: false },
+  { label: "1h", unit: 60, disabled: false },
+  { label: "4h", unit: 240, disabled: false },
+  { label: "1D", unit: 1440, disabled: false }
+] as const;
 
 type Tone = "purple" | "cyan" | "green" | "amber" | "red";
 
@@ -65,11 +72,23 @@ type LiveStatus = {
   emergency_stop?: boolean;
 };
 
+type BalanceEntry = {
+  balance?: number;
+  locked?: number;
+  avg_buy_price?: number;
+};
+
 type LiveBalances = LiveStatus & {
   balance_fetch_status?: string;
   error_message?: string | null;
   estimated_total_equity_krw?: number;
-  balances?: Record<string, { balance?: number; locked?: number; avg_buy_price?: number }>;
+  balances?: {
+    krw?: BalanceEntry;
+    btc?: BalanceEntry;
+    eth?: BalanceEntry;
+    by_currency?: Record<string, BalanceEntry>;
+  };
+  prices?: Record<string, { price?: number }>;
 };
 
 type PaperSession = {
@@ -112,6 +131,7 @@ type Candidate = {
   market?: string;
   parameters?: Record<string, number>;
   score?: number;
+  backtest_period?: string;
   backtest_total_return?: number;
   backtest_mdd?: number;
   backtest_win_rate?: number;
@@ -207,6 +227,7 @@ type LiveStrategyStatus = {
 
 type DashboardData = {
   candles: Candle[];
+  chartUnit: number;
   liveStatus: LiveStatus | null;
   liveBalances: LiveBalances | null;
   liveOrders: LiveOrder[];
@@ -258,7 +279,7 @@ async function fetchJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function postJson<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+async function postJson<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: body ? { "Content-Type": "application/json" } : undefined,
@@ -271,9 +292,23 @@ async function postJson<T>(path: string, body?: Record<string, unknown>): Promis
   return payload as T;
 }
 
-function useDashboardData() {
+async function patchJson<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.detail ?? payload.message ?? `${path} ${response.status}`);
+  }
+  return payload as T;
+}
+
+function useDashboardData(chartUnit: number) {
   const [data, setData] = React.useState<DashboardData>({
     candles: [],
+    chartUnit,
     liveStatus: null,
     liveBalances: null,
     liveOrders: [],
@@ -299,7 +334,7 @@ function useDashboardData() {
       };
 
       const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy] = await Promise.all([
-        settle("캔들", fetchJson<{ candles?: Candle[] }>(`/api/candles?market=${MARKET}&unit=${CHART_UNIT}&count=80`)),
+        settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
         settle("실거래 상태", fetchJson<LiveStatus>("/api/live/status")),
         settle("주문", fetchJson<{ orders?: LiveOrder[] }>("/api/live-orders")),
         settle("실시간 페이퍼", fetchJson<PaperSession>("/api/paper-trading/live/latest")),
@@ -317,6 +352,7 @@ function useDashboardData() {
 
       setData({
         candles: candlesResult?.candles ?? [],
+        chartUnit: candlesResult?.unit ?? chartUnit,
         liveStatus: status,
         liveBalances: balances,
         liveOrders: ordersResult?.orders ?? [],
@@ -329,7 +365,7 @@ function useDashboardData() {
         errors,
         updatedAt: new Date().toISOString()
       });
-  }, []);
+  }, [chartUnit]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -376,11 +412,56 @@ function formatNumber(value?: number | null, digits = 4) {
   return new Intl.NumberFormat("ko-KR", { maximumFractionDigits: digits }).format(value);
 }
 
+function parseDisplayNumber(value: string) {
+  const normalized = value.replace(/,/g, "").match(/[+-]?\d+(?:\.\d+)?/);
+  if (!normalized) return null;
+  const parsed = Number(normalized[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function formatAssetSub(value?: number | null) {
   if (value == null || !Number.isFinite(value)) return "-";
   if (value >= 1_000_000) return `≈ ${(value / 1_000_000).toFixed(2)}백만원`;
   if (value >= 10_000) return `≈ ${(value / 10_000).toFixed(1)}만원`;
   return `≈ ${formatKrw(value)}원`;
+}
+
+function balanceAmount(entry?: BalanceEntry | null) {
+  return (entry?.balance ?? 0) + (entry?.locked ?? 0);
+}
+
+function liveBtcStats(data: DashboardData) {
+  if (data.liveBalances?.balance_fetch_status !== "SUCCESS") return null;
+  const btc = data.liveBalances.balances?.btc ?? data.liveBalances.balances?.by_currency?.BTC;
+  const quantity = balanceAmount(btc);
+  const averageEntry = btc?.avg_buy_price ?? 0;
+  if (quantity <= 0 || averageEntry <= 0) return null;
+
+  const currentPrice = data.liveBalances.prices?.[MARKET]?.price
+    ?? latestCandle(data.candles)?.trade_price
+    ?? data.paper?.balance?.current_price
+    ?? null;
+  if (currentPrice == null || currentPrice <= 0) return null;
+
+  const costBasis = quantity * averageEntry;
+  const marketValue = quantity * currentPrice;
+  const unrealizedPnl = marketValue - costBasis;
+  const realizedPnl = data.liveOrders
+    .filter((order) => order.market === MARKET && order.actual_pnl != null)
+    .reduce((sum, order) => sum + (order.actual_pnl ?? 0), 0);
+  const totalPnl = realizedPnl + unrealizedPnl;
+
+  return {
+    quantity,
+    averageEntry,
+    currentPrice,
+    costBasis,
+    marketValue,
+    unrealizedPnl,
+    realizedPnl,
+    totalPnl,
+    totalReturn: costBasis > 0 ? totalPnl / costBasis : null
+  };
 }
 
 function parseDate(value?: string | null) {
@@ -414,6 +495,20 @@ function formatKstShort(value?: string | null) {
     minute: "2-digit",
     hour12: false
   }).format(date).replace(". ", "-").replace(".", "");
+}
+
+function formatChartCandleTime(value: string | null | undefined, unit: number) {
+  const date = parseDate(value);
+  if (!date) return "-";
+  if (unit >= 1440) {
+    return new Intl.DateTimeFormat("ko-KR", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(date).replace(/\. /g, "-").replace(".", "");
+  }
+  return formatKstTime(value);
 }
 
 function formatRuntimeDuration(ms?: number | null) {
@@ -635,12 +730,15 @@ function useKstClock() {
   }, []);
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
     hourCycle: "h23"
-  }).format(now);
+  }).format(now).replace(/\. /g, "-").replace(".", "");
 }
 
 function Topbar({ data }: { data: DashboardData }) {
@@ -770,8 +868,27 @@ function KpiCard({
   sub: string;
   tone?: Tone;
 }) {
+  const [direction, setDirection] = React.useState<"up" | "down" | null>(null);
+  const previousNumericRef = React.useRef<number | null>(parseDisplayNumber(value));
+
+  React.useEffect(() => {
+    const next = parseDisplayNumber(value);
+    const previous = previousNumericRef.current;
+    if (next == null) {
+      previousNumericRef.current = next;
+      return;
+    }
+    if (previous != null && next !== previous) {
+      setDirection(next > previous ? "up" : "down");
+      const timeoutId = window.setTimeout(() => setDirection(null), 920);
+      previousNumericRef.current = next;
+      return () => window.clearTimeout(timeoutId);
+    }
+    previousNumericRef.current = next;
+  }, [value]);
+
   return (
-    <RefPanel className={`ref-kpi ${className}`}>
+    <RefPanel className={`ref-kpi ${className} ${direction ? `is-value-${direction}` : ""}`}>
       <div className={`ref-kpi-icon ${tone}`}>{icon}</div>
       <div>
         <p>{label}</p>
@@ -799,18 +916,35 @@ function movingAverage(candles: Candle[], period: number) {
     .filter((item): item is { time: Time; value: number } => item != null);
 }
 
-function TradingChart({ candles, stageScale }: { candles: Candle[]; stageScale: number }) {
+function TradingChart({
+  candles,
+  stageScale,
+  chartUnit,
+  onHoverCandle
+}: {
+  candles: Candle[];
+  stageScale: number;
+  chartUnit: number;
+  onHoverCandle: (candle: Candle | null) => void;
+}) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const chartRef = React.useRef<ReturnType<typeof createChart> | null>(null);
   const candleSeriesRef = React.useRef<any>(null);
   const ma20Ref = React.useRef<any>(null);
   const ma50Ref = React.useRef<any>(null);
   const volumeSeriesRef = React.useRef<any>(null);
+  const candleByTimeRef = React.useRef<Map<number, Candle>>(new Map());
+  const onHoverCandleRef = React.useRef(onHoverCandle);
   const didSetInitialRangeRef = React.useRef(false);
   const previousDataLengthRef = React.useRef(0);
   const [hoverPoint, setHoverPoint] = React.useState<{ x: number; y: number } | null>(null);
+  const [hoverCandle, setHoverCandle] = React.useState<Candle | null>(null);
   const hasCandles = candles.length > 0;
   const latest = latestCandle(candles);
+
+  React.useEffect(() => {
+    onHoverCandleRef.current = onHoverCandle;
+  }, [onHoverCandle]);
 
   React.useEffect(() => {
     if (!containerRef.current || !hasCandles) return;
@@ -909,7 +1043,7 @@ function TradingChart({ candles, stageScale }: { candles: Candle[]; stageScale: 
       previousDataLengthRef.current = 0;
       chart.remove();
     };
-  }, [hasCandles]);
+  }, [hasCandles, chartUnit]);
 
   React.useEffect(() => {
     const chart = chartRef.current;
@@ -920,6 +1054,8 @@ function TradingChart({ candles, stageScale }: { candles: Candle[]; stageScale: 
     const currentRange = didSetInitialRangeRef.current ? timeScale.getVisibleLogicalRange() : null;
     const addedBars = Math.max(candles.length - previousLength, 0);
     const wasFollowingLatest = currentRange != null && previousLength > 0 && currentRange.to >= previousLength - 1.5;
+
+    candleByTimeRef.current = new Map(candles.map((candle) => [toChartTime(candle.candle_time_utc) as number, candle]));
 
     candleSeriesRef.current.setData(candles.map((candle) => ({
       time: toChartTime(candle.candle_time_utc),
@@ -964,18 +1100,47 @@ function TradingChart({ candles, stageScale }: { candles: Candle[]; stageScale: 
       onPointerMove={(event) => {
         const rect = event.currentTarget.getBoundingClientRect();
         const scale = stageScale || 1;
+        const x = (event.clientX - rect.left) / scale;
+        const y = (event.clientY - rect.top) / scale;
+        const coordinateToTime = chartRef.current?.timeScale() && (chartRef.current.timeScale() as any).coordinateToTime;
+        const hoveredTime = typeof coordinateToTime === "function" ? coordinateToTime.call(chartRef.current?.timeScale(), x) : null;
+        const hoveredCandle = typeof hoveredTime === "number" ? candleByTimeRef.current.get(hoveredTime) ?? null : null;
         setHoverPoint({
-          x: (event.clientX - rect.left) / scale,
-          y: (event.clientY - rect.top) / scale
+          x,
+          y
         });
+        setHoverCandle(hoveredCandle);
+        onHoverCandleRef.current(hoveredCandle);
       }}
-      onPointerLeave={() => setHoverPoint(null)}
+      onPointerLeave={() => {
+        setHoverPoint(null);
+        setHoverCandle(null);
+        onHoverCandleRef.current(null);
+      }}
+      onMouseLeave={() => {
+        setHoverPoint(null);
+        setHoverCandle(null);
+        onHoverCandleRef.current(null);
+      }}
     >
       <div ref={containerRef} className="ref-chart-canvas" />
       {hoverPoint && (
         <div className="ref-chart-hover" aria-hidden="true">
           <span className="ref-chart-hover-v" style={{ left: `${hoverPoint.x}px` }} />
           <span className="ref-chart-hover-h" style={{ top: `${hoverPoint.y}px` }} />
+          {hoverCandle && (
+            <span
+              className="ref-chart-tooltip"
+              style={{
+                left: `${Math.min(Math.max(hoverPoint.x + 14, 10), 660)}px`,
+                top: `${Math.min(Math.max(hoverPoint.y + 14, 10), 245)}px`
+              }}
+            >
+              <b>{formatChartCandleTime(hoverCandle.candle_time_utc, chartUnit)} · {chartUnitLabel(chartUnit)}</b>
+              <em>시 {formatKrw(hoverCandle.opening_price)} 고 {formatKrw(hoverCandle.high_price)}</em>
+              <em>저 {formatKrw(hoverCandle.low_price)} 종 {formatKrw(hoverCandle.trade_price)}</em>
+            </span>
+          )}
         </div>
       )}
       <span className="ref-chart-price">{formatKrw(latest?.trade_price)}</span>
@@ -984,14 +1149,34 @@ function TradingChart({ candles, stageScale }: { candles: Candle[]; stageScale: 
   );
 }
 
-function MainChartPanel({ data, stageScale }: { data: DashboardData; stageScale: number }) {
+function MainChartPanel({
+  data,
+  stageScale,
+  chartUnit,
+  onChartUnitChange
+}: {
+  data: DashboardData;
+  stageScale: number;
+  chartUnit: number;
+  onChartUnitChange: (unit: number) => void;
+}) {
+  const [hoveredCandle, setHoveredCandle] = React.useState<Candle | null>(null);
   const latest = latestCandle(data.candles);
-  const previous = previousCandle(data.candles);
+  const displayCandle = hoveredCandle ?? latest;
+  const displayIndex = displayCandle
+    ? data.candles.findIndex((candle) => candle.candle_time_utc === displayCandle.candle_time_utc)
+    : -1;
+  const previous = displayIndex > 0 ? data.candles[displayIndex - 1] : hoveredCandle ? null : previousCandle(data.candles);
   const indicators = computeIndicators(data.candles);
-  const change = latest && previous ? latest.trade_price - previous.trade_price : null;
-  const changeRate = latest && previous ? change! / previous.trade_price : null;
+  const change = displayCandle && previous ? displayCandle.trade_price - previous.trade_price : null;
+  const changeRate = displayCandle && previous ? change! / previous.trade_price : null;
+  const marketTone = change == null ? "" : change < 0 ? "ref-negative" : change > 0 ? "ref-positive" : "";
   const high = data.candles.length ? Math.max(...data.candles.map((candle) => candle.high_price)) : null;
   const low = data.candles.length ? Math.min(...data.candles.map((candle) => candle.low_price)) : null;
+
+  React.useEffect(() => {
+    setHoveredCandle(null);
+  }, [chartUnit, data.candles]);
 
   return (
     <RefPanel className="ref-chart-panel">
@@ -999,10 +1184,10 @@ function MainChartPanel({ data, stageScale }: { data: DashboardData; stageScale:
         <div className="ref-market-title">
           <span className="ref-bitcoin"><Bitcoin size={20} /></span>
           <b>BTC/KRW</b>
-          <strong>{formatKrw(latest?.trade_price)}</strong>
+          <strong className={marketTone}>{formatKrw(latest?.trade_price)}</strong>
         </div>
         <div className="ref-market-stats">
-          <span><b>{formatPercent(changeRate)}</b><b>{formatSignedKrw(change)}</b></span>
+          <span className={marketTone}><b>{formatPercent(changeRate)}</b><b>{formatSignedKrw(change)}</b></span>
           <span><em>고가</em>{formatKrw(high)}</span>
           <span><em>저가</em>{formatKrw(low)}</span>
           <span><em>거래량 ({data.candles.length}캔들)</em>{formatNumber(indicators.volume24, 2)} BTC</span>
@@ -1011,11 +1196,19 @@ function MainChartPanel({ data, stageScale }: { data: DashboardData; stageScale:
       <div className="ref-chart-toolbar">
         <div className="ref-left-tools">
           <button className="is-cross">+</button>
-          <button>1m</button>
-          <button className="is-selected">15m</button>
-          <button>1h</button>
-          <button>4h</button>
-          <button>1D</button>
+          {CHART_TIMEFRAMES.map((timeframe) => (
+            <button
+              key={timeframe.label}
+              className={`${chartUnit === timeframe.unit ? "is-selected" : ""} ${timeframe.disabled ? "is-disabled" : ""}`}
+              disabled={timeframe.disabled}
+              title={timeframe.disabled ? "일봉 데이터 API 연결 준비중" : `${timeframe.label} 차트 보기`}
+              onClick={() => {
+                if (!timeframe.disabled) onChartUnitChange(timeframe.unit);
+              }}
+            >
+              {timeframe.label}
+            </button>
+          ))}
           <span />
           <button><SlidersHorizontal size={18} /></button>
           <button>지표</button>
@@ -1030,20 +1223,21 @@ function MainChartPanel({ data, stageScale }: { data: DashboardData; stageScale:
         </div>
       </div>
       <div className="ref-chart-meta">
-        <b>BTC/KRW · 15 · {data.liveStatus?.exchange?.toUpperCase() ?? "EXCHANGE"}</b>
-        <span>시 {formatKrw(latest?.opening_price)}</span>
-        <span>고 {formatKrw(latest?.high_price)}</span>
-        <span>저 {formatKrw(latest?.low_price)}</span>
-        <span>종 {formatKrw(latest?.trade_price)}</span>
-        <strong>{formatSignedKrw(change)} ({formatPercent(changeRate)})</strong>
+        <b>BTC/KRW · {chartUnitLabel(chartUnit)} · {data.liveStatus?.exchange?.toUpperCase() ?? "EXCHANGE"}</b>
+        <span>{hoveredCandle ? formatChartCandleTime(hoveredCandle.candle_time_utc, chartUnit) : "최신"}</span>
+        <span>시 {formatKrw(displayCandle?.opening_price)}</span>
+        <span>고 {formatKrw(displayCandle?.high_price)}</span>
+        <span>저 {formatKrw(displayCandle?.low_price)}</span>
+        <span>종 {formatKrw(displayCandle?.trade_price)}</span>
+        <strong className={marketTone}>{formatSignedKrw(change)} ({formatPercent(changeRate)})</strong>
       </div>
       <div className="ref-ma-labels">
         <span>MA 20 close <b className="orange">{formatKrw(indicators.sma20)}</b></span>
         <span>RSI 14 <b className="blue">{indicators.rsi == null ? "-" : indicators.rsi.toFixed(1)}</b></span>
       </div>
-      <TradingChart candles={data.candles} stageScale={stageScale} />
+      <TradingChart candles={data.candles} stageScale={stageScale} chartUnit={chartUnit} onHoverCandle={setHoveredCandle} />
       <div className="ref-chart-footer">
-        <span>{formatKstTime(latest?.candle_time_utc)} (UTC+9)</span>
+        <span>{formatChartCandleTime(latest?.candle_time_utc, chartUnit)} (UTC+9)</span>
         <span>%</span>
         <span>로그</span>
         <b>자동</b>
@@ -1085,10 +1279,11 @@ function PositionPanel({ data }: { data: DashboardData }) {
   const latest = latestCandle(data.candles);
   const livePosition = data.liveStrategy?.position;
   const paperPosition = data.paper?.position;
-  const quantity = livePosition?.entry_volume ?? paperPosition?.btc_quantity ?? paperPosition?.current_position_volume ?? 0;
-  const entryPrice = livePosition?.entry_price ?? paperPosition?.avg_buy_price ?? paperPosition?.average_entry_price ?? null;
-  const currentPrice = livePosition?.current_price ?? data.paper?.balance?.current_price ?? latest?.trade_price ?? null;
-  const pnl = livePosition?.unrealized_pnl ?? data.paper?.balance?.unrealized_pnl ?? null;
+  const liveBtc = liveBtcStats(data);
+  const quantity = livePosition?.entry_volume ?? liveBtc?.quantity ?? paperPosition?.btc_quantity ?? paperPosition?.current_position_volume ?? 0;
+  const entryPrice = livePosition?.entry_price ?? liveBtc?.averageEntry ?? paperPosition?.avg_buy_price ?? paperPosition?.average_entry_price ?? null;
+  const currentPrice = livePosition?.current_price ?? liveBtc?.currentPrice ?? data.paper?.balance?.current_price ?? latest?.trade_price ?? null;
+  const pnl = livePosition?.unrealized_pnl ?? liveBtc?.unrealizedPnl ?? data.paper?.balance?.unrealized_pnl ?? null;
   const hasPosition = quantity > 0;
   const left = [
     ["포지션", hasPosition ? "BTC/KRW" : "-", hasPosition ? livePosition?.status ?? "보유 중" : "없음"],
@@ -1161,9 +1356,11 @@ function SignalPanel({ data }: { data: DashboardData }) {
 function PortfolioPanel({ data }: { data: DashboardData }) {
   const balanceOk = data.liveBalances?.balance_fetch_status === "SUCCESS";
   const btcPrice = latestCandle(data.candles)?.trade_price ?? 0;
-  const krw = balanceOk ? (data.liveBalances?.balances?.krw?.balance ?? 0) + (data.liveBalances?.balances?.krw?.locked ?? 0) : null;
-  const btc = balanceOk ? (data.liveBalances?.balances?.btc?.balance ?? 0) + (data.liveBalances?.balances?.btc?.locked ?? 0) : null;
-  const btcValue = btc == null ? null : btc * btcPrice;
+  const krwBalance = data.liveBalances?.balances?.krw ?? data.liveBalances?.balances?.by_currency?.KRW;
+  const btcBalance = data.liveBalances?.balances?.btc ?? data.liveBalances?.balances?.by_currency?.BTC;
+  const krw = balanceOk ? balanceAmount(krwBalance) : null;
+  const btc = balanceOk ? balanceAmount(btcBalance) : null;
+  const btcValue = btc == null ? null : btc * (data.liveBalances?.prices?.[MARKET]?.price ?? btcPrice);
   const paperEquity = data.paper?.balance?.equity ?? data.forward?.balance?.equity ?? null;
   const paperBtcValue = (data.paper?.position?.market_value ?? 0) || (data.paper?.position?.btc_quantity ?? 0) * (data.paper?.balance?.current_price ?? btcPrice);
   const total = balanceOk ? data.liveBalances?.estimated_total_equity_krw ?? null : paperEquity;
@@ -1566,8 +1763,10 @@ function AutoRightStack({ data }: { data: DashboardData }) {
   const total = data.liveBalances?.balance_fetch_status === "SUCCESS"
     ? data.liveBalances?.estimated_total_equity_krw
     : data.paper?.balance?.equity ?? data.forward?.balance?.equity ?? null;
-  const btcValue = ((data.liveBalances?.balances?.btc?.balance ?? 0) + (data.liveBalances?.balances?.btc?.locked ?? 0)) * (latest?.trade_price ?? 0);
-  const krwValue = (data.liveBalances?.balances?.krw?.balance ?? 0) + (data.liveBalances?.balances?.krw?.locked ?? 0);
+  const btcBalance = data.liveBalances?.balances?.btc ?? data.liveBalances?.balances?.by_currency?.BTC;
+  const krwBalance = data.liveBalances?.balances?.krw ?? data.liveBalances?.balances?.by_currency?.KRW;
+  const btcValue = balanceAmount(btcBalance) * (data.liveBalances?.prices?.[MARKET]?.price ?? latest?.trade_price ?? 0);
+  const krwValue = balanceAmount(krwBalance);
   const btcPercent = total && btcValue ? Math.min((btcValue / total) * 100, 100) : 50;
   const krwPercent = total && krwValue ? Math.min((krwValue / total) * 100, 100) : 20;
   const otherPercent = Math.max(100 - btcPercent - krwPercent, 0);
@@ -1727,41 +1926,152 @@ function formatTimeframe(unit?: number | null) {
   return `${unit}분`;
 }
 
+function chartUnitLabel(unit: number) {
+  return CHART_TIMEFRAMES.find((item) => item.unit === unit)?.label ?? formatTimeframe(unit);
+}
+
 function strategySparkTone(candidate?: Candidate | null) {
   const value = candidate?.backtest_total_return ?? candidate?.score ?? 0;
   return value < 0 ? "down" : "up";
 }
 
+type StrategyFilter = "ALL" | "ACTIVE" | "INACTIVE";
+
+type StrategyDraft = {
+  name: string;
+  description: string;
+  strategy: string;
+  unit: number;
+  market: string;
+  parameters: Record<string, number>;
+  status: string;
+};
+
+type StrategyValidationResult = {
+  run_id?: number;
+  rows?: Array<{
+    strategy?: string;
+    unit?: number;
+    period_label?: string;
+    metrics?: {
+      total_return?: number;
+      mdd?: number;
+      win_rate?: number;
+      profit_factor?: number;
+      trade_count?: number;
+      score?: number;
+    };
+  }>;
+};
+
+const STRATEGY_OPTIONS = ["ma_cross", "rsi", "volatility_breakout"];
+const TIMEFRAME_OPTIONS = [1, 5, 15, 60];
+
+function defaultStrategyParameters(strategy = "ma_cross"): Record<string, number> {
+  if (strategy === "rsi") return { period: 14, oversold: 30, overbought: 70 };
+  if (strategy === "volatility_breakout") return { k: 0.5, atr_period: 14, volume_window: 20 };
+  return { short_window: 12, long_window: 26, signal_window: 9 };
+}
+
+function strategyDraftFromCandidate(candidate: Candidate | null): StrategyDraft {
+  const strategy = candidate?.strategy ?? "ma_cross";
+  return {
+    name: candidate ? cleanStrategyName(candidate) : `${strategyLabel(strategy)} v2.1`,
+    description: candidate?.description && !/[Â�ìëí]/.test(candidate.description)
+      ? candidate.description
+      : "실제 후보 전략 데이터를 기반으로 조건과 리스크를 관리하는 자동매매 전략입니다.",
+    strategy,
+    unit: candidate?.unit ?? CHART_UNIT,
+    market: candidate?.market ?? MARKET,
+    parameters: { ...defaultStrategyParameters(strategy), ...(candidate?.parameters ?? {}) },
+    status: candidate?.status ?? "ACTIVE"
+  };
+}
+
+function formatFieldLabel(key: string) {
+  const labels: Record<string, string> = {
+    short_window: "단기 EMA",
+    long_window: "장기 EMA",
+    signal_window: "신호선",
+    period: "기간",
+    oversold: "과매도",
+    overbought: "과매수",
+    k: "돌파 계수",
+    atr_period: "ATR 기간",
+    volume_window: "거래량 기간"
+  };
+  return labels[key] ?? key.replace(/_/g, " ");
+}
+
+function buildCandidatePayload(draft: StrategyDraft, candidate?: Candidate | null) {
+  return {
+    name: draft.name.trim() || `${strategyLabel(draft.strategy)} v2.1`,
+    description: draft.description.trim(),
+    strategy: draft.strategy,
+    parameters: draft.parameters,
+    unit: draft.unit,
+    market: draft.market,
+    backtest_period: candidate?.backtest_period ?? "manual",
+    score: candidate?.score ?? 0,
+    backtest_total_return: candidate?.backtest_total_return ?? 0,
+    backtest_mdd: candidate?.backtest_mdd ?? 0,
+    backtest_win_rate: candidate?.backtest_win_rate ?? 0,
+    backtest_profit_factor: candidate?.backtest_profit_factor ?? 0,
+    backtest_trade_count: candidate?.backtest_trade_count ?? 0,
+    backtest_average_trade_pnl: candidate?.backtest_average_trade_pnl ?? 0,
+    warning: candidate?.warning ?? "",
+    status: draft.status
+  };
+}
+
 function StrategyListPanel({
   candidates,
   selectedId,
-  onSelect
+  onSelect,
+  filter,
+  onFilterChange,
+  search,
+  onSearchChange,
+  onCreate,
+  isBusy
 }: {
   candidates: Candidate[];
   selectedId: number | null;
   onSelect: (id: number) => void;
+  filter: StrategyFilter;
+  onFilterChange: (filter: StrategyFilter) => void;
+  search: string;
+  onSearchChange: (value: string) => void;
+  onCreate: () => void;
+  isBusy: boolean;
 }) {
   const activeCount = candidates.filter((candidate) => candidate.status === "ACTIVE").length;
   const inactiveCount = candidates.filter((candidate) => candidate.status !== "ACTIVE").length;
-  const rows = candidates.length ? candidates : [{ id: 0, strategy: "ma_cross", market: MARKET, unit: CHART_UNIT, status: "INACTIVE", name: "전략 없음" } as Candidate];
+  const filtered = candidates.filter((candidate) => {
+    const matchesStatus = filter === "ALL" || (filter === "ACTIVE" ? candidate.status === "ACTIVE" : candidate.status !== "ACTIVE");
+    const query = search.trim().toLowerCase();
+    const haystack = [cleanStrategyName(candidate), candidate.market, strategyLabel(candidate.strategy), formatTimeframe(candidate.unit), candidate.status].join(" ").toLowerCase();
+    return matchesStatus && (!query || haystack.includes(query));
+  });
+  const rows = filtered.length ? filtered : [{ id: 0, strategy: "ma_cross", market: MARKET, unit: CHART_UNIT, status: "INACTIVE", name: candidates.length ? "검색 결과 없음" : "전략 없음" } as Candidate];
 
   return (
     <RefPanel className="ref-strategy-list-panel">
       <div className="ref-strategy-list-head">
         <h2>전략 목록</h2>
-        <button><Plus size={18} />새 전략</button>
+        <button onClick={onCreate} disabled={isBusy}><Plus size={18} />새 전략</button>
       </div>
-      <div className="ref-strategy-search"><Search size={17} /><span>전략 검색</span></div>
+      <label className="ref-strategy-search"><Search size={17} /><input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="전략 검색" /></label>
       <div className="ref-strategy-tabs">
-        <button className="is-active">전체 ({candidates.length})</button>
-        <button>활성 {activeCount}</button>
-        <button>비활성 {inactiveCount}</button>
+        <button className={filter === "ALL" ? "is-active" : ""} onClick={() => onFilterChange("ALL")}>전체 ({candidates.length})</button>
+        <button className={filter === "ACTIVE" ? "is-active" : ""} onClick={() => onFilterChange("ACTIVE")}>활성 {activeCount}</button>
+        <button className={filter === "INACTIVE" ? "is-active" : ""} onClick={() => onFilterChange("INACTIVE")}>비활성 {inactiveCount}</button>
       </div>
       <div className="ref-strategy-cards">
         {rows.slice(0, 6).map((candidate) => {
           const active = candidate.id === selectedId;
           return (
-            <button key={candidate.id} className={`ref-strategy-list-card ${active ? "is-selected" : ""}`} onClick={() => candidate.id > 0 && onSelect(candidate.id)}>
+            <button key={candidate.id} className={`ref-strategy-list-card ${active ? "is-selected" : ""}`} onClick={() => candidate.id > 0 && onSelect(candidate.id)} disabled={candidate.id <= 0}>
               <div>
                 <strong>{cleanStrategyName(candidate)}</strong>
                 <RefStatusBadge value={statusLabel(candidate.status)} tone={statusTone(candidate.status)} />
@@ -1778,67 +2088,76 @@ function StrategyListPanel({
   );
 }
 
-function StrategyEditorPanel({ candidate }: { candidate: Candidate | null }) {
-  const params = candidate?.parameters ?? {};
-  const shortWindow = params.short_window ?? 12;
-  const longWindow = params.long_window ?? 26;
-  const conditionRows = [
-    ["EMA(20)", ">", "EMA(50)"],
-    ["EMA(50)", ">", "EMA(200)"],
-    ["종가", ">", "EMA(20)"]
-  ];
-  const exitRows = [
-    ["종가", "<", "EMA(20)"],
-    ["RSI(14)", ">", "70"]
-  ];
+function StrategyEditorPanel({
+  draft,
+  selected,
+  onDraftChange
+}: {
+  draft: StrategyDraft;
+  selected: Candidate | null;
+  onDraftChange: (next: StrategyDraft) => void;
+}) {
+  const params = draft.parameters;
+  const setParam = (key: string, value: number) => onDraftChange({ ...draft, parameters: { ...draft.parameters, [key]: value } });
+  const parameterRows = Object.entries(params).slice(0, 6);
+  const shortWindow = params.short_window ?? params.period ?? 12;
+  const longWindow = params.long_window ?? params.overbought ?? 26;
+  const conditionRows = draft.strategy === "rsi"
+    ? [["RSI", "<", String(params.oversold ?? 30)], ["RSI", ">", String(params.overbought ?? 70)], ["기간", "=", String(params.period ?? 14)]]
+    : draft.strategy === "volatility_breakout"
+      ? [["전일 고가", "+", `변동폭 x ${params.k ?? 0.5}`], ["ATR", ">", String(params.atr_period ?? 14)], ["거래량", ">", `${params.volume_window ?? 20}봉 평균`]]
+      : [[`EMA(${shortWindow})`, ">", `EMA(${longWindow})`], ["종가", ">", `EMA(${shortWindow})`], ["신호선", "=", String(params.signal_window ?? 9)]];
+  const exitRows = draft.strategy === "rsi"
+    ? [["RSI", ">", String(params.overbought ?? 70)], ["손절", "<", "-2.0%"]]
+    : [["종가", "<", `EMA(${shortWindow})`], ["트레일링", "=", "1.5%"]];
   const filters = [
-    ["거래량 (24h)", ">", "1,000,000,000"],
-    ["ATR(14)", ">", "현재가의 1.5%"],
-    ["변동성 (20)", "<", "5%"]
+    ["시장", "=", marketDisplay(draft.market)],
+    ["타임프레임", "=", formatTimeframe(draft.unit)],
+    ["상태", "=", statusLabel(draft.status)]
   ];
 
   return (
     <RefPanel className="ref-strategy-editor-panel">
       <h2>전략 편집</h2>
       <div className="ref-editor-top">
-        <label><span>전략 이름</span><input value={cleanStrategyName(candidate)} readOnly /></label>
-        <label className="ref-editor-state"><span>상태</span><RefStatusBadge value={statusLabel(candidate?.status)} tone={statusTone(candidate?.status)} /></label>
+        <label><span>전략 이름</span><input value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} /></label>
+        <label className="ref-editor-state"><span>상태</span><RefStatusBadge value={statusLabel(draft.status)} tone={statusTone(draft.status)} /></label>
       </div>
       <label className="ref-editor-description">
         <span>설명</span>
-        <textarea value={candidate?.description && !/[Â�ìëí]/.test(candidate.description) ? candidate.description : "이동평균 정배열 추세를 따라 매수하고, 추세 약화 시 익절/손절하는 전략"} readOnly />
-        <em>32 / 200</em>
+        <textarea value={draft.description} onChange={(event) => onDraftChange({ ...draft, description: event.target.value.slice(0, 200) })} />
+        <em>{draft.description.length} / 200</em>
       </label>
       <div className="ref-editor-row">
-        <label><span>거래 대상</span><div className="ref-token-input"><b>{marketDisplay(candidate?.market)}</b><button>+ 추가</button></div></label>
-        <label><span>타임프레임</span><select value={candidate?.unit ?? CHART_UNIT} disabled><option>{formatTimeframe(candidate?.unit ?? CHART_UNIT)}</option></select></label>
-        <label><span>전략 유형</span><select value={candidate?.strategy ?? "ma_cross"} disabled><option>{strategyLabel(candidate?.strategy)}</option></select></label>
+        <label><span>거래 대상</span><div className="ref-token-input"><b>{marketDisplay(draft.market)}</b><button type="button" disabled>KRW-BTC 고정</button></div></label>
+        <label><span>타임프레임</span><select value={draft.unit} onChange={(event) => onDraftChange({ ...draft, unit: Number(event.target.value) })}>{TIMEFRAME_OPTIONS.map((unit) => <option key={unit} value={unit}>{formatTimeframe(unit)}</option>)}</select></label>
+        <label><span>전략 유형</span><select value={draft.strategy} onChange={(event) => onDraftChange({ ...draft, strategy: event.target.value, parameters: defaultStrategyParameters(event.target.value) })}>{STRATEGY_OPTIONS.map((item) => <option key={item} value={item}>{strategyLabel(item)}</option>)}</select></label>
       </div>
       <div className="ref-editor-grid">
         <section>
           <h3>진입 조건 <button>AND⌄</button></h3>
-          {conditionRows.map((row, index) => (
-            <p key={index}><span>{index === 0 ? `EMA(${shortWindow})` : row[0]}</span><b>{row[1]}</b><span>{index === 0 ? `EMA(${longWindow})` : row[2]}</span><button>⋮</button></p>
-          ))}
-          <button className="ref-add-condition">+ 조건 추가</button>
+          {conditionRows.map((row, index) => <p key={index}><span>{row[0]}</span><b>{row[1]}</b><span>{row[2]}</span><button type="button">⋮</button></p>)}
+          <button className="ref-add-condition" type="button">실제 조건 미리보기</button>
           <h3>청산 조건 <button>OR⌄</button></h3>
-          {exitRows.map((row, index) => (
-            <p key={index}><span>{row[0]}</span><b>{row[1]}</b><span>{row[2]}</span><button>⋮</button></p>
-          ))}
-          <button className="ref-add-condition">+ 조건 추가</button>
+          {exitRows.map((row, index) => <p key={index}><span>{row[0]}</span><b>{row[1]}</b><span>{row[2]}</span><button type="button">⋮</button></p>)}
+          <button className="ref-add-condition" type="button">리스크 조건 연결</button>
         </section>
         <section>
-          <h3>필터 <em>(선택)</em></h3>
-          {filters.map((row) => (
-            <p key={row[0]}><span>{row[0]}</span><b>{row[1]}</b><span>{row[2]}</span><button>⊕</button></p>
-          ))}
-          <button className="ref-add-condition">+ 필터 추가</button>
-          <h3>리스크 관리</h3>
-          <div className="ref-risk-form">
-            <span>손절 (Stop Loss)</span><b>고정 비율</b><strong>-2.0%</strong>
-            <span>익절 (Take Profit)</span><b>고정 비율</b><strong>5.0%</strong>
-            <span>트레일링 스탑</span><i /> <strong>1.5%</strong>
-            <span>최대 보유 기간</span><b>12</b><strong>시간</strong>
+          <h3>파라미터 <em>(실제 저장)</em></h3>
+          <div className="ref-param-form">
+            {parameterRows.map(([key, value]) => (
+              <label key={key}>
+                <span>{formatFieldLabel(key)}</span>
+                <input type="number" value={Number(value)} step={key === "k" ? "0.1" : "1"} onChange={(event) => setParam(key, Number(event.target.value))} />
+              </label>
+            ))}
+          </div>
+          <h3>실행 필터</h3>
+          {filters.map((row) => <p key={row[0]}><span>{row[0]}</span><b>{row[1]}</b><span>{row[2]}</span><button type="button">⊕</button></p>)}
+          <div className="ref-editor-hint">선택 ID {selected?.id ?? "-"} · 최근 갱신 {formatKstShort(selected?.updated_at)}</div>
+          <div className="ref-risk-form compact">
+            <span>백테스트 기간</span><b>{selected?.backtest_period ?? "manual"}</b><strong>{formatNumber(selected?.score, 2)}점</strong>
+            <span>손익비</span><b>{formatNumber(selected?.backtest_profit_factor, 2)}</b><strong>{selected?.warning || "정상"}</strong>
           </div>
         </section>
       </div>
@@ -1851,12 +2170,38 @@ function StrategyEditorPanel({ candidate }: { candidate: Candidate | null }) {
   );
 }
 
-function StrategyRightPanels({ data, candidate }: { data: DashboardData; candidate: Candidate | null }) {
+function StrategyRightPanels({
+  data,
+  candidate,
+  draft,
+  isBusy,
+  actionMessage,
+  actionError,
+  validationResult,
+  onSave,
+  onClone,
+  onToggle,
+  onRunTest
+}: {
+  data: DashboardData;
+  candidate: Candidate | null;
+  draft: StrategyDraft;
+  isBusy: boolean;
+  actionMessage: string | null;
+  actionError: string | null;
+  validationResult: StrategyValidationResult | null;
+  onSave: () => void;
+  onClone: () => void;
+  onToggle: () => void;
+  onRunTest: () => void;
+}) {
   const totalReturn = candidate?.backtest_total_return ?? data.paper?.balance?.total_return ?? null;
   const winRate = candidate?.backtest_win_rate ?? null;
   const tradeCount = candidate?.backtest_trade_count ?? data.liveOrders.length;
   const mdd = candidate?.backtest_mdd ?? data.paper?.balance?.mdd ?? null;
-  const score = candidate?.score ?? null;
+  const latestValidation = validationResult?.rows?.[0];
+  const score = candidate?.score ?? latestValidation?.metrics?.score ?? null;
+  const statusIsActive = draft.status === "ACTIVE";
 
   return (
     <>
@@ -1874,7 +2219,7 @@ function StrategyRightPanels({ data, candidate }: { data: DashboardData; candida
       </RefPanel>
       <RefPanel className="ref-strategy-backtest-panel">
         <h3>백테스트 요약 <span>({data.liveStatus?.exchange ?? "거래소"} · {marketDisplay(candidate?.market)} · {formatTimeframe(candidate?.unit)})</span></h3>
-        <div className="ref-backtest-period">기간 <b>최근 데이터 기준</b></div>
+        <div className="ref-backtest-period">기간 <b>{validationResult ? `검증 Run #${validationResult.run_id ?? "-"}` : candidate?.backtest_period ?? "최근 데이터 기준"}</b></div>
         <div className="ref-backtest-grid">
           <p><span>총 수익률</span><b className="ref-positive">{formatPercent(totalReturn)}</b></p>
           <p><span>CAGR</span><b className="ref-positive">{formatPercent(totalReturn)}</b></p>
@@ -1885,30 +2230,153 @@ function StrategyRightPanels({ data, candidate }: { data: DashboardData; candida
           <p><span>최대 손실률</span><b className="ref-negative">{formatPercent(mdd)}</b></p>
           <p><span>점수</span><b>{formatNumber(score, 2)}</b></p>
         </div>
-        <button>백테스트 다시 실행</button>
+        <button onClick={onRunTest} disabled={isBusy}>백테스트 다시 실행</button>
       </RefPanel>
       <RefPanel className="ref-strategy-actions-panel">
-        <button className="primary"><Save size={18} />저장</button>
-        <button><Copy size={18} />복제</button>
-        <button className="danger"><PowerOff size={18} />비활성화</button>
-        <button className="blue"><Play size={18} />실행 테스트</button>
+        <button className="primary" onClick={onSave} disabled={isBusy}><Save size={18} />저장</button>
+        <button onClick={onClone} disabled={isBusy || !candidate}><Copy size={18} />복제</button>
+        <button className="danger" onClick={onToggle} disabled={isBusy || !candidate}><PowerOff size={18} />{statusIsActive ? "비활성화" : "활성화"}</button>
+        <button className="blue" onClick={onRunTest} disabled={isBusy}><Play size={18} />실행 테스트</button>
+        {(actionMessage || actionError) && <p className={actionError ? "ref-action-error" : "ref-action-message"}>{actionError ?? actionMessage}</p>}
       </RefPanel>
     </>
   );
 }
 
-function StrategiesView({ data }: { data: DashboardData }) {
+function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () => Promise<void> }) {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const [filter, setFilter] = React.useState<StrategyFilter>("ALL");
+  const [search, setSearch] = React.useState("");
+  const [draft, setDraft] = React.useState<StrategyDraft>(() => strategyDraftFromCandidate(null));
+  const [isBusy, setIsBusy] = React.useState(false);
+  const [actionMessage, setActionMessage] = React.useState<string | null>(null);
+  const [actionError, setActionError] = React.useState<string | null>(null);
+  const [validationResult, setValidationResult] = React.useState<StrategyValidationResult | null>(null);
+
   React.useEffect(() => {
-    if (selectedId == null && data.candidates.length > 0) setSelectedId(data.candidates[0].id);
+    if (data.candidates.length === 0) {
+      setSelectedId(null);
+      return;
+    }
+    if (selectedId == null || !data.candidates.some((candidate) => candidate.id === selectedId)) {
+      setSelectedId(data.candidates[0].id);
+    }
   }, [data.candidates, selectedId]);
+
   const selected = data.candidates.find((candidate) => candidate.id === selectedId) ?? data.candidates[0] ?? null;
+  React.useEffect(() => {
+    setDraft(strategyDraftFromCandidate(selected));
+    setActionMessage(null);
+    setActionError(null);
+    setValidationResult(null);
+  }, [selected?.id]);
+
+  const runAction = async (label: string, action: () => Promise<number | null | void>) => {
+    if (isBusy) return;
+    setIsBusy(true);
+    setActionError(null);
+    setActionMessage(`${label} 처리 중`);
+    try {
+      const nextSelectedId = await action();
+      await refresh();
+      if (typeof nextSelectedId === "number") setSelectedId(nextSelectedId);
+      setActionMessage(`${label} 완료`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : `${label} 실패`);
+      setActionMessage(null);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const createStrategy = () => runAction("새 전략 생성", async () => {
+    const payload = buildCandidatePayload(strategyDraftFromCandidate(null), null);
+    const created = await postJson<Candidate>("/api/candidate-strategies", payload);
+    setFilter("ALL");
+    setSearch("");
+    return created.id;
+  });
+
+  const saveStrategy = () => runAction(selected ? "전략 저장" : "전략 생성", async () => {
+    const payload = buildCandidatePayload(draft, selected);
+    if (!selected) {
+      const created = await postJson<Candidate>("/api/candidate-strategies", payload);
+      return created.id;
+    }
+    const result = await patchJson<{ candidate: Candidate }>(`/api/candidate-strategies/${selected.id}`, payload);
+    return result.candidate.id;
+  });
+
+  const cloneStrategy = () => runAction("전략 복제", async () => {
+    if (!selected) throw new Error("복제할 전략이 없습니다.");
+    const result = await postJson<{ candidate: Candidate }>(`/api/candidate-strategies/${selected.id}/clone`);
+    setFilter("ALL");
+    return result.candidate.id;
+  });
+
+  const toggleStrategy = () => runAction(draft.status === "ACTIVE" ? "전략 비활성화" : "전략 활성화", async () => {
+    if (!selected) throw new Error("상태를 변경할 전략이 없습니다.");
+    const nextStatus = draft.status === "ACTIVE" ? "INACTIVE" : "ACTIVE";
+    const result = await postJson<{ candidate: Candidate }>(`/api/candidate-strategies/${selected.id}/toggle`, { status: nextStatus });
+    setDraft(strategyDraftFromCandidate(result.candidate));
+    return result.candidate.id;
+  });
+
+  const runStrategyTest = () => runAction("전략 검증", async () => {
+    const result = await postJson<StrategyValidationResult>("/api/strategy-validation/run", {
+      market: draft.market,
+      strategy: draft.strategy,
+      timeframes: [draft.unit],
+      periods: ["30d"],
+      settings: draft.parameters,
+      risk: {}
+    });
+    setValidationResult(result);
+    const bestRow = result.rows?.find((row) => row.unit === draft.unit) ?? result.rows?.[0];
+    if (selected && bestRow?.metrics) {
+      const metrics = bestRow.metrics;
+      await patchJson<{ candidate: Candidate }>(`/api/candidate-strategies/${selected.id}`, {
+        ...buildCandidatePayload(draft, selected),
+        backtest_period: bestRow.period_label ?? "30d",
+        score: metrics.score ?? selected.score ?? 0,
+        backtest_total_return: metrics.total_return ?? selected.backtest_total_return ?? 0,
+        backtest_mdd: metrics.mdd ?? selected.backtest_mdd ?? 0,
+        backtest_win_rate: metrics.win_rate ?? selected.backtest_win_rate ?? 0,
+        backtest_profit_factor: metrics.profit_factor ?? selected.backtest_profit_factor ?? 0,
+        backtest_trade_count: metrics.trade_count ?? selected.backtest_trade_count ?? 0,
+        backtest_average_trade_pnl: metrics.trade_count ? (metrics.total_return ?? 0) / metrics.trade_count : selected.backtest_average_trade_pnl ?? 0
+      });
+    }
+    return selected?.id ?? null;
+  });
 
   return (
     <>
-      <StrategyListPanel candidates={data.candidates} selectedId={selected?.id ?? null} onSelect={setSelectedId} />
-      <StrategyEditorPanel candidate={selected} />
-      <StrategyRightPanels data={data} candidate={selected} />
+      <StrategyListPanel
+        candidates={data.candidates}
+        selectedId={selected?.id ?? null}
+        onSelect={setSelectedId}
+        filter={filter}
+        onFilterChange={setFilter}
+        search={search}
+        onSearchChange={setSearch}
+        onCreate={createStrategy}
+        isBusy={isBusy}
+      />
+      <StrategyEditorPanel draft={draft} selected={selected} onDraftChange={setDraft} />
+      <StrategyRightPanels
+        data={data}
+        candidate={selected}
+        draft={draft}
+        isBusy={isBusy}
+        actionMessage={actionMessage}
+        actionError={actionError}
+        validationResult={validationResult}
+        onSave={saveStrategy}
+        onClone={cloneStrategy}
+        onToggle={toggleStrategy}
+        onRunTest={runStrategyTest}
+      />
     </>
   );
 }
@@ -1922,7 +2390,9 @@ function DashboardView({
   activeStrategyCount,
   runningStrategyCount,
   winRate,
-  onOpenAutoTrade
+  onOpenAutoTrade,
+  chartUnit,
+  onChartUnitChange
 }: {
   data: DashboardData;
   scale: number;
@@ -1933,6 +2403,8 @@ function DashboardView({
   runningStrategyCount: number;
   winRate?: number | null;
   onOpenAutoTrade: () => void;
+  chartUnit: number;
+  onChartUnitChange: (unit: number) => void;
 }) {
   return (
     <>
@@ -1941,7 +2413,7 @@ function DashboardView({
       <KpiCard className="kpi-return" icon={<PieChart size={28} />} label="누적 수익률" value={formatPercent(totalReturn)} sub={formatSignedKrw(totalPnl)} tone="green" />
       <KpiCard className="kpi-strategy" icon={<Bot size={28} />} label="현재 전략 수" value={`${activeStrategyCount || "-"} 개`} sub={`실행 중 ${runningStrategyCount}개`} tone="amber" />
       <KpiCard className="kpi-win" icon={<Crosshair size={30} />} label="승률" value={formatPercent(winRate)} sub={`거래 ${data.liveOrders.length}건`} tone="red" />
-      <MainChartPanel data={data} stageScale={scale} />
+      <MainChartPanel data={data} stageScale={scale} chartUnit={chartUnit} onChartUnitChange={onChartUnitChange} />
       <BotStatusPanel data={data} onOpenAutoTrade={onOpenAutoTrade} />
       <PositionPanel data={data} />
       <SignalPanel data={data} />
@@ -1954,17 +2426,19 @@ function DashboardView({
 
 export function ReferenceDashboard() {
   const scale = useStageScale();
-  const { data, refresh } = useDashboardData();
+  const [chartUnit, setChartUnit] = React.useState(CHART_UNIT);
+  const { data, refresh } = useDashboardData(chartUnit);
   const [activeView, setActiveView] = React.useState<ReferenceView>("dashboard");
   const [isAutoToggling, setIsAutoToggling] = React.useState(false);
   const [autoToggleError, setAutoToggleError] = React.useState<string | null>(null);
   const scaledWidth = STAGE_WIDTH * scale;
   const scaledHeight = STAGE_HEIGHT * scale;
+  const liveBtc = liveBtcStats(data);
   const liveEquity = data.liveBalances?.balance_fetch_status === "SUCCESS" ? data.liveBalances?.estimated_total_equity_krw : null;
   const paperEquity = data.paper?.balance?.equity ?? data.forward?.balance?.equity ?? null;
   const totalEquity = liveEquity ?? paperEquity;
-  const totalPnl = data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
-  const totalReturn = data.paper?.balance?.total_return ?? data.forward?.balance?.total_return ?? null;
+  const totalPnl = liveBtc?.totalPnl ?? data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
+  const totalReturn = liveBtc?.totalReturn ?? data.paper?.balance?.total_return ?? data.forward?.balance?.total_return ?? null;
   const activeStrategyCount = data.candidates.filter((candidate) => candidate.status === "ACTIVE").length;
   const runningStrategyCount = [
     data.autoPilot?.session?.status,
@@ -2023,6 +2497,8 @@ export function ReferenceDashboard() {
               runningStrategyCount={runningStrategyCount}
               winRate={winRate}
               onOpenAutoTrade={() => setActiveView("auto-trade")}
+              chartUnit={chartUnit}
+              onChartUnitChange={setChartUnit}
             />
           )}
           {activeView === "auto-trade" && (
@@ -2033,7 +2509,7 @@ export function ReferenceDashboard() {
               autoToggleError={autoToggleError}
             />
           )}
-          {activeView === "strategies" && <StrategiesView data={data} />}
+          {activeView === "strategies" && <StrategiesView data={data} refresh={refresh} />}
         </div>
       </div>
     </main>
