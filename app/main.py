@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import logging
+import os
+import socket
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -8,10 +10,12 @@ from math import ceil
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.auth import auth_status, login_admin, logout_admin, require_admin_session
 from app.backtest import run_backtest
 from app.backtest import compare_strategies
 from app.auto_live_pilot import (
@@ -23,9 +27,11 @@ from app.auto_live_pilot import (
 )
 from app.database import (
     clone_candidate_strategy,
+    acquire_runtime_lock,
     create_forward_session_from_candidate,
     create_live_paper_session,
     get_last_live_order_time,
+    get_connection,
     get_live_order_log,
     has_unresolved_live_order,
     has_recent_live_order,
@@ -43,8 +49,10 @@ from app.database import (
     load_forward_sessions,
     load_latest_forward_session,
     load_live_order_logs,
+    load_runtime_lock,
     load_latest_paper_session,
     pause_running_forward_sessions_on_startup,
+    release_runtime_lock,
     save_backtest,
     save_candidate_strategy,
     save_paper_session,
@@ -102,12 +110,29 @@ from app.live_strategy_pilot import (
 )
 from app.paper_trading import run_paper_trading
 from app.strategy_validation import run_strategy_validation
-from app.upbit import UpbitClientError, fetch_day_candles, fetch_minute_candles
+from app.upbit import UpbitClientError, fetch_day_candles, fetch_minute_candles, fetch_tickers
 
 load_server_env()
 
 DEFAULT_MARKET = "KRW-BTC"
+RUNTIME_LOCK_ID = "auto-trading"
 logger = logging.getLogger("uvicorn.error")
+_latest_balance_sync_time_utc: str | None = None
+
+
+def _configure_runtime_logging() -> None:
+    log_dir = os.getenv("LOG_DIR", "").strip()
+    if not log_dir:
+        return
+    path = os.path.join(log_dir, "app.log")
+    os.makedirs(log_dir, exist_ok=True)
+    root = logging.getLogger()
+    if any(isinstance(handler, logging.FileHandler) and getattr(handler, "baseFilename", "") == path for handler in root.handlers):
+        return
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root.addHandler(handler)
 
 
 def _parse_utc(value: str) -> datetime:
@@ -125,6 +150,108 @@ def _format_upbit_to(value: datetime) -> str:
 
 def _format_candle_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "")
+
+
+def _health_payload(request: Request) -> dict:
+    runtime = _runtime_status_payload(request)
+    selected_exchange = os.getenv("AUTO_ALLOWED_EXCHANGE", os.getenv("EXCHANGE", "bithumb")).strip().lower()
+    if selected_exchange not in {"upbit", "bithumb"}:
+        selected_exchange = "bithumb"
+    database_status = "UNKNOWN"
+    try:
+        with get_connection() as conn:
+            conn.execute("SELECT 1").fetchone()
+        database_status = "OK"
+    except Exception as exc:
+        database_status = f"ERROR:{exc.__class__.__name__}"
+
+    risk_state = compute_risk_state(selected_exchange, os.getenv("AUTO_ALLOWED_MARKET", DEFAULT_MARKET))
+    scheduler = getattr(request.app.state, "scheduler", None)
+    scheduler_running = bool(scheduler and getattr(scheduler, "running", False))
+    scheduler_jobs = [job.id for job in scheduler.get_jobs()] if scheduler else []
+    return {
+        "server_status": "OK",
+        "database_status": database_status,
+        "broker_status": _live_status(selected_exchange)["broker_status"],
+        "selected_exchange": selected_exchange,
+        "scheduler_status": "RUNNING" if scheduler_running else "STOPPED",
+        "scheduler_jobs": scheduler_jobs,
+        "risk_manager_status": risk_state.get("status", "UNKNOWN"),
+        "emergency_stop_status": "ON" if is_emergency_stopped() else "OFF",
+        "live_trading_enabled": runtime["live_trading_enabled"],
+        "auto_trading_enabled": runtime["live_auto_trading_enabled"],
+        "auto_strategy_enabled": runtime["auto_strategy_pilot_enabled"],
+        "auto_runtime_status": runtime["runtime_status"],
+        "auto_strategy_status": runtime["strategy_status"],
+        "live_session_status": runtime["strategy_status"] if runtime["strategy_status"] != "STOPPED" else "PAUSED",
+        "latest_order_sync_time": runtime["last_order_time_utc"],
+        "latest_balance_sync_time": _latest_balance_sync_time_utc,
+    }
+
+
+def _instance_id() -> str:
+    return os.getenv("RUNTIME_INSTANCE_ID", "").strip() or getattr(app.state, "instance_id", "unknown")
+
+
+def _hostname() -> str:
+    return socket.gethostname()
+
+
+def _server_ip() -> str:
+    try:
+        return socket.gethostbyname(_hostname())
+    except OSError:
+        return "unknown"
+
+
+def _runtime_status_payload(request: Request) -> dict:
+    strategy = live_strategy_status()
+    auto = auto_live_pilot_status()
+    session = strategy.get("session") or auto.get("session") or {}
+    raw_status = str(session.get("status") or "")
+    if is_emergency_stopped():
+        runtime_status = "EMERGENCY_STOPPED"
+    elif raw_status in {"READY", "RUNNING"} and bool(session.get("auto_enabled", False)):
+        runtime_status = "RUNNING"
+    elif raw_status in {"PAUSED", "LIVE_PAUSED"}:
+        runtime_status = "PAUSED"
+    elif raw_status == "STOPPED":
+        runtime_status = "STOPPED"
+    else:
+        runtime_status = "OFF"
+    lock = load_runtime_lock(RUNTIME_LOCK_ID)
+    live_config = LiveTradingConfig.for_exchange(strategy.get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb"))
+    return {
+        "app_env": os.getenv("APP_ENV", "development"),
+        "exchange": strategy.get("exchange") or auto.get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb"),
+        "live_trading_enabled": live_config.live_trading_enabled,
+        "live_auto_trading_enabled": bool(strategy.get("live_auto_trading_enabled") or auto.get("live_auto_trading_enabled")),
+        "auto_strategy_pilot_enabled": bool(strategy.get("auto_strategy_pilot_enabled")),
+        "runtime_status": runtime_status,
+        "strategy_status": raw_status or "STOPPED",
+        "emergency_stop": is_emergency_stopped(),
+        "selected_strategy_id": session.get("candidate_strategy_id"),
+        "selected_market": strategy.get("market") or auto.get("market") or DEFAULT_MARKET,
+        "last_tick_time_utc": session.get("last_processed_candle_time_utc"),
+        "last_order_time_utc": session.get("last_order_time_utc") or get_last_live_order_time(),
+        "server_started_at": getattr(request.app.state, "server_started_at", None),
+        "instance_id": _instance_id(),
+        "hostname": _hostname(),
+        "server_ip": _server_ip(),
+        "runtime_owner": lock.get("runtime_owner") if lock else None,
+        "runtime_lock": lock,
+    }
+
+
+def _try_acquire_runtime_lock(owner: str) -> tuple[bool, dict | None]:
+    return acquire_runtime_lock(
+        lock_id=RUNTIME_LOCK_ID,
+        instance_id=_instance_id(),
+        hostname=_hostname(),
+        app_env=os.getenv("APP_ENV", "development"),
+        runtime_owner=owner,
+        ttl_seconds=int(os.getenv("RUNTIME_LOCK_TTL_SECONDS", "3600")),
+    )
 
 
 async def _load_period_candles(market: str, unit: int, start_time_utc: str, end_time_utc: str) -> list[dict]:
@@ -285,6 +412,17 @@ class LiveStrategyPilotStartRequest(BaseModel):
     order_confirmation: str = ""
 
 
+class RuntimeStartRequest(BaseModel):
+    candidate_strategy_id: int
+    confirmation: str = ""
+    order_confirmation: str = ""
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 class ExitCandidateActionRequest(BaseModel):
     candidate_id: int
 
@@ -306,6 +444,9 @@ class ExitOrderCancelRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     load_server_env()
+    _configure_runtime_logging()
+    _.state.server_started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    _.state.instance_id = os.getenv("RUNTIME_INSTANCE_ID", f"{socket.gethostname()}-{uuid.uuid4().hex[:12]}")
     init_db()
     reset_live_runtime_state()
     insert_live_mode_event("SERVER_START", current_live_mode(), "서버 시작 시 실거래 모드는 자동 잠금 상태로 초기화되었습니다.")
@@ -355,6 +496,8 @@ async def lifespan(_: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
+    _.state.scheduler = scheduler
+    _.state.scheduler_started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     logger.info("[paper-live] scheduler started interval_seconds=60")
     logger.info("[paper-forward] scheduler started interval_seconds=60")
     logger.info("[auto-live] pilot scheduler started interval_seconds=10")
@@ -366,18 +509,125 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Coin Bot Lab API", version="0.0.1", lifespan=lifespan)
+_cors_origins = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.middleware("http")
+async def require_admin_for_api(request: Request, call_next):
+    if request.method == "OPTIONS" or not request.url.path.startswith("/api/") or request.url.path.startswith("/api/auth/"):
+        return await call_next(request)
+    try:
+        require_admin_session(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
+
+
+@app.get("/api/auth/status")
+def auth_status_endpoint(request: Request) -> dict:
+    return auth_status(request)
+
+
+@app.post("/api/auth/login")
+def login_endpoint(payload: AdminLoginRequest, response: Response) -> dict:
+    return login_admin(payload.username, payload.password, response)
+
+
+@app.post("/api/auth/logout")
+def logout_endpoint(response: Response) -> dict:
+    return logout_admin(response)
+
+
+@app.get("/api/runtime/status")
+def get_runtime_status(request: Request) -> dict:
+    return _runtime_status_payload(request)
+
+
+@app.post("/api/runtime/start")
+def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request) -> dict:
+    if payload.confirmation != "AUTO STRATEGY ENABLE":
+        raise HTTPException(status_code=400, detail="AUTO STRATEGY ENABLE confirmation is required.")
+    acquired, current_lock = _try_acquire_runtime_lock("admin-ui")
+    if not acquired:
+        return {
+            "ok": False,
+            "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.",
+            "runtime_lock": current_lock,
+            **_runtime_status_payload(request),
+        }
+    result = start_live_strategy_pilot(
+        candidate_strategy_id=payload.candidate_strategy_id,
+        confirmation=payload.confirmation,
+        order_confirmation=payload.order_confirmation,
+    )
+    if result.get("ok") is False:
+        release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    return {**result, **_runtime_status_payload(request)}
+
+
+@app.post("/api/runtime/stop")
+def stop_runtime_endpoint(request: Request) -> dict:
+    strategy = stop_live_strategy_pilot()
+    auto = stop_auto_live_pilot()
+    release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    insert_live_mode_event("AUTO_TRADING_STOPPED_BY_USER", current_live_mode(), "사용자가 UI에서 자동매매 Runtime을 중지했습니다.")
+    return {"ok": True, "strategy": strategy, "auto": auto, **_runtime_status_payload(request)}
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health(request: Request) -> dict:
+    return _health_payload(request)
+
+
+@app.get("/health/live")
+def health_live(request: Request) -> dict:
+    payload = _health_payload(request)
+    return {
+        "server_status": payload["server_status"],
+        "database_status": payload["database_status"],
+        "scheduler_status": payload["scheduler_status"],
+        "auto_runtime_status": payload["auto_runtime_status"],
+    }
+
+
+@app.get("/health/broker")
+def health_broker(request: Request) -> dict:
+    payload = _health_payload(request)
+    return {
+        "broker_status": payload["broker_status"],
+        "selected_exchange": payload["selected_exchange"],
+        "live_trading_enabled": payload["live_trading_enabled"],
+        "auto_trading_enabled": payload["auto_trading_enabled"],
+        "latest_order_sync_time": payload["latest_order_sync_time"],
+        "latest_balance_sync_time": payload["latest_balance_sync_time"],
+    }
+
+
+@app.get("/health/risk")
+def health_risk(request: Request) -> dict:
+    payload = _health_payload(request)
+    return {
+        "risk_manager_status": payload["risk_manager_status"],
+        "emergency_stop_status": payload["emergency_stop_status"],
+        "selected_exchange": payload["selected_exchange"],
+    }
+
+
+@app.get("/health/scheduler")
+def health_scheduler(request: Request) -> dict:
+    payload = _health_payload(request)
+    return {
+        "scheduler_status": payload["scheduler_status"],
+        "started_at": getattr(request.app.state, "scheduler_started_at", None),
+        "jobs": payload.get("scheduler_jobs", []),
+    }
 
 
 @app.get("/api/candles")
@@ -636,6 +886,38 @@ async def _market_snapshot(market: str) -> dict | None:
         return None
 
 
+async def _market_snapshots(markets: list[str], exchange: str = "upbit") -> dict[str, dict]:
+    unique_markets = [market for market in dict.fromkeys(markets) if market]
+    if not unique_markets:
+        return {}
+
+    base_url = "https://api.bithumb.com" if exchange == "bithumb" else "https://api.upbit.com"
+    snapshots: dict[str, dict] = {}
+    try:
+        tickers = await fetch_tickers(unique_markets, base_url=base_url)
+        for ticker in tickers:
+            market = str(ticker.get("market", ""))
+            price = float(ticker.get("trade_price") or ticker.get("prev_closing_price") or 0)
+            if not market or price <= 0:
+                continue
+            snapshots[market] = {
+                "price": price,
+                "signed_change_rate": float(ticker.get("signed_change_rate") or 0),
+                "change_rate": float(ticker.get("change_rate") or 0),
+                "acc_trade_price_24h": float(ticker.get("acc_trade_price_24h") or 0),
+                "candle_time_utc": ticker.get("trade_timestamp"),
+            }
+    except Exception:
+        snapshots = {}
+
+    missing_markets = [market for market in unique_markets if market not in snapshots]
+    for market in missing_markets:
+        snapshot = await _market_snapshot(market)
+        if snapshot:
+            snapshots[market] = snapshot
+    return snapshots
+
+
 async def _safe_live_balances() -> tuple[dict, str, str | None]:
     config = LiveTradingConfig.from_env()
     if not config.live_trading_enabled:
@@ -659,7 +941,7 @@ async def _safe_live_balances_for_exchange(exchange: str | None = None) -> tuple
         balances = await get_live_broker(config.exchange).get_balances()
         return balances, "SUCCESS", None
     except LiveBrokerError as exc:
-        return empty, "FAILED", str(exc)
+        return empty, _broker_error_code(str(exc)), str(exc)
 
 
 async def _safe_order_chance(market: str, exchange: str | None = None) -> tuple[dict, str, str | None]:
@@ -671,7 +953,16 @@ async def _safe_order_chance(market: str, exchange: str | None = None) -> tuple[
         chance = await get_live_broker(config.exchange).get_order_chance(market)
         return chance, "SUCCESS", None
     except LiveBrokerError as exc:
-        return {}, "FAILED", str(exc)
+        return {}, _broker_error_code(str(exc)), str(exc)
+
+
+def _broker_error_code(message: str) -> str:
+    lowered = message.lower()
+    if any(pattern in lowered for pattern in ["ip", "authorization ip", "no_authorization_ip", "not allowed", "허용", "인증 ip"]):
+        return "API_IP_NOT_ALLOWED"
+    if any(pattern in lowered for pattern in ["jwt", "authorization", "unauthorized", "invalid api", "invalid_access_key", "authentication"]):
+        return "BROKER_AUTH_ERROR"
+    return "FAILED"
 
 
 @app.get("/api/live-trading/status")
@@ -683,22 +974,31 @@ def live_trading_status(exchange: str | None = Query(None, pattern=r"^(upbit|bit
 @app.get("/api/live-trading/balances")
 @app.get("/api/live/balances")
 async def live_trading_balances(exchange: str | None = Query(None, pattern=r"^(upbit|bithumb)$")) -> dict:
+    global _latest_balance_sync_time_utc
     selected_config = LiveTradingConfig.for_exchange(exchange) if exchange else LiveTradingConfig.from_env()
     balances, status, error = await _safe_live_balances_for_exchange(selected_config.exchange)
+    _latest_balance_sync_time_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     estimated_total = float(balances.get("krw", {}).get("balance", 0)) + float(balances.get("krw", {}).get("locked", 0))
-    btc_snapshot = await _market_snapshot("KRW-BTC")
-    eth_snapshot = await _market_snapshot("KRW-ETH")
-    if btc_snapshot:
-        estimated_total += (float(balances.get("btc", {}).get("balance", 0)) + float(balances.get("btc", {}).get("locked", 0))) * btc_snapshot["price"]
-    if eth_snapshot:
-        estimated_total += (float(balances.get("eth", {}).get("balance", 0)) + float(balances.get("eth", {}).get("locked", 0))) * eth_snapshot["price"]
+    currencies = [
+        str(currency).upper()
+        for currency, entry in (balances.get("by_currency") or {}).items()
+        if str(currency).upper() != "KRW"
+        and (float(entry.get("balance", 0)) + float(entry.get("locked", 0))) > 0
+    ]
+    markets = [f"KRW-{currency}" for currency in currencies]
+    prices = await _market_snapshots(markets, selected_config.exchange)
+    for currency in currencies:
+        entry = balances.get("by_currency", {}).get(currency, {})
+        snapshot = prices.get(f"KRW-{currency}")
+        if snapshot:
+            estimated_total += (float(entry.get("balance", 0)) + float(entry.get("locked", 0))) * float(snapshot["price"])
     return {
         **_live_status(selected_config.exchange),
         "balance_fetch_status": status,
         "error_message": error,
         "balances": balances,
         "estimated_total_equity_krw": estimated_total,
-        "prices": {"KRW-BTC": btc_snapshot, "KRW-ETH": eth_snapshot},
+        "prices": prices,
     }
 
 
@@ -1063,17 +1363,25 @@ def get_auto_live_pilot_status() -> dict:
 
 @app.post("/api/auto-live-pilot/start")
 def start_auto_live_pilot_endpoint(payload: AutoLivePilotStartRequest) -> dict:
-    return start_auto_live_pilot(
+    acquired, current_lock = _try_acquire_runtime_lock("auto-live-pilot-api")
+    if not acquired:
+        return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **auto_live_pilot_status()}
+    result = start_auto_live_pilot(
         candidate_strategy_id=payload.candidate_strategy_id,
         order_amount_krw=payload.order_amount_krw,
         confirmation=payload.confirmation,
         order_confirmation=payload.order_confirmation,
     )
+    if result.get("ok") is False:
+        release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    return result
 
 
 @app.post("/api/auto-live-pilot/stop")
 def stop_auto_live_pilot_endpoint() -> dict:
-    return stop_auto_live_pilot()
+    result = stop_auto_live_pilot()
+    release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    return result
 
 
 @app.post("/api/auto-live-pilot/cancel-open-order")
@@ -1088,16 +1396,24 @@ def get_live_strategy_pilot_status() -> dict:
 
 @app.post("/api/live-strategy-pilot/start")
 def start_live_strategy_pilot_endpoint(payload: LiveStrategyPilotStartRequest) -> dict:
-    return start_live_strategy_pilot(
+    acquired, current_lock = _try_acquire_runtime_lock("live-strategy-pilot-api")
+    if not acquired:
+        return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **live_strategy_status()}
+    result = start_live_strategy_pilot(
         candidate_strategy_id=payload.candidate_strategy_id,
         confirmation=payload.confirmation,
         order_confirmation=payload.order_confirmation,
     )
+    if result.get("ok") is False:
+        release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    return result
 
 
 @app.post("/api/live-strategy-pilot/stop")
 def stop_live_strategy_pilot_endpoint() -> dict:
-    return stop_live_strategy_pilot()
+    result = stop_live_strategy_pilot()
+    release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    return result
 
 
 @app.post("/api/live-strategy-pilot/cancel-open-order")

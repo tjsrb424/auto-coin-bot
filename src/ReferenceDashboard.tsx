@@ -18,6 +18,7 @@ import {
   ClipboardList,
   Copy,
   Crosshair,
+  Download,
   DollarSign,
   History,
   Home,
@@ -29,6 +30,8 @@ import {
   Plus,
   Power,
   PowerOff,
+  RefreshCw,
+  RotateCw,
   Save,
   Search,
   Settings,
@@ -53,6 +56,15 @@ const CHART_TIMEFRAMES = [
 ] as const;
 
 type Tone = "purple" | "cyan" | "green" | "amber" | "red";
+type DashboardExchange = "upbit" | "bithumb";
+
+type AuthStatus = {
+  auth_required: boolean;
+  auth_configured: boolean;
+  authenticated: boolean;
+  username?: string | null;
+  app_env?: string;
+};
 
 type Candle = {
   candle_time_utc: string;
@@ -73,9 +85,20 @@ type LiveStatus = {
 };
 
 type BalanceEntry = {
+  currency?: string;
   balance?: number;
   locked?: number;
   avg_buy_price?: number;
+  unit_currency?: string;
+};
+
+type MarketPrice = {
+  price?: number;
+  signed_change_rate?: number;
+  change_rate?: number;
+  range_rate?: number;
+  acc_trade_price_24h?: number;
+  candle_time_utc?: string | number | null;
 };
 
 type LiveBalances = LiveStatus & {
@@ -88,7 +111,16 @@ type LiveBalances = LiveStatus & {
     eth?: BalanceEntry;
     by_currency?: Record<string, BalanceEntry>;
   };
-  prices?: Record<string, { price?: number }>;
+  prices?: Record<string, MarketPrice | null>;
+};
+
+type EquityPoint = {
+  time?: string;
+  candle_time_utc?: string;
+  equity?: number;
+  cash_krw?: number;
+  btc_quantity?: number;
+  drawdown?: number;
 };
 
 type PaperSession = {
@@ -119,6 +151,7 @@ type PaperSession = {
     position_ratio?: number;
   };
   orders?: Array<Record<string, unknown>>;
+  equity_curve?: EquityPoint[];
 };
 
 type Candidate = {
@@ -174,6 +207,7 @@ type RiskDashboard = {
     daily_order_count?: number;
     consecutive_loss_count?: number;
     open_position_count?: number;
+    balance_mismatch_detected?: boolean;
   };
   risk_logs?: Array<{
     id?: number;
@@ -225,6 +259,41 @@ type LiveStrategyStatus = {
   auto_exit_enabled?: boolean;
 };
 
+type RuntimeStatus = {
+  app_env?: string;
+  exchange?: DashboardExchange | string;
+  live_trading_enabled?: boolean;
+  live_auto_trading_enabled?: boolean;
+  auto_strategy_pilot_enabled?: boolean;
+  runtime_status?: "OFF" | "RUNNING" | "PAUSED" | "STOPPED" | "EMERGENCY_STOPPED" | string;
+  strategy_status?: string;
+  emergency_stop?: boolean;
+  selected_strategy_id?: number | null;
+  selected_market?: string;
+  last_tick_time_utc?: string | null;
+  last_order_time_utc?: string | null;
+  server_started_at?: string | null;
+  instance_id?: string;
+  hostname?: string;
+  server_ip?: string;
+  runtime_owner?: string | null;
+};
+
+type HealthStatus = {
+  server_status?: string;
+  database_status?: string;
+  broker_status?: string;
+  selected_exchange?: string;
+  scheduler_status?: string;
+  risk_manager_status?: string;
+  emergency_stop_status?: string;
+  live_trading_enabled?: boolean;
+  auto_trading_enabled?: boolean;
+  auto_runtime_status?: string;
+  latest_balance_sync_time?: string | null;
+  latest_order_sync_time?: string | null;
+};
+
 type DashboardData = {
   candles: Candle[];
   chartUnit: number;
@@ -237,11 +306,13 @@ type DashboardData = {
   candidates: Candidate[];
   autoPilot: AutoPilotStatus | null;
   liveStrategy: LiveStrategyStatus | null;
+  runtimeStatus: RuntimeStatus | null;
+  health: HealthStatus | null;
   errors: string[];
   updatedAt: string | null;
 };
 
-type ReferenceView = "dashboard" | "auto-trade" | "strategies";
+type ReferenceView = "dashboard" | "auto-trade" | "strategies" | "portfolio" | "trades";
 
 const navItems = [
   { id: "dashboard", label: "대시보드", icon: Home },
@@ -271,7 +342,7 @@ function useStageScale() {
 }
 
 async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`);
+  const response = await fetch(`${API_BASE}${path}`, { credentials: "include" });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail ?? `${path} ${response.status}`);
@@ -282,6 +353,7 @@ async function fetchJson<T>(path: string): Promise<T> {
 async function postJson<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
+    credentials: "include",
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined
   });
@@ -295,6 +367,7 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
 async function patchJson<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "PATCH",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
@@ -305,7 +378,7 @@ async function patchJson<T>(path: string, body: unknown): Promise<T> {
   return payload as T;
 }
 
-function useDashboardData(chartUnit: number) {
+function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange) {
   const [data, setData] = React.useState<DashboardData>({
     candles: [],
     chartUnit,
@@ -318,6 +391,8 @@ function useDashboardData(chartUnit: number) {
     candidates: [],
     autoPilot: null,
     liveStrategy: null,
+    runtimeStatus: null,
+    health: null,
     errors: [],
     updatedAt: null
   });
@@ -333,21 +408,23 @@ function useDashboardData(chartUnit: number) {
         }
       };
 
-      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy] = await Promise.all([
+      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, health] = await Promise.all([
         settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
-        settle("실거래 상태", fetchJson<LiveStatus>("/api/live/status")),
+        settle("실거래 상태", fetchJson<LiveStatus>(`/api/live/status?exchange=${selectedExchange}`)),
         settle("주문", fetchJson<{ orders?: LiveOrder[] }>("/api/live-orders")),
         settle("실시간 페이퍼", fetchJson<PaperSession>("/api/paper-trading/live/latest")),
         settle("Forward Paper", fetchJson<PaperSession>("/api/forward-paper/latest")),
         settle("전략", fetchJson<{ candidates?: Candidate[] }>("/api/candidate-strategies")),
         settle("자동매매", fetchJson<AutoPilotStatus>("/api/auto-live-pilot/status")),
-        settle("전략 파일럿", fetchJson<LiveStrategyStatus>("/api/live-strategy-pilot/status"))
+        settle("전략 파일럿", fetchJson<LiveStrategyStatus>("/api/live-strategy-pilot/status")),
+        settle("Runtime", fetchJson<RuntimeStatus>("/api/runtime/status")),
+        settle("Health", fetchJson<HealthStatus>("/health"))
       ]);
 
-      const exchange = status?.exchange ?? "bithumb";
+      const exchange = (status?.exchange === "upbit" || status?.exchange === "bithumb") ? status.exchange : selectedExchange;
       const [balances, risk] = await Promise.all([
         settle("잔고", fetchJson<LiveBalances>(`/api/live/balances?exchange=${exchange}`)),
-        settle("리스크", fetchJson<RiskDashboard>(`/api/risk/status?exchange=${exchange === "bithumb" ? "bithumb" : "bithumb"}`))
+        settle("리스크", fetchJson<RiskDashboard>(`/api/risk/status?exchange=${exchange}`))
       ]);
 
       setData({
@@ -362,10 +439,12 @@ function useDashboardData(chartUnit: number) {
         candidates: candidatesResult?.candidates ?? [],
         autoPilot,
         liveStrategy,
+        runtimeStatus,
+        health,
         errors,
         updatedAt: new Date().toISOString()
       });
-  }, [chartUnit]);
+  }, [chartUnit, selectedExchange]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -405,6 +484,12 @@ function formatPercent(value?: number | null, digits = 2) {
   const normalized = Math.abs(value) > 1 ? value : value * 100;
   const sign = normalized > 0 ? "+" : "";
   return `${sign}${normalized.toFixed(digits)}%`;
+}
+
+function formatRatioPercent(value?: number | null, digits = 1) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  const normalized = Math.abs(value) > 1 ? value : value * 100;
+  return `${normalized.toFixed(digits)}%`;
 }
 
 function formatNumber(value?: number | null, digits = 4) {
@@ -685,6 +770,7 @@ function accountStateTone(status: LiveStatus | null) {
 }
 
 function botRuntimeState(data: DashboardData) {
+  if (data.runtimeStatus?.runtime_status) return data.runtimeStatus.runtime_status;
   const autoStatus = data.autoPilot?.session?.status;
   const strategyStatus = data.liveStrategy?.session?.status;
   if (isRunning(strategyStatus)) return strategyStatus ?? "RUNNING";
@@ -694,6 +780,11 @@ function botRuntimeState(data: DashboardData) {
   if (data.liveStatus?.emergency_stop) return "EMERGENCY_STOPPED";
   if (!data.liveStatus?.live_trading_enabled) return "LIVE_DISABLED";
   return "대기";
+}
+
+function isRuntimeRunning(data: DashboardData) {
+  if (data.runtimeStatus?.runtime_status) return data.runtimeStatus.runtime_status === "RUNNING";
+  return isRunning(data.liveStrategy?.session?.status) || isRunning(data.autoPilot?.session?.status);
 }
 
 function autoRuntimeMs(data: DashboardData, now: number) {
@@ -716,12 +807,6 @@ function autoRuntimeMs(data: DashboardData, now: number) {
   return completed[0]?.duration ?? null;
 }
 
-function exchangeLabel(exchange?: string) {
-  if (exchange === "bithumb") return "빗썸 (Bithumb)";
-  if (exchange === "upbit") return "업비트 (Upbit)";
-  return "-";
-}
-
 function useKstClock() {
   const [now, setNow] = React.useState(() => new Date());
   React.useEffect(() => {
@@ -741,10 +826,39 @@ function useKstClock() {
   }).format(now).replace(/\. /g, "-").replace(".", "");
 }
 
-function Topbar({ data }: { data: DashboardData }) {
+function Topbar({
+  data,
+  selectedExchange,
+  onExchangeChange,
+  onRefresh,
+  onLogout
+}: {
+  data: DashboardData;
+  selectedExchange: DashboardExchange;
+  onExchangeChange: (exchange: DashboardExchange) => void;
+  onRefresh: () => Promise<void>;
+  onLogout: () => Promise<void>;
+}) {
   const alertCount = data.risk?.risk_logs?.filter((log) => !log.allowed && log.read_status !== "READ").length ?? 0;
   const accountTone = accountStateTone(data.liveStatus);
   const kstTime = useKstClock();
+  const [userMenuOpen, setUserMenuOpen] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [refreshMessage, setRefreshMessage] = React.useState<string | null>(null);
+
+  const handleRefresh = React.useCallback(async () => {
+    setRefreshing(true);
+    setRefreshMessage(null);
+    try {
+      await onRefresh();
+      setRefreshMessage(`갱신 완료 ${formatKstTime(new Date().toISOString())}`);
+    } catch (err) {
+      setRefreshMessage(err instanceof Error ? err.message : "데이터 갱신 실패");
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onRefresh]);
+
   return (
     <header className="ref-topbar">
       <button className="ref-menu-button" aria-label="메뉴">
@@ -759,8 +873,9 @@ function Topbar({ data }: { data: DashboardData }) {
         <span className={`ref-account ${accountTone}`}>거래 상태 <i /> <b>{accountStateText(data.liveStatus)}</b></span>
         <label className="ref-exchange">
           <span>거래소</span>
-          <select value={data.liveStatus?.exchange ?? ""} onChange={() => undefined}>
-            <option value={data.liveStatus?.exchange ?? ""}>{exchangeLabel(data.liveStatus?.exchange)}</option>
+          <select value={selectedExchange} onChange={(event) => onExchangeChange(event.target.value as DashboardExchange)}>
+            <option value="bithumb">빗썸 (Bithumb)</option>
+            <option value="upbit">업비트 (Upbit)</option>
           </select>
         </label>
         <div className="ref-search">
@@ -772,7 +887,25 @@ function Topbar({ data }: { data: DashboardData }) {
           {alertCount > 0 && <em>{alertCount}</em>}
         </button>
         <span className="ref-trader">트레이더 <b>Pro</b></span>
-        <CircleUserRound className="ref-user" size={30} />
+        <div className="ref-user-menu-wrap">
+          <button className={`ref-user-button ${userMenuOpen ? "is-open" : ""}`} type="button" aria-label="사용자 메뉴" aria-expanded={userMenuOpen} onClick={() => setUserMenuOpen((value) => !value)}>
+            <CircleUserRound className="ref-user" size={30} />
+          </button>
+          {userMenuOpen && (
+            <div className="ref-user-menu">
+              <button className="ref-user-menu-action" type="button" onClick={() => void handleRefresh()} disabled={refreshing}>
+                <RefreshCw size={16} className={refreshing ? "ref-spin" : ""} />
+                <span>{refreshing ? "데이터 가져오는 중" : "데이터 가져오기"}</span>
+              </button>
+              <button className="ref-user-menu-action is-logout" type="button" onClick={() => void onLogout()}>
+                <PowerOff size={16} />
+                <span>로그아웃</span>
+              </button>
+              <p><span>최근 갱신</span><b>{refreshMessage ?? formatKstTime(data.updatedAt)}</b></p>
+              {data.errors.length > 0 && <em>{data.errors[0]}</em>}
+            </div>
+          )}
+        </div>
       </div>
     </header>
   );
@@ -784,7 +917,7 @@ function Sidebar({ activeView, onViewChange }: { activeView: ReferenceView; onVi
       <nav className="ref-nav">
         {navItems.map((item) => {
           const Icon = item.icon;
-          const isImplemented = item.id === "dashboard" || item.id === "auto-trade" || item.id === "strategies";
+          const isImplemented = item.id === "dashboard" || item.id === "auto-trade" || item.id === "strategies" || item.id === "portfolio" || item.id === "trades";
           const isActive = activeView === item.id;
           return (
             <button
@@ -1247,13 +1380,15 @@ function MainChartPanel({
 }
 
 function BotStatusPanel({ data, onOpenAutoTrade }: { data: DashboardData; onOpenAutoTrade: () => void }) {
-  const autoRunning = isRunning(data.autoPilot?.session?.status) || isRunning(data.liveStrategy?.session?.status);
+  const autoRunning = isRuntimeRunning(data);
   const riskState = data.risk?.risk_state;
   const dailyPnl = riskState?.daily_total_pnl ?? data.paper?.balance?.total_pnl ?? null;
   const strategyName = data.liveStrategy?.session?.strategy_name ?? data.autoPilot?.session?.strategy_name ?? data.candidates[0]?.name ?? "-";
   const ordersToday = data.liveStrategy?.session?.orders_created_today ?? data.autoPilot?.session?.orders_created_today;
   const maxOrders = data.liveStrategy?.session?.max_orders_per_day ?? data.autoPilot?.session?.max_orders_per_day;
   const runtimeState = botRuntimeState(data);
+  const health = data.health;
+  const runtime = data.runtimeStatus;
 
   return (
     <RefPanel className="ref-bot-panel">
@@ -1269,6 +1404,20 @@ function BotStatusPanel({ data, onOpenAutoTrade }: { data: DashboardData; onOpen
           <p><span>주문 (오늘)</span><b>{ordersToday == null || maxOrders == null ? "-" : `${ordersToday} / ${maxOrders}`}</b></p>
           <p><span>현재 전략</span><b>{strategyName}</b></p>
         </div>
+      </div>
+      <div className="ref-server-ops">
+        <p><span>APP_ENV</span><b>{runtime?.app_env ?? "-"}</b></p>
+        <p><span>Server</span><b>{health?.server_status ?? "-"}</b></p>
+        <p><span>Database</span><b>{health?.database_status ?? "-"}</b></p>
+        <p><span>Broker</span><b>{health?.broker_status ?? data.liveStatus?.broker_status ?? "-"}</b></p>
+        <p><span>Scheduler</span><b>{health?.scheduler_status ?? "-"}</b></p>
+        <p><span>Risk</span><b>{health?.risk_manager_status ?? data.risk?.risk_state?.status ?? "-"}</b></p>
+        <p><span>Exchange</span><b>{health?.selected_exchange ?? runtime?.exchange ?? "-"}</b></p>
+        <p><span>Runtime</span><b className={runtimeState === "RUNNING" ? "ref-positive" : ""}>{statusLabel(runtimeState)}</b></p>
+        <p><span>Auto</span><b>{runtime?.live_auto_trading_enabled || health?.auto_trading_enabled ? "Enabled" : "Disabled"}</b></p>
+        <p><span>Bal Sync</span><b>{formatKstShort(health?.latest_balance_sync_time)}</b></p>
+        <p><span>Ord Sync</span><b>{formatKstShort(health?.latest_order_sync_time ?? runtime?.last_order_time_utc)}</b></p>
+        <p><span>Started</span><b>{formatKstShort(runtime?.server_started_at)}</b></p>
       </div>
       <button className="ref-detail-button" onClick={onOpenAutoTrade}>상세 보기 <ChevronRight size={16} /></button>
     </RefPanel>
@@ -1398,6 +1547,679 @@ function PortfolioPanel({ data }: { data: DashboardData }) {
         </div>
       </div>
     </RefPanel>
+  );
+}
+
+type PortfolioAssetRow = {
+  symbol: string;
+  name: string;
+  color: string;
+  qty: number;
+  average: number | null;
+  current: number | null;
+  value: number;
+  pnl: number | null;
+  returnRate: number | null;
+  allocation: number;
+  change24h: number | null;
+  sector: string;
+  targetAllocation: number;
+};
+
+const portfolioAssets: PortfolioAssetRow[] = [
+  { symbol: "BTC", name: "비트코인", color: "#ffab16", qty: 0.35255, average: 70150000, current: 89240000, value: 16076000, pnl: 6904706, returnRate: 0.2744, allocation: 0.565, change24h: 0.0235, sector: "레이어 1", targetAllocation: 0.5 },
+  { symbol: "ETH", name: "이더리움", color: "#596dff", qty: 2.15, average: 3072000, current: 2660000, value: 5720000, pnl: -886800, returnRate: -0.134, allocation: 0.201, change24h: 0.0182, sector: "스마트 계약", targetAllocation: 0.25 },
+  { symbol: "XRP", name: "리플", color: "#1bc5d8", qty: 10000, average: 692, current: 753, value: 2310000, pnl: 610000, returnRate: 0.359, allocation: 0.081, change24h: -0.0045, sector: "결제/송금", targetAllocation: 0.08 },
+  { symbol: "SOL", name: "솔라나", color: "#7a5cff", qty: 12.5, average: 140000, current: 164000, value: 2050000, pnl: 300000, returnRate: 0.1714, allocation: 0.072, change24h: 0.0104, sector: "레이어 1", targetAllocation: 0.08 },
+  { symbol: "ADA", name: "에이다", color: "#2e7cff", qty: 5000, average: 140, current: 182, value: 910000, pnl: 210000, returnRate: 0.3, allocation: 0.032, change24h: -0.0078, sector: "스마트 계약", targetAllocation: 0.03 },
+  { symbol: "DOT", name: "폴카닷", color: "#e7429f", qty: 150, average: 8200, current: 7520, value: 1128000, pnl: -102600, returnRate: -0.0829, allocation: 0.04, change24h: -0.0126, sector: "레이어 1", targetAllocation: 0.03 },
+  { symbol: "USDT", name: "테더", color: "#20b69d", qty: 3588, average: 1400, current: 1400, value: 3588000, pnl: 0, returnRate: 0, allocation: 0.126, change24h: 0, sector: "기타", targetAllocation: 0.03 }
+];
+
+const portfolioBaseTotal = 28_450_000;
+
+const assetMeta: Record<string, { name: string; color: string; sector: string; targetAllocation: number }> = {
+  KRW: { name: "원화", color: "#38bdf8", sector: "현금", targetAllocation: 0.12 },
+  BTC: { name: "비트코인", color: "#ffab16", sector: "레이어 1", targetAllocation: 0.5 },
+  ETH: { name: "이더리움", color: "#596dff", sector: "스마트 계약", targetAllocation: 0.25 },
+  XRP: { name: "리플", color: "#1bc5d8", sector: "결제/송금", targetAllocation: 0.08 },
+  SOL: { name: "솔라나", color: "#7a5cff", sector: "레이어 1", targetAllocation: 0.08 },
+  ADA: { name: "에이다", color: "#2e7cff", sector: "스마트 계약", targetAllocation: 0.03 },
+  DOT: { name: "폴카닷", color: "#e7429f", sector: "레이어 1", targetAllocation: 0.03 },
+  USDT: { name: "테더", color: "#20b69d", sector: "스테이블", targetAllocation: 0.03 }
+};
+
+const fallbackColors = ["#8b5cff", "#18e0c8", "#3d7cff", "#ffab16", "#e7429f", "#22c55e", "#8ea1b7"];
+
+const coinIconUrls: Record<string, string> = {
+  BTC: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/btc.svg",
+  ETH: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/eth.svg",
+  XRP: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/xrp.svg",
+  SOL: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/sol.svg",
+  ADA: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/ada.svg",
+  DOT: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/dot.svg",
+  USDT: "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/usdt.svg"
+};
+
+function portfolioMeta(symbol: string, index = 0) {
+  return assetMeta[symbol] ?? {
+    name: symbol,
+    color: fallbackColors[index % fallbackColors.length],
+    sector: "기타",
+    targetAllocation: 0.03
+  };
+}
+
+function marketPriceFor(data: DashboardData, symbol: string) {
+  return data.liveBalances?.prices?.[`KRW-${symbol}`] ?? null;
+}
+
+function withAllocations(rows: PortfolioAssetRow[], totalOverride?: number | null) {
+  const total = totalOverride != null && totalOverride > 0 ? totalOverride : rows.reduce((sum, row) => sum + row.value, 0);
+  return rows.map((row) => ({ ...row, allocation: total > 0 ? row.value / total : 0 }));
+}
+
+function fallbackPortfolioRows(total: number) {
+  const scale = total / portfolioBaseTotal;
+  return portfolioAssets.map((asset) => ({ ...asset, value: asset.value * scale, pnl: asset.pnl == null ? null : asset.pnl * scale }));
+}
+
+function buildPortfolioRows(data: DashboardData, fallbackTotal: number) {
+  const byCurrency = data.liveBalances?.balances?.by_currency;
+  const hasLiveBalances = data.liveBalances?.balance_fetch_status === "SUCCESS" && byCurrency && Object.keys(byCurrency).length > 0;
+  if (!hasLiveBalances || !byCurrency) {
+    return withAllocations(fallbackPortfolioRows(fallbackTotal), fallbackTotal);
+  }
+
+  const rows = Object.entries(byCurrency)
+    .map(([currency, entry], index): PortfolioAssetRow | null => {
+      const symbol = currency.toUpperCase();
+      const qty = balanceAmount(entry);
+      if (qty <= 0) return null;
+      const meta = portfolioMeta(symbol, index);
+      const price = symbol === "KRW" ? null : marketPriceFor(data, symbol);
+      const current = symbol === "KRW" ? 1 : price?.price ?? null;
+      const average = symbol === "KRW" ? 1 : entry.avg_buy_price && entry.avg_buy_price > 0 ? entry.avg_buy_price : null;
+      const value = symbol === "KRW" ? qty : current != null ? qty * current : average != null ? qty * average : 0;
+      const cost = average != null ? qty * average : null;
+      const pnl = symbol === "KRW" ? 0 : cost != null && current != null ? value - cost : null;
+      return {
+        symbol,
+        name: meta.name,
+        color: meta.color,
+        qty,
+        average,
+        current,
+        value,
+        pnl,
+        returnRate: cost != null && cost > 0 && pnl != null ? pnl / cost : null,
+        allocation: 0,
+        change24h: price?.signed_change_rate ?? null,
+        sector: meta.sector,
+        targetAllocation: meta.targetAllocation
+      };
+    })
+    .filter((row): row is PortfolioAssetRow => row != null)
+    .sort((a, b) => b.value - a.value);
+
+  if (rows.length === 0) {
+    return withAllocations(fallbackPortfolioRows(fallbackTotal), fallbackTotal);
+  }
+  return withAllocations(rows, data.liveBalances?.estimated_total_equity_krw);
+}
+
+function buildConicGradient(rows: PortfolioAssetRow[]) {
+  let cursor = 0;
+  const segments = rows.map((row) => {
+    const start = cursor;
+    cursor += Math.max(0, row.allocation) * 100;
+    return `${row.color} ${start.toFixed(2)}% ${Math.min(cursor, 100).toFixed(2)}%`;
+  });
+  if (cursor < 100) segments.push(`#233348 ${cursor.toFixed(2)}% 100%`);
+  return `conic-gradient(${segments.join(", ")})`;
+}
+
+function buildSectorRows(rows: PortfolioAssetRow[]) {
+  const grouped = rows.reduce<Record<string, { value: number; color: string }>>((acc, row) => {
+    acc[row.sector] = acc[row.sector] ?? { value: 0, color: row.color };
+    acc[row.sector].value += row.value;
+    return acc;
+  }, {});
+  const total = rows.reduce((sum, row) => sum + row.value, 0);
+  return Object.entries(grouped)
+    .map(([name, item]) => [name, total > 0 ? item.value / total : 0, item.color] as const)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+}
+
+function buildRebalanceRows(rows: PortfolioAssetRow[], total: number) {
+  const targetSum = rows.reduce((sum, row) => sum + row.targetAllocation, 0) || 1;
+  return rows.slice(0, 6).map((row) => {
+    const target = row.targetAllocation / targetSum;
+    const suggestion = (target - row.allocation) * total;
+    return { symbol: row.symbol, allocation: row.allocation, target, suggestion };
+  });
+}
+
+function buildContributionRows(rows: PortfolioAssetRow[]) {
+  const withPnl = rows.filter((row) => row.pnl != null && row.symbol !== "KRW");
+  const top = [...withPnl].sort((a, b) => (b.pnl ?? 0) - (a.pnl ?? 0)).slice(0, 3);
+  const bottom = [...withPnl].sort((a, b) => (a.pnl ?? 0) - (b.pnl ?? 0)).slice(0, 3);
+  return { top, bottom };
+}
+
+function portfolioTrend(data: DashboardData, total: number) {
+  const source = (data.paper?.equity_curve?.length ? data.paper.equity_curve : data.forward?.equity_curve) ?? [];
+  const curve = source
+    .filter((point) => point.equity != null && Number.isFinite(point.equity))
+    .slice(-30)
+    .map((point) => ({ value: point.equity ?? 0, time: point.time ?? point.candle_time_utc }));
+  if (curve.length >= 2) {
+    const last = curve[curve.length - 1];
+    const values = total > 0 && Math.abs(last.value - total) / Math.max(total, 1) > 0.005
+      ? [...curve.map((point) => point.value), total]
+      : curve.map((point) => point.value);
+    const labelValues = curve.map((point) => point.time ?? "");
+    return { values, labels: values.length > labelValues.length ? [...labelValues, data.updatedAt ?? ""] : labelValues };
+  }
+  const ratios = [0.845, 0.86, 0.83, 0.855, 0.848, 0.872, 0.862, 0.881, 0.898, 0.927, 0.914, 0.936, 0.944, 0.969, 0.986, 0.952, 0.947, 0.962, 0.972, 1];
+  return { values: ratios.map((ratio) => total * ratio), labels: [] };
+}
+
+function formatAxisDate(value?: string) {
+  if (!value) return "";
+  const date = parseDate(value);
+  if (!date) return "";
+  return new Intl.DateTimeFormat("ko-KR", { month: "2-digit", day: "2-digit", timeZone: "Asia/Seoul" }).format(date).replace(". ", "-").replace(".", "");
+}
+
+function CoinLogo({ symbol, color }: { symbol: string; color: string }) {
+  const normalized = symbol.toUpperCase();
+  const fallback = normalized === "BTC" ? "₿" : normalized.slice(0, 1);
+  return (
+    <span
+      className="ref-coin-logo"
+      data-fallback={fallback}
+      style={{ backgroundColor: color } as React.CSSProperties}
+    >
+      <img
+        src={coinIconUrls[normalized]}
+        alt=""
+        aria-hidden="true"
+        onError={(event) => {
+          event.currentTarget.style.display = "none";
+        }}
+      />
+    </span>
+  );
+}
+
+function PortfolioTrendChart({ total, values, labels }: { total: number; values: number[]; labels: string[] }) {
+  const width = 510;
+  const height = 166;
+  const min = Math.min(...values) * 0.97;
+  const max = Math.max(...values) * 1.02;
+  const spread = Math.max(max - min, 1);
+  const points = values.map((value, index) => {
+    const x = 48 + (index / (values.length - 1)) * (width - 72);
+    const y = 18 + ((max - value) / spread) * (height - 50);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const pointList = points.split(" ");
+  const lastPoint = pointList[pointList.length - 1]?.split(",").map(Number) ?? [width - 24, 40];
+  const axisLabels = [0, 1, 2, 3, 4, 5, 6].map((item) => {
+    if (labels.length < 2) return ["04-24", "04-29", "06-04", "06-09", "06-14", "06-19", "06-24"][item];
+    const index = Math.round((item / 6) * (labels.length - 1));
+    return formatAxisDate(labels[index]);
+  });
+  return (
+    <div className="ref-portfolio-trend-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="포트폴리오 자산 추이">
+        <defs>
+          <linearGradient id="portfolioLineFill" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#8b5cff" stopOpacity="0.42" />
+            <stop offset="100%" stopColor="#8b5cff" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {[0, 1, 2, 3, 4].map((item) => <line key={item} x1="48" x2={width - 24} y1={24 + item * 26} y2={24 + item * 26} />)}
+        <polygon points={`48,${height - 28} ${points} ${width - 24},${height - 28}`} fill="url(#portfolioLineFill)" />
+        <polyline points={points} fill="none" stroke="#8b5cff" strokeWidth="3" />
+        <circle cx={lastPoint[0]} cy={lastPoint[1]} r="4" fill="#9f7bff" />
+        <text x={Math.max(330, lastPoint[0] - 48)} y={lastPoint[1] - 10}>{formatKrw(total)}</text>
+        {axisLabels.map((label, index) => (
+          <text key={`${label}-${index}`} x={48 + index * 68} y={height - 8} className="axis">{label}</text>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function PortfolioView({
+  data,
+  totalEquity,
+  totalPnl,
+  totalReturn,
+  onSimulate
+}: {
+  data: DashboardData;
+  totalEquity?: number | null;
+  totalPnl?: number | null;
+  totalReturn?: number | null;
+  onSimulate: () => void;
+}) {
+  const fallbackTotal = totalEquity != null && totalEquity >= 10_000 ? totalEquity : portfolioBaseTotal;
+  const rows = buildPortfolioRows(data, fallbackTotal);
+  const computedTotal = rows.reduce((sum, row) => sum + row.value, 0);
+  const total = data.liveBalances?.estimated_total_equity_krw && data.liveBalances.estimated_total_equity_krw > 0
+    ? data.liveBalances.estimated_total_equity_krw
+    : computedTotal > 0 ? computedTotal : fallbackTotal;
+  const cashValue = rows.find((row) => row.symbol === "KRW")?.value ?? 0;
+  const livePnl = rows.reduce((sum, row) => sum + (row.pnl ?? 0), 0);
+  const costBasis = rows.reduce((sum, row) => row.symbol === "KRW" ? sum : sum + ((row.average ?? 0) * row.qty), 0);
+  const pnl = data.liveBalances?.balance_fetch_status === "SUCCESS" ? livePnl : totalPnl ?? livePnl;
+  const returnRate = data.liveBalances?.balance_fetch_status === "SUCCESS" && costBasis > 0 ? pnl / costBasis : totalReturn ?? null;
+  const cashRatio = total > 0 ? cashValue / total : 0;
+  const mainRows = rows.slice(0, 5);
+  const otherValue = rows.slice(5).reduce((sum, item) => sum + item.value, 0);
+  const otherAllocation = total > 0 ? otherValue / total : 0;
+  const legendRows = otherValue > 0
+    ? [...mainRows, { ...portfolioMeta("기타"), symbol: "기타", value: otherValue, allocation: otherAllocation } as PortfolioAssetRow]
+    : mainRows;
+  const trend = portfolioTrend(data, total);
+  const trendStart = trend.values[0] ?? total;
+  const trendEnd = trend.values[trend.values.length - 1] ?? total;
+  const trendPnl = trendEnd - trendStart;
+  const trendReturn = trendStart > 0 ? trendPnl / trendStart : null;
+  const rebalanceRows = buildRebalanceRows(rows, total);
+  const estimatedFee = rebalanceRows.reduce((sum, row) => sum + Math.abs(row.suggestion), 0) * 0.0005;
+  const sectorRows = buildSectorRows(rows);
+  const contributions = buildContributionRows(rows);
+  const riskState = data.risk?.risk_state;
+  const riskScore = riskState?.balance_mismatch_detected ? "검토" : data.liveBalances?.balance_fetch_status === "SUCCESS" ? "양호" : "대기";
+  const mdd = data.paper?.balance?.mdd ?? data.forward?.balance?.mdd ?? null;
+
+  return (
+    <>
+      <KpiCard className="ref-portfolio-kpi-total" icon={<Wallet size={28} />} label="총자산(KRW)" value={formatKrw(total)} sub={formatAssetSub(total)} />
+      <KpiCard className="ref-portfolio-kpi-profit" icon={<LineChart size={28} />} label="평가 손익 (KRW)" value={formatSignedKrw(pnl)} sub={formatPercent(returnRate)} tone="cyan" />
+      <KpiCard className="ref-portfolio-kpi-return" icon={<PieChart size={28} />} label="수익률" value={formatPercent(returnRate)} sub={formatSignedKrw(pnl)} tone="green" />
+      <KpiCard className="ref-portfolio-kpi-cash" icon={<ShieldCheck size={28} />} label="현금 비율" value={formatRatioPercent(cashRatio, 1)} sub={`${formatKrw(cashValue)} KRW`} tone="amber" />
+      <KpiCard className="ref-portfolio-kpi-risk" icon={<Target size={28} />} label="리스크 상태" value={riskScore} sub={data.liveBalances?.balance_fetch_status ?? "-"} tone="cyan" />
+
+      <RefPanel className="ref-portfolio-composition">
+        <h3>포트폴리오 구성</h3>
+        <div className="ref-portfolio-page-body">
+          <div className="ref-portfolio-page-donut" style={{ background: buildConicGradient(legendRows) }}>
+            <div><span>총 자산</span><b>{formatKrw(total)}</b><em>KRW</em></div>
+          </div>
+          <div className="ref-portfolio-page-legend">
+            {legendRows.map((asset) => (
+              <p key={asset.symbol}><i style={{ background: asset.color }} /><span>{asset.symbol}</span><b>{formatRatioPercent(asset.allocation)}</b><em>{formatKrw(asset.value)} KRW</em></p>
+            ))}
+          </div>
+        </div>
+        <small>* {data.liveBalances?.balance_fetch_status === "SUCCESS" ? "거래소 실잔고 기준" : "실잔고 대기: 레퍼런스 데이터 표시"}</small>
+      </RefPanel>
+
+      <RefPanel className="ref-portfolio-trend">
+        <div className="ref-portfolio-panel-head"><h3>포트폴리오 자산 추이</h3><div><button>1일</button><button>7일</button><button className="is-active">30일</button><button>90일</button><button>전체</button></div></div>
+        <span>자산 (KRW)</span>
+        <PortfolioTrendChart total={total} values={trend.values} labels={trend.labels} />
+        <div className="ref-portfolio-trend-summary">
+          <p><span>기간 시작</span><b>{formatKrw(trendStart)}</b></p>
+          <p><span>기간 종료</span><b>{formatKrw(trendEnd)}</b></p>
+          <p><span>변동액</span><b className={trendPnl >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(trendPnl)}</b></p>
+          <p><span>수익률</span><b className={trendPnl >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(trendReturn)}</b></p>
+        </div>
+      </RefPanel>
+
+      <RefPanel className="ref-portfolio-rebalance">
+        <div className="ref-portfolio-panel-head"><h3>리밸런싱 제안</h3><span>업데이트: {formatKstTime(data.updatedAt)} ↻</span></div>
+        <div className="ref-rebalance-tabs"><button className="is-active">권장 조정</button><button>사용자 설정</button></div>
+        <table><thead><tr><th>자산</th><th>현재 비중</th><th>권장 비중</th><th>조정 제안</th></tr></thead><tbody>{rebalanceRows.map((row) => <tr key={row.symbol}><td>{row.symbol}</td><td>{formatRatioPercent(row.allocation)}</td><td>{formatRatioPercent(row.target)}</td><td className={row.suggestion >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(row.suggestion)} KRW</td></tr>)}</tbody></table>
+        <p><span>예상 거래 비용</span><b>{formatKrw(estimatedFee)} KRW</b></p>
+        <button className="ref-rebalance-action" type="button" onClick={onSimulate}>권장 리밸런싱 실행 / 시뮬레이션</button>
+      </RefPanel>
+
+      <RefPanel className="ref-portfolio-holdings">
+        <div className="ref-portfolio-panel-head"><h3>보유 자산</h3><div className="ref-portfolio-holdings-tools"><button>KRW 기준⌄</button><label>보유 자산만 보기 <i /></label></div></div>
+        <table>
+          <thead><tr><th>자산</th><th>보유 수량</th><th>평균 매수가 (KRW)</th><th>현재가 (KRW)</th><th>평가액 (KRW)</th><th>평가 손익 (KRW)</th><th>수익률</th><th>비중</th><th>24h 변동률</th></tr></thead>
+          <tbody>{rows.map((asset) => <tr key={asset.symbol}><td><span className="ref-asset-cell"><CoinLogo symbol={asset.symbol} color={asset.color} /><b>{asset.symbol}<em>{asset.name}</em></b></span></td><td>{formatNumber(asset.qty, 8)}</td><td>{formatKrw(asset.average)}</td><td>{formatKrw(asset.current)}</td><td>{formatKrw(asset.value)}</td><td className={asset.pnl != null && asset.pnl >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(asset.pnl)}</td><td className={asset.returnRate != null && asset.returnRate >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(asset.returnRate)}</td><td>{formatRatioPercent(asset.allocation)}</td><td className={asset.change24h != null && asset.change24h >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(asset.change24h)}</td></tr>)}</tbody>
+          <tfoot><tr><td>총 합계</td><td /><td /><td /><td>{formatKrw(total)}</td><td className={pnl >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(pnl)}</td><td className={returnRate != null && returnRate >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(returnRate)}</td><td>100%</td><td>-</td></tr></tfoot>
+        </table>
+      </RefPanel>
+
+      <RefPanel className="ref-portfolio-risk">
+        <h3>위험 노출 현황</h3>
+        <div className="ref-risk-metrics"><p><span>일일 손익</span><b className={(riskState?.daily_total_pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(riskState?.daily_total_pnl)}</b></p><p><span>최대 낙폭</span><b className="ref-negative">{formatPercent(mdd)}</b></p><p><span>주문 수</span><b>{riskState?.daily_order_count ?? 0}</b></p><p><span>오픈 포지션</span><b>{riskState?.open_position_count ?? rows.filter((row) => row.symbol !== "KRW").length}</b></p></div>
+      </RefPanel>
+
+      <RefPanel className="ref-portfolio-sector">
+        <div className="ref-portfolio-panel-head"><h3>섹터/테마 노출</h3><span>상세 보기 ›</span></div>
+        <div>{sectorRows.map((row) => <p key={row[0]}><span>{row[0]}</span><i><b style={{ width: `${row[1] * 100}%`, background: row[2] }} /></i><em>{(row[1] * 100).toFixed(1)}%</em></p>)}</div>
+      </RefPanel>
+
+      <RefPanel className="ref-portfolio-contribution">
+        <div className="ref-portfolio-panel-head"><h3>수익 기여도 TOP 3 / BOTTOM 3</h3><span>상세 보기 ›</span></div>
+        <div>
+          {[0, 1, 2].map((index) => {
+            const top = contributions.top[index];
+            const bottom = contributions.bottom[index];
+            return <p key={index}><b>{top?.symbol ?? "-"}</b><span className={(top?.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{top ? `${formatSignedKrw(top.pnl)} KRW` : "-"}</span><b>{bottom?.symbol ?? "-"}</b><span className={(bottom?.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{bottom ? `${formatSignedKrw(bottom.pnl)} KRW` : "-"}</span></p>;
+          })}
+        </div>
+      </RefPanel>
+    </>
+  );
+}
+
+type TradeHistoryRow = {
+  id: string;
+  exchange: string;
+  market: string;
+  strategy: string;
+  position: "롱" | "숏";
+  orderType: string;
+  rawStatus: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  entryTime: string;
+  exitTime: string;
+  entryPrice: number | null;
+  exitPrice: number | null;
+  volume: number | null;
+  pnl: number | null;
+  returnRate: number | null;
+  fee: number | null;
+  status: string;
+  orderId: string;
+  holdMs: number | null;
+};
+
+const tradeAssetColors: Record<string, string> = {
+  BTC: "#ff8a16",
+  ETH: "#6277ff",
+  SOL: "#111827",
+  XRP: "#0f172a",
+  DOGE: "#c9a62a",
+  ADA: "#2e7cff"
+};
+
+type TradeSortKey = "market" | "strategy" | "position" | "entryTime" | "exitTime" | "entryPrice" | "exitPrice" | "volume" | "pnl" | "returnRate" | "fee" | "status";
+
+const tradeSortLabels: Record<TradeSortKey, string> = {
+  market: "종목",
+  strategy: "전략명",
+  position: "포지션",
+  entryTime: "진입시간",
+  exitTime: "청산시간",
+  entryPrice: "진입가",
+  exitPrice: "청산가",
+  volume: "수량",
+  pnl: "실현손익",
+  returnRate: "수익률",
+  fee: "수수료",
+  status: "상태"
+};
+
+function normalizeTradeRow(order: LiveOrder, index: number): TradeHistoryRow {
+  const market = marketDisplay(order.market);
+  const side = String(order.side ?? order.order_type ?? "").toUpperCase();
+  const entryPrice = order.price ?? null;
+  const exitPrice = order.filled_amount_krw && order.executed_volume ? order.filled_amount_krw / order.executed_volume : entryPrice;
+  const pnl = order.actual_pnl ?? order.expected_pnl ?? null;
+  const cost = entryPrice && order.executed_volume ? entryPrice * order.executed_volume : order.amount_krw ?? null;
+  const created = parseDate(order.created_at);
+  const updated = parseDate(order.updated_at ?? order.created_at);
+  const rawStatus = String(order.status ?? "UNKNOWN").toUpperCase();
+  const filled = rawStatus === "FILLED" || rawStatus === "PARTIALLY_FILLED";
+  return {
+    id: String(order.request_id ?? order.id ?? `live-${index}`),
+    exchange: order.exchange ?? "-",
+    market,
+    strategy: order.strategy_name ?? "자동 전략",
+    position: side.includes("ASK") || side.includes("SELL") ? "숏" : "롱",
+    orderType: statusLabel(order.order_type ?? order.side ?? "-"),
+    rawStatus,
+    createdAt: order.created_at ?? null,
+    updatedAt: order.updated_at ?? order.created_at ?? null,
+    entryTime: formatKstShort(order.created_at),
+    exitTime: filled ? formatKstShort(order.updated_at ?? order.created_at) : "-",
+    entryPrice,
+    exitPrice: filled ? exitPrice : null,
+    volume: order.executed_volume ?? order.volume ?? null,
+    pnl,
+    returnRate: pnl != null && cost && cost > 0 ? pnl / cost : null,
+    fee: order.paid_fee ?? null,
+    status: filled ? "정산완료" : statusLabel(order.status),
+    orderId: String(order.request_id ?? order.id ?? "-"),
+    holdMs: created && updated && updated >= created ? updated.getTime() - created.getTime() : null
+  };
+}
+
+function tradeSymbol(market: string) {
+  return market.split("/")[0] ?? "BTC";
+}
+
+function TradeCoinIcon({ market }: { market: string }) {
+  const symbol = tradeSymbol(market);
+  const color = tradeAssetColors[symbol] ?? "#8b5cff";
+  return <span className="ref-trade-coin" style={{ backgroundColor: color }}><CoinLogo symbol={symbol} color={color} /></span>;
+}
+
+function exportTradeCsv(rows: TradeHistoryRow[]) {
+  const header = ["종목", "전략명", "포지션", "진입시간", "청산시간", "진입가", "청산가", "수량", "실현손익", "수익률", "수수료", "상태", "주문ID"];
+  const lines = [header, ...rows.map((row) => [
+    row.market,
+    row.strategy,
+    row.position,
+    row.entryTime,
+    row.exitTime,
+    row.entryPrice ?? "",
+    row.exitPrice ?? "",
+    row.volume ?? "",
+    row.pnl ?? "",
+    row.returnRate ?? "",
+    row.fee ?? "",
+    row.status,
+    row.orderId
+  ])].map((line) => line.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(","));
+  const blob = new Blob([`\uFEFF${lines.join("\n")}`], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `trade-history-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function TradeHistoryView({ data, refresh }: { data: DashboardData; refresh: () => Promise<void> }) {
+  const [search, setSearch] = React.useState("");
+  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [exchangeFilter, setExchangeFilter] = React.useState("ALL");
+  const [strategyFilter, setStrategyFilter] = React.useState("ALL");
+  const [marketFilter, setMarketFilter] = React.useState("ALL");
+  const [orderTypeFilter, setOrderTypeFilter] = React.useState("ALL");
+  const [statusFilter, setStatusFilter] = React.useState("ALL");
+  const [startDate, setStartDate] = React.useState("");
+  const [endDate, setEndDate] = React.useState("");
+  const [sortKey, setSortKey] = React.useState<TradeSortKey>("entryTime");
+  const [sortDirection, setSortDirection] = React.useState<"asc" | "desc">("desc");
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(10);
+  const liveRows = data.liveOrders.map(normalizeTradeRow);
+  const exchangeOptions = Array.from(new Set(liveRows.map((row) => row.exchange).filter(Boolean)));
+  const strategyOptions = Array.from(new Set(liveRows.map((row) => row.strategy).filter(Boolean)));
+  const marketOptions = Array.from(new Set(liveRows.map((row) => row.market).filter(Boolean)));
+  const orderTypeOptions = Array.from(new Set(liveRows.map((row) => row.orderType).filter(Boolean)));
+  const statusOptions = Array.from(new Set(liveRows.map((row) => row.status).filter(Boolean)));
+  const startMs = startDate ? new Date(`${startDate}T00:00:00+09:00`).getTime() : null;
+  const endMs = endDate ? new Date(`${endDate}T23:59:59+09:00`).getTime() : null;
+  const filteredRows = liveRows.filter((row) => {
+    const query = search.trim().toLowerCase();
+    const created = parseDate(row.createdAt);
+    if (query && ![row.market, row.strategy, row.orderId, row.status].some((value) => value.toLowerCase().includes(query))) return false;
+    if (exchangeFilter !== "ALL" && row.exchange !== exchangeFilter) return false;
+    if (strategyFilter !== "ALL" && row.strategy !== strategyFilter) return false;
+    if (marketFilter !== "ALL" && row.market !== marketFilter) return false;
+    if (orderTypeFilter !== "ALL" && row.orderType !== orderTypeFilter) return false;
+    if (statusFilter !== "ALL" && row.status !== statusFilter) return false;
+    if (startMs != null && (!created || created.getTime() < startMs)) return false;
+    if (endMs != null && (!created || created.getTime() > endMs)) return false;
+    return true;
+  });
+  const sortedRows = [...filteredRows].sort((a, b) => {
+    const value = (row: TradeHistoryRow) => {
+      if (sortKey === "entryTime") return parseDate(row.createdAt)?.getTime() ?? 0;
+      if (sortKey === "exitTime") return parseDate(row.updatedAt)?.getTime() ?? 0;
+      if (sortKey === "entryPrice") return row.entryPrice ?? 0;
+      if (sortKey === "exitPrice") return row.exitPrice ?? 0;
+      if (sortKey === "volume") return row.volume ?? 0;
+      if (sortKey === "pnl") return row.pnl ?? 0;
+      if (sortKey === "returnRate") return row.returnRate ?? 0;
+      if (sortKey === "fee") return row.fee ?? 0;
+      return String(row[sortKey] ?? "");
+    };
+    const av = value(a);
+    const bv = value(b);
+    const result = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv), "ko-KR");
+    return sortDirection === "asc" ? result : -result;
+  });
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pagedRows = sortedRows.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const selected = sortedRows.find((row) => row.id === selectedId) ?? pagedRows[0] ?? sortedRows[0] ?? null;
+  const todayKey = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(new Date());
+  const todayCount = liveRows.filter((row) => {
+    const created = parseDate(row.createdAt);
+    return created && new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(created) === todayKey;
+  }).length;
+  const totalTrades = filteredRows.length;
+  const settledRows = filteredRows.filter((row) => row.rawStatus === "FILLED" || row.pnl != null);
+  const profitable = settledRows.filter((row) => (row.pnl ?? 0) > 0).length;
+  const winRate = settledRows.length ? profitable / settledRows.length : null;
+  const realizedPnl = filteredRows.reduce((sum, row) => sum + (row.pnl ?? 0), 0);
+  const totalFee = filteredRows.reduce((sum, row) => sum + (row.fee ?? 0), 0);
+  const holdDurations = filteredRows.map((row) => row.holdMs).filter((value): value is number => value != null && value >= 0);
+  const avgHoldMs = holdDurations.length ? holdDurations.reduce((sum, value) => sum + value, 0) / holdDurations.length : null;
+  const chartCandles = data.candles.slice(-46);
+  const selectedMarket = selected?.market ?? marketDisplay(MARKET);
+  const selectedEntry = selected?.entryPrice ?? latestCandle(data.candles)?.trade_price ?? 0;
+  const selectedExit = selected?.exitPrice ?? selectedEntry;
+  const chartMin = chartCandles.length ? Math.min(...chartCandles.map((candle) => candle.low_price), selectedEntry) : selectedEntry * 0.98;
+  const chartMax = chartCandles.length ? Math.max(...chartCandles.map((candle) => candle.high_price), selectedExit) : selectedEntry * 1.02;
+  const chartSpread = Math.max(chartMax - chartMin, 1);
+  const handleSort = (key: TradeSortKey) => {
+    setSortKey((prev) => {
+      if (prev === key) {
+        setSortDirection((direction) => direction === "asc" ? "desc" : "asc");
+        return prev;
+      }
+      setSortDirection(key === "entryTime" || key === "exitTime" ? "desc" : "asc");
+      return key;
+    });
+  };
+  const resetPage = () => setPage(1);
+  React.useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  return (
+    <>
+      <KpiCard className="ref-trade-kpi-total" icon={<ClipboardList size={28} />} label="전체 거래 수" value={`${formatNumber(totalTrades, 0)} 건`} sub={`오늘 ${todayCount} 건`} />
+      <KpiCard className="ref-trade-kpi-win" icon={<Target size={28} />} label="승률" value={formatRatioPercent(winRate, 1)} sub={`${profitable} 승 / ${Math.max(settledRows.length - profitable, 0)} 패`} tone="cyan" />
+      <KpiCard className="ref-trade-kpi-profit" icon={<TrendingUp size={28} />} label="누적 실현 손익 (KRW)" value={formatSignedKrw(realizedPnl)} sub={formatPercent(realizedPnl / Math.max(data.liveBalances?.estimated_total_equity_krw ?? portfolioBaseTotal, 1))} tone="green" />
+      <KpiCard className="ref-trade-kpi-time" icon={<History size={28} />} label="평균 보유 시간" value={formatRuntimeDuration(avgHoldMs)} sub="필터 기준" tone="amber" />
+      <KpiCard className="ref-trade-kpi-fee" icon={<DollarSign size={28} />} label="총 수수료 (KRW)" value={`${formatSignedKrw(totalFee)} KRW`} sub="수수료 제외전" tone="green" />
+
+      <RefPanel className="ref-trade-filter-panel">
+        <div className="ref-trade-filter-grid">
+          <label><span>계정/거래소</span><select value={exchangeFilter} onChange={(event) => { setExchangeFilter(event.target.value); resetPage(); }}><option value="ALL">전체</option>{exchangeOptions.map((item) => <option key={item} value={item}>{item === "bithumb" ? "빗썸 (Bithumb)" : item === "upbit" ? "업비트 (Upbit)" : item}</option>)}</select></label>
+          <label><span>전략</span><select value={strategyFilter} onChange={(event) => { setStrategyFilter(event.target.value); resetPage(); }}><option value="ALL">전체</option>{strategyOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+          <label><span>종목</span><select value={marketFilter} onChange={(event) => { setMarketFilter(event.target.value); resetPage(); }}><option value="ALL">전체</option>{marketOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+          <label><span>기간</span><div className="ref-trade-period"><input type="date" value={startDate} onChange={(event) => { setStartDate(event.target.value); resetPage(); }} /><em>~</em><input type="date" value={endDate} onChange={(event) => { setEndDate(event.target.value); resetPage(); }} /></div></label>
+          <label><span>주문 유형</span><select value={orderTypeFilter} onChange={(event) => { setOrderTypeFilter(event.target.value); resetPage(); }}><option value="ALL">전체</option>{orderTypeOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+          <label><span>상태</span><select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); resetPage(); }}><option value="ALL">전체</option>{statusOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+        </div>
+        <div className="ref-trade-filter-actions">
+          <div className="ref-trade-search"><Search size={17} /><input value={search} onChange={(event) => { setSearch(event.target.value); resetPage(); }} placeholder="종목, 전략명, 주문ID 검색" /></div>
+          <button type="button" className="ref-trade-export" onClick={() => exportTradeCsv(sortedRows)} disabled={sortedRows.length === 0}><Download size={16} />CSV 내보내기</button>
+          <button type="button" className="ref-trade-refresh" onClick={() => void refresh()}><RotateCw size={16} /></button>
+        </div>
+      </RefPanel>
+
+      <RefPanel className="ref-trade-table-panel">
+        <table>
+          <thead><tr>{(["market", "strategy", "position", "entryTime", "exitTime", "entryPrice", "exitPrice", "volume", "pnl", "returnRate", "fee", "status"] as TradeSortKey[]).map((key) => <th key={key}><button type="button" onClick={() => handleSort(key)}>{tradeSortLabels[key]} {sortKey === key ? sortDirection === "asc" ? "↑" : "↓" : "↕"}</button></th>)}</tr></thead>
+          <tbody>
+            {pagedRows.length === 0 && <tr><td colSpan={12} className="ref-trade-empty">실제 거래내역 데이터가 없습니다.</td></tr>}
+            {pagedRows.map((row) => (
+              <tr key={row.id} className={selected && row.id === selected.id ? "is-selected" : ""} onClick={() => setSelectedId(row.id)}>
+                <td><span className="ref-trade-market"><TradeCoinIcon market={row.market} />{row.market}</span></td>
+                <td>{row.strategy}</td>
+                <td className={row.position === "롱" ? "ref-positive" : "ref-negative"}>{row.position}</td>
+                <td>{row.entryTime}</td>
+                <td>{row.exitTime}</td>
+                <td>{formatKrw(row.entryPrice)}</td>
+                <td>{formatKrw(row.exitPrice)}</td>
+                <td>{formatNumber(row.volume, 4)}</td>
+                <td className={(row.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(row.pnl)}</td>
+                <td className={(row.returnRate ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(row.returnRate)}</td>
+                <td>{formatKrw(row.fee)}</td>
+                <td><span className="ref-trade-status">{row.status}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="ref-trade-pagination"><span>전체 {formatNumber(filteredRows.length, 0)} 건</span><button type="button" onClick={() => setPage(1)} disabled={safePage === 1}>≪</button><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={safePage === 1}>‹</button>{Array.from({ length: Math.min(5, totalPages) }, (_, index) => Math.min(Math.max(1, safePage - 2), Math.max(1, totalPages - 4)) + index).filter((value, index, list) => value <= totalPages && list.indexOf(value) === index).map((item) => <button key={item} type="button" className={item === safePage ? "is-active" : ""} onClick={() => setPage(item)}>{item}</button>)}{totalPages > 5 && <em>...</em>}{totalPages > 5 && <button type="button" onClick={() => setPage(totalPages)}>{totalPages}</button>}<button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={safePage === totalPages}>›</button><button type="button" onClick={() => setPage(totalPages)} disabled={safePage === totalPages}>≫</button><select value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value)); setPage(1); }}><option value={10}>10개씩 보기</option><option value={20}>20개씩 보기</option><option value={50}>50개씩 보기</option></select></div>
+      </RefPanel>
+
+      <RefPanel className="ref-trade-detail-card">
+        <div className="ref-trade-detail-head"><span><TradeCoinIcon market={selectedMarket} />{selected?.market ?? "-"}</span><b>{selected?.status ?? "데이터 없음"}</b></div>
+        <div className="ref-trade-detail-grid">
+          <p><span>전략</span><b>{selected?.strategy ?? "-"}</b></p><p><span>수량</span><b>{formatNumber(selected?.volume, 6)} {tradeSymbol(selectedMarket)}</b></p>
+          <p><span>주문 유형</span><b>{selected?.orderType ?? "-"}</b></p><p><span>수수료</span><b>{formatKrw(selected?.fee)} KRW</b></p>
+          <p><span>진입가</span><b>{formatKrw(selected?.entryPrice)} KRW</b></p><p><span>보유시간</span><b>{formatRuntimeDuration(selected?.holdMs)}</b></p>
+          <p><span>청산가</span><b>{formatKrw(selected?.exitPrice)} KRW</b></p><p><span>진입시간</span><b>{selected?.entryTime ?? "-"}</b></p>
+          <p><span>수익률</span><b className={(selected?.returnRate ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(selected?.returnRate)}</b></p><p><span>청산시간</span><b>{selected?.exitTime ?? "-"}</b></p>
+          <p><span>실현손익</span><b className={(selected?.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(selected?.pnl)} KRW</b></p><p><span>주문ID</span><b>{selected?.orderId ?? "-"}</b></p>
+        </div>
+      </RefPanel>
+
+      <RefPanel className="ref-trade-timeline-card">
+        <h3>거래 타임라인</h3>
+        <div><p className="ok"><b>주문 생성</b><span>{selected?.createdAt ? formatKstShort(selected.createdAt) : "거래 데이터 없음"}</span></p><p className="ok"><b>거래소 제출</b><span>{selected?.exchange ?? "-"}</span></p><p className={selected?.rawStatus === "FAILED" || selected?.rawStatus === "BLOCKED" ? "danger" : "ok"}><b>{selected?.status ?? "상태 없음"}</b><span>{selected?.updatedAt ? formatKstShort(selected.updatedAt) : "-"}</span></p><p className={selected?.pnl != null && selected.pnl < 0 ? "danger" : "ok"}><b>손익 반영</b><span>{formatSignedKrw(selected?.pnl)} KRW</span></p></div>
+      </RefPanel>
+
+      <RefPanel className="ref-trade-log-card">
+        <h3>체결 로그</h3>
+        <table><thead><tr><th>시간</th><th>구분</th><th>가격</th><th>수량</th></tr></thead><tbody><tr><td>{selected?.entryTime ?? "-"}</td><td>{selected?.position === "숏" ? "매도" : "매수"}</td><td>{formatKrw(selected?.entryPrice)}</td><td>{formatNumber(selected?.volume, 4)}</td></tr><tr><td>{selected?.exitTime ?? "-"}</td><td className={selected?.position === "숏" ? "ref-positive" : "ref-negative"}>{selected?.rawStatus ?? "-"}</td><td>{formatKrw(selected?.exitPrice)}</td><td>{formatNumber(selected?.volume, 4)}</td></tr></tbody></table>
+      </RefPanel>
+
+      <RefPanel className="ref-trade-signal-card">
+        <h3>신호 근거</h3>
+        <div><p>✓ 전략: {selected?.strategy ?? "-"}</p><p>✓ 종목: {selected?.market ?? "-"}</p><p>✓ 주문 상태: <b>{selected?.status ?? "-"}</b></p><p>✓ 거래소: {selected?.exchange ?? "-"}</p></div>
+        <div><p>› 기준가: {formatKrw(selected?.entryPrice)} KRW</p><p>› 체결가: {formatKrw(selected?.exitPrice)} KRW</p><p>› 수수료: {formatKrw(selected?.fee)} KRW</p><p>› 수익률: <b>{formatPercent(selected?.returnRate)}</b></p></div>
+      </RefPanel>
+
+      <RefPanel className="ref-trade-chart-card">
+        <h3>가격 차트 (5분)</h3>
+        <svg viewBox="0 0 360 164" role="img" aria-label="거래 가격 차트">
+          {[0, 1, 2, 3, 4].map((line) => <line key={line} x1="18" x2="338" y1={24 + line * 28} y2={24 + line * 28} />)}
+          {chartCandles.map((candle, index) => {
+            const x = 22 + index * 7;
+            const open = 142 - ((candle.opening_price - chartMin) / chartSpread) * 118;
+            const close = 142 - ((candle.trade_price - chartMin) / chartSpread) * 118;
+            const high = 142 - ((candle.high_price - chartMin) / chartSpread) * 118;
+            const low = 142 - ((candle.low_price - chartMin) / chartSpread) * 118;
+            const up = close <= open;
+            return <g key={`${candle.candle_time_utc}-${index}`}><line x1={x} x2={x} y1={high} y2={low} className={up ? "up" : "down"} /><rect x={x - 2} y={Math.min(open, close)} width="4" height={Math.max(Math.abs(close - open), 2)} className={up ? "up" : "down"} /></g>;
+          })}
+          <text x="35" y="137">매수</text><text x="156" y="75">익절1</text><text x="284" y="25">최종 청산</text>
+        </svg>
+      </RefPanel>
+    </>
   );
 }
 
@@ -1570,7 +2392,7 @@ function AutoStatusPanel({
   toggleError: string | null;
 }) {
   const [now, setNow] = React.useState(() => Date.now());
-  const autoRunning = isRunning(data.liveStrategy?.session?.status) || isRunning(data.autoPilot?.session?.status);
+  const autoRunning = isRuntimeRunning(data);
   React.useEffect(() => {
     const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(intervalId);
@@ -1636,7 +2458,7 @@ function AutoStatusPanel({
 }
 
 function AutoStrategyStrip({ data }: { data: DashboardData }) {
-  const autoRunning = isRunning(data.liveStrategy?.session?.status) || isRunning(data.autoPilot?.session?.status);
+  const autoRunning = isRuntimeRunning(data);
   const candidates = data.candidates.slice(0, 5);
   const placeholders = Array.from({ length: Math.max(5 - candidates.length, 0) }, (_, index) => ({
     id: -(index + 1),
@@ -2424,10 +3246,63 @@ function DashboardView({
   );
 }
 
-export function ReferenceDashboard() {
+function LoginScreen({
+  auth,
+  onAuthenticated
+}: {
+  auth: AuthStatus | null;
+  onAuthenticated: (status: AuthStatus) => void;
+}) {
+  const [username, setUsername] = React.useState("admin");
+  const [password, setPassword] = React.useState("");
+  const [message, setMessage] = React.useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
+
+  const submit = React.useCallback(async (event: React.FormEvent) => {
+    event.preventDefault();
+    setIsSubmitting(true);
+    setMessage(null);
+    try {
+      const status = await postJson<AuthStatus & { ok?: boolean }>("/api/auth/login", { username, password });
+      onAuthenticated(status);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "로그인 실패");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [onAuthenticated, password, username]);
+
+  return (
+    <main className="ref-login-page">
+      <form className="ref-login-card" onSubmit={submit}>
+        <span className="ref-logo">Q</span>
+        <h1>Auto Trader</h1>
+        <p>관리자 로그인 후 대시보드와 실거래 제어를 사용할 수 있습니다.</p>
+        {!auth?.auth_configured && auth?.auth_required && (
+          <em>ADMIN_PASSWORD_HASH와 SESSION_SECRET 설정이 필요합니다.</em>
+        )}
+        <label>
+          <span>아이디</span>
+          <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" />
+        </label>
+        <label>
+          <span>비밀번호</span>
+          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" />
+        </label>
+        {message && <strong>{message}</strong>}
+        <button type="submit" disabled={isSubmitting || (auth?.auth_required && !auth?.auth_configured)}>
+          {isSubmitting ? "확인 중" : "로그인"}
+        </button>
+      </form>
+    </main>
+  );
+}
+
+function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void> }) {
   const scale = useStageScale();
   const [chartUnit, setChartUnit] = React.useState(CHART_UNIT);
-  const { data, refresh } = useDashboardData(chartUnit);
+  const [selectedExchange, setSelectedExchange] = React.useState<DashboardExchange>("bithumb");
+  const { data, refresh } = useDashboardData(chartUnit, selectedExchange);
   const [activeView, setActiveView] = React.useState<ReferenceView>("dashboard");
   const [isAutoToggling, setIsAutoToggling] = React.useState(false);
   const [autoToggleError, setAutoToggleError] = React.useState<string | null>(null);
@@ -2447,7 +3322,7 @@ export function ReferenceDashboard() {
     data.forward?.status
   ].filter(isRunning).length;
   const winRate = data.candidates.find((candidate) => candidate.backtest_win_rate != null)?.backtest_win_rate ?? null;
-  const isAutoTradingOn = isRunning(data.liveStrategy?.session?.status) || isRunning(data.autoPilot?.session?.status);
+  const isAutoTradingOn = isRuntimeRunning(data);
 
   const toggleAutoTrading = React.useCallback(async () => {
     if (isAutoToggling) return;
@@ -2455,18 +3330,17 @@ export function ReferenceDashboard() {
     setAutoToggleError(null);
     try {
       if (isAutoTradingOn) {
-        await Promise.allSettled([
-          postJson<LiveStrategyStatus>("/api/live-strategy-pilot/stop"),
-          postJson<AutoPilotStatus>("/api/auto-live-pilot/stop")
-        ]);
+        await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/stop");
       } else {
         const candidate = data.candidates.find((item) => item.id > 0 && item.market === MARKET && item.status !== "INACTIVE")
           ?? data.candidates.find((item) => item.id > 0 && item.market === MARKET)
           ?? data.candidates.find((item) => item.id > 0);
         if (!candidate) throw new Error("시작할 전략이 없습니다.");
-        const body = await postJson<LiveStrategyStatus & { ok?: boolean; message?: string }>("/api/live-strategy-pilot/start", {
+        const confirmation = window.prompt("자동매매를 시작하려면 확인 문구를 입력하세요: AUTO STRATEGY ENABLE")?.trim();
+        if (confirmation !== "AUTO STRATEGY ENABLE") throw new Error("확인 문구가 일치하지 않아 자동매매 시작을 취소했습니다.");
+        const body = await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/start", {
           candidate_strategy_id: candidate.id,
-          confirmation: "AUTO STRATEGY ENABLE",
+          confirmation,
           order_confirmation: "PLACE AUTO LIVE ORDER"
         });
         if (body.ok === false) throw new Error(body.message ?? "자동매매 시작이 차단되었습니다.");
@@ -2484,7 +3358,7 @@ export function ReferenceDashboard() {
     <main className="ref-viewport" style={{ ["--ref-scale" as string]: scale }}>
       <div className="ref-stage-shell" style={{ width: scaledWidth, height: scaledHeight }}>
         <div className="ref-stage">
-          <Topbar data={data} />
+          <Topbar data={data} selectedExchange={selectedExchange} onExchangeChange={setSelectedExchange} onRefresh={refresh} onLogout={onLogout} />
           <Sidebar activeView={activeView} onViewChange={setActiveView} />
           {activeView === "dashboard" && (
             <DashboardView
@@ -2510,8 +3384,54 @@ export function ReferenceDashboard() {
             />
           )}
           {activeView === "strategies" && <StrategiesView data={data} refresh={refresh} />}
+          {activeView === "portfolio" && <PortfolioView data={data} totalEquity={totalEquity} totalPnl={totalPnl} totalReturn={totalReturn} onSimulate={() => setActiveView("strategies")} />}
+          {activeView === "trades" && <TradeHistoryView data={data} refresh={refresh} />}
         </div>
       </div>
     </main>
   );
+}
+
+export function ReferenceDashboard() {
+  const [auth, setAuth] = React.useState<AuthStatus | null>(null);
+  const [loading, setLoading] = React.useState(true);
+
+  const loadAuth = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const status = await fetchJson<AuthStatus>("/api/auth/status");
+      setAuth(status);
+    } catch {
+      setAuth({ auth_required: true, auth_configured: false, authenticated: false });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void loadAuth();
+  }, [loadAuth]);
+
+  const logout = React.useCallback(async () => {
+    await postJson("/api/auth/logout");
+    setAuth((current) => ({ ...(current ?? { auth_required: true, auth_configured: true }), authenticated: false }));
+  }, []);
+
+  if (loading) {
+    return (
+      <main className="ref-login-page">
+        <div className="ref-login-card">
+          <span className="ref-logo">Q</span>
+          <h1>Auto Trader</h1>
+          <p>인증 상태를 확인하는 중입니다.</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (auth?.auth_required && !auth.authenticated) {
+    return <LoginScreen auth={auth} onAuthenticated={setAuth} />;
+  }
+
+  return <ReferenceDashboardContent onLogout={logout} />;
 }

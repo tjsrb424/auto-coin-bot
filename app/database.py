@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,9 +11,21 @@ from typing import Iterator
 DB_PATH = Path(__file__).resolve().parent.parent / "coin_bot_lab.db"
 
 
+def _database_path() -> Path:
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url.startswith("sqlite:///"):
+        raw_path = database_url.removeprefix("sqlite:///")
+        if raw_path.startswith("/") or (len(raw_path) > 1 and raw_path[1] == ":"):
+            return Path(raw_path)
+        return Path(__file__).resolve().parent.parent / raw_path
+    return DB_PATH
+
+
 @contextmanager
 def get_connection() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_PATH)
+    path = _database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -448,6 +461,18 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS runtime_locks (
+                lock_id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                hostname TEXT NOT NULL,
+                app_env TEXT NOT NULL,
+                runtime_owner TEXT NOT NULL,
+                status TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS risk_states (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 exchange TEXT NOT NULL,
@@ -781,7 +806,7 @@ def load_candidate_strategies(limit: int = 50) -> list[dict]:
         rows = conn.execute(
             """
             SELECT * FROM candidate_strategies
-            ORDER BY created_at DESC, id DESC
+            ORDER BY score DESC, updated_at DESC, id DESC
             LIMIT ?
             """,
             (limit,),
@@ -875,7 +900,7 @@ def pause_running_forward_sessions_on_startup() -> int:
                 stopped_at = ?,
                 updated_at = ?,
                 last_risk_result = 'STOPPED_ON_SERVER_RESTART'
-            WHERE status = 'RUNNING'
+            WHERE status IN ('READY', 'RUNNING')
             """,
             (now_utc, now_utc),
         )
@@ -948,7 +973,7 @@ def load_running_forward_sessions() -> list[dict]:
         rows = conn.execute(
             """
             SELECT id FROM paper_forward_sessions
-            WHERE status = 'RUNNING'
+            WHERE status IN ('READY', 'RUNNING')
             ORDER BY id ASC
             """
         ).fetchall()
@@ -1502,6 +1527,65 @@ def load_live_recovery_events(limit: int = 100) -> list[dict]:
     return events
 
 
+def load_runtime_lock(lock_id: str = "auto-trading") -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM runtime_locks WHERE lock_id = ?", (lock_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def acquire_runtime_lock(
+    *,
+    lock_id: str,
+    instance_id: str,
+    hostname: str,
+    app_env: str,
+    runtime_owner: str,
+    ttl_seconds: int,
+) -> tuple[bool, dict | None]:
+    now_utc = _utc_now()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM runtime_locks WHERE lock_id = ?", (lock_id,)).fetchone()
+        current = dict(row) if row else None
+        if current and current.get("status") == "RUNNING" and current.get("instance_id") != instance_id and str(current.get("expires_at") or "") > now_utc:
+            return False, current
+        conn.execute(
+            """
+            INSERT INTO runtime_locks (
+                lock_id, instance_id, hostname, app_env, runtime_owner,
+                status, acquired_at, expires_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?)
+            ON CONFLICT(lock_id) DO UPDATE SET
+                instance_id = excluded.instance_id,
+                hostname = excluded.hostname,
+                app_env = excluded.app_env,
+                runtime_owner = excluded.runtime_owner,
+                status = 'RUNNING',
+                acquired_at = excluded.acquired_at,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            """,
+            (lock_id, instance_id, hostname, app_env, runtime_owner, now_utc, expires_at, now_utc),
+        )
+    return True, load_runtime_lock(lock_id)
+
+
+def release_runtime_lock(*, lock_id: str, instance_id: str, status: str = "STOPPED") -> None:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE runtime_locks
+            SET status = ?,
+                expires_at = ?,
+                updated_at = ?
+            WHERE lock_id = ?
+              AND instance_id = ?
+            """,
+            (status, now_utc, now_utc, lock_id, instance_id),
+        )
+
+
 def upsert_risk_state(state: dict) -> int:
     now_utc = _utc_now()
     with get_connection() as conn:
@@ -1829,7 +1913,7 @@ def pause_running_live_strategy_sessions_on_startup() -> int:
                 auto_enabled = 0,
                 last_risk_result = 'SERVER_RESTART_LIVE_PAUSED',
                 updated_at = ?
-            WHERE status = 'RUNNING'
+            WHERE status IN ('READY', 'RUNNING')
             """,
             (now_utc,),
         )
@@ -2344,7 +2428,7 @@ def pause_running_auto_live_pilot_sessions_on_startup() -> int:
                 auto_enabled = 0,
                 last_order_status = COALESCE(last_order_status, 'SERVER_RESTART_LIVE_PAUSED'),
                 updated_at = ?
-            WHERE status = 'RUNNING'
+            WHERE status IN ('READY', 'RUNNING')
             """,
             (now_utc,),
         )

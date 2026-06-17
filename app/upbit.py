@@ -90,3 +90,21 @@ async def fetch_day_candles(
                 break
 
     return sorted(collected, key=lambda item: item["candle_date_time_utc"])
+
+
+async def fetch_tickers(markets: list[str], *, base_url: str = UPBIT_BASE_URL) -> list[dict[str, Any]]:
+    unique_markets = [market for market in dict.fromkeys(markets) if market]
+    if not unique_markets:
+        return []
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            f"{base_url.rstrip('/')}/v1/ticker",
+            params={"markets": ",".join(unique_markets)},
+        )
+        if response.status_code >= 400:
+            raise UpbitClientError(f"티커 조회 실패: {response.text}")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise UpbitClientError("티커 응답 형식이 올바르지 않습니다.")
+        return payload

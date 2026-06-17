@@ -87,10 +87,11 @@ class LiveStrategyConfig:
 
     @classmethod
     def from_env(cls) -> "LiveStrategyConfig":
+        live_feature_allowed = os.getenv("APP_ENV", "development").lower() == "production" or os.getenv("ALLOW_DEV_LIVE_TRADING", "false").lower() == "true"
         return cls(
-            exchange=os.getenv("EXCHANGE", "upbit").strip().lower(),
-            live_auto_trading_enabled=os.getenv("LIVE_AUTO_TRADING_ENABLED", "false").lower() == "true",
-            auto_strategy_pilot_enabled=os.getenv("AUTO_STRATEGY_PILOT_ENABLED", "false").lower() == "true",
+            exchange=os.getenv("EXCHANGE", os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb")).strip().lower(),
+            live_auto_trading_enabled=live_feature_allowed and os.getenv("LIVE_AUTO_TRADING_ENABLED", "false").lower() == "true",
+            auto_strategy_pilot_enabled=live_feature_allowed and os.getenv("AUTO_STRATEGY_PILOT_ENABLED", "false").lower() == "true",
             allowed_exchange=os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb").strip().lower(),
             allowed_market=os.getenv("AUTO_ALLOWED_MARKET", "KRW-BTC"),
             allowed_order_type=os.getenv("AUTO_ALLOWED_ORDER_TYPE", os.getenv("AUTO_ORDER_TYPE", "limit")).strip().lower(),
@@ -160,8 +161,8 @@ def start_live_strategy_pilot(*, candidate_strategy_id: int, confirmation: str, 
         return {"ok": False, "message": "Candidate strategy not found.", **live_strategy_status()}
     if candidate["market"] != config.allowed_market:
         return {"ok": False, "message": "Only KRW-BTC candidate strategies are allowed.", **live_strategy_status()}
-    if config.allowed_exchange != "bithumb" or config.exchange != "bithumb":
-        return {"ok": False, "message": "EXCHANGE=bithumb and AUTO_ALLOWED_EXCHANGE=bithumb are required.", **live_strategy_status()}
+    if config.allowed_exchange != "bithumb":
+        return {"ok": False, "message": "AUTO_ALLOWED_EXCHANGE=bithumb 설정이 필요합니다.", **live_strategy_status()}
     session_id = create_live_strategy_session(
         {
             "exchange": config.allowed_exchange,
@@ -371,7 +372,7 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_AUTO_DISABLED"
     if not config.auto_strategy_pilot_enabled:
         return "BLOCKED_AUTO_STRATEGY_DISABLED"
-    if config.exchange != "bithumb" or config.allowed_exchange != "bithumb" or session["exchange"] != "bithumb":
+    if config.allowed_exchange != "bithumb" or session["exchange"] != "bithumb":
         return "BLOCKED_EXCHANGE_NOT_ALLOWED"
     if config.allowed_market != "KRW-BTC" or session["market"] != "KRW-BTC":
         return "BLOCKED_MARKET_NOT_ALLOWED"

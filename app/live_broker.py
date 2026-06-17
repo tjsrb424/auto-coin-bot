@@ -61,11 +61,12 @@ class LiveTradingConfig:
             access_key = os.getenv("UPBIT_ACCESS_KEY", "")
             secret_key = os.getenv("UPBIT_SECRET_KEY", "")
             base_url = os.getenv("UPBIT_BASE_URL", UPBIT_BASE_URL)
+        live_feature_allowed = os.getenv("APP_ENV", "development").lower() == "production" or os.getenv("ALLOW_DEV_LIVE_TRADING", "false").lower() == "true"
         return cls(
             exchange=exchange,
             access_key_loaded=bool(access_key),
             secret_key_loaded=bool(secret_key),
-            live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
+            live_trading_enabled=live_feature_allowed and os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
             base_url=base_url.rstrip("/"),
             max_live_order_krw=float(os.getenv("MAX_LIVE_ORDER_KRW", "10000")),
             max_daily_live_loss_percent=float(os.getenv("MAX_DAILY_LIVE_LOSS_PERCENT", "1")),

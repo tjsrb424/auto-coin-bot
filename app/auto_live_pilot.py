@@ -64,9 +64,10 @@ class AutoLivePilotConfig:
 
     @classmethod
     def from_env(cls) -> "AutoLivePilotConfig":
+        live_feature_allowed = os.getenv("APP_ENV", "development").lower() == "production" or os.getenv("ALLOW_DEV_LIVE_TRADING", "false").lower() == "true"
         return cls(
-            live_auto_trading_enabled=os.getenv("LIVE_AUTO_TRADING_ENABLED", "false").lower() == "true",
-            auto_pilot_enabled=os.getenv("AUTO_PILOT_ENABLED", "false").lower() == "true",
+            live_auto_trading_enabled=live_feature_allowed and os.getenv("LIVE_AUTO_TRADING_ENABLED", "false").lower() == "true",
+            auto_pilot_enabled=live_feature_allowed and os.getenv("AUTO_PILOT_ENABLED", "false").lower() == "true",
             allowed_exchange=os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb").lower(),
             allowed_market=os.getenv("AUTO_ALLOWED_MARKET", "KRW-BTC"),
             min_order_krw=float(os.getenv("AUTO_MIN_ORDER_KRW", "10000")),

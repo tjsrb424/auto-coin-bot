@@ -5,8 +5,11 @@ from pathlib import Path
 
 
 def load_server_env() -> None:
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if not env_path.exists():
+    root = Path(__file__).resolve().parent.parent
+    candidates = [root / ".env.production"] if os.getenv("APP_ENV", "").lower() == "production" else [root / ".env"]
+    candidates.append(root / ".env.production")
+    env_path = next((path for path in candidates if path.exists()), None)
+    if env_path is None:
         return
     for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
@@ -15,5 +18,5 @@ def load_server_env() -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key:
+        if key and key not in os.environ:
             os.environ[key] = value
