@@ -97,6 +97,52 @@ class RiskManagerTests(unittest.TestCase):
 
         self.assertEqual(result["block_code"], "BLOCKED_MAX_ORDERS_PER_DAY")
 
+    def test_daily_loss_limit_does_not_block_exit(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "OPEN",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 99_000_000,
+                "unrealized_pnl": -20_000,
+                "realized_pnl": 0,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-16T00:00:00Z",
+            }
+        )
+        with patch.dict(os.environ, {"RISK_MAX_DAILY_LOSS_KRW": "10000", "RISK_MIN_COOLDOWN_SECONDS": "0"}, clear=False):
+            result = check_order_risk(
+                order={**order(), "request_id": "risk-test-exit", "side": "SELL"},
+                purpose="EXIT",
+                base_result={"allowed": True},
+                position_id=position_id,
+                is_auto=True,
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["checks"]["daily_limit_check"]["allowed"], True)
+
     def test_cooldown_blocks(self) -> None:
         database.insert_live_order_log(
             {
@@ -153,7 +199,7 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         with patch.dict(os.environ, {"RISK_MIN_COOLDOWN_SECONDS": "0"}, clear=False):
-            entry = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+            entry = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, candidate_strategy_id=1, is_auto=True)
             exit_result = check_order_risk(order={**order(), "side": "SELL"}, purpose="EXIT", base_result={"allowed": True}, position_id=position_id, is_auto=False)
 
         self.assertEqual(entry["block_code"], "BLOCKED_OPEN_POSITION_EXISTS")

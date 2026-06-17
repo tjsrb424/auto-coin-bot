@@ -279,7 +279,10 @@ def check_order_risk(
         block("BLOCKED_MAX_ENTRY_ORDERS_PER_DAY", check_name="daily_limit_check")
     elif purpose == "EXIT" and config.max_exit_orders_per_day > 0 and state["daily_exit_count"] >= config.max_exit_orders_per_day:
         block("BLOCKED_MAX_EXIT_ORDERS_PER_DAY", check_name="daily_limit_check")
-    elif abs(min(state["daily_total_pnl"], 0.0)) >= config.max_daily_loss_krw or state["daily_loss_percent"] >= config.max_daily_loss_percent:
+    elif purpose == "ENTRY" and (
+        abs(min(state["daily_total_pnl"], 0.0)) >= config.max_daily_loss_krw
+        or state["daily_loss_percent"] >= config.max_daily_loss_percent
+    ):
         block("BLOCKED_DAILY_LOSS_LIMIT", check_name="daily_limit_check")
     else:
         ok("daily_limit_check")
