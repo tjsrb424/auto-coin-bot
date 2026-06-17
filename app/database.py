@@ -2072,6 +2072,23 @@ def load_open_live_positions(exchange: str = "bithumb", market: str = "KRW-BTC")
     return [dict(row) for row in rows]
 
 
+def has_open_live_position_for_strategy(exchange: str, market: str, candidate_strategy_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM live_positions
+            WHERE exchange = ?
+              AND market = ?
+              AND candidate_strategy_id = ?
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+            LIMIT 1
+            """,
+            (exchange, market, candidate_strategy_id),
+        ).fetchone()
+    return row is not None
+
+
 def update_live_position(position_id: int, updates: dict) -> None:
     allowed = {
         "status",

@@ -16,6 +16,7 @@ from app.database import (
     create_live_strategy_session,
     get_live_order_log,
     has_live_strategy_order_for_signal,
+    has_open_live_position_for_strategy,
     has_open_live_strategy_order,
     insert_candles,
     insert_live_order_log,
@@ -97,7 +98,7 @@ class LiveStrategyConfig:
             allowed_exchange=os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb").strip().lower(),
             allowed_market=os.getenv("AUTO_ALLOWED_MARKET", "KRW-BTC"),
             allowed_order_type=os.getenv("AUTO_ALLOWED_ORDER_TYPE", os.getenv("AUTO_ORDER_TYPE", "limit")).strip().lower(),
-            max_order_krw=float(os.getenv("AUTO_MAX_ORDER_KRW", "10000")),
+            max_order_krw=float(os.getenv("AUTO_MAX_ORDER_KRW", "30000")),
             max_orders_per_day=int(os.getenv("AUTO_MAX_ORDERS_PER_DAY", "3")),
             max_open_position_count=int(os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "1")),
             cooldown_seconds=int(os.getenv("AUTO_COOLDOWN_SECONDS", "1800")),
@@ -439,7 +440,7 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_MAX_ORDERS_PER_DAY"
     if has_open_live_strategy_order("bithumb", "KRW-BTC"):
         return "BLOCKED_OPEN_ORDER_EXISTS"
-    if load_open_live_position(None, "bithumb", "KRW-BTC"):
+    if has_open_live_position_for_strategy("bithumb", "KRW-BTC", int(session["candidate_strategy_id"])):
         return "BLOCKED_OPEN_POSITION_EXISTS"
     recovery_block = await auto_order_recovery_block_reason("bithumb", "KRW-BTC")
     if recovery_block:

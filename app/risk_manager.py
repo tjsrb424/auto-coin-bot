@@ -7,6 +7,7 @@ from typing import Any
 
 from app.database import (
     get_connection,
+    has_open_live_position_for_strategy,
     insert_risk_log,
     load_latest_risk_state,
     load_open_live_positions,
@@ -53,7 +54,7 @@ class RiskConfig:
             block_on_open_order=os.getenv("RISK_BLOCK_ON_OPEN_ORDER", "true").lower() == "true",
             block_on_open_position=os.getenv("RISK_BLOCK_ON_OPEN_POSITION", "true").lower() == "true",
             max_position_ratio_percent=float(os.getenv("RISK_MAX_POSITION_RATIO_PERCENT", "20")),
-            max_order_krw=float(os.getenv("RISK_MAX_ORDER_KRW", "10000")),
+            max_order_krw=float(os.getenv("RISK_MAX_ORDER_KRW", "30000")),
             volatility_window=int(os.getenv("RISK_VOLATILITY_WINDOW", "5")),
             volatility_block_percent=float(os.getenv("RISK_VOLATILITY_BLOCK_PERCENT", "2")),
             min_volume_krw=float(os.getenv("RISK_MIN_VOLUME_KRW", "100000000")),
@@ -247,7 +248,12 @@ def check_order_risk(
     else:
         ok("amount_check", amount)
 
-    if purpose == "ENTRY" and config.block_on_open_position and state["open_position_count"] > 0:
+    same_strategy_position_open = (
+        purpose == "ENTRY"
+        and candidate_strategy_id is not None
+        and has_open_live_position_for_strategy(exchange, market, int(candidate_strategy_id))
+    )
+    if purpose == "ENTRY" and config.block_on_open_position and same_strategy_position_open:
         block("BLOCKED_OPEN_POSITION_EXISTS", check_name="position_check")
     elif purpose == "ENTRY":
         ok("position_check")

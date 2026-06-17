@@ -2279,17 +2279,30 @@ function RecentTradesPanel({ data }: { data: DashboardData }) {
 }
 
 function LogPanel({ data }: { data: DashboardData }) {
-  const riskLogs = (data.risk?.risk_logs ?? []).slice(0, 4).map((log) => ({
+  const riskLogs = (data.risk?.risk_logs ?? []).slice(0, 7).map((log) => ({
+    key: `risk-${log.id ?? log.created_at ?? ""}-${log.block_code ?? log.risk_level ?? ""}`,
+    createdAt: log.created_at,
     type: log.allowed ? "ok" : "warn",
     time: formatKstTime(log.created_at),
     text: log.block_reason ?? log.block_code ?? log.risk_level ?? "리스크 로그"
   }));
-  const orderLogs = data.liveOrders.slice(0, 2).map((order) => ({
+  const orderLogs = data.liveOrders.slice(0, 7).map((order) => ({
+    key: `order-${order.request_id ?? order.id ?? order.created_at ?? ""}`,
+    createdAt: order.created_at,
     type: order.status === "BLOCKED" || order.status === "FAILED" ? "warn" : "info",
     time: formatKstTime(order.created_at),
     text: `${marketDisplay(order.market)} ${statusLabel(order.side)} ${statusLabel(order.status)}`
   }));
-  const rows = [...riskLogs, ...orderLogs].slice(0, 6);
+  const recoveryLogs = data.recoveryEvents.slice(0, 7).map((event, index) => ({
+    key: `recovery-${event.created_at ?? index}-${event.event_type ?? ""}`,
+    createdAt: event.created_at,
+    type: event.severity === "ERROR" ? "warn" : "info",
+    time: formatKstTime(event.created_at),
+    text: event.event_type ?? event.message ?? "복구 로그"
+  }));
+  const rows = [...riskLogs, ...orderLogs, ...recoveryLogs]
+    .sort((a, b) => (parseDate(b.createdAt)?.getTime() ?? 0) - (parseDate(a.createdAt)?.getTime() ?? 0))
+    .slice(0, 7);
 
   return (
     <RefPanel className="ref-log-panel">
@@ -2300,7 +2313,7 @@ function LogPanel({ data }: { data: DashboardData }) {
       <div className="ref-log-list">
         {rows.length === 0 && <p><span>-</span><i className="info" />로그 데이터 없음</p>}
         {rows.map((row, index) => (
-          <p key={`${row.time}-${row.text}-${index}`}><span>{row.time}</span><i className={row.type} />{row.text}</p>
+          <p key={row.key} style={{ ["--log-index" as string]: index }}><span>{row.time}</span><i className={row.type} /><b>{row.text}</b></p>
         ))}
       </div>
     </RefPanel>

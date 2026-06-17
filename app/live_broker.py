@@ -68,7 +68,7 @@ class LiveTradingConfig:
             secret_key_loaded=bool(secret_key),
             live_trading_enabled=live_feature_allowed and os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
             base_url=base_url.rstrip("/"),
-            max_live_order_krw=float(os.getenv("MAX_LIVE_ORDER_KRW", "10000")),
+            max_live_order_krw=float(os.getenv("MAX_LIVE_ORDER_KRW", "30000")),
             max_daily_live_loss_percent=float(os.getenv("MAX_DAILY_LIVE_LOSS_PERCENT", "1")),
             min_order_krw=float(os.getenv("MIN_LIVE_ORDER_KRW", "5000")),
             max_position_ratio=float(os.getenv("MAX_LIVE_POSITION_RATIO", "0.5")),

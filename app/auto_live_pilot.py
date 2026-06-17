@@ -71,7 +71,7 @@ class AutoLivePilotConfig:
             allowed_exchange=os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb").lower(),
             allowed_market=os.getenv("AUTO_ALLOWED_MARKET", "KRW-BTC"),
             min_order_krw=float(os.getenv("AUTO_MIN_ORDER_KRW", "10000")),
-            max_order_krw=float(os.getenv("AUTO_MAX_ORDER_KRW", "10000")),
+            max_order_krw=float(os.getenv("AUTO_MAX_ORDER_KRW", "30000")),
             max_orders_per_day=int(os.getenv("AUTO_PILOT_MAX_ORDERS_PER_DAY", "1")),
             order_type=os.getenv("AUTO_ORDER_TYPE", "limit").lower(),
             buy_price_offset_percent=float(os.getenv("AUTO_BUY_PRICE_OFFSET_PERCENT", "3")),

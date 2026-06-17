@@ -2409,8 +2409,8 @@ body {
 
 .ref-log-list {
   display: grid;
-  gap: 13px;
-  margin-top: 18px;
+  gap: 9px;
+  margin-top: 14px;
 }
 
 .ref-log-list p {
@@ -2421,6 +2421,8 @@ body {
   margin: 0;
   color: #c0cad7;
   font-size: 12px;
+  animation: ref-log-enter 360ms cubic-bezier(0.2, 0.85, 0.2, 1) both;
+  animation-delay: calc(min(var(--log-index), 3) * 28ms);
 }
 
 .ref-log-list span {
@@ -2436,6 +2438,27 @@ body {
 .ref-log-list i.ok { background: var(--ref-green); }
 .ref-log-list i.info { background: #38a5ff; }
 .ref-log-list i.warn { background: var(--ref-amber); }
+
+.ref-log-list b {
+  min-width: 0;
+  overflow: hidden;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes ref-log-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
 .ref-trade-kpi-total { left: 220px; top: 90px; width: 217px; }
 .ref-trade-kpi-win { left: 449px; top: 90px; width: 207px; }

@@ -421,7 +421,7 @@ Policy:
 - Exchange: Bithumb
 - Market: `KRW-BTC`
 - Order type: `limit`
-- Amount: `5,000~10,000 KRW`
+- Amount: `5,000~30,000 KRW`
 - Price: below current price
 - No market orders
 
