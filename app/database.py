@@ -9,6 +9,14 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH = Path(__file__).resolve().parent.parent / "coin_bot_lab.db"
+LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
+              AND request_id NOT LIKE '%-submitted%'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+"""
 
 
 def _database_path() -> Path:
@@ -2311,14 +2319,13 @@ def has_live_strategy_order_for_signal(session_id: int, candidate_strategy_id: i
 def has_open_live_strategy_order(exchange: str, market: str) -> bool:
     with get_connection() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT id FROM live_order_logs
             WHERE exchange = ?
               AND market = ?
               AND session_id IS NOT NULL
               AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
-              AND request_id NOT LIKE '%-waiting-%'
-              AND request_id NOT LIKE '%-partial-%'
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
             LIMIT 1
             """,
             (exchange, market),
@@ -2333,18 +2340,13 @@ def has_unresolved_live_order(exchange: str, market: str) -> bool:
 def load_reconcilable_live_order_logs(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM live_order_logs
             WHERE exchange = ?
               AND market = ?
               AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
-              AND request_id NOT LIKE '%-submitted%'
-              AND request_id NOT LIKE '%-waiting-%'
-              AND request_id NOT LIKE '%-partial%'
-              AND request_id NOT LIKE '%-canceled-%'
-              AND request_id NOT LIKE '%-filled-%'
-              AND request_id NOT LIKE '%-failed-%'
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
             ORDER BY updated_at ASC, id ASC
             """,
             (exchange, market),
@@ -2355,16 +2357,11 @@ def load_reconcilable_live_order_logs(exchange: str = "bithumb", market: str = "
 def get_live_order_log_by_uuid(order_uuid: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT *
             FROM live_order_logs
             WHERE order_uuid = ?
-              AND request_id NOT LIKE '%-submitted%'
-              AND request_id NOT LIKE '%-waiting-%'
-              AND request_id NOT LIKE '%-partial%'
-              AND request_id NOT LIKE '%-canceled-%'
-              AND request_id NOT LIKE '%-filled-%'
-              AND request_id NOT LIKE '%-failed-%'
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
             ORDER BY updated_at DESC, id DESC
             LIMIT 1
             """,

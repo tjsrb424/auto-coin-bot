@@ -176,6 +176,13 @@ def _available_balance(balances: dict, currency: str) -> float:
     return _float(item.get("balance"))
 
 
+def _private_api_client(exchange: str) -> httpx.AsyncClient:
+    if exchange == "bithumb" and os.getenv("BITHUMB_FORCE_IPV4", "true").lower() not in {"false", "0", "no"}:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        return httpx.AsyncClient(timeout=10.0, transport=transport)
+    return httpx.AsyncClient(timeout=10.0)
+
+
 class BaseJwtBroker:
     exchange = "unknown"
 
@@ -202,7 +209,7 @@ class BaseJwtBroker:
     async def _request(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict | list:
         if not self.is_ready:
             raise LiveBrokerError(f"{self.exchange} API keys are missing.")
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _private_api_client(self.exchange) as client:
             url = f"{self.base_url}{path}"
             headers = self._headers(params)
             if method == "GET":
