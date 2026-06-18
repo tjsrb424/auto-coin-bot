@@ -30,6 +30,7 @@ from app.database import (
     acquire_runtime_lock,
     create_forward_session_from_candidate,
     create_live_paper_session,
+    delete_candidate_strategy,
     get_last_live_order_time,
     get_connection,
     get_live_order_log,
@@ -846,6 +847,17 @@ def toggle_candidate_strategy_endpoint(candidate_id: int, payload: CandidateStra
     next_status = payload.status or ("INACTIVE" if current.get("status") == "ACTIVE" else "ACTIVE")
     candidate = set_candidate_strategy_status(candidate_id, next_status)
     return {"candidate": candidate}
+
+
+@app.delete("/api/candidate-strategies/{candidate_id}")
+def delete_candidate_strategy_endpoint(candidate_id: int) -> dict:
+    current = load_candidate_strategy(candidate_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    deleted = delete_candidate_strategy(candidate_id)
+    if not deleted:
+        raise HTTPException(status_code=409, detail="실행 이력이나 주문/포지션과 연결된 전략은 삭제할 수 없습니다. 비활성화를 사용하세요.")
+    return {"ok": True, "deleted_id": candidate_id}
 
 
 def _live_status(exchange: str | None = None) -> dict:

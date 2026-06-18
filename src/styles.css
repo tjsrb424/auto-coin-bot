@@ -4825,10 +4825,10 @@ body {
   width: 432px;
   height: 92px;
   display: grid;
-  grid-template-columns: 74px 86px 106px 116px;
-  gap: 9px;
+  grid-template-columns: 68px 70px 90px 72px 104px;
+  gap: 7px;
   align-items: center;
-  padding: 14px 17px 22px;
+  padding: 14px 13px 22px;
 }
 
 .ref-strategy-actions-panel button {
@@ -4853,6 +4853,18 @@ body {
   border-color: rgba(123, 77, 255, 0.62);
   background: linear-gradient(135deg, rgba(123, 77, 255, 0.95), rgba(83, 45, 198, 0.95));
   color: #fff;
+}
+
+.ref-strategy-actions-panel .warning {
+  border-color: rgba(255, 168, 23, 0.48);
+  background: rgba(255, 168, 23, 0.13);
+  color: #ffc15c;
+}
+
+.ref-strategy-actions-panel .enable {
+  border-color: rgba(34, 214, 111, 0.48);
+  background: rgba(34, 214, 111, 0.13);
+  color: #48e489;
 }
 
 .ref-strategy-actions-panel .danger {

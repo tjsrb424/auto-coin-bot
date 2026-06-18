@@ -38,6 +38,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Target,
+  Trash2,
   TrendingUp,
   Wallet
 } from "lucide-react";
@@ -393,6 +394,18 @@ async function patchJson<T>(path: string, body: unknown): Promise<T> {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.detail ?? payload.message ?? `${path} ${response.status}`);
+  }
+  return payload as T;
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "DELETE",
+    credentials: "include"
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -3114,6 +3127,7 @@ function StrategyRightPanels({
   onSave,
   onClone,
   onToggle,
+  onDelete,
   onRunTest
 }: {
   data: DashboardData;
@@ -3128,6 +3142,7 @@ function StrategyRightPanels({
   onSave: () => void;
   onClone: () => void;
   onToggle: () => void;
+  onDelete: () => void;
   onRunTest: (days: number) => void;
 }) {
   const totalReturn = candidate?.backtest_total_return ?? data.paper?.balance?.total_return ?? null;
@@ -3138,6 +3153,8 @@ function StrategyRightPanels({
   const latestValidation = validationResult?.rows?.[0];
   const score = candidate?.score ?? latestValidation?.metrics?.score ?? null;
   const statusIsActive = draft.status === "ACTIVE";
+  const toggleLabel = statusIsActive ? "비활성화" : "활성화";
+  const toggleClass = statusIsActive ? "warning" : "enable";
   const normalizedBacktestDays = Math.max(1, Math.min(365, Math.round(backtestDays || 30)));
 
   return (
@@ -3185,7 +3202,8 @@ function StrategyRightPanels({
       <RefPanel className="ref-strategy-actions-panel">
         <button className="primary" onClick={onSave} disabled={isBusy}><Save size={18} />저장</button>
         <button onClick={onClone} disabled={isBusy || !candidate}><Copy size={18} />복제</button>
-        <button className="danger" onClick={onToggle} disabled={isBusy || !candidate}><PowerOff size={18} />{statusIsActive ? "비활성화" : "활성화"}</button>
+        <button className={toggleClass} onClick={onToggle} disabled={isBusy || !candidate}><PowerOff size={18} />{toggleLabel}</button>
+        <button className="danger" onClick={onDelete} disabled={isBusy || !candidate}><Trash2 size={18} />삭제</button>
         <button className="blue" onClick={() => onRunTest(normalizedBacktestDays)} disabled={isBusy}><Play size={18} />실행 테스트</button>
         {(actionMessage || actionError) && <p className={actionError ? "ref-action-error" : "ref-action-message"}>{actionError ?? actionMessage}</p>}
       </RefPanel>
@@ -3273,6 +3291,16 @@ function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () =>
     return result.candidate.id;
   });
 
+  const deleteStrategy = () => runAction("전략 삭제", async () => {
+    if (!selected) throw new Error("삭제할 전략이 없습니다.");
+    const ok = window.confirm(`${cleanStrategyName(selected)} 전략을 삭제할까요? 실행 이력이 있는 전략은 삭제되지 않습니다.`);
+    if (!ok) return selected.id;
+    await deleteJson<{ ok: boolean; deleted_id: number }>(`/api/candidate-strategies/${selected.id}`);
+    setSelectedId(null);
+    setFilter("ALL");
+    return null;
+  });
+
   const runStrategyTest = (days = backtestDays) => runAction("전략 검증", async () => {
     const normalizedDays = Math.max(1, Math.min(365, Math.round(days || 30)));
     const result = await postJson<StrategyValidationResult>("/api/strategy-validation/run", {
@@ -3329,6 +3357,7 @@ function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () =>
         onSave={saveStrategy}
         onClone={cloneStrategy}
         onToggle={toggleStrategy}
+        onDelete={deleteStrategy}
         onRunTest={runStrategyTest}
       />
     </>

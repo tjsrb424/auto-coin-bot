@@ -60,3 +60,37 @@ class DatabaseLiveOrderTests(unittest.TestCase):
         self.assertEqual(changed, 3)
         self.assertEqual([item["name"] for item in candidates[:3]], ["필승 v1 - 추세 돌파", "필승 v2 - 눌림 반등", "필승 v3 - 안정 추세"])
         self.assertTrue(all(item["status"] == "ACTIVE" for item in candidates[:3]))
+        self.assertEqual(database.ensure_default_candidate_strategies(), 0)
+
+    def test_delete_candidate_strategy_without_references(self) -> None:
+        candidate_id = database.save_candidate_strategy(
+            {
+                "strategy": "rsi",
+                "parameters": {"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70},
+                "unit": 5,
+                "market": "KRW-BTC",
+                "backtest_period": "30d",
+                "score": 1,
+            }
+        )
+
+        self.assertTrue(database.delete_candidate_strategy(candidate_id))
+        self.assertIsNone(database.load_candidate_strategy(candidate_id))
+
+    def test_delete_candidate_strategy_with_order_reference_is_blocked(self) -> None:
+        candidate_id = database.save_candidate_strategy(
+            {
+                "strategy": "rsi",
+                "parameters": {"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70},
+                "unit": 5,
+                "market": "KRW-BTC",
+                "backtest_period": "30d",
+                "score": 1,
+            }
+        )
+        payload = live_order_log("strategy-request", "SUBMITTED")
+        payload["candidate_strategy_id"] = candidate_id
+        database.insert_live_order_log(payload)
+
+        self.assertFalse(database.delete_candidate_strategy(candidate_id))
+        self.assertIsNotNone(database.load_candidate_strategy(candidate_id))

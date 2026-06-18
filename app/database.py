@@ -901,6 +901,13 @@ def ensure_default_candidate_strategies() -> int:
     now_utc = _utc_now()
     changed = 0
     with get_connection() as conn:
+        _ensure_app_settings_table(conn)
+        seeded = conn.execute(
+            "SELECT value_json FROM app_settings WHERE key = ?",
+            ("default_candidate_strategies_seeded",),
+        ).fetchone()
+        if seeded is not None:
+            return 0
         for candidate in DEFAULT_CANDIDATE_STRATEGIES:
             row = conn.execute(
                 "SELECT id FROM candidate_strategies WHERE name = ?",
@@ -964,6 +971,16 @@ def ensure_default_candidate_strategies() -> int:
                 values + (int(row["id"]),),
             )
             changed += 1
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            ("default_candidate_strategies_seeded", json.dumps(True), now_utc),
+        )
     return changed
 
 
@@ -1023,6 +1040,20 @@ def clone_candidate_strategy(candidate_id: int) -> dict | None:
 def set_candidate_strategy_status(candidate_id: int, status: str) -> dict | None:
     normalized = "ACTIVE" if status.upper() == "ACTIVE" else "INACTIVE"
     return update_candidate_strategy(candidate_id, {"status": normalized})
+
+
+def delete_candidate_strategy(candidate_id: int) -> bool:
+    with get_connection() as conn:
+        references = [
+            conn.execute("SELECT 1 FROM live_strategy_sessions WHERE candidate_strategy_id = ? LIMIT 1", (candidate_id,)).fetchone(),
+            conn.execute("SELECT 1 FROM live_order_logs WHERE candidate_strategy_id = ? LIMIT 1", (candidate_id,)).fetchone(),
+            conn.execute("SELECT 1 FROM live_positions WHERE candidate_strategy_id = ? LIMIT 1", (candidate_id,)).fetchone(),
+            conn.execute("SELECT 1 FROM paper_forward_sessions WHERE candidate_strategy_id = ? LIMIT 1", (candidate_id,)).fetchone(),
+        ]
+        if any(references):
+            return False
+        cursor = conn.execute("DELETE FROM candidate_strategies WHERE id = ?", (candidate_id,))
+        return cursor.rowcount > 0
 
 
 def pause_running_forward_sessions_on_startup() -> int:
