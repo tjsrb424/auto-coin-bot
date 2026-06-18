@@ -37,6 +37,8 @@ class RiskConfig:
     volatility_window: int
     volatility_block_percent: float
     min_volume_krw: float
+    min_current_1m_volume_krw: float
+    min_avg_5m_volume_krw: float
     require_completed_candle: bool
     require_order_chance_success: bool
 
@@ -59,7 +61,9 @@ class RiskConfig:
             max_order_krw=float(os.getenv("RISK_MAX_ORDER_KRW", "30000")),
             volatility_window=int(os.getenv("RISK_VOLATILITY_WINDOW", "5")),
             volatility_block_percent=float(os.getenv("RISK_VOLATILITY_BLOCK_PERCENT", "2")),
-            min_volume_krw=float(os.getenv("RISK_MIN_VOLUME_KRW", "50000000")),
+            min_volume_krw=float(os.getenv("RISK_MIN_VOLUME_KRW", "0")),
+            min_current_1m_volume_krw=float(os.getenv("RISK_MIN_CURRENT_1M_VOLUME_KRW", "30000000")),
+            min_avg_5m_volume_krw=float(os.getenv("RISK_MIN_AVG_5M_VOLUME_KRW", "50000000")),
             require_completed_candle=os.getenv("RISK_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
             require_order_chance_success=os.getenv("RISK_REQUIRE_ORDER_CHANCE_SUCCESS", "true").lower() == "true",
         )
@@ -185,7 +189,11 @@ def compute_risk_state(
         "balance_mismatch_detected": bool(balance_mismatch),
         "partial_fill_detected": partial_fill,
         "volatility_block_enabled": config.volatility_block_percent > 0,
-        "low_volume_block_enabled": config.min_volume_krw > 0,
+        "low_volume_block_enabled": (
+            config.min_volume_krw > 0
+            or config.min_current_1m_volume_krw > 0
+            or config.min_avg_5m_volume_krw > 0
+        ),
     }
     upsert_risk_state(state)
     return state
@@ -470,6 +478,21 @@ def market_condition_block(market_snapshot: dict | None, config: RiskConfig) -> 
     range_rate = _float(market_snapshot.get("range_rate"))
     if range_rate * 100 >= config.volatility_block_percent:
         return "BLOCKED_VOLATILITY_FILTER"
+    if market_snapshot.get("liquidity_check_required") or "current_1m_trade_price_volume" in market_snapshot or "recent_5m_avg_trade_price_volume" in market_snapshot:
+        current_1m = _float(market_snapshot.get("current_1m_trade_price_volume"))
+        avg_5m = _float(market_snapshot.get("recent_5m_avg_trade_price_volume"))
+        avg_count = int(_float(market_snapshot.get("recent_5m_volume_count")))
+        if config.min_current_1m_volume_krw > 0 and current_1m <= 0:
+            return "BLOCKED_VOLUME_DATA_UNAVAILABLE"
+        if config.min_avg_5m_volume_krw > 0 and (avg_5m <= 0 or avg_count < 5):
+            return "BLOCKED_VOLUME_DATA_UNAVAILABLE"
+        if config.min_current_1m_volume_krw > 0 and current_1m < config.min_current_1m_volume_krw:
+            return "BLOCKED_LOW_1M_VOLUME"
+        if config.min_avg_5m_volume_krw > 0 and avg_5m < config.min_avg_5m_volume_krw:
+            return "BLOCKED_LOW_5M_AVG_VOLUME"
+        if config.require_completed_candle and market_snapshot.get("complete") is False:
+            return "BLOCKED_INCOMPLETE_CANDLE"
+        return None
     volume_krw = _float(market_snapshot.get("trade_price_volume")) or _float(market_snapshot.get("volume_krw")) or 0.0
     if volume_krw <= 0:
         volume_krw = _float(market_snapshot.get("price")) * _float(market_snapshot.get("volume"))

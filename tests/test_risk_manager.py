@@ -328,6 +328,75 @@ class RiskManagerTests(unittest.TestCase):
         self.assertEqual(volatile["block_code"], "BLOCKED_VOLATILITY_FILTER")
         self.assertEqual(low_volume["block_code"], "BLOCKED_LOW_VOLUME")
 
+    def test_structured_liquidity_filters_block_entry(self) -> None:
+        env = {
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+            "RISK_VOLATILITY_BLOCK_PERCENT": "2",
+            "RISK_MIN_VOLUME_KRW": "0",
+            "RISK_MIN_CURRENT_1M_VOLUME_KRW": "30000000",
+            "RISK_MIN_AVG_5M_VOLUME_KRW": "50000000",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            low_current = check_order_risk(
+                order=order(),
+                purpose="ENTRY",
+                base_result={"allowed": True},
+                is_auto=True,
+                market_snapshot={
+                    "price": 100_000_000,
+                    "range_rate": 0.001,
+                    "liquidity_check_required": True,
+                    "current_1m_trade_price_volume": 20_000_000,
+                    "recent_5m_avg_trade_price_volume": 60_000_000,
+                    "recent_5m_volume_count": 5,
+                },
+            )
+            low_average = check_order_risk(
+                order={**order(), "request_id": "risk-test-low-5m-volume"},
+                purpose="ENTRY",
+                base_result={"allowed": True},
+                is_auto=True,
+                market_snapshot={
+                    "price": 100_000_000,
+                    "range_rate": 0.001,
+                    "liquidity_check_required": True,
+                    "current_1m_trade_price_volume": 35_000_000,
+                    "recent_5m_avg_trade_price_volume": 40_000_000,
+                    "recent_5m_volume_count": 5,
+                },
+            )
+
+        self.assertEqual(low_current["block_code"], "BLOCKED_LOW_1M_VOLUME")
+        self.assertEqual(low_average["block_code"], "BLOCKED_LOW_5M_AVG_VOLUME")
+
+    def test_structured_liquidity_filter_ignores_legacy_volume_when_present(self) -> None:
+        env = {
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+            "RISK_VOLATILITY_BLOCK_PERCENT": "2",
+            "RISK_MIN_VOLUME_KRW": "100000000",
+            "RISK_MIN_CURRENT_1M_VOLUME_KRW": "30000000",
+            "RISK_MIN_AVG_5M_VOLUME_KRW": "50000000",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = check_order_risk(
+                order=order(),
+                purpose="ENTRY",
+                base_result={"allowed": True},
+                is_auto=True,
+                market_snapshot={
+                    "price": 100_000_000,
+                    "range_rate": 0.001,
+                    "trade_price_volume": 35_000_000,
+                    "liquidity_check_required": True,
+                    "current_1m_trade_price_volume": 35_000_000,
+                    "recent_5m_avg_trade_price_volume": 55_000_000,
+                    "recent_5m_volume_count": 5,
+                },
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["checks"]["market_condition_check"]["allowed"], True)
+
 
 if __name__ == "__main__":
     unittest.main()

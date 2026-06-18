@@ -497,6 +497,7 @@ Policy:
 - Amount must stay within `AUTO_MAX_ORDER_KRW`
 - `RISK_MAX_DAILY_LOSS_PERCENT` is measured against account equity. Live order checks use the fetched exchange balance and dashboard-only checks fall back to `RISK_ACCOUNT_EQUITY_KRW`.
 - `RISK_MAX_DAILY_LOSS_KRW` remains a separate absolute daily loss stop and can block before the percentage limit.
+- Live entry liquidity uses the latest completed 1-minute candle and recent five completed 1-minute candles. Defaults require `RISK_MIN_CURRENT_1M_VOLUME_KRW=30000000` and `RISK_MIN_AVG_5M_VOLUME_KRW=50000000`.
 
 Flow:
 

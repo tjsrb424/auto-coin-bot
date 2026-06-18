@@ -60,6 +60,7 @@ from app.live_exit import (
     maybe_create_price_exit_candidate,
     submit_exit_order,
 )
+from app.market_liquidity import one_minute_liquidity_snapshot
 from app.risk_manager import check_order_risk
 from app.strategies import apply_strategy
 from app.upbit import fetch_minute_candles
@@ -515,6 +516,15 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         risk["allowed"] = False
         risk["risk_result"] = "BLOCKED_MAX_ORDER_AMOUNT"
         risk["blocked_reason"] = "BLOCKED_MAX_ORDER_AMOUNT"
+    liquidity_snapshot = await one_minute_liquidity_snapshot(config.allowed_market, require_completed=config.require_completed_candle)
+    market_snapshot = {
+        "price": current_price,
+        "range_rate": range_rate,
+        "volume": float(candle["candle_acc_trade_volume"]),
+        "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
+        "complete": True,
+        **liquidity_snapshot,
+    }
     risk = check_order_risk(
         order=order,
         purpose="ENTRY",
@@ -524,13 +534,7 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         candidate_strategy_id=int(session["candidate_strategy_id"]),
         candle_time_utc=candle["candle_time_utc"],
         signal=(signal or {}).get("signal"),
-        market_snapshot={
-            "price": current_price,
-            "range_rate": range_rate,
-            "volume": float(candle["candle_acc_trade_volume"]),
-            "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
-            "complete": True,
-        },
+        market_snapshot=market_snapshot,
         balances=balances,
         is_auto=True,
     )

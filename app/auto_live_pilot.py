@@ -39,6 +39,7 @@ from app.live_recovery import (
     log_recovery_event,
     recent_recovery_events,
 )
+from app.market_liquidity import one_minute_liquidity_snapshot
 from app.risk_manager import check_order_risk
 from app.strategies import apply_strategy
 from app.upbit import fetch_minute_candles
@@ -289,6 +290,15 @@ async def _submit_pilot_order(session: dict, candidate: dict, candle: dict, sign
         recent_duplicate=False,
         market_snapshot={"price": current_price, "range_rate": range_rate, "volume": float(candle["candle_acc_trade_volume"])},
     )
+    liquidity_snapshot = await one_minute_liquidity_snapshot(config.allowed_market, require_completed=config.require_completed_candle)
+    market_snapshot = {
+        "price": current_price,
+        "range_rate": range_rate,
+        "volume": float(candle["candle_acc_trade_volume"]),
+        "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
+        "complete": True,
+        **liquidity_snapshot,
+    }
     risk = check_order_risk(
         order=order,
         purpose="ENTRY",
@@ -298,13 +308,7 @@ async def _submit_pilot_order(session: dict, candidate: dict, candle: dict, sign
         candidate_strategy_id=session.get("candidate_strategy_id"),
         candle_time_utc=candle["candle_time_utc"],
         signal=(signal or {}).get("signal"),
-        market_snapshot={
-            "price": current_price,
-            "range_rate": range_rate,
-            "volume": float(candle["candle_acc_trade_volume"]),
-            "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
-            "complete": True,
-        },
+        market_snapshot=market_snapshot,
         balances=balances,
         is_auto=True,
     )
