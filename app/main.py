@@ -257,6 +257,32 @@ def _try_acquire_runtime_lock(owner: str) -> tuple[bool, dict | None]:
     )
 
 
+def _try_acquire_runtime_lock_for_start(owner: str, request: Request) -> tuple[bool, dict | None, dict | None]:
+    acquired, current_lock = _try_acquire_runtime_lock(owner)
+    if acquired:
+        return True, current_lock, None
+
+    status_payload = _runtime_status_payload(request)
+    if current_lock and status_payload.get("runtime_status") in {"OFF", "STOPPED", "PAUSED"}:
+        stale_instance_id = str(current_lock.get("instance_id") or "")
+        release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=stale_instance_id, status="STALE")
+        insert_live_mode_event(
+            "STALE_RUNTIME_LOCK_RELEASED",
+            current_live_mode(),
+            "자동매매 시작 전에 멈춤 상태로 남아있던 Runtime 락을 정리했습니다.",
+            {
+                "lock": current_lock,
+                "runtime_status": status_payload.get("runtime_status"),
+                "requested_owner": owner,
+            },
+        )
+        acquired, current_lock = _try_acquire_runtime_lock(owner)
+        if acquired:
+            return True, current_lock, None
+
+    return False, current_lock, status_payload
+
+
 async def _load_period_candles(market: str, unit: int, start_time_utc: str, end_time_utc: str) -> list[dict]:
     start = _parse_utc(start_time_utc)
     end = _parse_utc(end_time_utc)
@@ -562,13 +588,13 @@ def get_runtime_status(request: Request) -> dict:
 def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request) -> dict:
     if payload.confirmation != "AUTO STRATEGY ENABLE":
         raise HTTPException(status_code=400, detail="AUTO STRATEGY ENABLE confirmation is required.")
-    acquired, current_lock = _try_acquire_runtime_lock("admin-ui")
+    acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("admin-ui", request)
     if not acquired:
         return {
             "ok": False,
             "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.",
             "runtime_lock": current_lock,
-            **_runtime_status_payload(request),
+            **(status_payload or _runtime_status_payload(request)),
         }
     result = start_live_strategy_pilot(
         candidate_strategy_id=payload.candidate_strategy_id,
@@ -1389,10 +1415,10 @@ def get_auto_live_pilot_status() -> dict:
 
 
 @app.post("/api/auto-live-pilot/start")
-def start_auto_live_pilot_endpoint(payload: AutoLivePilotStartRequest) -> dict:
-    acquired, current_lock = _try_acquire_runtime_lock("auto-live-pilot-api")
+def start_auto_live_pilot_endpoint(payload: AutoLivePilotStartRequest, request: Request) -> dict:
+    acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("auto-live-pilot-api", request)
     if not acquired:
-        return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **auto_live_pilot_status()}
+        return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **(status_payload or auto_live_pilot_status())}
     result = start_auto_live_pilot(
         candidate_strategy_id=payload.candidate_strategy_id,
         order_amount_krw=payload.order_amount_krw,
@@ -1422,10 +1448,10 @@ def get_live_strategy_pilot_status() -> dict:
 
 
 @app.post("/api/live-strategy-pilot/start")
-def start_live_strategy_pilot_endpoint(payload: LiveStrategyPilotStartRequest) -> dict:
-    acquired, current_lock = _try_acquire_runtime_lock("live-strategy-pilot-api")
+def start_live_strategy_pilot_endpoint(payload: LiveStrategyPilotStartRequest, request: Request) -> dict:
+    acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("live-strategy-pilot-api", request)
     if not acquired:
-        return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **live_strategy_status()}
+        return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **(status_payload or live_strategy_status())}
     result = start_live_strategy_pilot(
         candidate_strategy_id=payload.candidate_strategy_id,
         confirmation=payload.confirmation,
