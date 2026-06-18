@@ -17,6 +17,13 @@ from app.smart_target_exposure import calculate_target_exposure
 
 
 class SmartEngineComponentTests(unittest.TestCase):
+    def build_readiness_with_empty_db(self, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with patch.object(database, "DB_PATH", db_path):
+                database.init_db()
+                return build_limited_readiness(**kwargs)
+
     def test_internal_signals_include_direction_score_confidence_reason_and_raw_value(self) -> None:
         signals = evaluate_internal_signals(
             {"signal": "BUY", "reason": "legacy buy"},
@@ -241,8 +248,8 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertIn("SMART_EXCHANGE_NOTICE_RISK_BLOCK", result["blockers"])
 
     def test_limited_readiness_summarizes_preflight_checks(self) -> None:
-        readiness = build_limited_readiness(
-            "KRW-BTC",
+        readiness = self.build_readiness_with_empty_db(
+            market="KRW-BTC",
             decision={
                 "risk_score": 35,
                 "order_intents": [{
@@ -266,8 +273,8 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertEqual(readiness["latest_intent_summary"]["id"], 7)
 
     def test_limited_readiness_blocks_when_policy_or_shadow_report_not_ready(self) -> None:
-        readiness = build_limited_readiness(
-            "KRW-BTC",
+        readiness = self.build_readiness_with_empty_db(
+            market="KRW-BTC",
             decision={"risk_score": 35, "order_intents": [{"side": "BID", "delta_value_krw": 20_000}]},
             report={"summary": {"recommendation": "MORE_SHADOW_DATA_REQUIRED"}},
             policy={"auto_trading_enabled": False},
