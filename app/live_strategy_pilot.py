@@ -262,7 +262,7 @@ async def _process_session(session: dict) -> None:
 
     position = load_open_live_position(int(session["id"]), config.allowed_exchange, config.allowed_market)
     if position:
-        await _process_open_position(session, position, config)
+        await _process_open_position(session, position, config, live_config)
         return
 
     strategy_position = load_open_live_position_for_strategy(
@@ -280,7 +280,7 @@ async def _process_session(session: dict) -> None:
                 "last_order_status": "POSITION_OPEN",
             },
         )
-        await _process_open_position(session, strategy_position, config)
+        await _process_open_position(session, strategy_position, config, live_config)
         return
 
     blocked = await _precheck_block_reason(session, config, live_config)
@@ -352,7 +352,7 @@ async def _process_session(session: dict) -> None:
     await _submit_entry_order(session, candidate, latest, signal, config, live_config)
 
 
-async def _process_open_position(session: dict, position: dict, config: LiveStrategyConfig) -> None:
+async def _process_open_position(session: dict, position: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> None:
     await manage_exit_order_timeout(position, LiveExitConfig.from_env())
     candidate = load_candidate_strategy(int(session["candidate_strategy_id"]))
     if candidate is None:
@@ -386,7 +386,7 @@ async def _process_open_position(session: dict, position: dict, config: LiveStra
         exit_candidate = create_exit_candidate_for_position(position, "STRATEGY_SELL", current_price, candle_time)
     smart_snapshot = _record_smart_shadow_decision(session=session, candidate=candidate, candles=candles, candle=latest, signal=signal)
     if smart_engine_live_mode() == "limited":
-        handled = await _submit_smart_limited_order(session, candidate, latest, signal, config, LiveStrategyConfig.from_env(), smart_snapshot)
+        handled = await _submit_smart_limited_order(session, candidate, latest, signal, config, live_config, smart_snapshot)
         if handled:
             return
     auto_exit_result = None

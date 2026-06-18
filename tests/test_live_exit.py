@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app import database
+from app.live_broker import LiveTradingConfig
 from app.live_exit import (
     approve_exit_candidate,
     create_exit_candidate_for_position,
@@ -15,6 +16,7 @@ from app.live_exit import (
     evaluate_exit_order,
     maybe_create_price_exit_candidate,
 )
+from app.live_strategy_pilot import LiveStrategyConfig, _process_open_position
 
 
 class LiveExitTests(unittest.IsolatedAsyncioTestCase):
@@ -130,6 +132,61 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log["side"], "SELL")
         self.assertEqual(log["exit_reason"], "STRATEGY_SELL")
         self.assertTrue(log["manual_confirmed"])
+
+    async def test_open_position_smart_limited_uses_live_trading_config(self) -> None:
+        position = self.create_position()
+        session = database.load_latest_live_strategy_session()
+        assert session is not None
+        config = LiveStrategyConfig(
+            exchange="bithumb",
+            live_auto_trading_enabled=True,
+            auto_strategy_pilot_enabled=True,
+            allowed_exchange="bithumb",
+            allowed_market="KRW-BTC",
+            allowed_order_type="limit",
+            max_order_krw=30_000,
+            max_orders_per_day=0,
+            max_open_position_count=1,
+            cooldown_seconds=0,
+            require_completed_candle=False,
+            cancel_unfilled_after_seconds=60,
+            entry_price_offset_percent=0.3,
+            stop_loss_percent=0.7,
+            take_profit_percent=1.0,
+            max_hold_minutes=60,
+            exit_enabled=False,
+            market_order_enabled=False,
+        )
+        live_config = LiveTradingConfig.for_exchange("bithumb")
+        candle = {
+            "market": "KRW-BTC",
+            "unit": 15,
+            "candle_time_utc": "2026-06-18T13:45:00Z",
+            "trade_price": 100_000_000,
+            "opening_price": 100_000_000,
+            "high_price": 100_000_000,
+            "low_price": 100_000_000,
+            "candle_acc_trade_volume": 1.0,
+            "candle_acc_trade_price": 100_000_000,
+        }
+        submit_mock = AsyncMock(return_value=True)
+
+        with (
+            patch("app.live_strategy_pilot.load_candidate_strategy", return_value={"id": 1, "unit": 15, "market": "KRW-BTC", "strategy": "ma_cross", "parameters": {}}),
+            patch("app.live_strategy_pilot.fetch_minute_candles", new=AsyncMock(return_value=[candle])),
+            patch("app.live_strategy_pilot.insert_candles"),
+            patch("app.live_strategy_pilot.load_candles", return_value=[candle]),
+            patch("app.live_strategy_pilot._latest_signal", return_value={"signal": "SELL", "reason": "test"}),
+            patch("app.live_strategy_pilot._record_smart_shadow_decision", return_value={"order_intents": [{"side": "ASK"}]}),
+            patch("app.live_strategy_pilot.smart_engine_live_mode", return_value="limited"),
+            patch("app.live_strategy_pilot._submit_smart_limited_order", new=submit_mock),
+        ):
+            await _process_open_position(session, position, config, live_config)
+
+        submit_mock.assert_awaited_once()
+        passed_live_config = submit_mock.await_args.args[5]
+        self.assertTrue(hasattr(passed_live_config, "fee_rate"))
+        self.assertIs(passed_live_config, live_config)
 
 
 if __name__ == "__main__":
