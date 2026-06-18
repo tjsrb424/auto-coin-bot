@@ -59,7 +59,7 @@ class RiskConfig:
             max_order_krw=float(os.getenv("RISK_MAX_ORDER_KRW", "30000")),
             volatility_window=int(os.getenv("RISK_VOLATILITY_WINDOW", "5")),
             volatility_block_percent=float(os.getenv("RISK_VOLATILITY_BLOCK_PERCENT", "2")),
-            min_volume_krw=float(os.getenv("RISK_MIN_VOLUME_KRW", "100000000")),
+            min_volume_krw=float(os.getenv("RISK_MIN_VOLUME_KRW", "50000000")),
             require_completed_candle=os.getenv("RISK_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
             require_order_chance_success=os.getenv("RISK_REQUIRE_ORDER_CHANCE_SUCCESS", "true").lower() == "true",
         )
