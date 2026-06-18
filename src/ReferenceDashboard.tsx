@@ -246,6 +246,7 @@ type AutoPilotStatus = {
     stopped_at?: string | null;
     status?: string;
     strategy_name?: string;
+    candidate_strategy_id?: number;
     orders_created_today?: number;
     max_orders_per_day?: number;
     last_signal?: string | null;
@@ -260,6 +261,7 @@ type LiveStrategyStatus = {
     stopped_at?: string | null;
     status?: string;
     strategy_name?: string;
+    candidate_strategy_id?: number;
     last_signal?: string | null;
     last_risk_result?: string | null;
     orders_created_today?: number;
@@ -2521,7 +2523,13 @@ function AutoStatusPanel({
 
 function AutoStrategyStrip({ data }: { data: DashboardData }) {
   const autoRunning = isRuntimeRunning(data);
-  const candidates = data.candidates.slice(0, 5);
+  const selectedStrategyId = data.runtimeStatus?.selected_strategy_id ?? data.liveStrategy?.session?.candidate_strategy_id ?? data.autoPilot?.session?.candidate_strategy_id ?? null;
+  const runningCandidate = selectedStrategyId == null ? null : data.candidates.find((candidate) => candidate.id === selectedStrategyId) ?? null;
+  const activeCandidates = data.candidates.filter((candidate) => candidate.status === "ACTIVE");
+  const candidates = [
+    ...(runningCandidate ? [runningCandidate] : []),
+    ...data.candidates.filter((candidate) => candidate.id !== runningCandidate?.id)
+  ].slice(0, 5);
   const placeholders = Array.from({ length: Math.max(5 - candidates.length, 0) }, (_, index) => ({
     id: -(index + 1),
     name: "전략 없음",
@@ -2535,25 +2543,28 @@ function AutoStrategyStrip({ data }: { data: DashboardData }) {
     <section className="ref-auto-strategy-section">
       <div className="ref-auto-section-title">
         <b>실행 중인 전략</b>
-        <em>{autoRunning ? `${Math.max(1, candidates.filter((candidate) => candidate.status === "ACTIVE").length)}개 실행 중` : "대기 중"}</em>
+        <em>{autoRunning && runningCandidate ? "1개 실행 중" : `${activeCandidates.length}개 대기`}</em>
         <button>전체 전략 보기 <ChevronRight size={16} /></button>
       </div>
       <div className="ref-auto-strategy-grid">
         {cards.map((candidate, index) => {
-          const active = autoRunning && index < 3 && candidate.id > 0;
+          const active = autoRunning && candidate.id === runningCandidate?.id;
+          const standby = !active && candidate.id > 0 && candidate.status === "ACTIVE";
+          const badgeValue = active ? "실행 중" : standby ? "대기" : statusLabel(candidate.status);
+          const badgeTone = active ? "green" : standby ? "amber" : statusTone(candidate.status);
           return (
             <RefPanel key={`${candidate.id}-${candidate.name}-${index}`} className="ref-auto-strategy-card">
               <div className="ref-auto-card-head">
                 <strong>{candidate.name || strategyLabel(candidate.strategy)}</strong>
-                <RefStatusBadge value={active ? "실행 중" : "대기"} tone={active ? "green" : "amber"} />
+                <RefStatusBadge value={badgeValue} tone={badgeTone} />
                 <button>상세</button>
               </div>
               <p>{marketDisplay(candidate.market)} · {strategyLabel(candidate.strategy)}</p>
               <div className="ref-auto-card-bottom">
                 <span>수익</span>
-                <b className={(candidate.backtest_total_return ?? 0) < 0 ? "ref-negative" : "ref-positive"}>{formatPercent(candidate.backtest_total_return)}</b>
+                <b className={valueToneClass(candidate.backtest_total_return)}>{formatPercent(candidate.backtest_total_return)}</b>
                 <span>포지션</span>
-                <b>{active ? `${index + 2} / 5` : "-"}</b>
+                <b>{active ? "1 / 1" : "-"}</b>
                 <i className="ref-auto-spark" />
               </div>
             </RefPanel>
