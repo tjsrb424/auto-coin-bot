@@ -2426,7 +2426,8 @@ body {
 }
 
 .ref-done,
-.ref-holding {
+.ref-holding,
+.ref-status-chip {
   display: inline-flex;
   height: 21px;
   align-items: center;
@@ -2438,9 +2439,25 @@ body {
   font-weight: 900;
 }
 
-.ref-holding {
+.ref-holding,
+.ref-status-chip.amber {
   background: rgba(246, 168, 0, 0.15);
   color: var(--ref-amber);
+}
+
+.ref-status-chip.red {
+  background: rgba(255, 64, 90, 0.15);
+  color: var(--ref-red);
+}
+
+.ref-status-chip.neutral {
+  background: rgba(142, 157, 177, 0.15);
+  color: #aeb9c8;
+}
+
+.ref-status-chip.cyan {
+  background: rgba(56, 165, 255, 0.14);
+  color: #38a5ff;
 }
 
 .ref-log-panel {
@@ -2482,6 +2499,7 @@ body {
 .ref-log-list i.ok { background: var(--ref-green); }
 .ref-log-list i.info { background: #38a5ff; }
 .ref-log-list i.warn { background: var(--ref-amber); }
+.ref-log-list i.danger { background: var(--ref-red); }
 
 .ref-log-list b {
   min-width: 0;
@@ -2805,7 +2823,8 @@ body {
   box-shadow: none;
 }
 
-.ref-trade-status {
+.ref-trade-status,
+.ref-trade-detail-head .ref-status-chip {
   display: inline-flex;
   height: 22px;
   align-items: center;
@@ -2815,6 +2834,30 @@ body {
   padding: 0 8px;
   font-size: 10px;
   font-weight: 900;
+}
+
+.ref-trade-status.amber,
+.ref-trade-detail-head .ref-status-chip.amber {
+  background: rgba(246, 168, 0, 0.15);
+  color: var(--ref-amber);
+}
+
+.ref-trade-status.red,
+.ref-trade-detail-head .ref-status-chip.red {
+  background: rgba(255, 64, 90, 0.15);
+  color: var(--ref-red);
+}
+
+.ref-trade-status.neutral,
+.ref-trade-detail-head .ref-status-chip.neutral {
+  background: rgba(142, 157, 177, 0.15);
+  color: #aeb9c8;
+}
+
+.ref-trade-status.cyan,
+.ref-trade-detail-head .ref-status-chip.cyan {
+  background: rgba(56, 165, 255, 0.14);
+  color: #38a5ff;
 }
 
 .ref-trade-pagination {
@@ -2894,14 +2937,6 @@ body {
   color: #f4f7ff;
   font-size: 14px;
   font-weight: 900;
-}
-
-.ref-trade-detail-head b {
-  border-radius: 4px;
-  background: rgba(24, 217, 111, 0.14);
-  color: var(--ref-green);
-  padding: 4px 8px;
-  font-size: 10px;
 }
 
 .ref-trade-detail-grid {
@@ -5850,6 +5885,10 @@ input:disabled {
 
 .log-list i.warn {
   background: #f59e0b;
+}
+
+.log-list i.danger {
+  background: #ef4444;
 }
 
 .tiny-link {

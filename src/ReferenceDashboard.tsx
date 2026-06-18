@@ -710,6 +710,10 @@ function statusTone(value?: string | null): "green" | "amber" | "red" | "cyan" |
   return "neutral";
 }
 
+function refStatusChipClass(value?: string | null) {
+  return `ref-status-chip ${statusTone(value)}`;
+}
+
 function isRunning(status?: string | null) {
   return status === "RUNNING" || status === "LIVE_PAUSED" || status === "READY";
 }
@@ -1327,10 +1331,14 @@ function MainChartPanel({
     ? data.candles.findIndex((candle) => candle.candle_time_utc === displayCandle.candle_time_utc)
     : -1;
   const previous = displayIndex > 0 ? data.candles[displayIndex - 1] : hoveredCandle ? null : previousCandle(data.candles);
+  const latestPrevious = previousCandle(data.candles);
   const indicators = computeIndicators(data.candles);
+  const latestChange = latest && latestPrevious ? latest.trade_price - latestPrevious.trade_price : null;
+  const latestChangeRate = latest && latestPrevious ? latestChange! / latestPrevious.trade_price : null;
   const change = displayCandle && previous ? displayCandle.trade_price - previous.trade_price : null;
   const changeRate = displayCandle && previous ? change! / previous.trade_price : null;
-  const marketTone = change == null ? "" : change < 0 ? "ref-negative" : change > 0 ? "ref-positive" : "";
+  const marketTone = latestChange == null ? "" : latestChange < 0 ? "ref-negative" : latestChange > 0 ? "ref-positive" : "";
+  const displayTone = change == null ? "" : change < 0 ? "ref-negative" : change > 0 ? "ref-positive" : "";
   const high = data.candles.length ? Math.max(...data.candles.map((candle) => candle.high_price)) : null;
   const low = data.candles.length ? Math.min(...data.candles.map((candle) => candle.low_price)) : null;
 
@@ -1347,7 +1355,7 @@ function MainChartPanel({
           <strong className={marketTone}>{formatKrw(latest?.trade_price)}</strong>
         </div>
         <div className="ref-market-stats">
-          <span className={marketTone}><b>{formatPercent(changeRate)}</b><b>{formatSignedKrw(change)}</b></span>
+          <span className={marketTone}><b>{formatPercent(latestChangeRate)}</b><b>{formatSignedKrw(latestChange)}</b></span>
           <span><em>고가</em>{formatKrw(high)}</span>
           <span><em>저가</em>{formatKrw(low)}</span>
           <span><em>거래량 ({data.candles.length}캔들)</em>{formatNumber(indicators.volume24, 2)} BTC</span>
@@ -1389,7 +1397,7 @@ function MainChartPanel({
         <span>고 {formatKrw(displayCandle?.high_price)}</span>
         <span>저 {formatKrw(displayCandle?.low_price)}</span>
         <span>종 {formatKrw(displayCandle?.trade_price)}</span>
-        <strong className={marketTone}>{formatSignedKrw(change)} ({formatPercent(changeRate)})</strong>
+        <strong className={displayTone}>{formatSignedKrw(change)} ({formatPercent(changeRate)})</strong>
       </div>
       <div className="ref-ma-labels">
         <span>MA 20 close <b className="orange">{formatKrw(indicators.sma20)}</b></span>
@@ -2198,7 +2206,7 @@ function TradeHistoryView({ data, refresh }: { data: DashboardData; refresh: () 
                 <td className={(row.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(row.pnl)}</td>
                 <td className={(row.returnRate ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(row.returnRate)}</td>
                 <td>{formatKrw(row.fee)}</td>
-                <td><span className="ref-trade-status">{row.status}</span></td>
+                <td><span className={refStatusChipClass(row.rawStatus)}>{row.status}</span></td>
               </tr>
             ))}
           </tbody>
@@ -2207,7 +2215,7 @@ function TradeHistoryView({ data, refresh }: { data: DashboardData; refresh: () 
       </RefPanel>
 
       <RefPanel className="ref-trade-detail-card">
-        <div className="ref-trade-detail-head"><span><TradeCoinIcon market={selectedMarket} />{selected?.market ?? "-"}</span><b>{selected?.status ?? "데이터 없음"}</b></div>
+        <div className="ref-trade-detail-head"><span><TradeCoinIcon market={selectedMarket} />{selected?.market ?? "-"}</span><b className={refStatusChipClass(selected?.rawStatus)}>{selected?.status ?? "데이터 없음"}</b></div>
         <div className="ref-trade-detail-grid">
           <p><span>전략</span><b>{selected?.strategy ?? "-"}</b></p><p><span>수량</span><b>{formatNumber(selected?.volume, 6)} {tradeSymbol(selectedMarket)}</b></p>
           <p><span>주문 유형</span><b>{selected?.orderType ?? "-"}</b></p><p><span>수수료</span><b>{formatKrw(selected?.fee)} KRW</b></p>
@@ -2280,7 +2288,7 @@ function RecentTradesPanel({ data }: { data: DashboardData }) {
                 <td>{formatNumber(order.executed_volume ?? order.volume, 8)}</td>
                 <td className={rate != null && rate >= 0 ? "ref-positive" : rate != null ? "ref-negative" : ""}>{formatPercent(rate)}</td>
                 <td className={pnl != null && pnl >= 0 ? "ref-positive" : pnl != null ? "ref-negative" : ""}>{formatSignedKrw(pnl)}</td>
-                <td><span className={status === "FILLED" || status === "SUBMITTED" ? "ref-done" : "ref-holding"}>{statusLabel(status)}</span></td>
+                <td><span className={refStatusChipClass(status)}>{statusLabel(status)}</span></td>
                 <td>{formatKstShort(order.created_at)}</td>
               </tr>
             );
@@ -2295,21 +2303,21 @@ function LogPanel({ data }: { data: DashboardData }) {
   const riskLogs = (data.risk?.risk_logs ?? []).slice(0, 7).map((log) => ({
     key: `risk-${log.id ?? log.created_at ?? ""}-${log.block_code ?? log.risk_level ?? ""}`,
     createdAt: log.created_at,
-    type: log.allowed ? "ok" : "warn",
+    type: log.allowed ? "ok" : "danger",
     time: formatKstTime(log.created_at),
     text: log.block_reason ?? log.block_code ?? log.risk_level ?? "리스크 로그"
   }));
   const orderLogs = data.liveOrders.slice(0, 7).map((order) => ({
     key: `order-${order.request_id ?? order.id ?? order.created_at ?? ""}`,
     createdAt: order.created_at,
-    type: order.status === "BLOCKED" || order.status === "FAILED" ? "warn" : "info",
+    type: order.status === "BLOCKED" || order.status === "FAILED" ? "danger" : "info",
     time: formatKstTime(order.created_at),
     text: `${marketDisplay(order.market)} ${statusLabel(order.side)} ${statusLabel(order.status)}`
   }));
   const recoveryLogs = data.recoveryEvents.slice(0, 7).map((event, index) => ({
     key: `recovery-${event.created_at ?? index}-${event.event_type ?? ""}`,
     createdAt: event.created_at,
-    type: event.severity === "ERROR" ? "warn" : "info",
+    type: event.severity === "ERROR" ? "danger" : "info",
     time: formatKstTime(event.created_at),
     text: event.event_type ?? event.message ?? "복구 로그"
   }));

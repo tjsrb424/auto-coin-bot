@@ -794,6 +794,21 @@ function statusTone(status?: string): Tone {
   return "neutral";
 }
 
+function riskStateTone(status?: string): Tone {
+  if (status === "OK") return "green";
+  if (status === "BLOCKED" || status === "EMERGENCY_STOPPED") return "red";
+  if (status === "WARNING" || status === "MANUAL_REVIEW_REQUIRED") return "amber";
+  return "neutral";
+}
+
+function liveOrderStatusTone(status?: string): Tone {
+  if (status === "FILLED") return "green";
+  if (status === "FAILED" || status === "BLOCKED") return "red";
+  if (status === "CANCELED" || status === "CANCELLED") return "neutral";
+  if (status) return "amber";
+  return "neutral";
+}
+
 function liveModeLabel(mode?: string) {
   return {
     PAPER: "PAPER MODE",
@@ -2476,7 +2491,7 @@ function App() {
                         <thead><tr><th>시간</th><th>종목</th><th>방향</th><th className="text-right">가격</th><th>상태</th></tr></thead>
                         <tbody>{liveOrders.slice(0, 6).map((order) => (
                           <tr key={order.request_id} className="border-t border-terminal-line">
-                            <td className="text-slate-400">{formatKstShort(order.created_at)}</td><td className="font-semibold">{order.market}</td><td><SideBadge side={order.side} /></td><td className="mono-num text-right">{formatKrw(order.price ?? undefined)}</td><td><StatusBadge value={formatLiveOrderStatus(order.status)} tone={order.status === "FILLED" ? "green" : order.status === "FAILED" || order.status === "BLOCKED" ? "red" : "amber"} /></td>
+                            <td className="text-slate-400">{formatKstShort(order.created_at)}</td><td className="font-semibold">{order.market}</td><td><SideBadge side={order.side} /></td><td className="mono-num text-right">{formatKrw(order.price ?? undefined)}</td><td><StatusBadge value={formatLiveOrderStatus(order.status)} tone={liveOrderStatusTone(order.status)} /></td>
                           </tr>
                         ))}</tbody>
                       </table>
@@ -2486,7 +2501,7 @@ function App() {
                     <div className="panel-card-header"><span className="panel-title"><Bell className="h-4 w-4" />시스템 로그</span><button onClick={() => setActiveView("alerts")} className="tiny-link">알림로그</button></div>
                     <div className="log-list dashboard-compact-log">
                       {(riskDashboard?.risk_logs ?? []).slice(0, 7).map((log) => (
-                        <span key={log.id}><i className={log.allowed ? "ok" : "warn"} />{formatKstShort(log.created_at)} · {log.block_code ?? "RISK_CHECK"} · {log.block_reason ?? "정상"}</span>
+                        <span key={log.id}><i className={log.allowed ? "ok" : "danger"} />{formatKstShort(log.created_at)} · {log.block_code ?? "RISK_CHECK"} · {log.block_reason ?? "정상"}</span>
                       ))}
                       {(riskDashboard?.risk_logs ?? []).length === 0 && <span><i className="ok" />최근 리스크 로그 없음</span>}
                     </div>
@@ -2542,7 +2557,7 @@ function App() {
                     <MetricCard label="MACD" value={paper.last_signal ?? "-"} tone={paper.last_signal === "BUY" ? "green" : paper.last_signal === "SELL" ? "red" : "neutral"} />
                     <MetricCard label="거래량 (24h)" value={latestDisplayCandle ? formatKrw(latestDisplayCandle.close * latestDisplayCandle.volume) : "-"} />
                     <MetricCard label="변동성 (ATR)" value={`${formatDecimal(riskState?.daily_loss_percent)}%`} tone="amber" />
-                    <MetricCard label="공포탐욕 지수" value={riskState?.status === "OK" ? "안정" : "주의"} tone={riskState?.status === "OK" ? "green" : "amber"} />
+                    <MetricCard label="공포탐욕 지수" value={riskState?.status === "OK" ? "안정" : "주의"} tone={riskStateTone(riskState?.status)} />
                     <MetricCard label="추세 강도" value={paper.last_signal === "BUY" ? "상승" : paper.last_signal === "SELL" ? "하락" : "중립"} tone={paper.last_signal === "BUY" ? "green" : paper.last_signal === "SELL" ? "red" : "neutral"} />
                   </div>
                 </div>
@@ -2579,7 +2594,7 @@ function App() {
               <div>
                 <h2>{isLiveStrategyOn || isAutoPilotOn ? "자동매매 실행 중" : "자동매매 대기 중"}</h2>
                 <p>봇이 KRW-BTC 기준 전략과 주문 안전장치를 모니터링합니다.</p>
-                <StatusBadge value={riskState?.status ?? "대기"} tone={riskState?.status === "OK" ? "green" : "amber"} />
+                <StatusBadge value={riskState?.status ?? "대기"} tone={riskStateTone(riskState?.status)} />
               </div>
               <div className="auto-switch">
                 <span>자동매매 전체 제어</span>
@@ -2676,7 +2691,7 @@ function App() {
         {activeView === "trades" && (
           <section className="trades-screen screen-grid">
             <div className="screen-kpis"><MetricCard icon={<History className="h-5 w-5" />} label="전체 거래" value={`${liveOrders.length + paperOrders.length}건`} /><MetricCard icon={<Target className="h-5 w-5" />} label="승률" value={formatPercent(metrics?.win_rate ?? forwardMetrics?.win_rate)} /><MetricCard icon={<TrendingUp className="h-5 w-5" />} label="실현 손익" value={formatKrw(balance?.realized_pnl ?? riskState?.daily_realized_pnl)} tone={pnlTone(balance?.realized_pnl ?? riskState?.daily_realized_pnl)} /><MetricCard icon={<Gauge className="h-5 w-5" />} label="평균 보유 시간" value={formatHoldingTime(metrics?.average_holding_time_minutes)} /><MetricCard icon={<DollarSign className="h-5 w-5" />} label="총 수수료" value={formatKrw((result?.orders ?? []).reduce((sum, order) => sum + (order.fee ?? 0), 0))} /></div>
-            <div className="trades-layout"><div className="terminal-panel"><div className="filter-bar"><button className="ghost-button"><Filter className="h-4 w-4" />코인 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />전략 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />상태 전체</button><div className="search-box compact"><Search className="h-4 w-4" /><input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="종목/전략명 검색" /></div><button onClick={exportTradesCsv} className="ghost-button"><Download className="h-4 w-4" />CSV 내보내기</button></div><div className="table-scroll max-h-[620px] overflow-auto"><table className="ops-table w-full min-w-[1080px] text-left text-sm"><thead><tr><th className="px-3 py-2">종목</th><th className="px-3 py-2">전략명</th><th className="px-3 py-2">진입시간</th><th className="px-3 py-2 text-right">진입가</th><th className="px-3 py-2 text-right">수량</th><th className="px-3 py-2 text-right">손익금</th><th className="px-3 py-2">상태</th></tr></thead><tbody>{filteredLiveOrders.slice(0, 16).map((order) => <tr key={order.request_id} className="border-t border-terminal-line"><td className="px-3 py-2 font-semibold">{order.market}</td><td className="px-3 py-2">{order.strategy_name ?? "-"}</td><td className="px-3 py-2 text-slate-400">{formatKstShort(order.created_at)}</td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.price ?? undefined)}</td><td className="mono-num px-3 py-2 text-right">{formatNumber(order.executed_volume)}</td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.filled_amount_krw)}</td><td className="px-3 py-2"><StatusBadge value={formatLiveOrderStatus(order.status)} tone={order.status === "FILLED" ? "green" : order.status === "FAILED" || order.status === "BLOCKED" ? "red" : "amber"} /></td></tr>)}</tbody></table></div></div><aside className="terminal-panel trade-detail-panel"><div className="panel-card-header"><span className="panel-title"><FileText className="h-4 w-4" />거래 상세</span><StatusBadge value={latestLiveOrder ? formatLiveOrderStatus(latestLiveOrder.status) : "-"} tone={latestLiveOrder?.status === "FILLED" ? "green" : latestLiveOrder ? "amber" : "neutral"} /></div><div className="metric-list"><span>종목 <b>{latestLiveOrder?.market ?? "-"}</b></span><span>주문유형 <b>{latestLiveOrder?.order_type ?? "-"}</b></span><span>주문 UUID <b>{latestLiveOrder?.order_uuid ? `${latestLiveOrder.order_uuid.slice(0, 12)}...` : "-"}</b></span><span>체결 금액 <b>{formatKrw(latestLiveOrder?.filled_amount_krw)}</b></span><span>Risk <b>{formatRiskStatus(latestLiveOrder?.risk_result)}</b></span></div><div className="timeline-list"><span>신호 발생</span><span>주문 제출</span><span>체결/대기</span><span>정산 기록</span></div></aside></div>
+            <div className="trades-layout"><div className="terminal-panel"><div className="filter-bar"><button className="ghost-button"><Filter className="h-4 w-4" />코인 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />전략 전체</button><button className="ghost-button"><Filter className="h-4 w-4" />상태 전체</button><div className="search-box compact"><Search className="h-4 w-4" /><input value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} placeholder="종목/전략명 검색" /></div><button onClick={exportTradesCsv} className="ghost-button"><Download className="h-4 w-4" />CSV 내보내기</button></div><div className="table-scroll max-h-[620px] overflow-auto"><table className="ops-table w-full min-w-[1080px] text-left text-sm"><thead><tr><th className="px-3 py-2">종목</th><th className="px-3 py-2">전략명</th><th className="px-3 py-2">진입시간</th><th className="px-3 py-2 text-right">진입가</th><th className="px-3 py-2 text-right">수량</th><th className="px-3 py-2 text-right">손익금</th><th className="px-3 py-2">상태</th></tr></thead><tbody>{filteredLiveOrders.slice(0, 16).map((order) => <tr key={order.request_id} className="border-t border-terminal-line"><td className="px-3 py-2 font-semibold">{order.market}</td><td className="px-3 py-2">{order.strategy_name ?? "-"}</td><td className="px-3 py-2 text-slate-400">{formatKstShort(order.created_at)}</td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.price ?? undefined)}</td><td className="mono-num px-3 py-2 text-right">{formatNumber(order.executed_volume)}</td><td className="mono-num px-3 py-2 text-right">{formatKrw(order.filled_amount_krw)}</td><td className="px-3 py-2"><StatusBadge value={formatLiveOrderStatus(order.status)} tone={liveOrderStatusTone(order.status)} /></td></tr>)}</tbody></table></div></div><aside className="terminal-panel trade-detail-panel"><div className="panel-card-header"><span className="panel-title"><FileText className="h-4 w-4" />거래 상세</span><StatusBadge value={latestLiveOrder ? formatLiveOrderStatus(latestLiveOrder.status) : "-"} tone={liveOrderStatusTone(latestLiveOrder?.status)} /></div><div className="metric-list"><span>종목 <b>{latestLiveOrder?.market ?? "-"}</b></span><span>주문유형 <b>{latestLiveOrder?.order_type ?? "-"}</b></span><span>주문 UUID <b>{latestLiveOrder?.order_uuid ? `${latestLiveOrder.order_uuid.slice(0, 12)}...` : "-"}</b></span><span>체결 금액 <b>{formatKrw(latestLiveOrder?.filled_amount_krw)}</b></span><span>Risk <b>{formatRiskStatus(latestLiveOrder?.risk_result)}</b></span></div><div className="timeline-list"><span>신호 발생</span><span>주문 제출</span><span>체결/대기</span><span>정산 기록</span></div></aside></div>
           </section>
         )}
 
