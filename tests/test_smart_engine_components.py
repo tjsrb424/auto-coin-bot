@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import unittest
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from app import database
 from app.smart_external_factors import load_external_factors
 from app.smart_market_regime import classify_market_regime
 from app.smart_promotion import evaluate_promotion, evaluate_rehearsal_preview
@@ -278,6 +281,38 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertFalse(readiness["can_enable_limited"])
         self.assertIn("policy_auto_trading", blocked)
         self.assertIn("shadow_report", blocked)
+
+    def test_limited_readiness_does_not_require_review_for_minimum_order_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with patch.object(database, "DB_PATH", db_path):
+                database.init_db()
+                database.insert_live_order_log({
+                    "request_id": "smart-rehearsal-too-small",
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "side": "BUY",
+                    "order_type": "LIMIT",
+                    "price": 100_000_000,
+                    "volume": 0.0,
+                    "amount_krw": 0.145,
+                    "risk_result": "BLOCKED_MIN_ORDER_AMOUNT",
+                    "status": "BLOCKED",
+                    "order_preview_payload": {},
+                })
+                readiness = build_limited_readiness(
+                    "KRW-BTC",
+                    decision={"risk_score": 35, "order_intents": [{"side": "BID", "delta_value_krw": 20_000}]},
+                    report={"summary": {"recommendation": "READY_FOR_LIMITED_PILOT_REVIEW"}},
+                    policy={"auto_trading_enabled": True},
+                    risk_state={"status": "OK"},
+                    daily_smart_order_count=0,
+                    emergency_stopped=False,
+                    live_mode="limited",
+                    now_utc=datetime(2026, 6, 18, 3, tzinfo=timezone.utc),
+                )
+        self.assertTrue(readiness["latest_rehearsal_order"]["reviewable"] is False)
+        self.assertNotIn("SMART_REHEARSAL_REVIEW_REQUIRED", readiness["rehearsal_blockers"])
 
 
 if __name__ == "__main__":

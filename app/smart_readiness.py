@@ -9,6 +9,10 @@ from app.risk_manager import compute_risk_state
 from app.shadow_report import build_shadow_report
 from app.smart_promotion import READY_RECOMMENDATION, evaluate_rehearsal_preview, smart_engine_live_mode
 
+NON_REVIEWABLE_REHEARSAL_RISK_RESULTS = {
+    "BLOCKED_MIN_ORDER_AMOUNT",
+}
+
 
 def build_limited_readiness(
     market: str = "KRW-BTC",
@@ -39,7 +43,12 @@ def build_limited_readiness(
     rehearsal = evaluate_rehearsal_preview(requested_order_krw=requested_order, risk_score=risk_score, daily_smart_order_count=daily_count, now_utc=now_utc)
     rehearsal_blockers = list(rehearsal.get("blockers") or [])
     latest_review = latest_rehearsal_order.get("review") if latest_rehearsal_order else None
-    if latest_rehearsal_order and latest_rehearsal_order.get("status") in {"FAILED", "BLOCKED"} and not (latest_review and latest_review.get("is_active")):
+    if (
+        latest_rehearsal_order
+        and _reviewable_rehearsal_order(latest_rehearsal_order)
+        and latest_rehearsal_order.get("status") in {"FAILED", "BLOCKED"}
+        and not (latest_review and latest_review.get("is_active"))
+    ):
         rehearsal_blockers.append("SMART_REHEARSAL_REVIEW_REQUIRED")
     checks = [
         _check("latest_decision", "Latest Smart decision", bool(decision), "Latest decision snapshot exists." if decision else "Run an auto-trading tick to create a decision snapshot."),
@@ -144,7 +153,19 @@ def _latest_rehearsal_order(exchange: str, market: str) -> dict | None:
     order["review_status"] = review.get("decision") if review else None
     order["review_active"] = bool(review and review.get("is_active"))
     order["review_expires_at"] = review.get("expires_at") if review else None
+    order["reviewable"] = _reviewable_rehearsal_order(order)
     return order
+
+
+def _reviewable_rehearsal_order(order: dict | None) -> bool:
+    if not order:
+        return False
+    if str(order.get("risk_result") or "") in NON_REVIEWABLE_REHEARSAL_RISK_RESULTS:
+        return False
+    amount = _float(order.get("amount_krw"))
+    if 0 < amount < 5_000:
+        return False
+    return True
 
 
 def _float(value: Any, default: float = 0.0) -> float:

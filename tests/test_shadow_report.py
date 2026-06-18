@@ -105,6 +105,28 @@ class ShadowReportTests(unittest.TestCase):
         self.assertEqual(report["summary"]["rehearsal"]["blocked_count"], 1)
         self.assertTrue(report["summary"]["rehearsal"]["requires_review"])
 
+    def test_shadow_report_does_not_require_review_for_minimum_order_block(self) -> None:
+        database.insert_live_order_log({
+            "request_id": "smart-rehearsal-too-small",
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": 100_000_000,
+            "volume": 0.0,
+            "amount_krw": 0.145,
+            "risk_result": "BLOCKED_MIN_ORDER_AMOUNT",
+            "status": "BLOCKED",
+            "order_preview_payload": {},
+        })
+
+        report = build_shadow_report("KRW-BTC", limit=10, horizon_candles=3)
+
+        self.assertFalse(report["summary"]["rehearsal"]["latest_order_reviewable"])
+        self.assertEqual(report["summary"]["rehearsal"]["reviewable_blocked_count"], 0)
+        self.assertFalse(report["summary"]["rehearsal"]["requires_review"])
+        self.assertNotEqual(report["summary"]["recommendation"], "REHEARSAL_REVIEW_REQUIRED")
+
     def test_shadow_report_accepts_active_approved_rehearsal_review(self) -> None:
         database.insert_live_order_log({
             "request_id": "smart-rehearsal-approved",

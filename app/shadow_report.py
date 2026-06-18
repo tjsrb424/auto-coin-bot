@@ -12,6 +12,10 @@ IGNORED_SHADOW_BLOCKERS = {
     "SMART_ORDER_DELTA_CAPPED_BY_MAX_TOTAL_EXPOSURE",
 }
 
+NON_REVIEWABLE_REHEARSAL_RISK_RESULTS = {
+    "BLOCKED_MIN_ORDER_AMOUNT",
+}
+
 
 def build_shadow_report(market: str = "KRW-BTC", limit: int = 100, horizon_candles: int = 3) -> dict:
     decisions = load_decision_snapshots(market=market, limit=limit)
@@ -224,14 +228,18 @@ def _rehearsal_summary(market: str) -> dict:
         order["review_expires_at"] = review.get("expires_at") if review else None
     latest = orders[0] if orders else None
     latest_review = latest.get("review") if latest else None
+    latest_reviewable = _reviewable_rehearsal_order(latest)
     submitted = [row for row in orders if row.get("status") in {"SUBMITTED", "WAITING", "PARTIALLY_FILLED", "FILLED", "CANCELED"}]
     blocked = [row for row in orders if row.get("status") in {"BLOCKED", "FAILED"}]
+    reviewable_blocked = [row for row in blocked if _reviewable_rehearsal_order(row)]
     requires_review = _requires_rehearsal_review(latest, latest_review)
     return {
         "order_count": len(orders),
         "submitted_count": len(submitted),
         "blocked_count": len(blocked),
+        "reviewable_blocked_count": len(reviewable_blocked),
         "latest_order": latest,
+        "latest_order_reviewable": latest_reviewable,
         "latest_review": latest_review,
         "review_status": latest_review.get("decision") if latest_review else None,
         "review_active": bool(latest_review and latest_review.get("is_active")),
@@ -244,11 +252,24 @@ def _rehearsal_summary(market: str) -> dict:
 def _requires_rehearsal_review(latest: dict | None, review: dict | None) -> bool:
     if not latest:
         return False
+    if not _reviewable_rehearsal_order(latest):
+        return False
     if review and review.get("decision") == "APPROVED" and review.get("is_active"):
         return False
     if latest.get("status") in {"BLOCKED", "FAILED", "SUBMITTED", "WAITING", "PARTIALLY_FILLED"}:
         return True
     return latest.get("risk_result") not in {None, "ALLOWED"}
+
+
+def _reviewable_rehearsal_order(order: dict | None) -> bool:
+    if not order:
+        return False
+    if str(order.get("risk_result") or "") in NON_REVIEWABLE_REHEARSAL_RISK_RESULTS:
+        return False
+    amount = _float(order.get("amount_krw"))
+    if 0 < amount < 5_000:
+        return False
+    return True
 
 
 def _count_by(rows: list[dict], key: str) -> dict:

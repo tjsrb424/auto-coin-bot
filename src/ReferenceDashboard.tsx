@@ -3496,20 +3496,20 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
             <p><span>주문</span><b>{latestRehearsal.side ?? "-"} · {formatKrw(latestRehearsal.amount_krw)} KRW</b></p>
             <p><span>상태</span><b title={`${latestRehearsal.status ?? "-"} · ${latestRehearsal.risk_result ?? "-"}`}>{latestRehearsal.status ?? "-"} · {latestRehearsal.risk_result ?? "-"}</b></p>
             <p><span>리뷰</span><b>{rehearsalReview?.decision ?? "미검토"}{rehearsalReview?.is_active ? " · 유효" : ""}</b></p>
-            <p><span>만료</span><b>{formatKstShort(rehearsalReview?.expires_at)}</b></p>
-            {latestRehearsal.error_message && <em title={latestRehearsal.error_message}>{latestRehearsal.error_message}</em>}
-            <label>
-              <span>검토 메모</span>
-              <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="검토 사유를 남기세요" />
-            </label>
             <div className="ref-ops-review-actions">
               <button type="button" onClick={() => void submitRehearsalReview("APPROVED")} disabled={isReviewing}>
-                <ShieldCheck size={17} />승인
+                <ShieldCheck size={17} />{isReviewing ? "처리 중" : "검토 승인"}
               </button>
               <button type="button" onClick={() => void submitRehearsalReview("REJECTED")} disabled={isReviewing}>
                 <PowerOff size={17} />반려
               </button>
             </div>
+            {latestRehearsal.error_message && <em title={latestRehearsal.error_message}>{latestRehearsal.error_message}</em>}
+            <label>
+              <span>검토 메모</span>
+              <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="선택 입력" />
+            </label>
+            {rehearsalReview?.expires_at && <p><span>만료</span><b>{formatKstShort(rehearsalReview.expires_at)}</b></p>}
             <section>
               {visibleRehearsalBlockers.map((item) => (
                 <p key={item}><span>남은 차단</span><b title={item}>{item}</b></p>
