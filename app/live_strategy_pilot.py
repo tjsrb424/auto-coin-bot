@@ -508,8 +508,10 @@ async def _submit_smart_limited_order(
         return False
     intent_id = intent.get("id")
     side = str(intent.get("side") or "").upper()
-    order_side = "SELL" if side in {"ASK", "SELL"} else "BUY"
-    if has_live_strategy_order_for_signal(int(session["id"]), int(session["candidate_strategy_id"]), str(session.get("market") or "KRW-BTC"), candle["candle_time_utc"], signal.get("signal", "HOLD"), order_side):
+    if any(
+        has_live_strategy_order_for_signal(int(session["id"]), int(session["candidate_strategy_id"]), str(session.get("market") or "KRW-BTC"), candle["candle_time_utc"], signal.get("signal", "HOLD"), order_side)
+        for order_side in ("BUY", "SELL")
+    ):
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_DUPLICATE_CANDLE", "last_order_status": "BLOCKED"})
         return True
     if side in {"ASK", "SELL"}:
