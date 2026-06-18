@@ -2415,6 +2415,24 @@ def load_open_live_position(session_id: int | None = None, exchange: str = "bith
     return dict(row) if row else None
 
 
+def load_live_position_by_entry_order_uuid(exchange: str, market: str, entry_order_uuid: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM live_positions
+            WHERE exchange = ?
+              AND market = ?
+              AND entry_order_uuid = ?
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange, market, entry_order_uuid),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def load_live_position(position_id: int) -> dict | None:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM live_positions WHERE id = ?", (position_id,)).fetchone()
@@ -2725,6 +2743,30 @@ def get_live_order_log_by_uuid(order_uuid: str) -> dict | None:
             (order_uuid,),
         ).fetchone()
     return _normalize_live_order_log(dict(row)) if row else None
+
+
+def load_filled_entry_order_logs_without_position(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND market = ?
+              AND side = 'BUY'
+              AND order_purpose = 'ENTRY'
+              AND status = 'FILLED'
+              AND position_id IS NULL
+              AND session_id IS NOT NULL
+              AND candidate_strategy_id IS NOT NULL
+              AND order_uuid IS NOT NULL
+              AND executed_volume > 0
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
+            ORDER BY updated_at ASC, id ASC
+            """,
+            (exchange, market),
+        ).fetchall()
+    return [_normalize_live_order_log(dict(row)) for row in rows]
 
 
 def _normalize_live_strategy_session(row: dict) -> dict:

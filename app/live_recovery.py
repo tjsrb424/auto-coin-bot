@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -13,6 +14,8 @@ from app.database import (
     get_live_order_log_by_uuid,
     has_unresolved_live_order,
     insert_live_recovery_event,
+    load_filled_entry_order_logs_without_position,
+    load_live_position_by_entry_order_uuid,
     load_live_recovery_events,
     load_latest_live_strategy_session,
     load_open_live_positions,
@@ -208,6 +211,18 @@ def apply_reconciled_order_status(log: dict, status: ReconciledOrderStatus, sour
             "filled_amount_krw": status.filled_amount_krw,
         },
     )
+    if status.status == "FILLED":
+        updated = {
+            **log,
+            "status": status.status,
+            "order_uuid": _order_uuid(status.raw) or log.get("order_uuid"),
+            "executed_volume": status.executed_volume,
+            "remaining_volume": status.remaining_volume,
+            "filled_amount_krw": status.filled_amount_krw,
+            "paid_fee": status.paid_fee,
+            "exchange_response_payload": status.raw,
+        }
+        ensure_filled_entry_order_position(updated, source=f"{source}_POSITION_SYNC")
 
 
 async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC") -> dict:
@@ -218,6 +233,7 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
         log_recovery_event("API_ERROR", "ERROR", "Balance reconciliation failed.", exchange=exchange, market=market, payload={"error": str(exc)})
         return {"status": "FAILED", "ok": False, "blocking": True, "message": str(exc)}
 
+    position_sync = ensure_filled_entry_order_positions(exchange, market)
     internal_positions = load_open_live_positions(exchange, market)
     internal_btc = sum(_float(position.get("entry_volume")) for position in internal_positions)
     exchange_btc = _balance_amount(balances, "BTC")
@@ -235,6 +251,7 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
         "difference_btc": difference,
         "tolerance_btc": tolerance,
         "open_position_count": len(internal_positions),
+        "position_sync": position_sync,
         "checked_at": _utc_now(),
     }
     if mismatch:
@@ -247,6 +264,99 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
             payload=status,
         )
     return status
+
+
+def ensure_filled_entry_order_positions(exchange: str = "bithumb", market: str = "KRW-BTC") -> dict:
+    created = 0
+    attached = 0
+    skipped = 0
+    for log in load_filled_entry_order_logs_without_position(exchange, market):
+        result = ensure_filled_entry_order_position(log, source="FILLED_ENTRY_POSITION_RECOVERY")
+        if result == "CREATED":
+            created += 1
+        elif result == "ATTACHED":
+            attached += 1
+        else:
+            skipped += 1
+    return {"created": created, "attached": attached, "skipped": skipped}
+
+
+def ensure_filled_entry_order_position(log: dict, *, source: str = "FILLED_ENTRY_POSITION_SYNC") -> str:
+    if str(log.get("status") or "").upper() != "FILLED":
+        return "SKIPPED"
+    if str(log.get("side") or "").upper() != "BUY" or str(log.get("order_purpose") or "ENTRY").upper() != "ENTRY":
+        return "SKIPPED"
+    if log.get("position_id"):
+        return "SKIPPED"
+
+    exchange = str(log.get("exchange") or "bithumb")
+    market = str(log.get("market") or "KRW-BTC")
+    order_uuid = str(log.get("order_uuid") or _order_uuid(log.get("exchange_response_payload") or ""))
+    if not order_uuid:
+        return "SKIPPED"
+
+    existing = load_live_position_by_entry_order_uuid(exchange, market, order_uuid)
+    if existing:
+        position_id = int(existing["id"])
+        update_live_order_log(str(log["request_id"]), {"position_id": position_id})
+        _adopt_position_in_relevant_session(log, position_id, "POSITION_ATTACHED_TO_FILLED_ORDER")
+        log_recovery_event(
+            source,
+            "INFO",
+            "Filled entry order was attached to an existing live position.",
+            exchange=exchange,
+            market=market,
+            session_id=log.get("session_id"),
+            request_id=log.get("request_id"),
+            order_uuid=order_uuid,
+            payload={"position_id": position_id},
+        )
+        return "ATTACHED"
+
+    entry_price = _entry_price_from_log(log)
+    entry_volume = _float(log.get("executed_volume")) or _float(log.get("volume"))
+    if entry_price <= 0 or entry_volume <= 0:
+        return "SKIPPED"
+
+    position_id = create_live_position(
+        {
+            "session_id": int(log["session_id"]),
+            "exchange": exchange,
+            "market": market,
+            "candidate_strategy_id": int(log["candidate_strategy_id"]),
+            "strategy_name": str(log.get("strategy_name") or "live_strategy"),
+            "status": "OPEN",
+            "entry_order_uuid": order_uuid,
+            "entry_price": entry_price,
+            "entry_volume": entry_volume,
+            "entry_amount_krw": _filled_amount_from_log(log, entry_price, entry_volume),
+            "current_price": entry_price,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "stop_loss_price": entry_price * (1 - _env_float("AUTO_STOP_LOSS_PERCENT", 0.7) / 100),
+            "take_profit_price": entry_price * (1 + _env_float("AUTO_TAKE_PROFIT_PERCENT", 1.0) / 100),
+            "opened_at": str(log.get("updated_at") or log.get("created_at") or _utc_now()),
+        }
+    )
+    update_live_order_log(str(log["request_id"]), {"position_id": position_id})
+    _adopt_position_in_relevant_session(log, position_id, "POSITION_OPEN_SYNCED")
+    log_recovery_event(
+        source,
+        "WARNING",
+        "Filled entry order without position_id was recovered as a live position.",
+        exchange=exchange,
+        market=market,
+        session_id=log.get("session_id"),
+        request_id=log.get("request_id"),
+        order_uuid=order_uuid,
+        payload={
+            "position_id": position_id,
+            "entry_price": entry_price,
+            "entry_volume": entry_volume,
+            "entry_amount_krw": _filled_amount_from_log(log, entry_price, entry_volume),
+        },
+    )
+    return "CREATED"
 
 
 async def import_exchange_btc_position(exchange: str = "bithumb", market: str = "KRW-BTC", *, confirmation: str) -> dict:
@@ -423,12 +533,67 @@ def _risk_result_for_status(status: str, fallback: str) -> str:
     return fallback
 
 
+def _adopt_position_in_relevant_session(log: dict, position_id: int, risk_result: str) -> None:
+    session_id = log.get("session_id")
+    if session_id:
+        update_live_strategy_session(
+            int(session_id),
+            {
+                "current_position_id": position_id,
+                "current_open_order_uuid": None,
+                "last_order_status": "FILLED",
+                "last_risk_result": risk_result,
+            },
+        )
+
+    latest = load_latest_live_strategy_session()
+    if not latest:
+        return
+    if str(latest.get("exchange") or "") != str(log.get("exchange") or "bithumb"):
+        return
+    if str(latest.get("market") or "") != str(log.get("market") or "KRW-BTC"):
+        return
+    if int(latest.get("candidate_strategy_id") or 0) != int(log.get("candidate_strategy_id") or 0):
+        return
+    update_live_strategy_session(
+        int(latest["id"]),
+        {
+            "current_position_id": position_id,
+            "current_open_order_uuid": None,
+            "last_order_status": "FILLED",
+            "last_risk_result": risk_result,
+        },
+    )
+
+
+def _entry_price_from_log(log: dict) -> float:
+    price = _float(log.get("price"))
+    if price > 0:
+        return price
+    amount = _float(log.get("filled_amount_krw")) or _float(log.get("amount_krw"))
+    volume = _float(log.get("executed_volume")) or _float(log.get("volume"))
+    return amount / volume if amount > 0 and volume > 0 else 0.0
+
+
+def _filled_amount_from_log(log: dict, entry_price: float, entry_volume: float) -> float:
+    return _float(log.get("filled_amount_krw")) or _float(log.get("amount_krw")) or entry_price * entry_volume
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _extract_orders(response: dict | list) -> list[dict]:
     raw = response.get("orders", []) if isinstance(response, dict) else response
     return [item for item in raw if isinstance(item, dict)]
 
 
 def _order_uuid(order: dict) -> str:
+    if not isinstance(order, dict):
+        return ""
     return str(order.get("uuid") or order.get("order_id") or order.get("id") or "")
 
 

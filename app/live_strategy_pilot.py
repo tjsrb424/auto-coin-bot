@@ -15,6 +15,7 @@ from app.database import (
     create_live_position,
     create_live_strategy_session,
     get_live_order_log,
+    get_live_order_log_by_uuid,
     has_live_strategy_order_for_signal,
     has_open_live_position_for_strategy,
     has_open_live_strategy_order,
@@ -27,6 +28,7 @@ from app.database import (
     load_live_order_logs,
     load_open_live_position,
     load_open_live_position_for_strategy,
+    load_live_position_by_entry_order_uuid,
     load_running_live_strategy_sessions,
     update_order_intent,
     update_live_order_log,
@@ -1092,12 +1094,18 @@ async def _handle_emergency(session: dict) -> None:
 
 
 def _create_position_from_order(session: dict, order_status: dict, config: LiveStrategyConfig) -> int:
+    entry_order_uuid = str(order_status.get("uuid") or order_status.get("order_id") or order_status.get("id") or session.get("current_open_order_uuid") or "")
+    if entry_order_uuid:
+        existing = load_live_position_by_entry_order_uuid(session["exchange"], session["market"], entry_order_uuid)
+        if existing:
+            _attach_position_to_order_log(entry_order_uuid, int(existing["id"]))
+            return int(existing["id"])
     entry_price = _float(order_status.get("price"))
     entry_volume = _float(order_status.get("executed_volume")) or _float(order_status.get("volume"))
     entry_amount = entry_price * entry_volume
     stop_loss_price = entry_price * (1 - config.stop_loss_percent / 100) if entry_price > 0 else 0.0
     take_profit_price = entry_price * (1 + config.take_profit_percent / 100) if entry_price > 0 else 0.0
-    return create_live_position(
+    position_id = create_live_position(
         {
             "session_id": session["id"],
             "exchange": session["exchange"],
@@ -1105,7 +1113,7 @@ def _create_position_from_order(session: dict, order_status: dict, config: LiveS
             "candidate_strategy_id": session["candidate_strategy_id"],
             "strategy_name": session["strategy_name"],
             "status": "OPEN",
-            "entry_order_uuid": order_status.get("uuid") or session.get("current_open_order_uuid"),
+            "entry_order_uuid": entry_order_uuid,
             "entry_price": entry_price,
             "entry_volume": entry_volume,
             "entry_amount_krw": entry_amount,
@@ -1117,6 +1125,20 @@ def _create_position_from_order(session: dict, order_status: dict, config: LiveS
             "opened_at": _utc_now(),
         }
     )
+    if entry_order_uuid:
+        _attach_position_to_order_log(entry_order_uuid, position_id)
+    return position_id
+
+
+def _attach_position_to_order_log(order_uuid: str, position_id: int) -> None:
+    log = get_live_order_log_by_uuid(order_uuid)
+    if not log:
+        return
+    if str(log.get("order_purpose") or "ENTRY").upper() != "ENTRY":
+        return
+    if log.get("position_id"):
+        return
+    update_live_order_log(str(log["request_id"]), {"position_id": position_id})
 
 
 def _insert_blocked_log(session: dict, risk_result: str, message: str | None, candle_time_utc: str | None, signal: dict | None, order: dict | None = None, preview: dict | None = None) -> None:
