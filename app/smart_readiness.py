@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.database import count_live_strategy_orders_today, get_connection, load_bot_operation_policy, load_latest_decision_snapshot
+from app.database import count_live_strategy_orders_today, get_connection, load_bot_operation_policy, load_latest_decision_snapshot, load_smart_rehearsal_review
 from app.live_broker import is_emergency_stopped
 from app.risk_manager import compute_risk_state
 from app.shadow_report import build_shadow_report
@@ -38,7 +38,8 @@ def build_limited_readiness(
     latest_rehearsal_order = _latest_rehearsal_order(exchange, market)
     rehearsal = evaluate_rehearsal_preview(requested_order_krw=requested_order, risk_score=risk_score, daily_smart_order_count=daily_count, now_utc=now_utc)
     rehearsal_blockers = list(rehearsal.get("blockers") or [])
-    if latest_rehearsal_order and latest_rehearsal_order.get("status") in {"FAILED", "BLOCKED"}:
+    latest_review = latest_rehearsal_order.get("review") if latest_rehearsal_order else None
+    if latest_rehearsal_order and latest_rehearsal_order.get("status") in {"FAILED", "BLOCKED"} and not (latest_review and latest_review.get("is_active")):
         rehearsal_blockers.append("SMART_REHEARSAL_REVIEW_REQUIRED")
     checks = [
         _check("latest_decision", "Latest Smart decision", bool(decision), "Latest decision snapshot exists." if decision else "Run an auto-trading tick to create a decision snapshot."),
@@ -124,7 +125,7 @@ def _latest_rehearsal_order(exchange: str, market: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT request_id, status, risk_result, side, price, volume, amount_krw,
+            SELECT request_id, exchange, status, risk_result, side, price, volume, amount_krw,
                    order_uuid, error_message, created_at, updated_at
             FROM live_order_logs
             WHERE exchange = ?
@@ -135,7 +136,15 @@ def _latest_rehearsal_order(exchange: str, market: str) -> dict | None:
             """,
             (exchange, market),
         ).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    order = dict(row)
+    review = load_smart_rehearsal_review(order.get("request_id"), exchange=exchange, market=market)
+    order["review"] = review
+    order["review_status"] = review.get("decision") if review else None
+    order["review_active"] = bool(review and review.get("is_active"))
+    order["review_expires_at"] = review.get("expires_at") if review else None
+    return order
 
 
 def _float(value: Any, default: float = 0.0) -> float:

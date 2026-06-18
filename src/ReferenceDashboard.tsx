@@ -437,6 +437,35 @@ type SmartReadinessCheck = {
   detail?: string;
 };
 
+type SmartRehearsalReview = {
+  request_id?: string;
+  exchange?: string;
+  market?: string;
+  decision?: "APPROVED" | "REJECTED" | string;
+  note?: string;
+  reviewed_by?: string;
+  reviewed_at?: string;
+  expires_at?: string | null;
+  is_active?: boolean;
+};
+
+type SmartRehearsalOrder = {
+  request_id?: string;
+  exchange?: string;
+  status?: string;
+  risk_result?: string;
+  side?: string;
+  amount_krw?: number;
+  price?: number;
+  volume?: number;
+  error_message?: string | null;
+  created_at?: string;
+  review?: SmartRehearsalReview | null;
+  review_status?: string | null;
+  review_active?: boolean;
+  review_expires_at?: string | null;
+};
+
 type SmartLimitedReadiness = {
   status?: string;
   can_enable_limited?: boolean;
@@ -448,14 +477,7 @@ type SmartLimitedReadiness = {
   rehearsal_blockers?: string[];
   checks?: SmartReadinessCheck[];
   external_provider_health?: Record<string, { stale?: boolean; severity?: string | null; source?: string | null; reason?: string | null }>;
-  latest_rehearsal_order?: {
-    request_id?: string;
-    status?: string;
-    risk_result?: string;
-    side?: string;
-    amount_krw?: number;
-    created_at?: string;
-  } | null;
+  latest_rehearsal_order?: SmartRehearsalOrder | null;
   rehearsal?: {
     allowed?: boolean;
     blockers?: string[];
@@ -510,6 +532,12 @@ type DashboardData = {
     promotion_blockers?: string[];
     readiness?: ShadowReport["summary"];
     limited_readiness?: SmartLimitedReadiness;
+    latest_rehearsal_order?: SmartRehearsalOrder | null;
+    rehearsal_review?: SmartRehearsalReview | null;
+    rehearsal_review_status?: string | null;
+    rehearsal_review_active?: boolean;
+    rehearsal_review_expires_at?: string | null;
+    remaining_rehearsal_blockers?: string[];
   } | null;
   botPolicy: BotPolicy | null;
   health: HealthStatus | null;
@@ -3305,11 +3333,15 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
   const policy = data.botPolicy;
   const readiness = data.smartEngineStatus?.limited_readiness;
   const readinessChecks = readiness?.checks ?? [];
-  const latestRehearsal = readiness?.latest_rehearsal_order;
+  const latestRehearsal = data.smartEngineStatus?.latest_rehearsal_order ?? readiness?.latest_rehearsal_order;
+  const rehearsalReview = data.smartEngineStatus?.rehearsal_review ?? latestRehearsal?.review ?? null;
+  const rehearsalBlockers = data.smartEngineStatus?.remaining_rehearsal_blockers ?? readiness?.rehearsal_blockers ?? [];
   const [autoTradingEnabled, setAutoTradingEnabled] = React.useState(false);
   const [maxExposure, setMaxExposure] = React.useState(500000);
   const [dailyLossPct, setDailyLossPct] = React.useState(3);
   const [isSaving, setIsSaving] = React.useState(false);
+  const [reviewNote, setReviewNote] = React.useState("");
+  const [isReviewing, setIsReviewing] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -3337,6 +3369,29 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
       setError(err instanceof Error ? err.message : "운용정책 저장 실패");
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const submitRehearsalReview = async (decision: "APPROVED" | "REJECTED") => {
+    if (isReviewing || !latestRehearsal?.request_id) return;
+    setIsReviewing(true);
+    setMessage(null);
+    setError(null);
+    try {
+      await postJson<{ ok?: boolean }>("/api/smart-engine/rehearsal-review", {
+        request_id: latestRehearsal.request_id,
+        exchange: latestRehearsal.exchange ?? "bithumb",
+        market: MARKET,
+        decision,
+        note: reviewNote.trim()
+      });
+      await refresh();
+      setMessage(decision === "APPROVED" ? "리허설 검토 승인 완료" : "리허설 반려 기록 완료");
+      setReviewNote("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "리허설 검토 저장 실패");
+    } finally {
+      setIsReviewing(false);
     }
   };
 
@@ -3422,6 +3477,38 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
           ))}
           {readinessChecks.length === 0 && <div className="is-warn"><span>점검</span><b>대기</b><em>상태 데이터가 아직 없습니다.</em></div>}
         </section>
+      </RefPanel>
+      <RefPanel className="ref-ops-review">
+        <h3>리허설 검토</h3>
+        {latestRehearsal ? (
+          <>
+            <p><span>요청</span><b>{latestRehearsal.request_id ?? "-"}</b></p>
+            <p><span>주문</span><b>{latestRehearsal.side ?? "-"} · {formatKrw(latestRehearsal.amount_krw)} KRW</b></p>
+            <p><span>상태</span><b>{latestRehearsal.status ?? "-"} · {latestRehearsal.risk_result ?? "-"}</b></p>
+            <p><span>리뷰</span><b>{rehearsalReview?.decision ?? "미검토"}{rehearsalReview?.is_active ? " · 유효" : ""}</b></p>
+            <p><span>만료</span><b>{formatKstShort(rehearsalReview?.expires_at)}</b></p>
+            {latestRehearsal.error_message && <em>{latestRehearsal.error_message}</em>}
+            <label>
+              <span>검토 메모</span>
+              <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="검토 사유를 남기세요" />
+            </label>
+            <div className="ref-ops-review-actions">
+              <button type="button" onClick={() => void submitRehearsalReview("APPROVED")} disabled={isReviewing}>
+                <ShieldCheck size={17} />승인
+              </button>
+              <button type="button" onClick={() => void submitRehearsalReview("REJECTED")} disabled={isReviewing}>
+                <PowerOff size={17} />반려
+              </button>
+            </div>
+            <section>
+              {(rehearsalBlockers.length ? rehearsalBlockers : ["남은 리허설 차단 사유 없음"]).slice(0, 6).map((item) => (
+                <p key={item}><span>남은 차단</span><b>{item}</b></p>
+              ))}
+            </section>
+          </>
+        ) : (
+          <p><span>최신 리허설</span><b>없음</b></p>
+        )}
       </RefPanel>
       <RefPanel className="ref-ops-modules">
         <h3>내부 판단 모듈</h3>

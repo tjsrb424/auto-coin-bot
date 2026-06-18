@@ -8,8 +8,9 @@
 - 사용자가 직접 수정하는 값은 자동매매 ON/OFF, 최대 투입 금액, 일 손실률 제한 3개만 유지한다.
 - 운용자본금 입력 기능은 만들지 않는다.
 - 기준 자본은 `max_total_exposure_krw`만 사용한다.
-- 제한 실주문 코드는 준비하지만 기본값은 `SMART_ENGINE_LIVE_MODE=shadow`다.
-- `SMART_ENGINE_LIVE_MODE=limited`를 켜도 정책, 리스크, Shadow report, 리허설 게이트를 모두 통과해야 주문 후보가 제출된다.
+- 운영 서버는 `SMART_ENGINE_LIVE_MODE=limited`, `SMART_ENGINE_SHADOW_MODE=false`로 실전 자동주문을 준비한다.
+- `SMART_ENGINE_LIVE_MODE=limited`에서도 정책, 리스크, Shadow report, 리허설 리뷰 승인, 리허설 게이트를 모두 통과해야 주문 후보가 제출된다.
+- `SMART_REHEARSAL_MAX_DAILY_ORDERS=0`은 리허설 일일 건수 제한 없음으로 해석한다.
 
 ## 완료
 
@@ -63,6 +64,7 @@
 ## 아직 남은 단계
 
 - [ ] 실계좌에서 `SMART_ENGINE_LIVE_MODE=limited` 소액 리허설 1회 수행
+- [ ] 관리자 화면에서 최신 리허설 결과를 검토 승인 또는 반려
 - [ ] 리허설 결과를 Shadow report/주문 로그와 대조해 승격 기준 보정
 - [ ] 전략관리 잔여 UI를 내부 신호 읽기 전용 화면으로 더 정리
 
@@ -70,4 +72,4 @@
 
 현재는 "제한 실주문 코드 준비, 기본 OFF, 소액 리허설 게이트 구현, limited 전환 점검 화면/API, 외부요인 provider 2차 반영, SELL/REDUCE 제한 실주문 경로 준비" 단계까지 완료되었습니다.
 
-다음 추천 개발은 실제 `SMART_ENGINE_LIVE_MODE=limited` 전환 전 운영 점검과 소액 리허설 1회 수행입니다. 실제 주문 실행은 별도 승인 후 진행합니다.
+다음 운영 단계는 소액 수동 주문/취소 smoke test, 리허설 결과 UI 승인, `AUTO STRATEGY ENABLE` 수동 시작, live order log의 `order_uuid` 확인입니다.

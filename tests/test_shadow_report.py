@@ -105,6 +105,66 @@ class ShadowReportTests(unittest.TestCase):
         self.assertEqual(report["summary"]["rehearsal"]["blocked_count"], 1)
         self.assertTrue(report["summary"]["rehearsal"]["requires_review"])
 
+    def test_shadow_report_accepts_active_approved_rehearsal_review(self) -> None:
+        database.insert_live_order_log({
+            "request_id": "smart-rehearsal-approved",
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": 100_000_000,
+            "volume": 0.0001,
+            "amount_krw": 10_000,
+            "risk_result": "SMART_PROMOTION_BLOCKED",
+            "status": "BLOCKED",
+            "order_preview_payload": {},
+        })
+        review = database.insert_smart_rehearsal_review(
+            request_id="smart-rehearsal-approved",
+            exchange="bithumb",
+            market="KRW-BTC",
+            decision="APPROVED",
+            note="reviewed",
+        )
+
+        report = build_shadow_report("KRW-BTC", limit=10, horizon_candles=3)
+
+        self.assertTrue(review["is_active"])
+        self.assertFalse(report["summary"]["rehearsal"]["requires_review"])
+        self.assertNotEqual(report["summary"]["recommendation"], "REHEARSAL_REVIEW_REQUIRED")
+
+    def test_shadow_report_ignores_expired_rehearsal_review(self) -> None:
+        database.insert_live_order_log({
+            "request_id": "smart-rehearsal-expired",
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": 100_000_000,
+            "volume": 0.0001,
+            "amount_krw": 10_000,
+            "risk_result": "SMART_PROMOTION_BLOCKED",
+            "status": "BLOCKED",
+            "order_preview_payload": {},
+        })
+        database.insert_smart_rehearsal_review(
+            request_id="smart-rehearsal-expired",
+            exchange="bithumb",
+            market="KRW-BTC",
+            decision="APPROVED",
+            note="reviewed",
+        )
+        with database.get_connection() as conn:
+            conn.execute(
+                "UPDATE smart_rehearsal_reviews SET expires_at = ? WHERE request_id = ?",
+                ("2020-01-01T00:00:00Z", "smart-rehearsal-expired"),
+            )
+
+        report = build_shadow_report("KRW-BTC", limit=10, horizon_candles=3)
+
+        self.assertTrue(report["summary"]["rehearsal"]["requires_review"])
+        self.assertEqual(report["summary"]["recommendation"], "REHEARSAL_REVIEW_REQUIRED")
+
 
 def candle(candle_time_utc: str, price: float) -> dict:
     return {

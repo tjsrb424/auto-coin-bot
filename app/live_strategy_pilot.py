@@ -576,6 +576,7 @@ async def _submit_smart_limited_order(
         request_exists=False,
         recent_duplicate=False,
         market_snapshot={"price": current_price},
+        is_auto=True,
     )
     risk_preview = check_order_risk(
         order=order,
@@ -703,7 +704,7 @@ async def _submit_smart_limited_sell_order(
         "volume": volume,
         "order_purpose": "EXIT",
     }
-    risk_preview = evaluate_live_order_risk(order=order, config=live_config, mode="LIVE_MANUAL_ONLY", balances=balances, request_exists=False, recent_duplicate=False, market_snapshot={"price": current_price})
+    risk_preview = evaluate_live_order_risk(order=order, config=live_config, mode="AUTO_STRATEGY_RUNNING", balances=balances, request_exists=False, recent_duplicate=False, market_snapshot={"price": current_price}, is_auto=True)
     risk_preview = check_order_risk(
         order=order,
         purpose="EXIT",
@@ -791,11 +792,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
     risk = evaluate_live_order_risk(
         order=order,
         config=live_config,
-        mode="LIVE_MANUAL_ONLY",
+        mode="AUTO_STRATEGY_RUNNING",
         balances=balances,
         request_exists=False,
         recent_duplicate=False,
         market_snapshot={"price": current_price, "range_rate": range_rate, "volume": float(candle["candle_acc_trade_volume"])},
+        is_auto=True,
     )
     if amount > config.max_order_krw:
         risk["allowed"] = False

@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
-from app.database import get_connection, load_decision_snapshots
+from app.database import get_connection, load_decision_snapshots, load_smart_rehearsal_review
 
 
 IGNORED_SHADOW_BLOCKERS = {
@@ -186,10 +186,7 @@ def _readiness_score(*, total: int, hard_block_rate: float, policy_block_rate: f
 
 
 def _recommendation(total: int, readiness_score: float, directional_win_rate: float, hard_block_rate: float, rehearsal: dict | None = None) -> str:
-    latest = (rehearsal or {}).get("latest_order") or {}
-    if latest.get("status") in {"BLOCKED", "FAILED"} or latest.get("risk_result") not in {None, "ALLOWED"}:
-        return "REHEARSAL_REVIEW_REQUIRED"
-    if latest.get("status") in {"SUBMITTED", "WAITING", "PARTIALLY_FILLED"}:
+    if (rehearsal or {}).get("requires_review"):
         return "REHEARSAL_REVIEW_REQUIRED"
     if total < 20:
         return "MORE_SHADOW_DATA_REQUIRED"
@@ -204,7 +201,7 @@ def _rehearsal_summary(market: str) -> dict:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT request_id, status, risk_result, side, price, volume, amount_krw,
+            SELECT request_id, exchange, status, risk_result, side, price, volume, amount_krw,
                    filled_amount_krw, paid_fee, error_message, created_at, updated_at
             FROM live_order_logs
             WHERE market = ?
@@ -215,17 +212,43 @@ def _rehearsal_summary(market: str) -> dict:
             (market,),
         ).fetchall()
     orders = [dict(row) for row in rows]
+    for order in orders:
+        review = load_smart_rehearsal_review(
+            order.get("request_id"),
+            exchange=str(order.get("exchange") or "bithumb"),
+            market=market,
+        )
+        order["review"] = review
+        order["review_status"] = review.get("decision") if review else None
+        order["review_active"] = bool(review and review.get("is_active"))
+        order["review_expires_at"] = review.get("expires_at") if review else None
     latest = orders[0] if orders else None
+    latest_review = latest.get("review") if latest else None
     submitted = [row for row in orders if row.get("status") in {"SUBMITTED", "WAITING", "PARTIALLY_FILLED", "FILLED", "CANCELED"}]
     blocked = [row for row in orders if row.get("status") in {"BLOCKED", "FAILED"}]
+    requires_review = _requires_rehearsal_review(latest, latest_review)
     return {
         "order_count": len(orders),
         "submitted_count": len(submitted),
         "blocked_count": len(blocked),
         "latest_order": latest,
-        "requires_review": bool(latest and (latest.get("status") in {"BLOCKED", "FAILED", "SUBMITTED", "WAITING", "PARTIALLY_FILLED"} or latest.get("risk_result") not in {None, "ALLOWED"})),
+        "latest_review": latest_review,
+        "review_status": latest_review.get("decision") if latest_review else None,
+        "review_active": bool(latest_review and latest_review.get("is_active")),
+        "review_expires_at": latest_review.get("expires_at") if latest_review else None,
+        "requires_review": requires_review,
         "recent_orders": orders[:5],
     }
+
+
+def _requires_rehearsal_review(latest: dict | None, review: dict | None) -> bool:
+    if not latest:
+        return False
+    if review and review.get("decision") == "APPROVED" and review.get("is_active"):
+        return False
+    if latest.get("status") in {"BLOCKED", "FAILED", "SUBMITTED", "WAITING", "PARTIALLY_FILLED"}:
+        return True
+    return latest.get("risk_result") not in {None, "ALLOWED"}
 
 
 def _count_by(rows: list[dict], key: str) -> dict:

@@ -65,6 +65,33 @@ class LiveBrokerRiskTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["risk_result"], "BLOCKED_LIVE_LOCKED")
 
+    def test_auto_strategy_running_allows_auto_order_when_live_enabled(self) -> None:
+        result = evaluate_live_order_risk(
+            order={"market": "KRW-BTC", "side": "BUY", "order_type": "LIMIT", "amount_krw": 5_000, "price": 100_000_000},
+            config=config(),
+            mode="AUTO_STRATEGY_RUNNING",
+            balances=balances(krw=100_000, btc=0),
+            request_exists=False,
+            recent_duplicate=False,
+            market_snapshot={"price": 100_000_000, "range_rate": 0.01, "volume": 10},
+            is_auto=True,
+        )
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["risk_result"], "ALLOWED")
+
+    def test_auto_strategy_running_without_auto_flag_stays_locked(self) -> None:
+        result = evaluate_live_order_risk(
+            order={"market": "KRW-BTC", "side": "BUY", "order_type": "LIMIT", "amount_krw": 5_000, "price": 100_000_000},
+            config=config(),
+            mode="AUTO_STRATEGY_RUNNING",
+            balances=balances(krw=100_000, btc=0),
+            request_exists=False,
+            recent_duplicate=False,
+            market_snapshot={"price": 100_000_000, "range_rate": 0.01, "volume": 10},
+        )
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["risk_result"], "BLOCKED_LIVE_LOCKED")
+
     def test_live_disabled_blocks_orders(self) -> None:
         disabled = LiveTradingConfig(
             **{**config().__dict__, "live_trading_enabled": False}

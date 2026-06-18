@@ -40,6 +40,7 @@ from app.database import (
     init_db,
     insert_live_mode_event,
     insert_live_order_log,
+    insert_smart_rehearsal_review,
     insert_risk_log,
     insert_candles,
     load_candidate_strategy,
@@ -461,6 +462,14 @@ class RuntimeStartRequest(BaseModel):
     candidate_strategy_id: int
     confirmation: str = ""
     order_confirmation: str = ""
+
+
+class SmartRehearsalReviewRequest(BaseModel):
+    request_id: str
+    exchange: str = Field("bithumb", pattern=r"^(upbit|bithumb)$")
+    market: str = Field(DEFAULT_MARKET, pattern=r"^[A-Z]+-[A-Z0-9]+$")
+    decision: str = Field(..., pattern=r"^(APPROVED|REJECTED)$")
+    note: str = Field("", max_length=1000)
 
 
 class ImportExchangePositionRequest(BaseModel):
@@ -1497,15 +1506,46 @@ def smart_engine_status(market: str = Query(DEFAULT_MARKET)) -> dict:
     report = build_shadow_report(market=market, limit=100, horizon_candles=3)
     latest_intent = (decision.get("order_intents") or [None])[0] if decision else None
     limited_readiness = build_limited_readiness(market=market, decision=decision, report=report)
+    latest_rehearsal = (limited_readiness or {}).get("latest_rehearsal_order")
+    rehearsal_review = (latest_rehearsal or {}).get("review") or (report.get("summary", {}).get("rehearsal", {}) or {}).get("latest_review")
     return {
         "live_mode": smart_engine_live_mode(),
         "decision": decision,
         "latest_intent": latest_intent,
         "readiness": report.get("summary", {}),
         "limited_readiness": limited_readiness,
+        "latest_rehearsal_order": latest_rehearsal,
+        "rehearsal_review": rehearsal_review,
+        "rehearsal_review_status": (rehearsal_review or {}).get("decision"),
+        "rehearsal_review_active": bool(rehearsal_review and rehearsal_review.get("is_active")),
+        "rehearsal_review_expires_at": (rehearsal_review or {}).get("expires_at"),
+        "remaining_rehearsal_blockers": (limited_readiness or {}).get("rehearsal_blockers", []),
         "promotion_status": (latest_intent or {}).get("promotion_status"),
         "promotion_blockers": (latest_intent or {}).get("promotion_blockers", []),
     }
+
+
+@app.post("/api/smart-engine/rehearsal-review")
+def smart_engine_rehearsal_review(payload: SmartRehearsalReviewRequest) -> dict:
+    request_id = payload.request_id.strip()
+    if not request_id.startswith("smart-rehearsal-"):
+        raise HTTPException(status_code=400, detail="Smart rehearsal request_id만 검토할 수 있습니다.")
+    log = get_live_order_log(request_id)
+    if log is None:
+        raise HTTPException(status_code=404, detail="리허설 주문 로그를 찾을 수 없습니다.")
+    exchange = str(log.get("exchange") or payload.exchange or "bithumb")
+    market = str(log.get("market") or payload.market or DEFAULT_MARKET)
+    if exchange != payload.exchange or market != payload.market:
+        raise HTTPException(status_code=409, detail="요청한 exchange/market이 리허설 주문 로그와 일치하지 않습니다.")
+    review = insert_smart_rehearsal_review(
+        request_id=request_id,
+        exchange=exchange,
+        market=market,
+        decision=payload.decision,
+        note=payload.note,
+        reviewed_by="admin-ui",
+    )
+    return {"ok": True, "review": review, **smart_engine_status(market=market)}
 
 
 @app.post("/api/alerts/{alert_id}/read")

@@ -658,6 +658,19 @@ def init_db() -> None:
                 completed_at TEXT,
                 FOREIGN KEY(decision_snapshot_id) REFERENCES decision_snapshots(id)
             );
+
+            CREATE TABLE IF NOT EXISTS smart_rehearsal_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                reviewed_by TEXT NOT NULL DEFAULT 'admin',
+                reviewed_at TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         _ensure_column(conn, "paper_sessions", "mode", "TEXT NOT NULL DEFAULT 'SIMULATION'")
@@ -709,6 +722,12 @@ def init_db() -> None:
         _ensure_column(conn, "order_intents", "pilot_order_cap_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_intents", "promotion_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "order_intents", "promotion_status", "TEXT NOT NULL DEFAULT 'SHADOW_ONLY'")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_smart_rehearsal_reviews_latest
+            ON smart_rehearsal_reviews(exchange, market, request_id, reviewed_at DESC, id DESC)
+            """
+        )
         conn.execute(
             """
             INSERT INTO bot_operation_policy (
@@ -1617,6 +1636,66 @@ def get_live_order_log(request_id: str) -> dict | None:
     if row is None:
         return None
     return _normalize_live_order_log(dict(row))
+
+
+def insert_smart_rehearsal_review(
+    *,
+    request_id: str,
+    exchange: str = "bithumb",
+    market: str = "KRW-BTC",
+    decision: str,
+    note: str = "",
+    reviewed_by: str = "admin",
+) -> dict:
+    normalized_decision = str(decision or "").strip().upper()
+    if normalized_decision not in {"APPROVED", "REJECTED"}:
+        raise ValueError("decision must be APPROVED or REJECTED.")
+    now_utc = _utc_now()
+    expires_at = _smart_rehearsal_review_expiry(now_utc) if normalized_decision == "APPROVED" else None
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO smart_rehearsal_reviews (
+                request_id, exchange, market, decision, note, reviewed_by, reviewed_at, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                exchange,
+                market,
+                normalized_decision,
+                str(note or "")[:1000],
+                str(reviewed_by or "admin")[:120],
+                now_utc,
+                expires_at,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM smart_rehearsal_reviews WHERE id = ?", (int(cursor.lastrowid),)).fetchone()
+    return _normalize_smart_rehearsal_review(dict(row))
+
+
+def load_smart_rehearsal_review(
+    request_id: str | None,
+    exchange: str = "bithumb",
+    market: str = "KRW-BTC",
+) -> dict | None:
+    if not request_id:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM smart_rehearsal_reviews
+            WHERE request_id = ?
+              AND exchange = ?
+              AND market = ?
+            ORDER BY reviewed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (request_id, exchange, market),
+        ).fetchone()
+    return _normalize_smart_rehearsal_review(dict(row)) if row else None
 
 
 def load_live_order_logs(limit: int = 100, include_canonical_with_events: bool = False) -> list[dict]:
@@ -2993,6 +3072,34 @@ def _normalize_order_intent(row: dict) -> dict:
     row["policy_preview"] = _json_load(row.pop("policy_preview_json", "{}"), {})
     row["promotion_blockers"] = _json_load(row.pop("promotion_blockers_json", "[]"), [])
     return row
+
+
+def _normalize_smart_rehearsal_review(row: dict) -> dict:
+    row["is_active"] = _smart_rehearsal_review_active(row)
+    return row
+
+
+def _smart_rehearsal_review_active(review: dict | None, now_utc: datetime | None = None) -> bool:
+    if not review or review.get("decision") != "APPROVED":
+        return False
+    expires_at = _parse_utc(review.get("expires_at"))
+    if expires_at is None:
+        return False
+    now = now_utc or datetime.now(timezone.utc)
+    return now < expires_at
+
+
+def _smart_rehearsal_review_expiry(reviewed_at_utc: str) -> str:
+    reviewed_at = _parse_utc(reviewed_at_utc) or datetime.now(timezone.utc)
+    kst = timezone(timedelta(hours=9))
+    reviewed_kst = reviewed_at.astimezone(kst)
+    next_midnight_kst = datetime(
+        reviewed_kst.year,
+        reviewed_kst.month,
+        reviewed_kst.day,
+        tzinfo=kst,
+    ) + timedelta(days=1)
+    return _format_utc(next_midnight_kst)
 
 
 def load_bot_operation_policy(market: str = "KRW-BTC") -> dict:

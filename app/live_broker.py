@@ -443,6 +443,7 @@ def evaluate_live_order_risk(
     request_exists: bool,
     recent_duplicate: bool,
     market_snapshot: dict | None,
+    is_auto: bool = False,
 ) -> dict:
     side = str(order.get("side", "")).upper()
     market = str(order.get("market", "KRW-BTC"))
@@ -469,10 +470,12 @@ def evaluate_live_order_risk(
     risk_result = "ALLOWED"
     allowed = True
     reason = ""
-    if mode != "LIVE_MANUAL_ONLY":
+    if mode == "EMERGENCY_STOPPED":
+        risk_result = "BLOCKED_EMERGENCY_STOP"
+    elif not config.live_trading_enabled:
+        risk_result = "BLOCKED_LIVE_DISABLED"
+    elif mode != "LIVE_MANUAL_ONLY" and not (mode == "AUTO_STRATEGY_RUNNING" and is_auto):
         risk_result = "BLOCKED_EMERGENCY_STOP" if mode == "EMERGENCY_STOPPED" else "BLOCKED_LIVE_LOCKED"
-        if risk_result == "BLOCKED_LIVE_LOCKED" and not config.live_trading_enabled:
-            risk_result = "BLOCKED_LIVE_DISABLED"
     elif request_exists or recent_duplicate:
         risk_result = "BLOCKED_DUPLICATE_ORDER"
     elif side == "SELL" and asset_available < volume:

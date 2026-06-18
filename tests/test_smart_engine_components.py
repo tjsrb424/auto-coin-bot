@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from app.smart_external_factors import load_external_factors
 from app.smart_market_regime import classify_market_regime
-from app.smart_promotion import evaluate_promotion
+from app.smart_promotion import evaluate_promotion, evaluate_rehearsal_preview
 from app.smart_readiness import build_limited_readiness
 from app.smart_signal_engine import aggregate_signal_score, evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
@@ -115,6 +115,17 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertIn("SMART_REHEARSAL_DAILY_ORDER_LIMIT", result["promotion_blockers"])
         self.assertIn("SMART_REHEARSAL_RISK_SCORE_TOO_HIGH", result["promotion_blockers"])
         self.assertFalse(result["policy_preview"]["rehearsal"]["allowed"])
+
+    def test_rehearsal_daily_limit_zero_means_unlimited(self) -> None:
+        with patch.dict(os.environ, {"SMART_REHEARSAL_MAX_DAILY_ORDERS": "0"}, clear=False):
+            rehearsal = evaluate_rehearsal_preview(
+                requested_order_krw=20_000,
+                risk_score=35,
+                daily_smart_order_count=99,
+                now_utc=datetime(2026, 6, 18, 3, tzinfo=timezone.utc),
+            )
+        self.assertTrue(rehearsal["allowed"])
+        self.assertNotIn("SMART_REHEARSAL_DAILY_ORDER_LIMIT", rehearsal["blockers"])
 
     def test_promotion_supports_limited_sell_without_exceeding_position_qty(self) -> None:
         snapshot = {"current_bot_position_value_krw": 120_000, "current_bot_position_qty": 0.002, "risk_score": 35}

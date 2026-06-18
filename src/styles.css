@@ -1170,6 +1170,7 @@ body {
 .ref-ops-preview h3,
 .ref-ops-balance h3,
 .ref-ops-readiness h3,
+.ref-ops-review h3,
 .ref-ops-modules h3 {
   margin: 0 0 18px;
   color: #e7eefb;
@@ -1188,6 +1189,7 @@ body {
 .ref-ops-limits span,
 .ref-ops-balance span,
 .ref-ops-readiness span,
+.ref-ops-review span,
 .ref-ops-modules span {
   display: block;
   margin-bottom: 7px;
@@ -1275,6 +1277,7 @@ body {
 .ref-ops-limits p,
 .ref-ops-preview p,
 .ref-ops-balance p,
+.ref-ops-review p,
 .ref-ops-modules p {
   display: flex;
   justify-content: space-between;
@@ -1288,6 +1291,7 @@ body {
 .ref-ops-preview span,
 .ref-ops-balance span,
 .ref-ops-readiness span,
+.ref-ops-review span,
 .ref-ops-modules span {
   margin: 0;
 }
@@ -1296,6 +1300,7 @@ body {
 .ref-ops-preview b,
 .ref-ops-balance b,
 .ref-ops-readiness b,
+.ref-ops-review b,
 .ref-ops-modules b {
   overflow: hidden;
   color: #dbe7f7;
@@ -1362,7 +1367,7 @@ body {
 .ref-ops-readiness {
   left: 222px;
   top: 614px;
-  width: 994px;
+  width: 586px;
   height: 260px;
   padding: 24px;
 }
@@ -1395,13 +1400,13 @@ body {
 
 .ref-ops-readiness section {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px 14px;
 }
 
 .ref-ops-readiness div {
   display: grid;
-  grid-template-columns: 126px 44px 1fr;
+  grid-template-columns: 116px 44px 1fr;
   align-items: center;
   gap: 10px;
   min-height: 26px;
@@ -1430,6 +1435,91 @@ body {
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ref-ops-review {
+  left: 828px;
+  top: 614px;
+  width: 388px;
+  height: 260px;
+  padding: 24px;
+}
+
+.ref-ops-review p {
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+}
+
+.ref-ops-review em {
+  display: block;
+  overflow: hidden;
+  margin: -2px 0 8px;
+  color: #fca5a5;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-ops-review label {
+  display: block;
+  margin: 8px 0 10px;
+}
+
+.ref-ops-review textarea {
+  width: 100%;
+  height: 46px;
+  resize: none;
+  border: 1px solid #26384d;
+  border-radius: 5px;
+  background: rgba(7, 14, 24, 0.74);
+  color: #e5edf8;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.35;
+  padding: 8px 10px;
+}
+
+.ref-ops-review-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ref-ops-review-actions button {
+  display: inline-flex;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgba(45, 63, 86, 0.9);
+  border-radius: 5px;
+  background: rgba(15, 23, 42, 0.88);
+  color: #dbe7f7;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.ref-ops-review-actions button:first-child {
+  border-color: rgba(34, 197, 94, 0.42);
+  color: #86efac;
+}
+
+.ref-ops-review-actions button:disabled {
+  opacity: 0.56;
+}
+
+.ref-ops-review section {
+  display: grid;
+  gap: 6px;
+}
+
+.ref-ops-review section p {
+  margin: 0;
+  padding: 0;
+  border-bottom: 0;
 }
 
 .ref-ops-modules {

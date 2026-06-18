@@ -143,7 +143,7 @@ def _evaluate_rehearsal(
     now = now_utc or datetime.now(timezone.utc)
     kst_now = now.astimezone(timezone(timedelta(hours=9)))
     blockers: list[str] = []
-    if rules["max_daily_orders"] >= 0 and daily_smart_order_count >= rules["max_daily_orders"]:
+    if rules["max_daily_orders"] > 0 and daily_smart_order_count >= rules["max_daily_orders"]:
         blockers.append("SMART_REHEARSAL_DAILY_ORDER_LIMIT")
     if requested_order_krw > 0 and requested_order_krw < rules["min_order_krw"]:
         blockers.append("SMART_REHEARSAL_ORDER_TOO_SMALL")
