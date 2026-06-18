@@ -3336,6 +3336,9 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
   const latestRehearsal = data.smartEngineStatus?.latest_rehearsal_order ?? readiness?.latest_rehearsal_order;
   const rehearsalReview = data.smartEngineStatus?.rehearsal_review ?? latestRehearsal?.review ?? null;
   const rehearsalBlockers = data.smartEngineStatus?.remaining_rehearsal_blockers ?? readiness?.rehearsal_blockers ?? [];
+  const visibleReadinessChecks = readinessChecks.slice(0, 3);
+  const hiddenReadinessCount = Math.max(readinessChecks.length - visibleReadinessChecks.length, 0);
+  const visibleRehearsalBlockers = (rehearsalBlockers.length ? rehearsalBlockers : ["남은 리허설 차단 사유 없음"]).slice(0, 2);
   const [autoTradingEnabled, setAutoTradingEnabled] = React.useState(false);
   const [maxExposure, setMaxExposure] = React.useState(500000);
   const [dailyLossPct, setDailyLossPct] = React.useState(3);
@@ -3463,18 +3466,25 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
         </strong>
         <p>{readiness?.next_required_operator_action ?? readiness?.recommended_next_action ?? "Smart Engine 상태를 불러오는 중입니다."}</p>
         {latestRehearsal && (
-          <p>
+          <p title={`${formatKstShort(latestRehearsal.created_at)} · ${latestRehearsal.side ?? "-"} · ${latestRehearsal.status ?? "-"} · ${latestRehearsal.risk_result ?? "-"}`}>
             최신 리허설 {formatKstShort(latestRehearsal.created_at)} · {latestRehearsal.side ?? "-"} · {latestRehearsal.status ?? "-"} · {latestRehearsal.risk_result ?? "-"}
           </p>
         )}
         <section>
-          {readinessChecks.slice(0, 8).map((check) => (
+          {visibleReadinessChecks.map((check) => (
             <div key={check.id ?? check.label} className={smartReadinessTone(check.status)}>
               <span>{check.label ?? "-"}</span>
               <b>{check.status === "pass" ? "통과" : check.status === "warn" ? "주의" : "차단"}</b>
-              <em>{check.detail ?? "-"}</em>
+              <em title={check.detail ?? "-"}>{check.detail ?? "-"}</em>
             </div>
           ))}
+          {hiddenReadinessCount > 0 && (
+            <div className="is-warn">
+              <span>추가 점검</span>
+              <b>{hiddenReadinessCount}개</b>
+              <em>나머지 항목은 Smart Engine 상세 상태에서 확인</em>
+            </div>
+          )}
           {readinessChecks.length === 0 && <div className="is-warn"><span>점검</span><b>대기</b><em>상태 데이터가 아직 없습니다.</em></div>}
         </section>
       </RefPanel>
@@ -3482,12 +3492,12 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
         <h3>리허설 검토</h3>
         {latestRehearsal ? (
           <>
-            <p><span>요청</span><b>{latestRehearsal.request_id ?? "-"}</b></p>
+            <p><span>요청</span><b title={latestRehearsal.request_id ?? "-"}>{latestRehearsal.request_id ?? "-"}</b></p>
             <p><span>주문</span><b>{latestRehearsal.side ?? "-"} · {formatKrw(latestRehearsal.amount_krw)} KRW</b></p>
-            <p><span>상태</span><b>{latestRehearsal.status ?? "-"} · {latestRehearsal.risk_result ?? "-"}</b></p>
+            <p><span>상태</span><b title={`${latestRehearsal.status ?? "-"} · ${latestRehearsal.risk_result ?? "-"}`}>{latestRehearsal.status ?? "-"} · {latestRehearsal.risk_result ?? "-"}</b></p>
             <p><span>리뷰</span><b>{rehearsalReview?.decision ?? "미검토"}{rehearsalReview?.is_active ? " · 유효" : ""}</b></p>
             <p><span>만료</span><b>{formatKstShort(rehearsalReview?.expires_at)}</b></p>
-            {latestRehearsal.error_message && <em>{latestRehearsal.error_message}</em>}
+            {latestRehearsal.error_message && <em title={latestRehearsal.error_message}>{latestRehearsal.error_message}</em>}
             <label>
               <span>검토 메모</span>
               <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="검토 사유를 남기세요" />
@@ -3501,8 +3511,8 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
               </button>
             </div>
             <section>
-              {(rehearsalBlockers.length ? rehearsalBlockers : ["남은 리허설 차단 사유 없음"]).slice(0, 6).map((item) => (
-                <p key={item}><span>남은 차단</span><b>{item}</b></p>
+              {visibleRehearsalBlockers.map((item) => (
+                <p key={item}><span>남은 차단</span><b title={item}>{item}</b></p>
               ))}
             </section>
           </>
