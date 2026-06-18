@@ -3091,15 +3091,7 @@ def _smart_rehearsal_review_active(review: dict | None, now_utc: datetime | None
 
 def _smart_rehearsal_review_expiry(reviewed_at_utc: str) -> str:
     reviewed_at = _parse_utc(reviewed_at_utc) or datetime.now(timezone.utc)
-    kst = timezone(timedelta(hours=9))
-    reviewed_kst = reviewed_at.astimezone(kst)
-    next_midnight_kst = datetime(
-        reviewed_kst.year,
-        reviewed_kst.month,
-        reviewed_kst.day,
-        tzinfo=kst,
-    ) + timedelta(days=1)
-    return _format_utc(next_midnight_kst)
+    return _format_utc(reviewed_at + timedelta(days=7))
 
 
 def load_bot_operation_policy(market: str = "KRW-BTC") -> dict:

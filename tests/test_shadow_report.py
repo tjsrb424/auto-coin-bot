@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -154,6 +155,22 @@ class ShadowReportTests(unittest.TestCase):
         self.assertTrue(review["is_active"])
         self.assertFalse(report["summary"]["rehearsal"]["requires_review"])
         self.assertNotEqual(report["summary"]["recommendation"], "REHEARSAL_REVIEW_REQUIRED")
+
+    def test_approved_rehearsal_review_expires_after_seven_days(self) -> None:
+        review = database.insert_smart_rehearsal_review(
+            request_id="smart-rehearsal-weekly",
+            exchange="bithumb",
+            market="KRW-BTC",
+            decision="APPROVED",
+            note="weekly approval",
+        )
+
+        reviewed_at = datetime.fromisoformat(review["reviewed_at"].replace("Z", "+00:00"))
+        expires_at = datetime.fromisoformat(review["expires_at"].replace("Z", "+00:00"))
+
+        self.assertEqual((expires_at - reviewed_at).total_seconds(), 7 * 24 * 60 * 60)
+        self.assertTrue(database._smart_rehearsal_review_active(review, reviewed_at + (expires_at - reviewed_at) / 2))
+        self.assertFalse(database._smart_rehearsal_review_active(review, expires_at))
 
     def test_shadow_report_ignores_expired_rehearsal_review(self) -> None:
         database.insert_live_order_log({

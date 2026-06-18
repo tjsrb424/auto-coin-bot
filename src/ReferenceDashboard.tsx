@@ -927,6 +927,10 @@ const policyBlockReasonLabels: Record<string, string> = {
   POLICY_BLOCKED: "정책차단"
 };
 
+function isOpenOrderWaitCode(value?: string | null) {
+  return normalizeBlockCode(value) === "BLOCKED_OPEN_ORDER_EXISTS";
+}
+
 function statusLabel(value?: string | null) {
   if (!value) return "-";
   const normalized = String(value).toUpperCase();
@@ -965,6 +969,7 @@ function statusLabel(value?: string | null) {
   };
   const reasonLabels: Record<string, string> = {
     ...policyBlockReasonLabels,
+    BLOCKED_OPEN_ORDER_EXISTS: "기존 주문 체결 대기",
     BLOCKED_OPEN_POSITION_EXISTS: "포지션 있음",
     BLOCKED_DUPLICATE_SIGNAL: "중복 신호",
     BLOCKED_DUPLICATE_CANDLE: "중복 캔들",
@@ -1015,7 +1020,16 @@ function extractPolicyBlockCode(value?: string | null) {
 function policyBlockText(code?: string | null, fallback?: string | null) {
   const normalized = extractPolicyBlockCode(code) ?? extractPolicyBlockCode(fallback);
   if (normalized) return policyBlockReasonLabels[normalized] ?? statusLabel(normalized);
+  if (isOpenOrderWaitCode(code) || isOpenOrderWaitCode(fallback)) return "기존 매수 주문 체결 대기";
   return fallback ?? statusLabel(code);
+}
+
+function isOpenOrderWaitLog(log: Pick<RiskLog, "block_code" | "block_reason">) {
+  return isOpenOrderWaitCode(log.block_code) || isOpenOrderWaitCode(log.block_reason);
+}
+
+function isOpenOrderWaitOrder(order: Pick<LiveOrder, "risk_result" | "status">) {
+  return order.status === "BLOCKED" && isOpenOrderWaitCode(order.risk_result);
 }
 
 function shadowRecommendationLabel(value?: string | null) {
@@ -2656,7 +2670,7 @@ function TradeHistoryView({ data, refresh }: { data: DashboardData; refresh: () 
 }
 
 function RecentTradesPanel({ data }: { data: DashboardData }) {
-  const rows = data.liveOrders.slice(0, 5);
+  const rows = data.liveOrders.filter((order) => !isOpenOrderWaitOrder(order)).slice(0, 5);
   return (
     <RefPanel className="ref-trades-panel">
       <h3>최근 거래 내역 <span>⊞</span></h3>
@@ -2696,18 +2710,22 @@ function LogPanel({ data }: { data: DashboardData }) {
   const riskLogs = (data.risk?.risk_logs ?? []).slice(0, 7).map((log) => ({
     key: `risk-${log.id ?? log.created_at ?? ""}-${log.block_code ?? log.risk_level ?? ""}`,
     createdAt: log.created_at,
-    type: log.allowed ? "ok" : extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason) ? "warn" : "danger",
+    type: log.allowed ? "ok" : isOpenOrderWaitLog(log) ? "info" : extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason) ? "warn" : "danger",
     time: formatKstTime(log.created_at),
-    text: extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)
+    text: isOpenOrderWaitLog(log)
+      ? "BTC/KRW 기존 매수 주문 체결 대기"
+      : extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)
       ? `정책 차단 · ${policyBlockText(log.block_code, log.block_reason)}`
       : log.block_reason ?? log.block_code ?? log.risk_level ?? "리스크 로그"
   }));
   const orderLogs = data.liveOrders.slice(0, 7).map((order) => ({
     key: `order-${order.request_id ?? order.id ?? order.created_at ?? ""}`,
     createdAt: order.created_at,
-    type: order.status === "BLOCKED" || order.status === "FAILED" ? "danger" : "info",
+    type: isOpenOrderWaitOrder(order) ? "info" : order.status === "BLOCKED" || order.status === "FAILED" ? "danger" : "info",
     time: formatKstTime(order.created_at),
-    text: `${marketDisplay(order.market)} ${statusLabel(order.side)} ${statusLabel(order.status)}`
+    text: isOpenOrderWaitOrder(order)
+      ? `${marketDisplay(order.market)} 기존 매수 주문 체결 대기`
+      : `${marketDisplay(order.market)} ${statusLabel(order.side)} ${statusLabel(order.status)}`
   }));
   const recoveryLogs = data.recoveryEvents.slice(0, 7).map((event, index) => ({
     key: `recovery-${event.created_at ?? index}-${event.event_type ?? ""}`,
@@ -2757,26 +2775,31 @@ function AlertsView({ data }: { data: DashboardData }) {
           <h3>알림로그</h3>
           <span>{logs.length}건</span>
         </div>
-        <table className="ref-alerts-table">
-          <thead><tr><th>시간</th><th>심각도</th><th>유형</th><th>메시지</th><th>상태</th></tr></thead>
-          <tbody>
-            {logs.length === 0 && <tr><td colSpan={5}>최근 리스크 로그 없음</td></tr>}
-            {logs.slice(0, 24).map((log) => {
-              const code = extractPolicyBlockCode(log.block_code) ?? log.block_code ?? log.risk_level ?? "RISK_CHECK";
-              const isPolicy = Boolean(log.policy_block_detail || extractPolicyBlockCode(log.block_code));
-              const message = isPolicy ? policyBlockText(code, log.block_reason) : log.block_reason ?? "정상";
-              return (
-                <tr key={log.id ?? log.created_at} className={`${selected?.id === log.id ? "is-selected" : ""} ${!log.allowed ? "is-alert" : ""}`} onClick={() => setSelectedId(log.id ?? null)}>
-                  <td>{formatKstShort(log.created_at)}</td>
-                  <td><RefStatusBadge value={statusLabel(log.risk_level ?? (log.allowed ? "OK" : "BLOCKED"))} tone={log.allowed ? "green" : isPolicy ? "amber" : "red"} /></td>
-                  <td>{isPolicy ? "정책 차단" : statusLabel(code)}</td>
-                  <td title={message}>{message}</td>
-                  <td>{log.read_status === "READ" || log.allowed ? "읽음" : log.read_status === "IGNORED" ? "무시됨" : "미해결"}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        <div className="ref-alerts-table-wrap">
+          <table className="ref-alerts-table">
+            <thead><tr><th>시간</th><th>심각도</th><th>유형</th><th>메시지</th><th>상태</th></tr></thead>
+            <tbody>
+              {logs.length === 0 && <tr><td colSpan={5}>최근 리스크 로그 없음</td></tr>}
+              {logs.slice(0, 50).map((log) => {
+                const code = extractPolicyBlockCode(log.block_code) ?? log.block_code ?? log.risk_level ?? "RISK_CHECK";
+                const isWaitingOpenOrder = isOpenOrderWaitLog(log);
+                const isPolicy = Boolean(log.policy_block_detail || extractPolicyBlockCode(log.block_code));
+                const typeLabel = isWaitingOpenOrder ? "주문 대기" : isPolicy ? "정책 차단" : statusLabel(code);
+                const message = isPolicy ? policyBlockText(code, log.block_reason) : log.block_reason ?? "정상";
+                const readLabel = log.read_status === "READ" || log.allowed ? "읽음" : log.read_status === "IGNORED" ? "무시됨" : "미해결";
+                return (
+                  <tr key={log.id ?? log.created_at} className={`${selected?.id === log.id ? "is-selected" : ""} ${!log.allowed ? "is-alert" : ""}`} onClick={() => setSelectedId(log.id ?? null)}>
+                    <td>{formatKstShort(log.created_at)}</td>
+                    <td><RefStatusBadge value={isWaitingOpenOrder ? "대기" : statusLabel(log.risk_level ?? (log.allowed ? "OK" : "BLOCKED"))} tone={log.allowed ? "green" : isWaitingOpenOrder ? "cyan" : isPolicy ? "amber" : "red"} /></td>
+                    <td title={typeLabel}>{typeLabel}</td>
+                    <td title={message}>{isWaitingOpenOrder ? "기존 매수 주문이 체결/취소될 때까지 신규 매수를 보류합니다." : message}</td>
+                    <td>{readLabel}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </RefPanel>
       <RefPanel className="ref-alerts-detail-panel">
         <div className="ref-title-row">
@@ -2996,55 +3019,75 @@ function AutoStatusPanel({
   );
 }
 
-function AutoStrategyStrip({ data }: { data: DashboardData }) {
-  const autoRunning = isRuntimeRunning(data);
-  const selectedStrategyId = data.runtimeStatus?.selected_strategy_id ?? data.liveStrategy?.session?.candidate_strategy_id ?? data.autoPilot?.session?.candidate_strategy_id ?? null;
-  const runningCandidate = selectedStrategyId == null ? null : data.candidates.find((candidate) => candidate.id === selectedStrategyId) ?? null;
-  const activeCandidates = data.candidates.filter((candidate) => candidate.status === "ACTIVE");
-  const candidates = [
-    ...(runningCandidate ? [runningCandidate] : []),
-    ...data.candidates.filter((candidate) => candidate.id !== runningCandidate?.id)
-  ].slice(0, 5);
-  const placeholders = Array.from({ length: Math.max(5 - candidates.length, 0) }, (_, index) => ({
-    id: -(index + 1),
-    name: "전략 없음",
-    strategy: "-",
-    market: "-",
-    status: "INACTIVE"
-  } as Candidate));
-  const cards = [...candidates, ...placeholders].slice(0, 5);
+function AutoOperationsStrip({ data }: { data: DashboardData }) {
+  const policy = data.botPolicy;
+  const readiness = data.smartEngineStatus?.limited_readiness;
+  const latestRehearsal = data.smartEngineStatus?.latest_rehearsal_order ?? readiness?.latest_rehearsal_order;
+  const review = data.smartEngineStatus?.rehearsal_review ?? latestRehearsal?.review ?? null;
+  const blockers = data.smartEngineStatus?.remaining_rehearsal_blockers ?? readiness?.rehearsal_blockers ?? [];
+  const balanceStatus = policy?.balance_fetch_status ?? data.liveBalances?.balance_fetch_status ?? "WAITING";
+  const availableKrw = policy?.available_krw_balance ?? balanceAmount(data.liveBalances?.balances?.krw ?? data.liveBalances?.balances?.by_currency?.KRW);
+  const maxOrder = data.liveStrategy?.max_order_krw ?? policy?.max_total_exposure_krw ?? null;
+  const positionValue = policy?.current_bot_position_value_krw ?? null;
+  const remainingExposure = (
+    policy?.max_total_exposure_krw != null && positionValue != null
+      ? Math.max(policy.max_total_exposure_krw - positionValue, 0)
+      : null
+  );
+  const reviewStatus = review?.decision ?? latestRehearsal?.review_status ?? "미검토";
+  const reviewTone = reviewStatus === "APPROVED" ? "green" : reviewStatus === "REJECTED" ? "red" : "amber";
+  const limitedReady = readiness?.can_enable_limited === true || readiness?.status === "READY";
+  const limitedBlocked = readiness?.can_enable_limited === false || readiness?.status === "BLOCKED";
+  const readinessTone = limitedBlocked ? "red" : limitedReady ? "green" : "amber";
+  const blockerText = blockers.length ? blockers.slice(0, 2).join(" · ") : "남은 차단 사유 없음";
+  const cards = [
+    {
+      label: "운용정책",
+      value: policy?.auto_trading_enabled ? "ON" : "OFF",
+      detail: `최대 투입 ${formatKrw(policy?.max_total_exposure_krw)} · 일 손실 ${formatRatioPercent(policy?.daily_loss_limit_pct, 1)}`,
+      tone: policy?.auto_trading_enabled ? "green" : "red"
+    },
+    {
+      label: "주문 한도",
+      value: formatKrw(maxOrder),
+      detail: `남은 한도 ${formatKrw(remainingExposure)} · 현재 포지션 ${formatKrw(positionValue)}`,
+      tone: "cyan"
+    },
+    {
+      label: "거래소 잔고",
+      value: formatKrw(availableKrw),
+      detail: `조회 상태 ${statusLabel(balanceStatus)} · 정책 대비 여유 ${formatKrw(remainingExposure)}`,
+      tone: balanceStatus === "SUCCESS" ? "green" : "amber"
+    },
+    {
+      label: "리허설 검토",
+      value: reviewStatus === "APPROVED" ? "승인됨" : reviewStatus === "REJECTED" ? "반려됨" : "미검토",
+      detail: latestRehearsal ? `${latestRehearsal.side ?? "-"} · ${formatKrw(latestRehearsal.amount_krw)}` : "최근 리허설 없음",
+      tone: reviewTone
+    },
+    {
+      label: "limited 전환",
+      value: limitedBlocked ? "차단" : limitedReady ? "통과" : "점검",
+      detail: blockerText,
+      tone: readinessTone
+    }
+  ];
 
   return (
-    <section className="ref-auto-strategy-section">
+    <section className="ref-auto-ops-section">
       <div className="ref-auto-section-title">
-        <b>실행 중인 전략</b>
-        <em>{autoRunning && runningCandidate ? "1개 실행 중" : `${activeCandidates.length}개 대기`}</em>
-        <button>전체 전략 보기 <ChevronRight size={16} /></button>
+        <b>운용 기준 요약</b>
+        <em>{policy?.auto_trading_enabled ? "정책 ON" : "정책 OFF"}</em>
+        <button>운용설정 보기 <ChevronRight size={16} /></button>
       </div>
-      <div className="ref-auto-strategy-grid">
-        {cards.map((candidate, index) => {
-          const active = autoRunning && candidate.id === runningCandidate?.id;
-          const standby = !active && candidate.id > 0 && candidate.status === "ACTIVE";
-          const badgeValue = active ? "실행 중" : standby ? "대기" : statusLabel(candidate.status);
-          const badgeTone = active ? "green" : standby ? "amber" : statusTone(candidate.status);
-          return (
-            <RefPanel key={`${candidate.id}-${candidate.name}-${index}`} className="ref-auto-strategy-card">
-              <div className="ref-auto-card-head">
-                <strong>{candidate.name || strategyLabel(candidate.strategy)}</strong>
-                <RefStatusBadge value={badgeValue} tone={badgeTone} />
-                <button>상세</button>
-              </div>
-              <p>{marketDisplay(candidate.market)} · {strategyLabel(candidate.strategy)}</p>
-              <div className="ref-auto-card-bottom">
-                <span>수익</span>
-                <b className={valueToneClass(candidate.backtest_total_return)}>{formatPercent(candidate.backtest_total_return)}</b>
-                <span>포지션</span>
-                <b>{active ? "1 / 1" : "-"}</b>
-                <i className="ref-auto-spark" />
-              </div>
-            </RefPanel>
-          );
-        })}
+      <div className="ref-auto-ops-grid">
+        {cards.map((card) => (
+          <RefPanel key={card.label} className={`ref-auto-ops-card ${card.tone}`}>
+            <span>{card.label}</span>
+            <strong title={card.value}>{card.value}</strong>
+            <p title={card.detail}>{card.detail}</p>
+          </RefPanel>
+        ))}
       </div>
     </section>
   );
@@ -3319,7 +3362,7 @@ function AutoTradeView({
   return (
     <>
       <AutoStatusPanel data={data} onToggle={onToggleAutoTrading} isToggling={isAutoToggling} toggleError={autoToggleError} />
-      <AutoStrategyStrip data={data} />
+      <AutoOperationsStrip data={data} />
       <AutoWatchPanel data={data} />
       <AutoRiskPanel data={data} onImportExchangePosition={onImportExchangePosition} isImportingPosition={isImportingPosition} importPositionError={importPositionError} />
       <AutoChartPanel data={data} />
