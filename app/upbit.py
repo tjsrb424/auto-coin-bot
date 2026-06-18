@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 from datetime import datetime
 from typing import Any
 
@@ -7,10 +9,39 @@ import httpx
 
 UPBIT_BASE_URL = "https://api.upbit.com"
 SUPPORTED_UNITS = {1, 3, 5, 10, 15, 30, 60, 240}
+UPBIT_PUBLIC_BATCH_DELAY_SECONDS = float(os.getenv("UPBIT_PUBLIC_BATCH_DELAY_SECONDS", "0.12"))
+UPBIT_PUBLIC_MAX_RETRIES = int(os.getenv("UPBIT_PUBLIC_MAX_RETRIES", "5"))
 
 
 class UpbitClientError(RuntimeError):
     pass
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), UPBIT_PUBLIC_BATCH_DELAY_SECONDS)
+        except ValueError:
+            pass
+    return min(0.5 * (2**attempt), 4.0)
+
+
+async def _get_public_json(client: httpx.AsyncClient, url: str, params: dict[str, Any], label: str) -> Any:
+    for attempt in range(UPBIT_PUBLIC_MAX_RETRIES + 1):
+        response = await client.get(url, params=params)
+        if response.status_code == 429 and attempt < UPBIT_PUBLIC_MAX_RETRIES:
+            await asyncio.sleep(_retry_delay(response, attempt))
+            continue
+        if response.status_code >= 400:
+            raise UpbitClientError(f"{label} failed: {response.text}")
+        return response.json()
+    raise UpbitClientError(f"{label} failed: too many requests")
+
+
+async def _pace_next_public_batch(remaining: int) -> None:
+    if remaining > 0 and UPBIT_PUBLIC_BATCH_DELAY_SECONDS > 0:
+        await asyncio.sleep(UPBIT_PUBLIC_BATCH_DELAY_SECONDS)
 
 
 async def fetch_minute_candles(
@@ -20,9 +51,9 @@ async def fetch_minute_candles(
     to: str | None = None,
 ) -> list[dict[str, Any]]:
     if unit not in SUPPORTED_UNITS:
-        raise UpbitClientError("지원하지 않는 분봉 단위입니다.")
+        raise UpbitClientError("Unsupported minute candle unit.")
     if count < 1 or count > 20000:
-        raise UpbitClientError("캔들 개수는 1~20000 범위여야 합니다.")
+        raise UpbitClientError("Candle count must be between 1 and 20000.")
 
     collected: list[dict[str, Any]] = []
     cursor = to
@@ -34,13 +65,12 @@ async def fetch_minute_candles(
             params: dict[str, Any] = {"market": market, "count": batch_count}
             if cursor:
                 params["to"] = cursor
-            response = await client.get(
+            batch = await _get_public_json(
+                client,
                 f"{UPBIT_BASE_URL}/v1/candles/minutes/{unit}",
-                params=params,
+                params,
+                "Upbit minute candle fetch",
             )
-            if response.status_code >= 400:
-                raise UpbitClientError(f"업비트 캔들 조회 실패: {response.text}")
-            batch = response.json()
             if not batch:
                 break
             collected.extend(batch)
@@ -49,6 +79,7 @@ async def fetch_minute_candles(
             cursor = datetime.fromisoformat(oldest).strftime("%Y-%m-%dT%H:%M:%S")
             if len(batch) < batch_count:
                 break
+            await _pace_next_public_batch(remaining)
 
     return sorted(collected, key=lambda item: item["candle_date_time_utc"])
 
@@ -59,7 +90,7 @@ async def fetch_day_candles(
     to: str | None = None,
 ) -> list[dict[str, Any]]:
     if count < 1 or count > 20000:
-        raise UpbitClientError("캔들 개수는 1~20000 범위여야 합니다.")
+        raise UpbitClientError("Candle count must be between 1 and 20000.")
 
     collected: list[dict[str, Any]] = []
     cursor = to
@@ -71,13 +102,12 @@ async def fetch_day_candles(
             params: dict[str, Any] = {"market": market, "count": batch_count}
             if cursor:
                 params["to"] = cursor
-            response = await client.get(
+            batch = await _get_public_json(
+                client,
                 f"{UPBIT_BASE_URL}/v1/candles/days",
-                params=params,
+                params,
+                "Upbit day candle fetch",
             )
-            if response.status_code >= 400:
-                raise UpbitClientError(f"업비트 일봉 조회 실패: {response.text}")
-            batch = response.json()
             if not batch:
                 break
             for item in batch:
@@ -88,6 +118,7 @@ async def fetch_day_candles(
             cursor = datetime.fromisoformat(oldest).strftime("%Y-%m-%dT%H:%M:%S")
             if len(batch) < batch_count:
                 break
+            await _pace_next_public_batch(remaining)
 
     return sorted(collected, key=lambda item: item["candle_date_time_utc"])
 
@@ -98,13 +129,12 @@ async def fetch_tickers(markets: list[str], *, base_url: str = UPBIT_BASE_URL) -
         return []
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
+        payload = await _get_public_json(
+            client,
             f"{base_url.rstrip('/')}/v1/ticker",
-            params={"markets": ",".join(unique_markets)},
+            {"markets": ",".join(unique_markets)},
+            "Upbit ticker fetch",
         )
-        if response.status_code >= 400:
-            raise UpbitClientError(f"티커 조회 실패: {response.text}")
-        payload = response.json()
         if not isinstance(payload, list):
-            raise UpbitClientError("티커 응답 형식이 올바르지 않습니다.")
+            raise UpbitClientError("Upbit ticker response format is invalid.")
         return payload
