@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database
+from app.live_strategy_pilot import _insert_blocked_log
 
 
 def live_order_log(request_id: str, status: str, *, order_uuid: str = "order-uuid", session_id: int = 1) -> dict:
@@ -94,3 +95,25 @@ class DatabaseLiveOrderTests(unittest.TestCase):
 
         self.assertFalse(database.delete_candidate_strategy(candidate_id))
         self.assertIsNotNone(database.load_candidate_strategy(candidate_id))
+
+    def test_blocked_log_accepts_missing_order_payload(self) -> None:
+        _insert_blocked_log(
+            {
+                "id": 21,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 5,
+                "strategy_name": "rsi",
+                "max_order_krw": 30_000,
+            },
+            "SMART_SELL_POSITION_MISSING",
+            "No open bot position.",
+            "2026-06-18T10:00:00Z",
+            {"signal": "SELL"},
+        )
+
+        logs = database.load_live_order_logs()
+
+        self.assertEqual(logs[0]["status"], "BLOCKED")
+        self.assertEqual(logs[0]["risk_result"], "SMART_SELL_POSITION_MISSING")
+        self.assertEqual(logs[0]["side"], "BUY")

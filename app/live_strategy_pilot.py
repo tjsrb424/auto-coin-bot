@@ -655,7 +655,9 @@ async def _submit_smart_limited_sell_order(
     intent: dict,
 ) -> bool:
     intent_id = intent.get("id")
-    position = load_open_live_position(int(session["id"]), str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC"))
+    exchange = str(session.get("exchange") or "bithumb")
+    market = str(session.get("market") or "KRW-BTC")
+    position = load_open_live_position(int(session["id"]), exchange, market) or load_open_live_position(None, exchange, market)
     if not position:
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_SELL_POSITION_MISSING"], "status": "BLOCKED"})
@@ -1114,8 +1116,8 @@ def _insert_blocked_log(session: dict, risk_result: str, message: str | None, ca
         "request_id": f"strategy-blocked-{uuid.uuid4().hex[:18]}",
         "exchange": session.get("exchange", "bithumb"),
         "market": session.get("market", "KRW-BTC"),
-        "side": order.get("side", "BUY"),
-        "order_type": order.get("order_type", "LIMIT"),
+        "side": "BUY",
+        "order_type": "LIMIT",
         "price": 0.0,
         "volume": 0.0,
         "amount_krw": session.get("max_order_krw", 0.0),
@@ -1130,8 +1132,8 @@ def _log_payload(session: dict, status: str, risk_result: str, candle_time_utc: 
         "candidate_strategy_id": session.get("candidate_strategy_id"),
         "exchange": order.get("exchange", session.get("exchange", "bithumb")),
         "market": order.get("market", session.get("market", "KRW-BTC")),
-        "side": "BUY",
-        "order_type": "LIMIT",
+        "side": order.get("side", "BUY"),
+        "order_type": order.get("order_type", "LIMIT"),
         "price": order.get("price"),
         "volume": order.get("volume"),
         "amount_krw": order.get("amount_krw"),
