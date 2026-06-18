@@ -79,8 +79,8 @@ jobs:
             git fetch origin main
             git checkout main
             git reset --hard origin/main
-            sudo docker compose --env-file .env.production build backend
-            sudo docker compose --env-file .env.production up -d backend
+            sudo docker compose --env-file .env.production build backend frontend
+            sudo docker compose --env-file .env.production up -d backend frontend
             sudo docker compose --env-file .env.production ps
           "
 

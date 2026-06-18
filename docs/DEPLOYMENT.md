@@ -287,7 +287,7 @@ On every push to `main`, GitHub Actions:
 2. Installs frontend dependencies and runs `npm run build`.
 3. SSHes into Lightsail.
 4. Resets `/home/ubuntu/auto-coin-bot` to `origin/main`.
-5. Rebuilds and restarts the backend container only.
+5. Rebuilds and restarts the backend and frontend containers.
 6. Checks `http://43.201.162.191/health`.
 
 Required GitHub repository secrets:
