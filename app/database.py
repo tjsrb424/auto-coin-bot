@@ -18,6 +18,63 @@ LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-failed-%'
 """
 
+DEFAULT_CANDIDATE_STRATEGIES = [
+    {
+        "name": "필승 v1 - 추세 돌파",
+        "description": "15분봉 변동성 돌파를 기준으로 거래량과 추세가 동시에 붙을 때만 진입하는 기본 전략입니다.",
+        "strategy": "volatility_breakout",
+        "parameters": {"k": 0.45, "exit_window": 12},
+        "unit": 15,
+        "market": "KRW-BTC",
+        "backtest_period": "30d",
+        "score": 91.2,
+        "backtest_total_return": 0.0,
+        "backtest_mdd": 0.0,
+        "backtest_win_rate": 0.0,
+        "backtest_profit_factor": 0.0,
+        "backtest_trade_count": 0,
+        "backtest_average_trade_pnl": 0.0,
+        "warning": "백테스트 실행 필요",
+        "status": "ACTIVE",
+    },
+    {
+        "name": "필승 v2 - 눌림 반등",
+        "description": "5분봉 RSI 과매도 회복 구간을 노리는 빠른 반등 전략입니다. 짧은 검증 기간에서 민첩하게 확인합니다.",
+        "strategy": "rsi",
+        "parameters": {"rsi_period": 14, "buy_threshold": 28, "sell_threshold": 68},
+        "unit": 5,
+        "market": "KRW-BTC",
+        "backtest_period": "30d",
+        "score": 89.4,
+        "backtest_total_return": 0.0,
+        "backtest_mdd": 0.0,
+        "backtest_win_rate": 0.0,
+        "backtest_profit_factor": 0.0,
+        "backtest_trade_count": 0,
+        "backtest_average_trade_pnl": 0.0,
+        "warning": "백테스트 실행 필요",
+        "status": "ACTIVE",
+    },
+    {
+        "name": "필승 v3 - 안정 추세",
+        "description": "15분봉 이동평균 교차로 큰 방향성을 확인하는 안정형 전략입니다. 잦은 매매보다 신호 품질을 우선합니다.",
+        "strategy": "ma_cross",
+        "parameters": {"short_window": 10, "long_window": 30},
+        "unit": 15,
+        "market": "KRW-BTC",
+        "backtest_period": "30d",
+        "score": 87.8,
+        "backtest_total_return": 0.0,
+        "backtest_mdd": 0.0,
+        "backtest_win_rate": 0.0,
+        "backtest_profit_factor": 0.0,
+        "backtest_trade_count": 0,
+        "backtest_average_trade_pnl": 0.0,
+        "warning": "백테스트 실행 필요",
+        "status": "ACTIVE",
+    },
+]
+
 
 def _database_path() -> Path:
     database_url = os.getenv("DATABASE_URL", "").strip()
@@ -838,6 +895,76 @@ def load_candidate_strategy(candidate_id: int) -> dict | None:
     item = dict(row)
     item["parameters"] = json.loads(item.pop("parameters_json"))
     return item
+
+
+def ensure_default_candidate_strategies() -> int:
+    now_utc = _utc_now()
+    changed = 0
+    with get_connection() as conn:
+        for candidate in DEFAULT_CANDIDATE_STRATEGIES:
+            row = conn.execute(
+                "SELECT id FROM candidate_strategies WHERE name = ?",
+                (candidate["name"],),
+            ).fetchone()
+            values = (
+                candidate["strategy"],
+                json.dumps(candidate["parameters"], ensure_ascii=False),
+                candidate["unit"],
+                candidate["market"],
+                candidate["backtest_period"],
+                candidate["score"],
+                candidate.get("backtest_total_return", 0.0),
+                candidate.get("backtest_mdd", 0.0),
+                candidate.get("backtest_win_rate", 0.0),
+                candidate.get("backtest_profit_factor", 0.0),
+                candidate.get("backtest_trade_count", 0),
+                candidate.get("backtest_average_trade_pnl", 0.0),
+                candidate.get("warning", ""),
+                candidate["name"],
+                candidate.get("description", ""),
+                candidate.get("status", "ACTIVE"),
+                now_utc,
+            )
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO candidate_strategies (
+                        strategy, parameters_json, unit, market, backtest_period, score,
+                        backtest_total_return, backtest_mdd, backtest_win_rate,
+                        backtest_profit_factor, backtest_trade_count,
+                        backtest_average_trade_pnl, warning, name, description, status, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+                changed += 1
+                continue
+            conn.execute(
+                """
+                UPDATE candidate_strategies
+                SET strategy = ?,
+                    parameters_json = ?,
+                    unit = ?,
+                    market = ?,
+                    backtest_period = ?,
+                    score = MAX(score, ?),
+                    backtest_total_return = CASE WHEN warning = '백테스트 실행 필요' THEN ? ELSE backtest_total_return END,
+                    backtest_mdd = CASE WHEN warning = '백테스트 실행 필요' THEN ? ELSE backtest_mdd END,
+                    backtest_win_rate = CASE WHEN warning = '백테스트 실행 필요' THEN ? ELSE backtest_win_rate END,
+                    backtest_profit_factor = CASE WHEN warning = '백테스트 실행 필요' THEN ? ELSE backtest_profit_factor END,
+                    backtest_trade_count = CASE WHEN warning = '백테스트 실행 필요' THEN ? ELSE backtest_trade_count END,
+                    backtest_average_trade_pnl = CASE WHEN warning = '백테스트 실행 필요' THEN ? ELSE backtest_average_trade_pnl END,
+                    warning = CASE WHEN warning = '' THEN ? ELSE warning END,
+                    name = ?,
+                    description = ?,
+                    status = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                values + (int(row["id"]),),
+            )
+            changed += 1
+    return changed
 
 
 def update_candidate_strategy(candidate_id: int, updates: dict) -> dict | None:

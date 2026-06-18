@@ -509,6 +509,16 @@ function formatPercent(value?: number | null, digits = 2) {
   return `${sign}${normalized.toFixed(digits)}%`;
 }
 
+function valueToneClass(value?: number | null) {
+  if (value == null || !Number.isFinite(value) || value === 0) return "ref-neutral";
+  return value > 0 ? "ref-positive" : "ref-negative";
+}
+
+function lossToneClass(value?: number | null) {
+  if (value == null || !Number.isFinite(value) || value === 0) return "ref-neutral";
+  return value > 0 ? "ref-negative" : "ref-positive";
+}
+
 function formatRatioPercent(value?: number | null, digits = 1) {
   if (value == null || !Number.isFinite(value)) return "-";
   const normalized = Math.abs(value) > 1 ? value : value * 100;
@@ -3084,10 +3094,12 @@ function StrategyRightPanels({
   data,
   candidate,
   draft,
+  backtestDays,
   isBusy,
   actionMessage,
   actionError,
   validationResult,
+  onBacktestDaysChange,
   onSave,
   onClone,
   onToggle,
@@ -3096,57 +3108,74 @@ function StrategyRightPanels({
   data: DashboardData;
   candidate: Candidate | null;
   draft: StrategyDraft;
+  backtestDays: number;
   isBusy: boolean;
   actionMessage: string | null;
   actionError: string | null;
   validationResult: StrategyValidationResult | null;
+  onBacktestDaysChange: (days: number) => void;
   onSave: () => void;
   onClone: () => void;
   onToggle: () => void;
-  onRunTest: () => void;
+  onRunTest: (days: number) => void;
 }) {
   const totalReturn = candidate?.backtest_total_return ?? data.paper?.balance?.total_return ?? null;
   const winRate = candidate?.backtest_win_rate ?? null;
   const tradeCount = candidate?.backtest_trade_count ?? data.liveOrders.length;
   const mdd = candidate?.backtest_mdd ?? data.paper?.balance?.mdd ?? null;
+  const averageReturn = candidate?.backtest_average_trade_pnl ?? null;
   const latestValidation = validationResult?.rows?.[0];
   const score = candidate?.score ?? latestValidation?.metrics?.score ?? null;
   const statusIsActive = draft.status === "ACTIVE";
+  const normalizedBacktestDays = Math.max(1, Math.min(365, Math.round(backtestDays || 30)));
 
   return (
     <>
       <RefPanel className="ref-strategy-performance-panel">
-        <div className="ref-title-row"><h3>전략 성과 <span>(과거지원)</span></h3><button>최근 30일⌄</button></div>
+        <div className="ref-title-row"><h3>전략 성과 <span>(과거지원)</span></h3><button>최근 {normalizedBacktestDays}일</button></div>
         <div className="ref-performance-grid">
-          <p><span>총 수익률</span><b className={totalReturn != null && totalReturn < 0 ? "ref-negative" : "ref-positive"}>{formatPercent(totalReturn)}</b><em>{formatSignedKrw(data.paper?.balance?.total_pnl)}</em></p>
+          <p><span>총 수익률</span><b className={valueToneClass(totalReturn)}>{formatPercent(totalReturn)}</b><em className={valueToneClass(data.paper?.balance?.total_pnl)}>{formatSignedKrw(data.paper?.balance?.total_pnl)}</em></p>
           <p><span>승률</span><b>{formatPercent(winRate)}</b><em>{tradeCount}건</em></p>
           <p><span>총 거래 수</span><b>{tradeCount}건</b><em>최근 로그</em></p>
-          <p><span>평균 수익률</span><b className="ref-positive">{formatPercent(candidate?.backtest_average_trade_pnl)}</b></p>
+          <p><span>평균 수익률</span><b className={valueToneClass(averageReturn)}>{formatPercent(averageReturn)}</b></p>
           <p><span>최대 연속 승리</span><b>{Math.max(1, Math.round((winRate ?? 0) * 10))}연속</b></p>
-          <p><span>최대 낙폭 (MDD)</span><b className="ref-negative">{formatPercent(mdd)}</b></p>
+          <p><span>최대 낙폭 (MDD)</span><b className={lossToneClass(mdd)}>{formatPercent(mdd)}</b></p>
         </div>
         <div className="ref-performance-chart"><i /></div>
       </RefPanel>
       <RefPanel className="ref-strategy-backtest-panel">
         <h3>백테스트 요약 <span>({data.liveStatus?.exchange ?? "거래소"} · {marketDisplay(candidate?.market)} · {formatTimeframe(candidate?.unit)})</span></h3>
-        <div className="ref-backtest-period">기간 <b>{validationResult ? `검증 Run #${validationResult.run_id ?? "-"}` : candidate?.backtest_period ?? "최근 데이터 기준"}</b></div>
+        <div className="ref-backtest-period">
+          <span>기간</span>
+          <label>
+            <input
+              type="number"
+              min={1}
+              max={365}
+              value={normalizedBacktestDays}
+              onChange={(event) => onBacktestDaysChange(Math.max(1, Math.min(365, Number(event.target.value) || 1)))}
+            />
+            <em>일</em>
+          </label>
+          <b>{validationResult ? `검증 Run #${validationResult.run_id ?? "-"} · ${latestValidation?.period_label ?? `${normalizedBacktestDays}d`}` : candidate?.backtest_period ?? "최근 데이터 기준"}</b>
+        </div>
         <div className="ref-backtest-grid">
-          <p><span>총 수익률</span><b className="ref-positive">{formatPercent(totalReturn)}</b></p>
-          <p><span>CAGR</span><b className="ref-positive">{formatPercent(totalReturn)}</b></p>
-          <p><span>승률</span><b className="ref-positive">{formatPercent(winRate)}</b></p>
+          <p><span>총 수익률</span><b className={valueToneClass(totalReturn)}>{formatPercent(totalReturn)}</b></p>
+          <p><span>CAGR</span><b className={valueToneClass(totalReturn)}>{formatPercent(totalReturn)}</b></p>
+          <p><span>승률</span><b>{formatPercent(winRate)}</b></p>
           <p><span>총 거래 수</span><b>{tradeCount}</b></p>
-          <p><span>평균 수익률</span><b className="ref-positive">{formatPercent(candidate?.backtest_average_trade_pnl)}</b></p>
+          <p><span>평균 수익률</span><b className={valueToneClass(averageReturn)}>{formatPercent(averageReturn)}</b></p>
           <p><span>손익비</span><b>{formatNumber(candidate?.backtest_profit_factor, 2)}</b></p>
-          <p><span>최대 손실률</span><b className="ref-negative">{formatPercent(mdd)}</b></p>
+          <p><span>최대 손실률</span><b className={lossToneClass(mdd)}>{formatPercent(mdd)}</b></p>
           <p><span>점수</span><b>{formatNumber(score, 2)}</b></p>
         </div>
-        <button onClick={onRunTest} disabled={isBusy}>백테스트 다시 실행</button>
+        <button onClick={() => onRunTest(normalizedBacktestDays)} disabled={isBusy}>{normalizedBacktestDays}일 백테스트 다시 실행</button>
       </RefPanel>
       <RefPanel className="ref-strategy-actions-panel">
         <button className="primary" onClick={onSave} disabled={isBusy}><Save size={18} />저장</button>
         <button onClick={onClone} disabled={isBusy || !candidate}><Copy size={18} />복제</button>
         <button className="danger" onClick={onToggle} disabled={isBusy || !candidate}><PowerOff size={18} />{statusIsActive ? "비활성화" : "활성화"}</button>
-        <button className="blue" onClick={onRunTest} disabled={isBusy}><Play size={18} />실행 테스트</button>
+        <button className="blue" onClick={() => onRunTest(normalizedBacktestDays)} disabled={isBusy}><Play size={18} />실행 테스트</button>
         {(actionMessage || actionError) && <p className={actionError ? "ref-action-error" : "ref-action-message"}>{actionError ?? actionMessage}</p>}
       </RefPanel>
     </>
@@ -3158,6 +3187,7 @@ function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () =>
   const [filter, setFilter] = React.useState<StrategyFilter>("ALL");
   const [search, setSearch] = React.useState("");
   const [draft, setDraft] = React.useState<StrategyDraft>(() => strategyDraftFromCandidate(null));
+  const [backtestDays, setBacktestDays] = React.useState(30);
   const [isBusy, setIsBusy] = React.useState(false);
   const [actionMessage, setActionMessage] = React.useState<string | null>(null);
   const [actionError, setActionError] = React.useState<string | null>(null);
@@ -3232,12 +3262,13 @@ function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () =>
     return result.candidate.id;
   });
 
-  const runStrategyTest = () => runAction("전략 검증", async () => {
+  const runStrategyTest = (days = backtestDays) => runAction("전략 검증", async () => {
+    const normalizedDays = Math.max(1, Math.min(365, Math.round(days || 30)));
     const result = await postJson<StrategyValidationResult>("/api/strategy-validation/run", {
       market: draft.market,
       strategy: draft.strategy,
       timeframes: [draft.unit],
-      periods: ["30d"],
+      periods: [`${normalizedDays}d`],
       settings: draft.parameters,
       risk: {}
     });
@@ -3247,7 +3278,7 @@ function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () =>
       const metrics = bestRow.metrics;
       await patchJson<{ candidate: Candidate }>(`/api/candidate-strategies/${selected.id}`, {
         ...buildCandidatePayload(draft, selected),
-        backtest_period: bestRow.period_label ?? "30d",
+        backtest_period: bestRow.period_label ?? `${normalizedDays}d`,
         score: metrics.score ?? selected.score ?? 0,
         backtest_total_return: metrics.total_return ?? selected.backtest_total_return ?? 0,
         backtest_mdd: metrics.mdd ?? selected.backtest_mdd ?? 0,
@@ -3278,10 +3309,12 @@ function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () =>
         data={data}
         candidate={selected}
         draft={draft}
+        backtestDays={backtestDays}
         isBusy={isBusy}
         actionMessage={actionMessage}
         actionError={actionError}
         validationResult={validationResult}
+        onBacktestDaysChange={setBacktestDays}
         onSave={saveStrategy}
         onClone={cloneStrategy}
         onToggle={toggleStrategy}

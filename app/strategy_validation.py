@@ -16,6 +16,16 @@ PERIOD_DAYS = {
 }
 
 
+def period_days(period: str) -> int | None:
+    if period in PERIOD_DAYS:
+        return PERIOD_DAYS[period]
+    if period.endswith("d") and period[:-1].isdigit():
+        days = int(period[:-1])
+        if 1 <= days <= 365:
+            return days
+    return None
+
+
 def parameter_grid(strategy: str, base_settings: dict | None = None) -> list[dict]:
     base = dict(base_settings or {})
     if strategy == "ma_cross":
@@ -51,7 +61,7 @@ def build_periods(periods: list[str], custom_start: str | None, custom_end: str 
                     }
                 )
             continue
-        days = PERIOD_DAYS.get(period)
+        days = period_days(period)
         if days is None:
             continue
         start = now - timedelta(days=days)

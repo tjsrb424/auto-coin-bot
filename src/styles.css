@@ -902,6 +902,7 @@ body {
 
 .ref-positive { color: var(--ref-green) !important; }
 .ref-negative { color: var(--ref-red) !important; }
+.ref-neutral { color: #dbe5f3 !important; }
 
 .ref-chart-panel {
   left: 208px;
@@ -4736,6 +4737,43 @@ body {
   padding: 0 14px;
   color: #98a8bc;
   font-size: 12px;
+}
+
+.ref-backtest-period label {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(123, 77, 255, 0.4);
+  border-radius: 5px;
+  background: rgba(123, 77, 255, 0.11);
+  padding: 0 8px;
+}
+
+.ref-backtest-period input {
+  width: 52px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #f4f7ff;
+  font-size: 13px;
+  font-weight: 850;
+  text-align: right;
+}
+
+.ref-backtest-period em {
+  color: #bba7ff;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.ref-backtest-period b {
+  max-width: 170px;
+  overflow: hidden;
+  color: #dbe5f3;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ref-backtest-grid {

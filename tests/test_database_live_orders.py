@@ -52,3 +52,11 @@ class DatabaseLiveOrderTests(unittest.TestCase):
         database.insert_live_order_log(live_order_log("strategy-request", "SUBMITTED"))
 
         self.assertTrue(database.has_open_live_strategy_order("bithumb", "KRW-BTC"))
+
+    def test_default_candidate_strategies_are_seeded(self) -> None:
+        changed = database.ensure_default_candidate_strategies()
+        candidates = database.load_candidate_strategies()
+
+        self.assertEqual(changed, 3)
+        self.assertEqual([item["name"] for item in candidates[:3]], ["필승 v1 - 추세 돌파", "필승 v2 - 눌림 반등", "필승 v3 - 안정 추세"])
+        self.assertTrue(all(item["status"] == "ACTIVE" for item in candidates[:3]))

@@ -33,6 +33,7 @@ from app.database import (
     get_last_live_order_time,
     get_connection,
     get_live_order_log,
+    ensure_default_candidate_strategies,
     has_unresolved_live_order,
     has_recent_live_order,
     init_db,
@@ -453,6 +454,7 @@ async def lifespan(_: FastAPI):
     _.state.server_started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     _.state.instance_id = os.getenv("RUNTIME_INSTANCE_ID", f"{socket.gethostname()}-{uuid.uuid4().hex[:12]}")
     init_db()
+    ensure_default_candidate_strategies()
     reset_live_runtime_state()
     insert_live_mode_event("SERVER_START", current_live_mode(), "서버 시작 시 실거래 모드는 자동 잠금 상태로 초기화되었습니다.")
     recovery_result = await run_startup_live_recovery_async()
