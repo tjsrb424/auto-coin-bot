@@ -44,6 +44,7 @@ jobs:
   deploy:
     name: Deploy to Lightsail
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: test
     environment: production
     steps:
@@ -79,8 +80,10 @@ jobs:
             git fetch origin main
             git checkout main
             git reset --hard origin/main
-            sudo docker compose --env-file .env.production build backend frontend
-            sudo docker compose --env-file .env.production up -d backend frontend
+            COMPOSE_PARALLEL_LIMIT=1 sudo docker compose --env-file .env.production build backend
+            sudo docker compose --env-file .env.production up -d backend
+            COMPOSE_PARALLEL_LIMIT=1 sudo docker compose --env-file .env.production build frontend
+            sudo docker compose --env-file .env.production up -d frontend
             sudo docker compose --env-file .env.production ps
           "
 
