@@ -135,7 +135,7 @@ class LiveBrokerRiskTests(unittest.TestCase):
             get_live_broker("unknown")
 
     def test_server_restart_does_not_keep_live_manual_mode(self) -> None:
-        with patch.dict(os.environ, {"LIVE_TRADING_ENABLED": "true"}, clear=False):
+        with patch.dict(os.environ, {"ALLOW_DEV_LIVE_TRADING": "true", "LIVE_TRADING_ENABLED": "true"}, clear=False):
             reset_live_runtime_state()
             self.assertEqual(current_live_mode(), "LIVE_LOCKED")
 

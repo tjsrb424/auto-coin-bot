@@ -277,6 +277,42 @@ curl http://localhost/health
 
 After update, run the restart test again and confirm runtime is not auto-resumed.
 
+### 16.1 GitHub Actions Auto Deploy
+
+The repository includes `.github/workflows/deploy-production.yml`.
+
+On every push to `main`, GitHub Actions:
+
+1. Installs backend dependencies and runs `python -m unittest discover -s tests`.
+2. Installs frontend dependencies and runs `npm run build`.
+3. SSHes into Lightsail.
+4. Resets `/home/ubuntu/auto-coin-bot` to `origin/main`.
+5. Rebuilds and restarts the backend container only.
+6. Checks `http://43.201.162.191/health`.
+
+Required GitHub repository secrets:
+
+```text
+LIGHTSAIL_HOST=43.201.162.191
+LIGHTSAIL_USER=ubuntu
+LIGHTSAIL_SSH_KEY=<private key contents>
+```
+
+If these secrets are missing, the workflow still runs tests and build checks but skips the deploy step.
+
+Optional GitHub repository variables:
+
+```text
+LIGHTSAIL_APP_DIR=/home/ubuntu/auto-coin-bot
+PRODUCTION_APP_URL=http://43.201.162.191
+```
+
+The workflow uses `docker compose --env-file .env.production`, so the server-side `.env.production` remains the production source for API keys and runtime flags. Do not commit `.env.production`.
+
+The deploy step intentionally runs `git reset --hard origin/main` on the server. Keep production-only values in ignored files such as `.env.production` or Docker volumes, not in tracked files.
+
+Auto deploy updates code only. Runtime safety still applies after backend restart: live sessions are paused and must be resumed from the authenticated UI after review.
+
 ## 17. Rollback
 
 ```bash

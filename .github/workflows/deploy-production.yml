@@ -1,0 +1,98 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Run backend tests
+        run: python -m unittest discover -s tests
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+  deploy:
+    name: Deploy to Lightsail
+    runs-on: ubuntu-latest
+    needs: test
+    environment: production
+    steps:
+      - name: Configure SSH
+        id: deploy-config
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          SSH_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          SSH_USER: ${{ secrets.LIGHTSAIL_USER }}
+        run: |
+          if [ -z "$SSH_PRIVATE_KEY" ] || [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
+            echo "deploy_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Lightsail deploy secrets are not configured. Tests ran, deploy skipped."
+            exit 0
+          fi
+          echo "deploy_enabled=true" >> "$GITHUB_OUTPUT"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lightsail_key
+          chmod 600 ~/.ssh/lightsail_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Pull, rebuild, and restart
+        if: steps.deploy-config.outputs.deploy_enabled == 'true'
+        env:
+          SSH_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          SSH_USER: ${{ secrets.LIGHTSAIL_USER }}
+          APP_DIR: ${{ vars.LIGHTSAIL_APP_DIR || '/home/ubuntu/auto-coin-bot' }}
+        run: |
+          ssh -i ~/.ssh/lightsail_key "$SSH_USER@$SSH_HOST" "
+            set -euo pipefail
+            cd '$APP_DIR'
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+            sudo docker compose --env-file .env.production build backend
+            sudo docker compose --env-file .env.production up -d backend
+            sudo docker compose --env-file .env.production ps
+          "
+
+      - name: Health check
+        if: steps.deploy-config.outputs.deploy_enabled == 'true'
+        env:
+          APP_URL: ${{ vars.PRODUCTION_APP_URL || 'http://43.201.162.191' }}
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if curl --fail --silent --show-error "$APP_URL/health"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
