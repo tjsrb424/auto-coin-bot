@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
-from app.database import get_connection, load_decision_snapshots, load_smart_rehearsal_review
+from app.database import get_connection, load_decision_snapshots, load_latest_smart_rehearsal_review
 
 
 IGNORED_SHADOW_BLOCKERS = {
@@ -216,12 +216,9 @@ def _rehearsal_summary(market: str) -> dict:
             (market,),
         ).fetchall()
     orders = [dict(row) for row in rows]
+    weekly_review = load_latest_smart_rehearsal_review(exchange="bithumb", market=market)
     for order in orders:
-        review = load_smart_rehearsal_review(
-            order.get("request_id"),
-            exchange=str(order.get("exchange") or "bithumb"),
-            market=market,
-        )
+        review = weekly_review if str(order.get("exchange") or "bithumb") == "bithumb" else load_latest_smart_rehearsal_review(exchange=str(order.get("exchange") or "bithumb"), market=market)
         order["review"] = review
         order["review_status"] = review.get("decision") if review else None
         order["review_active"] = bool(review and review.get("is_active"))

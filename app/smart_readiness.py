@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.database import count_live_strategy_orders_today, get_connection, load_bot_operation_policy, load_latest_decision_snapshot, load_smart_rehearsal_review
+from app.database import count_live_strategy_orders_today, get_connection, load_bot_operation_policy, load_latest_decision_snapshot, load_latest_smart_rehearsal_review
 from app.live_broker import is_emergency_stopped
 from app.risk_manager import compute_risk_state
 from app.shadow_report import build_shadow_report
@@ -148,7 +148,7 @@ def _latest_rehearsal_order(exchange: str, market: str) -> dict | None:
     if row is None:
         return None
     order = dict(row)
-    review = load_smart_rehearsal_review(order.get("request_id"), exchange=exchange, market=market)
+    review = load_latest_smart_rehearsal_review(exchange=exchange, market=market)
     order["review"] = review
     order["review_status"] = review.get("decision") if review else None
     order["review_active"] = bool(review and review.get("is_active"))

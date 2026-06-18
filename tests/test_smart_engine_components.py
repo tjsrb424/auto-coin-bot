@@ -321,6 +321,59 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertTrue(readiness["latest_rehearsal_order"]["reviewable"] is False)
         self.assertNotIn("SMART_REHEARSAL_REVIEW_REQUIRED", readiness["rehearsal_blockers"])
 
+    def test_limited_readiness_accepts_active_weekly_market_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with patch.object(database, "DB_PATH", db_path):
+                database.init_db()
+                database.insert_live_order_log({
+                    "request_id": "smart-rehearsal-reviewed-before",
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "side": "BUY",
+                    "order_type": "LIMIT",
+                    "price": 100_000_000,
+                    "volume": 0.0001,
+                    "amount_krw": 10_000,
+                    "risk_result": "SMART_PROMOTION_BLOCKED",
+                    "status": "BLOCKED",
+                    "order_preview_payload": {},
+                })
+                database.insert_smart_rehearsal_review(
+                    request_id="smart-rehearsal-reviewed-before",
+                    exchange="bithumb",
+                    market="KRW-BTC",
+                    decision="APPROVED",
+                    note="weekly approval",
+                )
+                database.insert_live_order_log({
+                    "request_id": "smart-rehearsal-new-weekly-candidate",
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "side": "BUY",
+                    "order_type": "LIMIT",
+                    "price": 100_000_000,
+                    "volume": 0.0001,
+                    "amount_krw": 10_000,
+                    "risk_result": "SMART_PROMOTION_BLOCKED",
+                    "status": "BLOCKED",
+                    "order_preview_payload": {},
+                })
+                readiness = build_limited_readiness(
+                    "KRW-BTC",
+                    decision={"risk_score": 35, "order_intents": [{"side": "BID", "delta_value_krw": 20_000}]},
+                    report={"summary": {"recommendation": "READY_FOR_LIMITED_PILOT_REVIEW"}},
+                    policy={"auto_trading_enabled": True},
+                    risk_state={"status": "OK"},
+                    daily_smart_order_count=0,
+                    emergency_stopped=False,
+                    live_mode="limited",
+                    now_utc=datetime(2026, 6, 18, 3, tzinfo=timezone.utc),
+                )
+        self.assertEqual(readiness["latest_rehearsal_order"]["request_id"], "smart-rehearsal-new-weekly-candidate")
+        self.assertEqual(readiness["latest_rehearsal_order"]["review_status"], "APPROVED")
+        self.assertNotIn("SMART_REHEARSAL_REVIEW_REQUIRED", readiness["rehearsal_blockers"])
+
 
 if __name__ == "__main__":
     unittest.main()

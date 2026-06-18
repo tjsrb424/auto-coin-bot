@@ -1698,6 +1698,25 @@ def load_smart_rehearsal_review(
     return _normalize_smart_rehearsal_review(dict(row)) if row else None
 
 
+def load_latest_smart_rehearsal_review(
+    exchange: str = "bithumb",
+    market: str = "KRW-BTC",
+) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM smart_rehearsal_reviews
+            WHERE exchange = ?
+              AND market = ?
+            ORDER BY reviewed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange, market),
+        ).fetchone()
+    return _normalize_smart_rehearsal_review(dict(row)) if row else None
+
+
 def load_live_order_logs(limit: int = 100, include_canonical_with_events: bool = False) -> list[dict]:
     if include_canonical_with_events:
         with get_connection() as conn:

@@ -156,6 +156,82 @@ class ShadowReportTests(unittest.TestCase):
         self.assertFalse(report["summary"]["rehearsal"]["requires_review"])
         self.assertNotEqual(report["summary"]["recommendation"], "REHEARSAL_REVIEW_REQUIRED")
 
+    def test_shadow_report_treats_active_approval_as_weekly_market_approval(self) -> None:
+        database.insert_live_order_log({
+            "request_id": "smart-rehearsal-weekly-approved",
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": 100_000_000,
+            "volume": 0.0001,
+            "amount_krw": 10_000,
+            "risk_result": "SMART_PROMOTION_BLOCKED",
+            "status": "BLOCKED",
+            "order_preview_payload": {},
+        })
+        database.insert_smart_rehearsal_review(
+            request_id="smart-rehearsal-weekly-approved",
+            exchange="bithumb",
+            market="KRW-BTC",
+            decision="APPROVED",
+            note="weekly approval",
+        )
+        database.insert_live_order_log({
+            "request_id": "smart-rehearsal-new-candidate",
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": 100_000_000,
+            "volume": 0.0001,
+            "amount_krw": 10_000,
+            "risk_result": "SMART_PROMOTION_BLOCKED",
+            "status": "BLOCKED",
+            "order_preview_payload": {},
+        })
+
+        report = build_shadow_report("KRW-BTC", limit=10, horizon_candles=3)
+
+        self.assertEqual(report["summary"]["rehearsal"]["latest_order"]["request_id"], "smart-rehearsal-new-candidate")
+        self.assertEqual(report["summary"]["rehearsal"]["review_status"], "APPROVED")
+        self.assertFalse(report["summary"]["rehearsal"]["requires_review"])
+
+    def test_shadow_report_latest_rejected_market_review_blocks_weekly_approval(self) -> None:
+        database.insert_live_order_log({
+            "request_id": "smart-rehearsal-weekly-rejected",
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": 100_000_000,
+            "volume": 0.0001,
+            "amount_krw": 10_000,
+            "risk_result": "SMART_PROMOTION_BLOCKED",
+            "status": "BLOCKED",
+            "order_preview_payload": {},
+        })
+        database.insert_smart_rehearsal_review(
+            request_id="smart-rehearsal-weekly-rejected",
+            exchange="bithumb",
+            market="KRW-BTC",
+            decision="APPROVED",
+            note="weekly approval",
+        )
+        database.insert_smart_rehearsal_review(
+            request_id="smart-rehearsal-weekly-rejected",
+            exchange="bithumb",
+            market="KRW-BTC",
+            decision="REJECTED",
+            note="latest rejection",
+        )
+
+        report = build_shadow_report("KRW-BTC", limit=10, horizon_candles=3)
+
+        self.assertEqual(report["summary"]["rehearsal"]["review_status"], "REJECTED")
+        self.assertTrue(report["summary"]["rehearsal"]["requires_review"])
+        self.assertEqual(report["summary"]["recommendation"], "REHEARSAL_REVIEW_REQUIRED")
+
     def test_approved_rehearsal_review_expires_after_seven_days(self) -> None:
         review = database.insert_smart_rehearsal_review(
             request_id="smart-rehearsal-weekly",
