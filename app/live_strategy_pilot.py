@@ -28,6 +28,7 @@ from app.database import (
     load_open_live_position,
     load_open_live_position_for_strategy,
     load_running_live_strategy_sessions,
+    update_order_intent,
     update_live_order_log,
     update_live_position,
     update_live_strategy_session,
@@ -62,6 +63,9 @@ from app.live_exit import (
 )
 from app.market_liquidity import one_minute_liquidity_snapshot
 from app.risk_manager import check_order_risk
+from app.smart_decision import record_shadow_decision
+from app.shadow_report import build_shadow_report
+from app.smart_promotion import evaluate_promotion, smart_engine_live_mode
 from app.strategies import apply_strategy
 from app.upbit import fetch_minute_candles
 
@@ -325,6 +329,10 @@ async def _process_session(session: dict) -> None:
             "last_processed_candle_time_utc": candle_time,
         },
     )
+    smart_snapshot = _record_smart_shadow_decision(session=session, candidate=candidate, candles=candles, candle=latest, signal=signal)
+    if smart_engine_live_mode() == "limited":
+        await _submit_smart_limited_order(session, candidate, latest, signal, config, live_config, smart_snapshot)
+        return
 
     if signal["signal"] == "SELL":
         position = load_open_live_position(int(session["id"]), config.allowed_exchange, config.allowed_market)
@@ -374,6 +382,11 @@ async def _process_open_position(session: dict, position: dict, config: LiveStra
     )
     if signal["signal"] == "SELL" and exit_candidate is None:
         exit_candidate = create_exit_candidate_for_position(position, "STRATEGY_SELL", current_price, candle_time)
+    smart_snapshot = _record_smart_shadow_decision(session=session, candidate=candidate, candles=candles, candle=latest, signal=signal)
+    if smart_engine_live_mode() == "limited":
+        handled = await _submit_smart_limited_order(session, candidate, latest, signal, config, LiveStrategyConfig.from_env(), smart_snapshot)
+        if handled:
+            return
     auto_exit_result = None
     if exit_candidate and config.exit_enabled:
         auto_exit_result = await _submit_auto_exit_candidate(session, exit_candidate)
@@ -437,6 +450,14 @@ async def _submit_auto_exit_candidate(session: dict, exit_candidate: dict) -> di
         return {"ok": False, "status": "FAILED", "risk_result": "AUTO_EXIT_FAILED", "message": str(exc)}
 
 
+def _record_smart_shadow_decision(*, session: dict, candidate: dict, candles: list[dict], candle: dict, signal: dict) -> dict | None:
+    try:
+        return record_shadow_decision(session=session, candidate=candidate, candles=candles, candle=candle, legacy_signal=signal)
+    except Exception as exc:
+        logger.warning("[smart-decision] shadow decision record failed session_id=%s error=%s", session.get("id"), exc)
+        return None
+
+
 async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> str | None:
     if is_emergency_stopped():
         return "BLOCKED_EMERGENCY_STOP"
@@ -469,6 +490,262 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
     if last_order_time and _seconds_since(str(last_order_time)) < config.cooldown_seconds:
         return "BLOCKED_COOLDOWN"
     return None
+
+
+async def _submit_smart_limited_order(
+    session: dict,
+    candidate: dict,
+    candle: dict,
+    signal: dict,
+    config: LiveStrategyConfig,
+    live_config: LiveTradingConfig,
+    smart_snapshot: dict | None,
+) -> bool:
+    if not smart_snapshot:
+        return False
+    intent = (smart_snapshot.get("order_intents") or [None])[0]
+    if not intent:
+        return False
+    intent_id = intent.get("id")
+    side = str(intent.get("side") or "").upper()
+    if side in {"ASK", "SELL"}:
+        return await _submit_smart_limited_sell_order(session, candle, signal, live_config, smart_snapshot, intent)
+    if side not in {"BID", "BUY"}:
+        if intent_id:
+            update_order_intent(
+                int(intent_id),
+                {
+                    "promotion_status": "BLOCKED",
+                    "promotion_blockers": ["SMART_LIMITED_SIDE_UNSUPPORTED"],
+                    "status": "BLOCKED",
+                },
+            )
+        return False
+    broker = get_live_broker("bithumb")
+    try:
+        balances = await broker.get_balances()
+        chance = await broker.get_order_chance("KRW-BTC")
+    except Exception as exc:
+        _insert_blocked_log(session, "SMART_ORDER_CHANCE_FAILED", str(exc), candle["candle_time_utc"], signal)
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
+        return True
+    if not chance:
+        _insert_blocked_log(session, "SMART_ORDER_CHANCE_FAILED", "Order chance failed.", candle["candle_time_utc"], signal)
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
+        return True
+    current_price = float(candle["trade_price"])
+    amount_requested = abs(_float(intent.get("delta_value_krw")))
+    max_total = _float(smart_snapshot.get("max_total_exposure_krw"))
+    current_value = _float(smart_snapshot.get("current_bot_position_value_krw"))
+    available_krw = _available_balance(balances, "KRW")
+    hard_cap = min(
+        max_total * 0.2,
+        config.max_order_krw,
+        live_config.max_live_order_krw,
+        max(max_total - current_value, 0.0),
+        available_krw,
+    )
+    amount = max(min(amount_requested, hard_cap), 0.0)
+    price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))
+    request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
+    order = {
+        "request_id": request_id,
+        "client_order_id": request_id[:36],
+        "exchange": "bithumb",
+        "market": "KRW-BTC",
+        "side": "BUY",
+        "ord_type": "limit",
+        "order_type": "LIMIT",
+        "price": price,
+        "amount_krw": amount,
+        "volume": amount / price if price > 0 else 0.0,
+    }
+    risk_preview = evaluate_live_order_risk(
+        order=order,
+        config=live_config,
+        mode="AUTO_STRATEGY_RUNNING",
+        balances=balances,
+        request_exists=False,
+        recent_duplicate=False,
+        market_snapshot={"price": current_price},
+    )
+    risk_preview = check_order_risk(
+        order=order,
+        purpose="ENTRY",
+        base_result=risk_preview,
+        mode="AUTO_STRATEGY_RUNNING",
+        session_id=int(session["id"]),
+        candidate_strategy_id=int(session["candidate_strategy_id"]),
+        candle_time_utc=candle["candle_time_utc"],
+        signal=(signal or {}).get("signal"),
+        market_snapshot={"price": current_price, "complete": True},
+        balances=balances,
+        is_auto=True,
+    )
+    try:
+        recommendation = build_shadow_report(str(session.get("market") or "KRW-BTC"), limit=100).get("summary", {}).get("recommendation")
+    except Exception:
+        recommendation = None
+    promotion = evaluate_promotion(
+        intent={**intent, "delta_value_krw": amount},
+        snapshot=smart_snapshot,
+        policy={"auto_trading_enabled": True, "max_total_exposure_krw": max_total},
+        risk_preview=risk_preview,
+        shadow_recommendation=recommendation,
+        available_krw=available_krw,
+        daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
+        risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
+    )
+    if intent_id:
+        update_order_intent(
+            int(intent_id),
+            {
+                **promotion,
+                "status": "CREATED" if promotion["promotion_status"] == "READY_FOR_LIMITED" else "BLOCKED",
+            },
+        )
+    if promotion["promotion_status"] != "READY_FOR_LIMITED":
+        _insert_blocked_log(session, promotion["promotion_blockers"][0] if promotion["promotion_blockers"] else "SMART_PROMOTION_BLOCKED", "Smart Engine limited order blocked.", candle["candle_time_utc"], signal, order, risk_preview)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_PROMOTION_BLOCKED", "last_order_status": "BLOCKED"})
+        return True
+    insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview))
+    try:
+        response = await broker.place_order(order)
+        order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
+        update_live_order_log(
+            request_id,
+            {
+                "status": "SUBMITTED",
+                "risk_result": "ALLOWED",
+                "order_uuid": order_uuid,
+                "exchange_request_payload_masked": masked_exchange_request(order),
+                "exchange_response_payload": response,
+            },
+        )
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "SUBMITTED", "status": "SUBMITTED", "submitted_at": _utc_now()})
+        update_live_strategy_session(
+            int(session["id"]),
+            {
+                "status": "RUNNING",
+                "orders_created_today": int(session.get("orders_created_today") or 0) + 1,
+                "current_open_order_uuid": order_uuid,
+                "last_order_time_utc": _utc_now(),
+                "last_order_status": "SUBMITTED",
+                "last_risk_result": "ALLOWED",
+            },
+        )
+        return True
+    except Exception as exc:
+        update_live_order_log(request_id, {"status": "FAILED", "risk_result": "SMART_SUBMIT_FAILED", "error_message": str(exc)})
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_SUBMIT_FAILED"]})
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_SUBMIT_FAILED", "last_order_status": "FAILED"})
+        return True
+
+
+async def _submit_smart_limited_sell_order(
+    session: dict,
+    candle: dict,
+    signal: dict,
+    live_config: LiveTradingConfig,
+    smart_snapshot: dict,
+    intent: dict,
+) -> bool:
+    intent_id = intent.get("id")
+    position = load_open_live_position(int(session["id"]), str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC"))
+    if not position:
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_SELL_POSITION_MISSING"], "status": "BLOCKED"})
+        _insert_blocked_log(session, "SMART_SELL_POSITION_MISSING", "Smart Engine limited sell blocked: no open bot position.", candle.get("candle_time_utc"), signal)
+        return True
+    broker = get_live_broker("bithumb")
+    try:
+        balances = await broker.get_balances()
+        chance = await broker.get_order_chance("KRW-BTC")
+    except Exception as exc:
+        _insert_blocked_log(session, "SMART_ORDER_CHANCE_FAILED", str(exc), candle["candle_time_utc"], signal)
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
+        return True
+    if not chance:
+        _insert_blocked_log(session, "SMART_ORDER_CHANCE_FAILED", "Order chance failed.", candle["candle_time_utc"], signal)
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
+        return True
+    current_price = float(candle["trade_price"])
+    current_qty = max(_float(position.get("entry_volume")), 0.0)
+    requested_qty = abs(_float(intent.get("target_qty"))) or (abs(_float(intent.get("delta_value_krw"))) / current_price if current_price > 0 else 0.0)
+    volume = max(min(requested_qty, current_qty), 0.0)
+    price = _round_krw_price(current_price)
+    amount = volume * price
+    request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
+    order = {
+        "request_id": request_id,
+        "client_order_id": request_id[:36],
+        "exchange": "bithumb",
+        "market": "KRW-BTC",
+        "side": "SELL",
+        "ord_type": "limit",
+        "order_type": "LIMIT",
+        "price": price,
+        "amount_krw": amount,
+        "volume": volume,
+        "order_purpose": "EXIT",
+    }
+    risk_preview = evaluate_live_order_risk(order=order, config=live_config, mode="LIVE_MANUAL_ONLY", balances=balances, request_exists=False, recent_duplicate=False, market_snapshot={"price": current_price})
+    risk_preview = check_order_risk(
+        order=order,
+        purpose="EXIT",
+        base_result=risk_preview,
+        mode="AUTO_STRATEGY_RUNNING",
+        session_id=int(session["id"]),
+        position_id=int(position["id"]),
+        candidate_strategy_id=int(session["candidate_strategy_id"]),
+        candle_time_utc=candle["candle_time_utc"],
+        signal=(signal or {}).get("signal"),
+        market_snapshot={"price": current_price, "complete": True},
+        balances=balances,
+        is_auto=True,
+    )
+    try:
+        recommendation = build_shadow_report(str(session.get("market") or "KRW-BTC"), limit=100).get("summary", {}).get("recommendation")
+    except Exception:
+        recommendation = None
+    promotion = evaluate_promotion(
+        intent={**intent, "delta_value_krw": amount, "target_qty": volume},
+        snapshot=smart_snapshot,
+        policy={"auto_trading_enabled": True, "max_total_exposure_krw": _float(smart_snapshot.get("max_total_exposure_krw"))},
+        risk_preview=risk_preview,
+        shadow_recommendation=recommendation,
+        available_krw=None,
+        daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
+        risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
+    )
+    if intent_id:
+        update_order_intent(int(intent_id), {**promotion, "status": "CREATED" if promotion["promotion_status"] == "READY_FOR_LIMITED" else "BLOCKED"})
+    if promotion["promotion_status"] != "READY_FOR_LIMITED":
+        _insert_blocked_log(session, promotion["promotion_blockers"][0] if promotion["promotion_blockers"] else "SMART_PROMOTION_BLOCKED", "Smart Engine limited sell blocked.", candle["candle_time_utc"], signal, order, risk_preview)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_PROMOTION_BLOCKED", "last_order_status": "BLOCKED"})
+        return True
+    insert_live_order_log({**_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview), "position_id": position.get("id"), "order_purpose": "EXIT", "is_auto_exit": True})
+    try:
+        response = await broker.place_order(order)
+        order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
+        update_live_order_log(request_id, {"status": "SUBMITTED", "risk_result": "ALLOWED", "order_uuid": order_uuid, "exchange_request_payload_masked": masked_exchange_request(order), "exchange_response_payload": response})
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "SUBMITTED", "status": "SUBMITTED", "submitted_at": _utc_now()})
+        update_live_position(int(position["id"]), {"status": "CLOSING", "exit_order_uuid": order_uuid})
+        update_live_strategy_session(int(session["id"]), {"last_order_status": "SUBMITTED", "last_risk_result": "SMART_SELL_SUBMITTED", "last_order_time_utc": _utc_now()})
+        return True
+    except Exception as exc:
+        update_live_order_log(request_id, {"status": "FAILED", "risk_result": "SMART_SUBMIT_FAILED", "error_message": str(exc)})
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_SUBMIT_FAILED"]})
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_SUBMIT_FAILED", "last_order_status": "FAILED"})
+        return True
 
 
 async def _submit_entry_order(session: dict, candidate: dict, candle: dict, signal: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> None:
@@ -837,8 +1114,8 @@ def _insert_blocked_log(session: dict, risk_result: str, message: str | None, ca
         "request_id": f"strategy-blocked-{uuid.uuid4().hex[:18]}",
         "exchange": session.get("exchange", "bithumb"),
         "market": session.get("market", "KRW-BTC"),
-        "side": "BUY",
-        "order_type": "LIMIT",
+        "side": order.get("side", "BUY"),
+        "order_type": order.get("order_type", "LIMIT"),
         "price": 0.0,
         "volume": 0.0,
         "amount_krw": session.get("max_order_krw", 0.0),
@@ -868,6 +1145,7 @@ def _log_payload(session: dict, status: str, risk_result: str, candle_time_utc: 
         "strategy_name": session.get("strategy_name"),
         "signal_reason": (signal or {}).get("reason"),
         "candle_time_utc": candle_time_utc,
+        "order_purpose": order.get("order_purpose", "ENTRY"),
     }
 
 

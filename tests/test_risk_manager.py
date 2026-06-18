@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database
-from app.risk_manager import check_order_risk, compute_risk_state
+from app.risk_manager import check_order_risk, compute_risk_state, get_risk_dashboard
 
 
 def order() -> dict:
@@ -31,6 +31,10 @@ class RiskManagerTests(unittest.TestCase):
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()
         database.init_db()
+        database.update_bot_operation_policy(
+            "KRW-BTC",
+            {"auto_trading_enabled": True, "max_total_exposure_krw": 300_000, "daily_loss_limit_pct": 20},
+        )
 
     def tearDown(self) -> None:
         self.db_patch.stop()
@@ -171,7 +175,7 @@ class RiskManagerTests(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=False):
             result = check_order_risk(
-                order=order(),
+                order={**order(), "amount_krw": 500, "volume": 0.000005},
                 purpose="ENTRY",
                 base_result={"allowed": True},
                 balances=balances,
@@ -396,6 +400,120 @@ class RiskManagerTests(unittest.TestCase):
 
         self.assertTrue(result["allowed"])
         self.assertEqual(result["checks"]["market_condition_check"]["allowed"], True)
+
+    def test_policy_auto_trading_off_blocks_auto_entry_only(self) -> None:
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": False})
+        with patch.dict(os.environ, {"RISK_MIN_COOLDOWN_SECONDS": "0"}, clear=False):
+            entry = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+            manual = check_order_risk(order={**order(), "request_id": "manual-policy-preview"}, purpose="ENTRY", base_result={"allowed": True}, is_auto=False)
+            exit_result = check_order_risk(order={**order(), "request_id": "exit-policy", "side": "SELL"}, purpose="EXIT", base_result={"allowed": True}, is_auto=True)
+
+        self.assertFalse(entry["allowed"])
+        self.assertEqual(entry["block_code"], "BLOCKED_POLICY_AUTO_TRADING_DISABLED")
+        self.assertTrue(manual["checks"]["operation_policy_check"]["allowed"])
+        self.assertTrue(exit_result["checks"]["operation_policy_check"]["allowed"])
+
+    def test_policy_max_total_exposure_blocks_entry(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "OPEN",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 100_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": 0,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-16T00:00:00Z",
+            }
+        )
+        database.update_bot_operation_policy("KRW-BTC", {"max_total_exposure_krw": 100_000})
+        with patch.dict(os.environ, {"RISK_MIN_COOLDOWN_SECONDS": "0", "RISK_BLOCK_ON_OPEN_POSITION": "false"}, clear=False):
+            result = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True, market_snapshot={"price": 100_000_000})
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["block_code"], "BLOCKED_POLICY_MAX_TOTAL_EXPOSURE")
+        self.assertEqual(result["operation_policy"]["current_bot_position_value_krw"], 100_000)
+        self.assertEqual(result["checks"]["operation_policy_check"]["detail"]["max_total_exposure_krw"], 100_000)
+
+        dashboard = get_risk_dashboard("bithumb", "KRW-BTC")
+        latest = dashboard["latest_policy_block"]
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["policy_block_detail"]["code"], "BLOCKED_POLICY_MAX_TOTAL_EXPOSURE")
+        self.assertEqual(latest["policy_block_detail"]["current_bot_position_value_krw"], 100_000)
+        self.assertGreaterEqual(latest["policy_block_detail"]["exceeded_by_krw"], 10_000)
+
+    def test_policy_daily_loss_blocks_entry_but_not_exit(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "STOPPED",
+                "auto_enabled": False,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSED",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 99_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": -6_000,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-16T00:00:00Z",
+                "closed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        database.update_bot_operation_policy("KRW-BTC", {"max_total_exposure_krw": 100_000, "daily_loss_limit_pct": 5})
+        with patch.dict(os.environ, {"RISK_MIN_COOLDOWN_SECONDS": "0", "RISK_MAX_DAILY_LOSS_KRW": "999999", "RISK_MAX_DAILY_LOSS_PERCENT": "99"}, clear=False):
+            entry = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+            exit_result = check_order_risk(order={**order(), "request_id": "policy-loss-exit", "side": "SELL"}, purpose="EXIT", base_result={"allowed": True}, is_auto=True)
+
+        self.assertFalse(entry["allowed"])
+        self.assertEqual(entry["block_code"], "BLOCKED_POLICY_DAILY_LOSS_LIMIT")
+        self.assertTrue(exit_result["checks"]["operation_policy_check"]["allowed"])
+
+    def test_policy_krw_balance_blocks_entry(self) -> None:
+        balances = {"by_currency": {"KRW": {"balance": 5_000, "locked": 0}}}
+        with patch.dict(os.environ, {"RISK_MIN_COOLDOWN_SECONDS": "0"}, clear=False):
+            result = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, balances=balances, is_auto=True)
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["block_code"], "BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT")
 
 
 if __name__ == "__main__":

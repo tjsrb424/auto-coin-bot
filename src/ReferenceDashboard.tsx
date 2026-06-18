@@ -213,6 +213,38 @@ type RecoveryEvent = {
   };
 };
 
+type PolicyBlockDetail = {
+  code?: string;
+  summary?: string;
+  reason?: string;
+  auto_trading_enabled?: boolean;
+  requested_order_krw?: number;
+  max_total_exposure_krw?: number;
+  current_bot_position_value_krw?: number;
+  projected_bot_position_value_krw?: number;
+  remaining_exposure_krw?: number;
+  available_krw_balance?: number | null;
+  daily_loss_krw?: number;
+  daily_loss_limit_pct?: number;
+  daily_loss_limit_krw?: number;
+  daily_loss_usage_pct?: number;
+  exceeded_by_krw?: number;
+  krw_shortfall_krw?: number;
+  next_action?: string;
+};
+
+type RiskLog = {
+  id?: number;
+  risk_level?: string;
+  allowed?: boolean;
+  block_code?: string | null;
+  block_reason?: string | null;
+  read_status?: string | null;
+  created_at?: string;
+  policy_block_detail?: PolicyBlockDetail | null;
+  policy_block_summary?: string | null;
+};
+
 type RiskDashboard = {
   risk_state?: {
     status?: string;
@@ -230,15 +262,9 @@ type RiskDashboard = {
     max_daily_loss_krw?: number;
     account_equity_krw?: number;
   };
-  risk_logs?: Array<{
-    id?: number;
-    risk_level?: string;
-    allowed?: boolean;
-    block_code?: string | null;
-    block_reason?: string | null;
-    read_status?: string | null;
-    created_at?: string;
-  }>;
+  risk_logs?: RiskLog[];
+  latest_policy_block?: RiskLog | null;
+  policy_block_logs?: RiskLog[];
 };
 
 type AutoPilotStatus = {
@@ -302,6 +328,151 @@ type RuntimeStatus = {
   runtime_owner?: string | null;
 };
 
+type OrderIntent = {
+  id?: number;
+  side?: string;
+  action_hint?: string;
+  current_value_krw?: number;
+  target_value_krw?: number;
+  delta_value_krw?: number;
+  target_qty?: number | null;
+  order_type?: string;
+  limit_price?: number | null;
+  urgency?: string;
+  status?: string;
+  blockers?: string[];
+  risk_preview?: Record<string, unknown>;
+  policy_preview?: Record<string, unknown>;
+  pilot_order_cap_krw?: number;
+  promotion_blockers?: string[];
+  promotion_status?: string;
+  created_at?: string;
+};
+
+type AnalysisDecision = {
+  id?: number;
+  one_line_summary?: string;
+  action_hint?: string;
+  market_regime?: string;
+  legacy_signal?: string;
+  current_bot_position_qty?: number;
+  current_bot_position_value_krw?: number;
+  current_exposure_pct?: number;
+  target_exposure_pct?: number;
+  confidence_score?: number;
+  risk_score?: number;
+  positive_reasons?: string[];
+  negative_reasons?: string[];
+  blockers?: string[];
+  raw_features?: Record<string, unknown>;
+  external_factors?: Record<string, unknown>;
+  internal_signals?: Record<string, unknown>;
+  order_intents?: OrderIntent[];
+  created_at?: string;
+  decided_at?: string;
+};
+
+type ShadowReportRow = {
+  decision_id?: number;
+  decided_at?: string;
+  market_regime?: string;
+  action_hint?: string;
+  direction?: string;
+  outcome?: string;
+  markout_pct?: number | null;
+  promotion_status?: string;
+  promotion_blockers?: string[];
+  pilot_order_cap_krw?: number;
+  confidence_score?: number;
+  risk_score?: number;
+  blockers?: string[];
+  hard_blockers?: string[];
+};
+
+type ShadowReport = {
+  summary?: {
+    decision_count?: number;
+    intent_count?: number;
+    actionable_count?: number;
+    evaluated_count?: number;
+    favorable_count?: number;
+    directional_win_rate?: number;
+    average_confidence_score?: number;
+    average_risk_score?: number;
+    average_markout_pct?: number | null;
+    hard_block_count?: number;
+    hard_block_rate?: number;
+    policy_block_count?: number;
+    policy_block_rate?: number;
+    readiness_score?: number;
+    recommendation?: string;
+  };
+  action_counts?: Record<string, number>;
+  direction_counts?: Record<string, number>;
+  market_regime_counts?: Record<string, number>;
+  blocker_counts?: Record<string, number>;
+  recent_rows?: ShadowReportRow[];
+};
+
+type BotPolicy = {
+  id?: number;
+  market?: string;
+  auto_trading_enabled?: boolean;
+  max_total_exposure_krw?: number;
+  daily_loss_limit_pct?: number;
+  daily_loss_limit_krw?: number;
+  current_bot_position_value_krw?: number;
+  available_krw_balance?: number | null;
+  exposure_usage_pct?: number;
+  balance_fetch_status?: string;
+  balance_error?: string | null;
+  updated_at?: string;
+};
+
+type SmartReadinessCheck = {
+  id?: string;
+  label?: string;
+  status?: "pass" | "block" | "warn" | string;
+  required?: boolean;
+  detail?: string;
+};
+
+type SmartLimitedReadiness = {
+  status?: string;
+  can_enable_limited?: boolean;
+  live_mode?: string;
+  checked_at?: string;
+  recommended_next_action?: string;
+  next_required_operator_action?: string;
+  can_run_rehearsal?: boolean;
+  rehearsal_blockers?: string[];
+  checks?: SmartReadinessCheck[];
+  external_provider_health?: Record<string, { stale?: boolean; severity?: string | null; source?: string | null; reason?: string | null }>;
+  latest_rehearsal_order?: {
+    request_id?: string;
+    status?: string;
+    risk_result?: string;
+    side?: string;
+    amount_krw?: number;
+    created_at?: string;
+  } | null;
+  rehearsal?: {
+    allowed?: boolean;
+    blockers?: string[];
+    daily_smart_order_count?: number;
+    risk_score?: number;
+    rules?: Record<string, number>;
+  };
+  latest_intent_summary?: {
+    side?: string;
+    status?: string;
+    promotion_status?: string;
+    delta_value_krw?: number;
+    pilot_order_cap_krw?: number;
+    promotion_blockers?: string[];
+  } | null;
+};
+
 type HealthStatus = {
   server_status?: string;
   database_status?: string;
@@ -330,18 +501,30 @@ type DashboardData = {
   autoPilot: AutoPilotStatus | null;
   liveStrategy: LiveStrategyStatus | null;
   runtimeStatus: RuntimeStatus | null;
+  analysisLatest: AnalysisDecision | null;
+  analysisHistory: AnalysisDecision[];
+  shadowReport: ShadowReport | null;
+  smartEngineStatus: {
+    live_mode?: string;
+    promotion_status?: string;
+    promotion_blockers?: string[];
+    readiness?: ShadowReport["summary"];
+    limited_readiness?: SmartLimitedReadiness;
+  } | null;
+  botPolicy: BotPolicy | null;
   health: HealthStatus | null;
   recoveryEvents: RecoveryEvent[];
   errors: string[];
   updatedAt: string | null;
 };
 
-type ReferenceView = "dashboard" | "auto-trade" | "strategies" | "portfolio" | "trades";
+type ReferenceView = "dashboard" | "auto-trade" | "analysis" | "operations" | "portfolio" | "trades" | "alerts";
 
 const navItems = [
   { id: "dashboard", label: "대시보드", icon: Home },
   { id: "auto-trade", label: "자동매매", icon: Bot },
-  { id: "strategies", label: "전략관리", icon: ClipboardList },
+  { id: "analysis", label: "분석근거", icon: ShieldCheck },
+  { id: "operations", label: "운용설정", icon: SlidersHorizontal },
   { id: "portfolio", label: "포트폴리오", icon: PieChart },
   { id: "trades", label: "거래내역", icon: History },
   { id: "backtest", label: "백테스트", icon: BarChart3 },
@@ -428,6 +611,11 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     autoPilot: null,
     liveStrategy: null,
     runtimeStatus: null,
+    analysisLatest: null,
+    analysisHistory: [],
+    shadowReport: null,
+    smartEngineStatus: null,
+    botPolicy: null,
     health: null,
     recoveryEvents: [],
     errors: [],
@@ -445,7 +633,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         }
       };
 
-      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, health] = await Promise.all([
+      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, botPolicyResult, health] = await Promise.all([
         settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
         settle("실거래 상태", fetchJson<LiveStatus>(`/api/live/status?exchange=${selectedExchange}`)),
         settle("주문", fetchJson<{ orders?: LiveOrder[]; recovery_events?: RecoveryEvent[] }>("/api/live-orders")),
@@ -455,6 +643,11 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         settle("자동매매", fetchJson<AutoPilotStatus>("/api/auto-live-pilot/status")),
         settle("전략 파일럿", fetchJson<LiveStrategyStatus>("/api/live-strategy-pilot/status")),
         settle("Runtime", fetchJson<RuntimeStatus>("/api/runtime/status")),
+        settle("분석근거", fetchJson<{ decision?: AnalysisDecision | null }>(`/api/analysis/latest?market=${MARKET}`)),
+        settle("분석 히스토리", fetchJson<{ decisions?: AnalysisDecision[] }>(`/api/analysis/history?market=${MARKET}&limit=50`)),
+        settle("Shadow 리포트", fetchJson<{ report?: ShadowReport }>(`/api/analysis/shadow-report?market=${MARKET}&limit=100&horizon_candles=3`)),
+        settle("Smart Engine", fetchJson<DashboardData["smartEngineStatus"]>(`/api/smart-engine/status?market=${MARKET}`)),
+        settle("운용정책", fetchJson<{ policy?: BotPolicy }>(`/api/bot/policy?market=${MARKET}&exchange=${selectedExchange}`)),
         settle("Health", fetchJson<HealthStatus>("/health"))
       ]);
 
@@ -477,6 +670,11 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         autoPilot,
         liveStrategy,
         runtimeStatus,
+        analysisLatest: analysisLatestResult?.decision ?? null,
+        analysisHistory: analysisHistoryResult?.decisions ?? [],
+        shadowReport: shadowReportResult?.report ?? null,
+        smartEngineStatus: smartEngineStatusResult,
+        botPolicy: botPolicyResult?.policy ?? null,
         health,
         recoveryEvents: ordersResult?.recovery_events ?? [],
         errors,
@@ -557,6 +755,23 @@ function formatAssetSub(value?: number | null) {
   if (value >= 1_000_000) return `≈ ${(value / 1_000_000).toFixed(2)}백만원`;
   if (value >= 10_000) return `≈ ${(value / 10_000).toFixed(1)}만원`;
   return `≈ ${formatKrw(value)}원`;
+}
+
+function formatAnalysisValue(value: unknown) {
+  if (value == null) return "-";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return "-";
+    return Math.abs(value) >= 1000 ? formatKrw(value) : formatNumber(value, 4);
+  }
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function compactEntries(data?: Record<string, unknown> | null, limit = 12) {
+  return Object.entries(data ?? {})
+    .filter(([, value]) => value !== undefined)
+    .slice(0, limit);
 }
 
 function balanceAmount(entry?: BalanceEntry | null) {
@@ -671,6 +886,19 @@ function strategyLabel(value?: string | null) {
   return labels[value] ?? value;
 }
 
+const policyBlockReasonLabels: Record<string, string> = {
+  BLOCKED_POLICY_AUTO_TRADING_DISABLED: "운용정책 OFF로 신규매수 차단",
+  BLOCKED_POLICY_MAX_EXPOSURE_INVALID: "최대 투입 금액 설정 오류",
+  BLOCKED_POLICY_MAX_TOTAL_EXPOSURE: "최대 투입 금액 한도 초과",
+  BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT: "거래소 KRW 잔고 부족",
+  BLOCKED_POLICY_DAILY_LOSS_LIMIT: "일 손실 한도 도달",
+  SMART_POLICY_AUTO_TRADING_DISABLED: "운용정책 OFF",
+  SMART_MAX_TOTAL_EXPOSURE_REACHED: "최대 투입 금액 도달",
+  SMART_DAILY_LOSS_LIMIT_REACHED: "일 손실 한도 도달",
+  SMART_ORDER_DELTA_CAPPED_BY_MAX_TOTAL_EXPOSURE: "최대 투입 금액 기준 주문 후보 축소",
+  POLICY_BLOCKED: "정책차단"
+};
+
 function statusLabel(value?: string | null) {
   if (!value) return "-";
   const normalized = String(value).toUpperCase();
@@ -708,6 +936,7 @@ function statusLabel(value?: string | null) {
     MARKET: "시장가"
   };
   const reasonLabels: Record<string, string> = {
+    ...policyBlockReasonLabels,
     BLOCKED_OPEN_POSITION_EXISTS: "포지션 있음",
     BLOCKED_DUPLICATE_SIGNAL: "중복 신호",
     BLOCKED_DUPLICATE_CANDLE: "중복 캔들",
@@ -724,6 +953,117 @@ function statusLabel(value?: string | null) {
     .replace(/^ORDER_/, "주문 ")
     .replace(/_/g, " ")
     .toLowerCase();
+}
+
+type PolicyBlockNotice = {
+  code: string;
+  text: string;
+  createdAt?: string;
+  source: "risk" | "analysis";
+  detail?: PolicyBlockDetail | null;
+};
+
+function normalizeBlockCode(value?: string | null) {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function isPolicyBlockCode(value?: string | null) {
+  const normalized = normalizeBlockCode(value);
+  return normalized.startsWith("BLOCKED_POLICY_")
+    || normalized.startsWith("SMART_POLICY_")
+    || normalized === "SMART_MAX_TOTAL_EXPOSURE_REACHED"
+    || normalized === "SMART_DAILY_LOSS_LIMIT_REACHED"
+    || normalized === "SMART_ORDER_DELTA_CAPPED_BY_MAX_TOTAL_EXPOSURE"
+    || normalized === "POLICY_BLOCKED";
+}
+
+function extractPolicyBlockCode(value?: string | null) {
+  const normalized = normalizeBlockCode(value);
+  if (isPolicyBlockCode(normalized)) return normalized;
+  const match = normalized.match(/(BLOCKED_POLICY_[A-Z0-9_]+|SMART_POLICY_[A-Z0-9_]+|SMART_[A-Z0-9_]+)/);
+  return match && isPolicyBlockCode(match[1]) ? match[1] : null;
+}
+
+function policyBlockText(code?: string | null, fallback?: string | null) {
+  const normalized = extractPolicyBlockCode(code) ?? extractPolicyBlockCode(fallback);
+  if (normalized) return policyBlockReasonLabels[normalized] ?? statusLabel(normalized);
+  return fallback ?? statusLabel(code);
+}
+
+function shadowRecommendationLabel(value?: string | null) {
+  const labels: Record<string, string> = {
+    MORE_SHADOW_DATA_REQUIRED: "데이터 수집 필요",
+    FIX_BLOCKERS_BEFORE_PROMOTION: "차단요인 정리 필요",
+    READY_FOR_LIMITED_PILOT_REVIEW: "제한 실주문 검토 가능",
+    CONTINUE_SHADOW_MODE: "Shadow 유지"
+  };
+  return labels[String(value ?? "").toUpperCase()] ?? value ?? "-";
+}
+
+function shadowOutcomeLabel(value?: string | null) {
+  const labels: Record<string, string> = {
+    FAVORABLE: "유리",
+    UNFAVORABLE: "불리",
+    FLAT: "보합",
+    PENDING: "대기",
+    NOT_ACTIONABLE: "관망"
+  };
+  return labels[String(value ?? "").toUpperCase()] ?? value ?? "-";
+}
+
+function promotionStatusLabel(value?: string | null) {
+  const labels: Record<string, string> = {
+    SHADOW_ONLY: "Shadow 전용",
+    READY_FOR_LIMITED: "제한 실주문 준비",
+    BLOCKED: "승격 차단",
+    SUBMITTED: "주문 제출"
+  };
+  return labels[String(value ?? "").toUpperCase()] ?? value ?? "-";
+}
+
+function smartReadinessLabel(value?: string | null) {
+  const labels: Record<string, string> = {
+    READY_TO_ENABLE_LIMITED: "limited 전환 가능",
+    BLOCKED: "전환 차단"
+  };
+  return labels[String(value ?? "").toUpperCase()] ?? value ?? "-";
+}
+
+function smartReadinessTone(value?: string | null) {
+  const normalized = String(value ?? "").toLowerCase();
+  if (normalized === "pass") return "is-pass";
+  if (normalized === "warn") return "is-warn";
+  return "is-block";
+}
+
+function latestPolicyBlockNotice(data: DashboardData): PolicyBlockNotice | null {
+  const riskNotices = (data.risk?.risk_logs ?? [])
+    .filter((log) => !log.allowed && (extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)))
+    .map((log) => {
+      const code = extractPolicyBlockCode(log.block_code) ?? extractPolicyBlockCode(log.block_reason) ?? "POLICY_BLOCKED";
+      return {
+        code,
+        text: policyBlockText(code, log.block_reason),
+        createdAt: log.created_at,
+        source: "risk" as const,
+        detail: log.policy_block_detail
+      };
+    });
+  const latest = data.analysisLatest;
+  const analysisNotices = (latest?.blockers ?? [])
+    .filter((blocker) => extractPolicyBlockCode(blocker))
+    .map((blocker) => {
+      const code = extractPolicyBlockCode(blocker) ?? "POLICY_BLOCKED";
+      return {
+        code,
+        text: policyBlockText(code, blocker),
+        createdAt: latest?.decided_at ?? latest?.created_at,
+        source: "analysis" as const,
+        detail: undefined
+      };
+    });
+  return [...riskNotices, ...analysisNotices]
+    .sort((a, b) => (parseDate(b.createdAt)?.getTime() ?? 0) - (parseDate(a.createdAt)?.getTime() ?? 0))[0] ?? null;
 }
 
 function statusTone(value?: string | null): "green" | "amber" | "red" | "cyan" | "neutral" {
@@ -969,7 +1309,7 @@ function Sidebar({ activeView, onViewChange }: { activeView: ReferenceView; onVi
       <nav className="ref-nav">
         {navItems.map((item) => {
           const Icon = item.icon;
-          const isImplemented = item.id === "dashboard" || item.id === "auto-trade" || item.id === "strategies" || item.id === "portfolio" || item.id === "trades";
+          const isImplemented = item.id === "dashboard" || item.id === "auto-trade" || item.id === "analysis" || item.id === "operations" || item.id === "portfolio" || item.id === "trades" || item.id === "alerts";
           const isActive = activeView === item.id;
           return (
             <button
@@ -2328,9 +2668,11 @@ function LogPanel({ data }: { data: DashboardData }) {
   const riskLogs = (data.risk?.risk_logs ?? []).slice(0, 7).map((log) => ({
     key: `risk-${log.id ?? log.created_at ?? ""}-${log.block_code ?? log.risk_level ?? ""}`,
     createdAt: log.created_at,
-    type: log.allowed ? "ok" : "danger",
+    type: log.allowed ? "ok" : extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason) ? "warn" : "danger",
     time: formatKstTime(log.created_at),
-    text: log.block_reason ?? log.block_code ?? log.risk_level ?? "리스크 로그"
+    text: extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)
+      ? `정책 차단 · ${policyBlockText(log.block_code, log.block_reason)}`
+      : log.block_reason ?? log.block_code ?? log.risk_level ?? "리스크 로그"
   }));
   const orderLogs = data.liveOrders.slice(0, 7).map((order) => ({
     key: `order-${order.request_id ?? order.id ?? order.created_at ?? ""}`,
@@ -2359,15 +2701,107 @@ function LogPanel({ data }: { data: DashboardData }) {
       <div className="ref-log-list">
         {rows.length === 0 && <p><span>-</span><i className="info" />로그 데이터 없음</p>}
         {rows.map((row, index) => (
-          <p key={row.key} style={{ ["--log-index" as string]: index }}><span>{row.time}</span><i className={row.type} /><b>{row.text}</b></p>
+          <p key={row.key} style={{ ["--log-index" as string]: index }}><span>{row.time}</span><i className={row.type} /><b title={row.text}>{row.text}</b></p>
         ))}
       </div>
     </RefPanel>
   );
 }
 
+function AlertsView({ data }: { data: DashboardData }) {
+  const logs = data.risk?.risk_logs ?? [];
+  const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const selected = logs.find((log) => log.id === selectedId)
+    ?? data.risk?.latest_policy_block
+    ?? logs.find((log) => !log.allowed)
+    ?? logs[0]
+    ?? null;
+
+  React.useEffect(() => {
+    if (selectedId != null && logs.some((log) => log.id === selectedId)) return;
+    setSelectedId(data.risk?.latest_policy_block?.id ?? logs.find((log) => !log.allowed)?.id ?? logs[0]?.id ?? null);
+  }, [data.risk?.latest_policy_block?.id, logs, selectedId]);
+
+  return (
+    <>
+      <RefPanel className="ref-alerts-list-panel">
+        <div className="ref-title-row">
+          <h3>알림로그</h3>
+          <span>{logs.length}건</span>
+        </div>
+        <table className="ref-alerts-table">
+          <thead><tr><th>시간</th><th>심각도</th><th>유형</th><th>메시지</th><th>상태</th></tr></thead>
+          <tbody>
+            {logs.length === 0 && <tr><td colSpan={5}>최근 리스크 로그 없음</td></tr>}
+            {logs.slice(0, 24).map((log) => {
+              const code = extractPolicyBlockCode(log.block_code) ?? log.block_code ?? log.risk_level ?? "RISK_CHECK";
+              const isPolicy = Boolean(log.policy_block_detail || extractPolicyBlockCode(log.block_code));
+              const message = isPolicy ? policyBlockText(code, log.block_reason) : log.block_reason ?? "정상";
+              return (
+                <tr key={log.id ?? log.created_at} className={`${selected?.id === log.id ? "is-selected" : ""} ${!log.allowed ? "is-alert" : ""}`} onClick={() => setSelectedId(log.id ?? null)}>
+                  <td>{formatKstShort(log.created_at)}</td>
+                  <td><RefStatusBadge value={statusLabel(log.risk_level ?? (log.allowed ? "OK" : "BLOCKED"))} tone={log.allowed ? "green" : isPolicy ? "amber" : "red"} /></td>
+                  <td>{isPolicy ? "정책 차단" : statusLabel(code)}</td>
+                  <td title={message}>{message}</td>
+                  <td>{log.read_status === "READ" || log.allowed ? "읽음" : log.read_status === "IGNORED" ? "무시됨" : "미해결"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </RefPanel>
+      <RefPanel className="ref-alerts-detail-panel">
+        <div className="ref-title-row">
+          <h3>상세 근거</h3>
+          <span>{selected?.policy_block_detail ? "Policy" : "Risk"}</span>
+        </div>
+        {selected ? (
+          <div className="ref-alert-detail-body">
+            <strong>{selected.policy_block_detail?.summary ?? selected.block_reason ?? selected.block_code ?? "리스크 로그"}</strong>
+            <p><span>발생 시간</span><b>{formatKstShort(selected.created_at)}</b></p>
+            <p><span>차단 코드</span><b>{selected.block_code ?? "-"}</b></p>
+            <p><span>상태</span><b>{selected.allowed ? "허용" : "차단"}</b></p>
+            <PolicyBlockDetailGrid detail={selected.policy_block_detail} />
+            {!selected.policy_block_detail && <em>정책 차단이 아닌 일반 리스크 로그입니다.</em>}
+          </div>
+        ) : (
+          <div className="ref-alert-detail-body empty">선택할 알림이 없습니다.</div>
+        )}
+      </RefPanel>
+    </>
+  );
+}
+
 function RefStatusBadge({ value, tone = "green" }: { value: string; tone?: "green" | "amber" | "red" | "cyan" | "neutral" }) {
   return <span className={`ref-status-badge ${tone}`}>{value}</span>;
+}
+
+function PolicyBlockDetailGrid({ detail, compact = false }: { detail?: PolicyBlockDetail | null; compact?: boolean }) {
+  if (!detail) return null;
+  const rows = [
+    ["요청금액", formatKrw(detail.requested_order_krw)],
+    ["최대투입", formatKrw(detail.max_total_exposure_krw)],
+    ["현재포지션", formatKrw(detail.current_bot_position_value_krw)],
+    ["예상포지션", formatKrw(detail.projected_bot_position_value_krw)],
+    ["남은한도", formatKrw(detail.remaining_exposure_krw)],
+    ["초과금액", formatKrw(detail.exceeded_by_krw)],
+    ["KRW잔고", detail.available_krw_balance == null ? "-" : formatKrw(detail.available_krw_balance)],
+    ["잔고부족", formatKrw(detail.krw_shortfall_krw)],
+    ["일손실", formatKrw(detail.daily_loss_krw)],
+    ["손실한도", formatKrw(detail.daily_loss_limit_krw)],
+    ["손실사용률", formatRatioPercent(detail.daily_loss_usage_pct, 1)]
+  ];
+  const visibleRows = compact
+    ? rows.filter(([, value]) => value !== "-" && value !== "0").slice(0, 4)
+    : rows;
+  return (
+    <div className={`ref-policy-detail-grid ${compact ? "compact" : ""}`}>
+      {visibleRows.map(([label, value]) => (
+        <p key={label}><span>{label}</span><b>{value}</b></p>
+      ))}
+      {!compact && detail.next_action && <em>{detail.next_action}</em>}
+    </div>
+  );
 }
 
 function AutoMiniChart({ candles }: { candles: Candle[] }) {
@@ -2651,10 +3085,20 @@ function AutoRiskPanel({
     || data.risk?.risk_state?.balance_mismatch_detected)
   );
   const exchangeBtc = latestMismatch?.payload?.exchange_btc_total;
+  const policyBlock = latestPolicyBlockNotice(data);
+  const policyUsage = data.botPolicy?.exposure_usage_pct;
   return (
     <RefPanel className="ref-auto-risk-panel">
       <div className="ref-title-row"><h3>리스크 관리</h3></div>
       <div className="ref-risk-ok"><ShieldCheck size={26} /><b>{risk?.status === "OK" ? "리스크 양호" : statusLabel(risk?.status ?? "WAITING")}</b></div>
+      {policyBlock && (
+        <div className="ref-policy-block-card">
+          <span>최근 정책 차단</span>
+          <b>{policyBlock.text}</b>
+          <em>{formatKstShort(policyBlock.createdAt)} · {policyBlock.source === "risk" ? "주문 리스크" : "분석근거"}</em>
+          <PolicyBlockDetailGrid detail={policyBlock.detail} compact />
+        </div>
+      )}
       {balanceMismatch && (
         <div className="ref-balance-recovery">
           <span>거래소 BTC 잔고 불일치 감지</span>
@@ -2669,6 +3113,7 @@ function AutoRiskPanel({
       <div className="ref-auto-bar"><i style={{ width: `${Math.min(dailyLoss / Math.max(maxDailyLossPercent, 1) * 100, 100)}%` }} /></div>
       <div className="ref-auto-risk-row"><span>일일 손익 한도</span><b>{formatKrw(maxOrder)}</b></div>
       <div className="ref-auto-bar"><i style={{ width: "38%" }} /></div>
+      <div className="ref-auto-risk-row"><span>운용정책 사용률</span><b>{formatRatioPercent(policyUsage)}</b></div>
       <div className="ref-auto-risk-foot">
         <span>연속 손실 <b>{risk?.consecutive_loss_count ?? 0}회</b></span>
         <span>최대 손실 한도 <b>-</b></span>
@@ -2771,15 +3216,17 @@ function AutoBottomPanels({ data }: { data: DashboardData }) {
       time: formatKstTime(order.created_at),
       strategy: order.strategy_name ?? "-",
       market: marketDisplay(order.market),
-      type: order.order_type ?? order.side ?? "-",
+      type: statusLabel(order.order_type ?? order.side ?? "-"),
       price: formatKrw(order.price),
       status: order.status ?? "-"
     })),
     ...data.risk?.risk_logs?.slice(0, 2).map((log) => ({
       time: formatKstTime(log.created_at),
-      strategy: "Risk",
+      strategy: extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason) ? "Policy" : "Risk",
       market: "-",
-      type: statusLabel(log.block_code ?? log.risk_level ?? "-"),
+      type: extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)
+        ? policyBlockText(log.block_code, log.block_reason)
+        : statusLabel(log.block_code ?? log.risk_level ?? "-"),
       price: "-",
       status: log.allowed ? "OK" : "BLOCKED"
     })) ?? []
@@ -2815,7 +3262,7 @@ function AutoBottomPanels({ data }: { data: DashboardData }) {
           <thead><tr><th>시간</th><th>전략</th><th>심볼</th><th>주문 유형</th><th>가격</th><th>상태</th></tr></thead>
           <tbody>
             {logs.length === 0 && <tr><td colSpan={6}>실행 로그 없음</td></tr>}
-            {logs.map((row, index) => <tr key={`${row.time}-${index}`}><td>{row.time}</td><td>{row.strategy}</td><td>{row.market}</td><td>{statusLabel(row.type)}</td><td>{row.price}</td><td><RefStatusBadge value={statusLabel(row.status)} tone={statusTone(row.status)} /></td></tr>)}
+            {logs.map((row, index) => <tr key={`${row.time}-${index}`}><td>{row.time}</td><td>{row.strategy}</td><td>{row.market}</td><td title={row.type}>{row.type}</td><td>{row.price}</td><td><RefStatusBadge value={statusLabel(row.status)} tone={statusTone(row.status)} /></td></tr>)}
           </tbody>
         </table>
         <button className="ref-auto-more">전체 실행 내역 보기 <ChevronRight size={15} /></button>
@@ -2850,6 +3297,138 @@ function AutoTradeView({
       <AutoChartPanel data={data} />
       <AutoRightStack data={data} />
       <AutoBottomPanels data={data} />
+    </>
+  );
+}
+
+function OperationsView({ data, refresh }: { data: DashboardData; refresh: () => Promise<void> }) {
+  const policy = data.botPolicy;
+  const readiness = data.smartEngineStatus?.limited_readiness;
+  const readinessChecks = readiness?.checks ?? [];
+  const latestRehearsal = readiness?.latest_rehearsal_order;
+  const [autoTradingEnabled, setAutoTradingEnabled] = React.useState(false);
+  const [maxExposure, setMaxExposure] = React.useState(500000);
+  const [dailyLossPct, setDailyLossPct] = React.useState(3);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const [message, setMessage] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!policy) return;
+    setAutoTradingEnabled(Boolean(policy.auto_trading_enabled));
+    setMaxExposure(Math.max(1, Math.round(policy.max_total_exposure_krw ?? 500000)));
+    setDailyLossPct(Number((policy.daily_loss_limit_pct ?? 3).toFixed(2)));
+  }, [policy?.auto_trading_enabled, policy?.daily_loss_limit_pct, policy?.max_total_exposure_krw]);
+
+  const save = async () => {
+    if (isSaving) return;
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      await patchJson<{ policy: BotPolicy }>("/api/bot/policy?market=KRW-BTC&exchange=bithumb", {
+        auto_trading_enabled: autoTradingEnabled,
+        max_total_exposure_krw: maxExposure,
+        daily_loss_limit_pct: dailyLossPct
+      });
+      await refresh();
+      setMessage("운용정책 저장 완료");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "운용정책 저장 실패");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const projectedLossLimit = maxExposure * dailyLossPct / 100;
+  const usage = policy?.exposure_usage_pct ?? 0;
+  const usageWidth = Math.min(Math.max(usage, 0), 100);
+
+  return (
+    <>
+      <RefPanel className="ref-ops-summary">
+        <span>Bot Operation Policy</span>
+        <h2>{autoTradingEnabled ? "자동매매 정책 ON" : "자동매매 정책 OFF"}</h2>
+        <p>{marketDisplay(policy?.market)} · 마지막 수정 {formatKstShort(policy?.updated_at)}</p>
+        {(message || error) && <strong className={error ? "is-error" : ""}>{error ?? message}</strong>}
+      </RefPanel>
+      <RefPanel className="ref-ops-form">
+        <h3>운용설정</h3>
+        <label className="ref-ops-toggle">
+          <span>자동매매</span>
+          <button type="button" className={autoTradingEnabled ? "is-on" : ""} onClick={() => setAutoTradingEnabled((value) => !value)}>
+            {autoTradingEnabled ? "ON" : "OFF"}
+          </button>
+        </label>
+        <label>
+          <span>최대 투입 금액</span>
+          <input type="number" min={1} step={10000} value={maxExposure} onChange={(event) => setMaxExposure(Math.max(1, Number(event.target.value) || 1))} />
+          <em>KRW</em>
+        </label>
+        <label>
+          <span>일 손실률 제한</span>
+          <input type="number" min={0.1} max={100} step={0.1} value={dailyLossPct} onChange={(event) => setDailyLossPct(Math.min(100, Math.max(0.1, Number(event.target.value) || 0.1)))} />
+          <em>%</em>
+        </label>
+        <button className="ref-ops-save" type="button" onClick={() => void save()} disabled={isSaving}>
+          <Save size={18} />{isSaving ? "저장 중" : "저장"}
+        </button>
+      </RefPanel>
+      <RefPanel className="ref-ops-limits">
+        <h3>정책 한도</h3>
+        <div>
+          <p><span>최대 투입</span><b>{formatKrw(policy?.max_total_exposure_krw)} KRW</b></p>
+          <p><span>현재 포지션</span><b>{formatKrw(policy?.current_bot_position_value_krw)} KRW</b></p>
+          <p><span>사용률</span><b>{formatRatioPercent(policy?.exposure_usage_pct, 1)}</b></p>
+          <p><span>일 손실 한도</span><b>{formatKrw(policy?.daily_loss_limit_krw)} KRW</b></p>
+        </div>
+        <section className="ref-ops-usage">
+          <span><i style={{ width: `${usageWidth}%` }} /></span>
+          <b>{formatRatioPercent(usage, 1)}</b>
+        </section>
+      </RefPanel>
+      <RefPanel className="ref-ops-preview">
+        <h3>저장 예정 값</h3>
+        <p><span>자동매매</span><b>{autoTradingEnabled ? "ON" : "OFF"}</b></p>
+        <p><span>최대 투입</span><b>{formatKrw(maxExposure)} KRW</b></p>
+        <p><span>일 손실률</span><b>{formatRatioPercent(dailyLossPct, 1)}</b></p>
+        <p><span>일 손실 한도</span><b>{formatKrw(projectedLossLimit)} KRW</b></p>
+      </RefPanel>
+      <RefPanel className="ref-ops-balance">
+        <h3>거래소 잔고</h3>
+        <p><span>조회 상태</span><b>{policy?.balance_fetch_status ?? "-"}</b></p>
+        <p><span>사용 가능 KRW</span><b>{formatKrw(policy?.available_krw_balance)} KRW</b></p>
+        <p><span>정책 대비 여유</span><b>{formatKrw(Math.max((policy?.max_total_exposure_krw ?? 0) - (policy?.current_bot_position_value_krw ?? 0), 0))} KRW</b></p>
+        {policy?.balance_error && <em>{policy.balance_error}</em>}
+      </RefPanel>
+      <RefPanel className="ref-ops-readiness">
+        <h3>limited 전환 점검</h3>
+        <strong className={readiness?.can_enable_limited ? "is-ready" : "is-blocked"}>
+          {smartReadinessLabel(readiness?.status)}
+        </strong>
+        <p>{readiness?.next_required_operator_action ?? readiness?.recommended_next_action ?? "Smart Engine 상태를 불러오는 중입니다."}</p>
+        {latestRehearsal && (
+          <p>
+            최신 리허설 {formatKstShort(latestRehearsal.created_at)} · {latestRehearsal.side ?? "-"} · {latestRehearsal.status ?? "-"} · {latestRehearsal.risk_result ?? "-"}
+          </p>
+        )}
+        <section>
+          {readinessChecks.slice(0, 8).map((check) => (
+            <div key={check.id ?? check.label} className={smartReadinessTone(check.status)}>
+              <span>{check.label ?? "-"}</span>
+              <b>{check.status === "pass" ? "통과" : check.status === "warn" ? "주의" : "차단"}</b>
+              <em>{check.detail ?? "-"}</em>
+            </div>
+          ))}
+          {readinessChecks.length === 0 && <div className="is-warn"><span>점검</span><b>대기</b><em>상태 데이터가 아직 없습니다.</em></div>}
+        </section>
+      </RefPanel>
+      <RefPanel className="ref-ops-modules">
+        <h3>내부 판단 모듈</h3>
+        {["RSI", "이동평균", "변동성 돌파", "시장상태", "리스크 필터", "외부요인"].map((item) => (
+          <p key={item}><span>{item}</span><b>읽기 전용</b></p>
+        ))}
+      </RefPanel>
     </>
   );
 }
@@ -3211,6 +3790,158 @@ function StrategyRightPanels({
   );
 }
 
+function AnalysisView({ data }: { data: DashboardData }) {
+  const latest = data.analysisLatest ?? data.analysisHistory[0] ?? null;
+  const intent = latest?.order_intents?.[0] ?? null;
+  const policyBlock = latestPolicyBlockNotice(data);
+  const positiveReasons = latest?.positive_reasons?.length ? latest.positive_reasons : ["저장된 긍정 근거가 없습니다."];
+  const negativeReasons = latest?.negative_reasons?.length ? latest.negative_reasons : ["저장된 부정 근거가 없습니다."];
+  const blockers = latest?.blockers?.length ? latest.blockers : ["차단 사유 없음"];
+  const signalEntries = compactEntries(latest?.internal_signals, 10);
+  const externalProviders = compactEntries((latest?.external_factors?.providers as Record<string, unknown> | undefined) ?? {}, 8);
+  const externalAdjustment = typeof latest?.external_factors?.target_adjustment_pct === "number" ? latest.external_factors.target_adjustment_pct : null;
+  const externalRiskScore = typeof latest?.external_factors?.external_risk_score === "number" ? latest.external_factors.external_risk_score : null;
+  const externalHardBlockers = Array.isArray(latest?.external_factors?.hard_blockers) ? latest.external_factors.hard_blockers.length : 0;
+  const shadowSummary = data.shadowReport?.summary;
+  const shadowRows = data.shadowReport?.recent_rows ?? [];
+  const rehearsal = intent?.policy_preview?.rehearsal as { allowed?: boolean; blockers?: string[]; daily_smart_order_count?: number; risk_score?: number } | undefined;
+
+  if (!latest) {
+    return (
+      <RefPanel className="ref-analysis-empty">
+        <h2>분석근거</h2>
+        <p>아직 저장된 smart decision snapshot이 없습니다.</p>
+        <span>자동매매 전략 틱이 한 번 실행되면 Shadow Mode 판단이 이곳에 표시됩니다.</span>
+      </RefPanel>
+    );
+  }
+
+  return (
+    <>
+      <RefPanel className="ref-analysis-hero">
+        <span>Smart Engine · Shadow Mode</span>
+        <h2>{latest.one_line_summary ?? "최근 판단 요약이 없습니다."}</h2>
+        <p>최근 판단 {formatKstShort(latest.decided_at ?? latest.created_at)} · snapshot #{latest.id ?? "-"}</p>
+      </RefPanel>
+      <RefPanel className="ref-analysis-decision">
+        <h3>현재 판단</h3>
+        <strong>{latest.action_hint ?? "-"}</strong>
+        <div>
+          <p><span>시장상태</span><b>{latest.market_regime ?? "-"}</b></p>
+          <p><span>기존 전략</span><b>{latest.legacy_signal ?? "-"}</b></p>
+          <p><span>확신도</span><b>{formatNumber(latest.confidence_score, 1)}</b></p>
+          <p><span>위험점수</span><b>{formatNumber(latest.risk_score, 1)}</b></p>
+        </div>
+      </RefPanel>
+      <RefPanel className="ref-analysis-exposure">
+        <h3>보유비중</h3>
+        <div className="ref-analysis-bars">
+          <p><span>현재</span><b>{formatRatioPercent(latest.current_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.current_exposure_pct ?? 0, 0), 100)}%` }} /></p>
+          <p><span>목표</span><b>{formatRatioPercent(latest.target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
+        </div>
+        <small>봇 포지션 {formatNumber(latest.current_bot_position_qty, 8)} BTC · {formatKrw(latest.current_bot_position_value_krw)} KRW</small>
+      </RefPanel>
+      <RefPanel className="ref-analysis-reasons">
+        <h3>판단 근거</h3>
+        <div>
+          <section>
+            <b>긍정</b>
+            {positiveReasons.map((reason, index) => <p key={`positive-${index}`}>{reason}</p>)}
+          </section>
+          <section>
+            <b>부정</b>
+            {negativeReasons.map((reason, index) => <p key={`negative-${index}`}>{reason}</p>)}
+          </section>
+        </div>
+      </RefPanel>
+      <RefPanel className="ref-analysis-blockers">
+        <h3>리스크 차단</h3>
+        {policyBlock && (
+          <div className="ref-analysis-policy-block">
+            <span>최근 정책 차단</span>
+            <b>{policyBlock.text}</b>
+            <em>{formatKstShort(policyBlock.createdAt)} · {policyBlock.source === "risk" ? "주문 리스크" : "스마트 엔진"}</em>
+            <PolicyBlockDetailGrid detail={policyBlock.detail} />
+          </div>
+        )}
+        {blockers.map((blocker, index) => {
+          const code = extractPolicyBlockCode(blocker);
+          return <p key={`blocker-${index}`}>{code ? `정책 차단 · ${policyBlockText(code, blocker)}` : blocker}</p>;
+        })}
+      </RefPanel>
+      <RefPanel className="ref-analysis-intent">
+        <h3>주문 후보</h3>
+        {intent ? (
+          <div>
+            <p><span>상태</span><b>{intent.status ?? "-"}</b></p>
+            <p><span>방향</span><b>{intent.side ?? "-"}</b></p>
+            <p><span>필요금액</span><b>{formatSignedKrw(intent.delta_value_krw)}</b></p>
+            <p><span>목표금액</span><b>{formatKrw(intent.target_value_krw)}</b></p>
+            <p><span>지정가</span><b>{formatKrw(intent.limit_price)}</b></p>
+            <p><span>승격상태</span><b>{promotionStatusLabel(intent.promotion_status ?? data.smartEngineStatus?.promotion_status)}</b></p>
+            <p><span>제한주문상한</span><b>{formatKrw(intent.pilot_order_cap_krw)}</b></p>
+            <p><span>리허설</span><b>{rehearsal ? `${rehearsal.allowed ? "통과" : "차단"} · ${rehearsal.blockers?.[0] ?? "사유 없음"}` : "-"}</b></p>
+          </div>
+        ) : (
+          <p>생성된 주문 후보가 없습니다.</p>
+        )}
+      </RefPanel>
+      <RefPanel className="ref-analysis-features">
+        <h3>내부 신호 / 외부요인</h3>
+        <div>
+          <p><span>external_adjustment</span><b>{externalAdjustment == null ? "-" : `${formatNumber(externalAdjustment, 2)}pt`}</b></p>
+          <p><span>external_risk</span><b>{externalRiskScore == null ? "-" : `${formatNumber(externalRiskScore, 1)} · hard ${externalHardBlockers}`}</b></p>
+          {signalEntries.map(([key, value]) => {
+            const item = value as { direction?: string; score?: number; confidence?: number };
+            return <p key={key}><span>{key}</span><b>{item.direction ?? "-"} · {formatNumber(item.score, 1)} · {formatRatioPercent(item.confidence, 0)}</b></p>;
+          })}
+          {externalProviders.slice(0, 4).map(([key, value]) => {
+            const item = value as { value?: unknown; stale?: boolean; reason?: string };
+            return <p key={`external-${key}`}><span>{key}</span><b>{item.stale ? "대기" : formatAnalysisValue(item.value)}</b></p>;
+          })}
+        </div>
+      </RefPanel>
+      <RefPanel className="ref-analysis-shadow-report">
+        <h3>Shadow 성과 리포트</h3>
+        <div>
+          <p><span>승격 준비도</span><b>{formatRatioPercent(shadowSummary?.readiness_score, 1)}</b></p>
+          <p><span>추천</span><b>{shadowRecommendationLabel(shadowSummary?.recommendation)}</b></p>
+          <p><span>판단/주문후보</span><b>{formatNumber(shadowSummary?.decision_count, 0)} / {formatNumber(shadowSummary?.intent_count, 0)}</b></p>
+          <p><span>평가/유리</span><b>{formatNumber(shadowSummary?.evaluated_count, 0)} / {formatNumber(shadowSummary?.favorable_count, 0)}</b></p>
+          <p><span>방향 적중률</span><b>{formatRatioPercent(shadowSummary?.directional_win_rate, 1)}</b></p>
+          <p><span>평균 Markout</span><b>{formatPercent((shadowSummary?.average_markout_pct ?? 0) / 100)}</b></p>
+          <p><span>하드 차단</span><b>{formatNumber(shadowSummary?.hard_block_count, 0)}건</b></p>
+          <p><span>정책 차단</span><b>{formatNumber(shadowSummary?.policy_block_count, 0)}건</b></p>
+        </div>
+        <section>
+          {shadowRows.slice(0, 4).map((row) => (
+            <p key={row.decision_id ?? row.decided_at}>
+              <span>{formatKstShort(row.decided_at)}</span>
+              <b>{row.action_hint ?? "-"}</b>
+              <em>{shadowOutcomeLabel(row.outcome)}</em>
+              <i className={(row.markout_pct ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent((row.markout_pct ?? 0) / 100)}</i>
+            </p>
+          ))}
+          {shadowRows.length === 0 && <p><span>-</span><b>데이터 없음</b><em>-</em><i>-</i></p>}
+        </section>
+      </RefPanel>
+      <RefPanel className="ref-analysis-history">
+        <h3>최근 판단 히스토리</h3>
+        <div>
+          {data.analysisHistory.slice(0, 10).map((item) => (
+            <p key={item.id ?? item.created_at}>
+              <span>{formatKstShort(item.decided_at ?? item.created_at)}</span>
+              <b>{item.action_hint ?? "-"}</b>
+              <em>{item.market_regime ?? "-"}</em>
+              <i>{formatRatioPercent(item.target_exposure_pct)}</i>
+            </p>
+          ))}
+        </div>
+      </RefPanel>
+    </>
+  );
+}
+
 function StrategiesView({ data, refresh }: { data: DashboardData; refresh: () => Promise<void> }) {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   const [filter, setFilter] = React.useState<StrategyFilter>("ALL");
@@ -3370,9 +4101,6 @@ function DashboardView({
   totalEquity,
   totalPnl,
   totalReturn,
-  activeStrategyCount,
-  runningStrategyCount,
-  winRate,
   onOpenAutoTrade,
   chartUnit,
   onChartUnitChange
@@ -3382,20 +4110,19 @@ function DashboardView({
   totalEquity?: number | null;
   totalPnl?: number | null;
   totalReturn?: number | null;
-  activeStrategyCount: number;
-  runningStrategyCount: number;
-  winRate?: number | null;
   onOpenAutoTrade: () => void;
   chartUnit: number;
   onChartUnitChange: (unit: number) => void;
 }) {
+  const policy = data.botPolicy;
+  const policyState = policy?.auto_trading_enabled ? "정책 ON" : "정책 OFF";
   return (
     <>
       <KpiCard className="kpi-asset" icon={<Wallet size={28} />} label="총 자산 (KRW)" value={formatKrw(totalEquity)} sub={data.liveBalances?.balance_fetch_status === "FAILED" ? "실잔고 조회 실패" : formatAssetSub(totalEquity)} />
       <KpiCard className="kpi-profit" icon={<LineChart size={28} />} label="총 수익 (KRW)" value={formatSignedKrw(totalPnl)} sub={formatPercent(totalReturn)} tone="cyan" />
       <KpiCard className="kpi-return" icon={<PieChart size={28} />} label="누적 수익률" value={formatPercent(totalReturn)} sub={formatSignedKrw(totalPnl)} tone="green" />
-      <KpiCard className="kpi-strategy" icon={<Bot size={28} />} label="현재 전략 수" value={`${activeStrategyCount || "-"} 개`} sub={`실행 중 ${runningStrategyCount}개`} tone="amber" />
-      <KpiCard className="kpi-win" icon={<Crosshair size={30} />} label="승률" value={formatPercent(winRate)} sub={`거래 ${data.liveOrders.length}건`} tone="red" />
+      <KpiCard className="kpi-strategy" icon={<Bot size={28} />} label="최대 투입 금액" value={formatKrw(policy?.max_total_exposure_krw)} sub={`${policyState} · 손실한도 ${formatRatioPercent(policy?.daily_loss_limit_pct, 1)}`} tone="amber" />
+      <KpiCard className="kpi-win" icon={<Crosshair size={30} />} label="정책 사용률" value={formatRatioPercent(policy?.exposure_usage_pct, 1)} sub={`${formatKrw(policy?.current_bot_position_value_krw)} KRW 사용`} tone="red" />
       <MainChartPanel data={data} stageScale={scale} chartUnit={chartUnit} onChartUnitChange={onChartUnitChange} />
       <BotStatusPanel data={data} onOpenAutoTrade={onOpenAutoTrade} />
       <PositionPanel data={data} />
@@ -3477,14 +4204,6 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
   const totalEquity = liveEquity ?? paperEquity;
   const totalPnl = liveBtc?.totalPnl ?? data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
   const totalReturn = liveBtc?.totalReturn ?? data.paper?.balance?.total_return ?? data.forward?.balance?.total_return ?? null;
-  const activeStrategyCount = data.candidates.filter((candidate) => candidate.status === "ACTIVE").length;
-  const runningStrategyCount = [
-    data.autoPilot?.session?.status,
-    data.liveStrategy?.session?.status,
-    data.paper?.status,
-    data.forward?.status
-  ].filter(isRunning).length;
-  const winRate = data.candidates.find((candidate) => candidate.backtest_win_rate != null)?.backtest_win_rate ?? null;
   const isAutoTradingOn = isRuntimeRunning(data);
 
   const toggleAutoTrading = React.useCallback(async () => {
@@ -3551,9 +4270,6 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
               totalEquity={totalEquity}
               totalPnl={totalPnl}
               totalReturn={totalReturn}
-              activeStrategyCount={activeStrategyCount}
-              runningStrategyCount={runningStrategyCount}
-              winRate={winRate}
               onOpenAutoTrade={() => setActiveView("auto-trade")}
               chartUnit={chartUnit}
               onChartUnitChange={setChartUnit}
@@ -3570,9 +4286,11 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
               importPositionError={importPositionError}
             />
           )}
-          {activeView === "strategies" && <StrategiesView data={data} refresh={refresh} />}
-          {activeView === "portfolio" && <PortfolioView data={data} totalEquity={totalEquity} totalPnl={totalPnl} totalReturn={totalReturn} onSimulate={() => setActiveView("strategies")} />}
+          {activeView === "analysis" && <AnalysisView data={data} />}
+          {activeView === "operations" && <OperationsView data={data} refresh={refresh} />}
+          {activeView === "portfolio" && <PortfolioView data={data} totalEquity={totalEquity} totalPnl={totalPnl} totalReturn={totalReturn} onSimulate={() => setActiveView("operations")} />}
           {activeView === "trades" && <TradeHistoryView data={data} refresh={refresh} />}
+          {activeView === "alerts" && <AlertsView data={data} />}
         </div>
       </div>
     </main>

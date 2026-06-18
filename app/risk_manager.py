@@ -9,6 +9,7 @@ from app.database import (
     get_connection,
     has_open_live_position_for_strategy,
     insert_risk_log,
+    load_bot_operation_policy,
     load_latest_risk_state,
     load_open_live_positions,
     load_reconcilable_live_order_logs,
@@ -16,6 +17,14 @@ from app.database import (
     upsert_risk_state,
 )
 from app.live_broker import is_emergency_stopped
+
+POLICY_BLOCK_LABELS = {
+    "BLOCKED_POLICY_AUTO_TRADING_DISABLED": "운용정책 OFF로 신규매수 차단",
+    "BLOCKED_POLICY_MAX_EXPOSURE_INVALID": "최대 투입 금액 설정 오류",
+    "BLOCKED_POLICY_MAX_TOTAL_EXPOSURE": "최대 투입 금액 한도 초과",
+    "BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT": "거래소 KRW 잔고 부족",
+    "BLOCKED_POLICY_DAILY_LOSS_LIMIT": "일 손실 한도 도달",
+}
 
 
 @dataclass(frozen=True)
@@ -76,7 +85,83 @@ def kst_date(value: datetime | None = None) -> str:
 
 def get_risk_dashboard(exchange: str = "bithumb", market: str = "KRW-BTC") -> dict:
     state = compute_risk_state(exchange, market)
-    return {"risk_state": state, "risk_logs": load_risk_logs(50, exchange, market), "config": RiskConfig.from_env().__dict__}
+    logs = [enrich_policy_block_log(log) for log in load_risk_logs(50, exchange, market)]
+    policy_block_logs = [log for log in logs if log.get("policy_block_detail")]
+    return {
+        "risk_state": state,
+        "risk_logs": logs,
+        "latest_policy_block": policy_block_logs[0] if policy_block_logs else None,
+        "policy_block_logs": policy_block_logs,
+        "config": RiskConfig.from_env().__dict__,
+    }
+
+
+def is_policy_block_code(value: str | None) -> bool:
+    return str(value or "").upper() in POLICY_BLOCK_LABELS
+
+
+def enrich_policy_block_log(log: dict) -> dict:
+    detail = policy_block_detail_from_log(log)
+    if detail is None:
+        return log
+    return {
+        **log,
+        "policy_block_detail": detail,
+        "policy_block_summary": detail["summary"],
+    }
+
+
+def policy_block_detail_from_log(log: dict) -> dict | None:
+    code = str(log.get("block_code") or "").upper()
+    if not is_policy_block_code(code):
+        return None
+    checks = log.get("checks") or {}
+    policy_check = checks.get("operation_policy_check") or {}
+    detail = policy_check.get("detail") if isinstance(policy_check, dict) else {}
+    detail = detail if isinstance(detail, dict) else {}
+    max_total = _float(detail.get("max_total_exposure_krw"))
+    current_value = _float(detail.get("current_bot_position_value_krw"))
+    requested = _float(detail.get("requested_order_krw"))
+    projected = _float(detail.get("projected_bot_position_value_krw")) or (current_value + requested)
+    remaining = _float(detail.get("remaining_exposure_krw"))
+    available_krw = detail.get("available_krw_balance")
+    daily_loss = _float(detail.get("daily_loss_krw"))
+    daily_loss_limit = _float(detail.get("daily_loss_limit_krw"))
+    exceeded_by = max(projected - max_total, 0.0) if max_total > 0 else 0.0
+    krw_shortfall = _float(detail.get("krw_shortfall_krw"))
+    return {
+        "code": code,
+        "summary": POLICY_BLOCK_LABELS.get(code, code),
+        "reason": log.get("block_reason") or code,
+        "auto_trading_enabled": bool(detail.get("auto_trading_enabled")),
+        "requested_order_krw": requested,
+        "max_total_exposure_krw": max_total,
+        "current_bot_position_value_krw": current_value,
+        "projected_bot_position_value_krw": projected,
+        "remaining_exposure_krw": remaining,
+        "available_krw_balance": available_krw,
+        "daily_loss_krw": daily_loss,
+        "daily_loss_limit_pct": _float(detail.get("daily_loss_limit_pct")),
+        "daily_loss_limit_krw": daily_loss_limit,
+        "daily_loss_usage_pct": (daily_loss / daily_loss_limit * 100) if daily_loss_limit > 0 else 0.0,
+        "exceeded_by_krw": exceeded_by,
+        "krw_shortfall_krw": krw_shortfall,
+        "next_action": _policy_block_next_action(code),
+    }
+
+
+def _policy_block_next_action(code: str) -> str:
+    if code == "BLOCKED_POLICY_AUTO_TRADING_DISABLED":
+        return "운용설정에서 자동매매를 ON으로 바꿔야 신규매수가 허용됩니다."
+    if code == "BLOCKED_POLICY_MAX_TOTAL_EXPOSURE":
+        return "포지션을 줄이거나 최대 투입 금액을 상향해야 추가매수가 허용됩니다."
+    if code == "BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT":
+        return "거래소 KRW 주문 가능 잔고가 주문 후보 금액보다 커야 합니다."
+    if code == "BLOCKED_POLICY_DAILY_LOSS_LIMIT":
+        return "오늘 신규매수는 중단하고 다음 KST 일자 리셋 후 재평가합니다."
+    if code == "BLOCKED_POLICY_MAX_EXPOSURE_INVALID":
+        return "운용설정의 최대 투입 금액을 0보다 크게 저장해야 합니다."
+    return "운용정책 설정과 현재 포지션 상태를 확인하세요."
 
 
 def compute_risk_state(
@@ -235,13 +320,16 @@ def check_order_risk(
     result = _standard_result(base_result, config)
     checks: dict[str, dict] = {}
 
-    def block(code: str, reason: str | None = None, check_name: str = "guardrail") -> None:
+    def block(code: str, reason: str | None = None, check_name: str = "guardrail", detail: Any = None) -> None:
         if result["allowed"]:
             result["allowed"] = False
             result["risk_level"] = "BLOCKED"
             result["block_code"] = code
             result["block_reason"] = reason or code
-        checks[check_name] = {"allowed": False, "code": code, "reason": reason or code}
+        check = {"allowed": False, "code": code, "reason": reason or code}
+        if detail is not None:
+            check["detail"] = detail
+        checks[check_name] = check
 
     def ok(check_name: str, detail: Any = True) -> None:
         checks.setdefault(check_name, {"allowed": True, "detail": detail})
@@ -278,6 +366,45 @@ def check_order_risk(
         block("BLOCKED_MAX_ORDER_AMOUNT", check_name="amount_check")
     else:
         ok("amount_check", amount)
+
+    policy = load_bot_operation_policy(market)
+    policy_limit = _float(policy.get("max_total_exposure_krw"))
+    policy_daily_loss_limit_krw = policy_limit * _float(policy.get("daily_loss_limit_pct")) / 100
+    current_bot_position_value = _current_bot_position_value_krw(exchange, market, market_snapshot)
+    available_krw = _available_balance_total(balances, "KRW")
+    policy_max_allowed = max(policy_limit - current_bot_position_value, 0.0) if policy_limit > 0 else 0.0
+    policy_check_detail = {
+        "auto_trading_enabled": bool(policy.get("auto_trading_enabled")),
+        "max_total_exposure_krw": policy_limit,
+        "daily_loss_limit_pct": _float(policy.get("daily_loss_limit_pct")),
+        "daily_loss_limit_krw": policy_daily_loss_limit_krw,
+        "daily_loss_krw": abs(min(state["daily_total_pnl"], 0.0)),
+        "current_bot_position_value_krw": current_bot_position_value,
+        "requested_order_krw": amount,
+        "projected_bot_position_value_krw": current_bot_position_value + amount,
+        "remaining_exposure_krw": policy_max_allowed,
+        "available_krw_balance": available_krw if balances else None,
+        "max_allowed_entry_krw": min(policy_max_allowed, available_krw) if balances else policy_max_allowed,
+        "exposure_overage_krw": max((current_bot_position_value + amount) - policy_limit, 0.0) if policy_limit > 0 else 0.0,
+        "krw_shortfall_krw": max(amount - available_krw, 0.0) if balances is not None else 0.0,
+    }
+    if purpose == "ENTRY" and side in {"BUY", "BID"} and is_auto:
+        if not policy.get("auto_trading_enabled"):
+            block("BLOCKED_POLICY_AUTO_TRADING_DISABLED", check_name="operation_policy_check", detail=policy_check_detail)
+        elif policy_limit <= 0:
+            block("BLOCKED_POLICY_MAX_EXPOSURE_INVALID", check_name="operation_policy_check", detail=policy_check_detail)
+        elif current_bot_position_value >= policy_limit:
+            block("BLOCKED_POLICY_MAX_TOTAL_EXPOSURE", check_name="operation_policy_check", detail=policy_check_detail)
+        elif current_bot_position_value + amount > policy_limit:
+            block("BLOCKED_POLICY_MAX_TOTAL_EXPOSURE", check_name="operation_policy_check", detail=policy_check_detail)
+        elif balances is not None and available_krw < amount:
+            block("BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT", check_name="operation_policy_check", detail=policy_check_detail)
+        elif policy_daily_loss_limit_krw > 0 and abs(min(state["daily_total_pnl"], 0.0)) >= policy_daily_loss_limit_krw:
+            block("BLOCKED_POLICY_DAILY_LOSS_LIMIT", check_name="operation_policy_check", detail=policy_check_detail)
+        else:
+            ok("operation_policy_check", policy_check_detail)
+    else:
+        ok("operation_policy_check", {**policy_check_detail, "scope": "not_auto_entry"})
 
     same_strategy_position_open = (
         purpose == "ENTRY"
@@ -358,6 +485,9 @@ def check_order_risk(
     result["risk_result"] = "ALLOWED" if result["allowed"] else result["block_code"]
     result["blocked_reason"] = "" if result["allowed"] else result["block_reason"]
     result["max_allowed_order_krw"] = min(result.get("max_allowed_order_krw", config.max_order_krw), config.max_order_krw)
+    if purpose == "ENTRY" and side in {"BUY", "BID"}:
+        result["max_allowed_order_krw"] = min(result["max_allowed_order_krw"], policy_check_detail["max_allowed_entry_krw"])
+    result["operation_policy"] = policy_check_detail
     result["checked_at"] = _utc_now()
     insert_risk_log(
         {
@@ -522,6 +652,33 @@ def _balance_total(balances: dict | None, currency: str) -> float:
     if isinstance(item, dict):
         return _float(item.get("balance")) + _float(item.get("locked"))
     return 0.0
+
+
+def _available_balance_total(balances: dict | None, currency: str) -> float:
+    if not balances:
+        return 0.0
+    target = currency.upper()
+    for item in balances.get("balances", []) or []:
+        if str(item.get("currency", "")).upper() == target:
+            return _float(item.get("balance"))
+    by_currency = balances.get("by_currency") or {}
+    item = by_currency.get(target) or by_currency.get(target.lower())
+    if isinstance(item, dict):
+        return _float(item.get("balance"))
+    direct = balances.get(target.lower()) or balances.get(target)
+    if isinstance(direct, dict):
+        return _float(direct.get("balance"))
+    return 0.0
+
+
+def _current_bot_position_value_krw(exchange: str, market: str, market_snapshot: dict | None) -> float:
+    fallback_price = _float((market_snapshot or {}).get("price")) or _float((market_snapshot or {}).get("trade_price"))
+    total = 0.0
+    for position in load_open_live_positions(exchange, market):
+        qty = _float(position.get("entry_volume"))
+        price = _float(position.get("current_price")) or fallback_price or _float(position.get("entry_price"))
+        total += qty * price
+    return total
 
 
 def _standard_result(result: dict | None, config: RiskConfig) -> dict:

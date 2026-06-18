@@ -43,7 +43,12 @@ from app.database import (
     insert_risk_log,
     insert_candles,
     load_candidate_strategy,
+    load_bot_operation_policy,
     load_latest_live_paper_session,
+    load_decision_snapshot,
+    load_decision_snapshots,
+    load_latest_decision_snapshot,
+    load_risk_log,
     load_candles,
     load_candles_between,
     load_candidate_strategies,
@@ -51,6 +56,7 @@ from app.database import (
     load_forward_sessions,
     load_latest_forward_session,
     load_live_order_logs,
+    load_open_live_positions,
     load_runtime_lock,
     load_latest_paper_session,
     pause_running_forward_sessions_on_startup,
@@ -65,6 +71,7 @@ from app.database import (
     stop_latest_paper_session,
     update_live_order_log,
     update_app_settings,
+    update_bot_operation_policy,
     update_candidate_strategy,
     update_risk_log_resolution,
 )
@@ -102,7 +109,10 @@ from app.live_exit import (
     reject_exit_candidate,
     submit_exit_order,
 )
-from app.risk_manager import check_order_risk, compute_risk_state, get_risk_dashboard
+from app.risk_manager import check_order_risk, compute_risk_state, enrich_policy_block_log, get_risk_dashboard
+from app.shadow_report import build_shadow_report
+from app.smart_promotion import smart_engine_live_mode
+from app.smart_readiness import build_limited_readiness
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
     cancel_live_strategy_open_order,
@@ -391,6 +401,12 @@ class CandidateStrategyToggleRequest(BaseModel):
 
 class AppSettingsRequest(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class BotPolicyPatchRequest(BaseModel):
+    auto_trading_enabled: bool | None = None
+    max_total_exposure_krw: float | None = Field(None, gt=0)
+    daily_loss_limit_pct: float | None = Field(None, gt=0, le=100)
 
 
 class ForwardPaperStartRequest(BaseModel):
@@ -1367,6 +1383,129 @@ async def import_exchange_position_endpoint(payload: ImportExchangePositionReque
 @app.get("/api/risk/status")
 def risk_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     return get_risk_dashboard(exchange, DEFAULT_MARKET)
+
+
+@app.get("/api/risk/policy-blocks/latest")
+def latest_policy_block(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    dashboard = get_risk_dashboard(exchange, DEFAULT_MARKET)
+    return {
+        "policy_block": dashboard.get("latest_policy_block"),
+        "policy_block_logs": dashboard.get("policy_block_logs", [])[:10],
+    }
+
+
+@app.get("/api/risk/logs/{log_id}")
+def risk_log_detail(log_id: int) -> dict:
+    log = load_risk_log(log_id)
+    if log is None:
+        raise HTTPException(status_code=404, detail="Risk log not found.")
+    return {"log": enrich_policy_block_log(log)}
+
+
+async def _bot_policy_payload(market: str = DEFAULT_MARKET, exchange: str = "bithumb") -> dict:
+    policy = load_bot_operation_policy(market)
+    latest_price = 0.0
+    try:
+        snapshot = await _market_snapshot(market)
+        latest_price = float(snapshot.get("price") or 0.0) if snapshot else 0.0
+    except Exception:
+        latest_price = 0.0
+    current_position_value = 0.0
+    for position in load_open_live_positions(exchange, market):
+        volume = float(position.get("entry_volume") or 0.0)
+        price = float(position.get("current_price") or latest_price or position.get("entry_price") or 0.0)
+        current_position_value += volume * price
+
+    balances, balance_status, balance_error = await _safe_live_balances_for_exchange(exchange)
+    available_krw = None
+    if balance_status == "SUCCESS":
+        krw = (balances.get("by_currency") or {}).get("KRW") or balances.get("krw") or {}
+        available_krw = float(krw.get("balance") or 0.0)
+
+    max_total = float(policy.get("max_total_exposure_krw") or 0.0)
+    daily_loss_pct = float(policy.get("daily_loss_limit_pct") or 0.0)
+    return {
+        **policy,
+        "daily_loss_limit_krw": max_total * daily_loss_pct / 100,
+        "current_bot_position_value_krw": current_position_value,
+        "available_krw_balance": available_krw,
+        "balance_fetch_status": balance_status,
+        "balance_error": balance_error,
+        "exposure_usage_pct": (current_position_value / max_total * 100) if max_total > 0 else 0.0,
+    }
+
+
+@app.get("/api/bot/policy")
+async def get_bot_policy(market: str = Query(DEFAULT_MARKET), exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    return {"policy": await _bot_policy_payload(market, exchange)}
+
+
+@app.patch("/api/bot/policy")
+async def patch_bot_policy(payload: BotPolicyPatchRequest, market: str = Query(DEFAULT_MARKET), exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    updates = payload.model_dump(exclude_unset=True)
+    try:
+        update_bot_operation_policy(market, updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"policy": await _bot_policy_payload(market, exchange)}
+
+
+@app.get("/api/analysis/latest")
+def latest_analysis(market: str | None = Query(None)) -> dict:
+    snapshot = load_latest_decision_snapshot(market)
+    return {"decision": snapshot}
+
+
+@app.get("/api/analysis/history")
+def analysis_history(
+    market: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    from_time: str | None = Query(None, alias="from"),
+    to_time: str | None = Query(None, alias="to"),
+) -> dict:
+    snapshots = load_decision_snapshots(
+        market=market,
+        limit=limit,
+        offset=offset,
+        from_time=from_time,
+        to_time=to_time,
+    )
+    return {"decisions": snapshots, "limit": limit, "offset": offset}
+
+
+@app.get("/api/analysis/decision/{decision_id}")
+def analysis_decision(decision_id: int) -> dict:
+    snapshot = load_decision_snapshot(decision_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Decision snapshot not found.")
+    return {"decision": snapshot}
+
+
+@app.get("/api/analysis/shadow-report")
+def analysis_shadow_report(
+    market: str = Query(DEFAULT_MARKET),
+    limit: int = Query(100, ge=1, le=500),
+    horizon_candles: int = Query(3, ge=1, le=24),
+) -> dict:
+    return {"report": build_shadow_report(market=market, limit=limit, horizon_candles=horizon_candles)}
+
+
+@app.get("/api/smart-engine/status")
+def smart_engine_status(market: str = Query(DEFAULT_MARKET)) -> dict:
+    decision = load_latest_decision_snapshot(market)
+    report = build_shadow_report(market=market, limit=100, horizon_candles=3)
+    latest_intent = (decision.get("order_intents") or [None])[0] if decision else None
+    limited_readiness = build_limited_readiness(market=market, decision=decision, report=report)
+    return {
+        "live_mode": smart_engine_live_mode(),
+        "decision": decision,
+        "latest_intent": latest_intent,
+        "readiness": report.get("summary", {}),
+        "limited_readiness": limited_readiness,
+        "promotion_status": (latest_intent or {}).get("promotion_status"),
+        "promotion_blockers": (latest_intent or {}).get("promotion_blockers", []),
+    }
 
 
 @app.post("/api/alerts/{alert_id}/read")

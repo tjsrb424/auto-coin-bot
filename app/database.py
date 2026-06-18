@@ -587,6 +587,77 @@ def init_db() -> None:
                 value_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS bot_operation_policy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market TEXT NOT NULL UNIQUE,
+                auto_trading_enabled INTEGER NOT NULL DEFAULT 0,
+                max_total_exposure_krw REAL NOT NULL DEFAULT 500000,
+                daily_loss_limit_pct REAL NOT NULL DEFAULT 3,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS decision_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decided_at TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                candle_time_utc TEXT,
+                candle_time_kst TEXT,
+                selected_strategy_id INTEGER,
+                selected_strategy_name TEXT,
+                legacy_signal TEXT NOT NULL,
+                market_regime TEXT NOT NULL,
+                current_bot_position_qty REAL NOT NULL DEFAULT 0,
+                current_bot_position_value_krw REAL NOT NULL DEFAULT 0,
+                current_exposure_pct REAL NOT NULL DEFAULT 0,
+                target_exposure_pct REAL NOT NULL DEFAULT 0,
+                action_hint TEXT NOT NULL,
+                confidence_score REAL NOT NULL DEFAULT 0,
+                risk_score REAL NOT NULL DEFAULT 0,
+                one_line_summary TEXT NOT NULL,
+                positive_reasons_json TEXT NOT NULL,
+                negative_reasons_json TEXT NOT NULL,
+                blockers_json TEXT NOT NULL,
+                raw_features_json TEXT NOT NULL,
+                external_factors_json TEXT NOT NULL,
+                internal_signals_json TEXT NOT NULL DEFAULT '{}',
+                max_total_exposure_krw REAL NOT NULL DEFAULT 0,
+                daily_loss_limit_pct REAL NOT NULL DEFAULT 0,
+                daily_loss_limit_krw REAL NOT NULL DEFAULT 0,
+                available_krw_balance REAL,
+                exposure_limit_blocked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_snapshot_id INTEGER NOT NULL,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                action_hint TEXT NOT NULL,
+                current_value_krw REAL NOT NULL DEFAULT 0,
+                target_value_krw REAL NOT NULL DEFAULT 0,
+                delta_value_krw REAL NOT NULL DEFAULT 0,
+                target_qty REAL,
+                order_type TEXT NOT NULL,
+                limit_price REAL,
+                urgency TEXT NOT NULL,
+                status TEXT NOT NULL,
+                blockers_json TEXT NOT NULL,
+                risk_preview_json TEXT NOT NULL DEFAULT '{}',
+                policy_preview_json TEXT NOT NULL DEFAULT '{}',
+                pilot_order_cap_krw REAL NOT NULL DEFAULT 0,
+                promotion_blockers_json TEXT NOT NULL DEFAULT '[]',
+                promotion_status TEXT NOT NULL DEFAULT 'SHADOW_ONLY',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                submitted_at TEXT,
+                completed_at TEXT,
+                FOREIGN KEY(decision_snapshot_id) REFERENCES decision_snapshots(id)
+            );
             """
         )
         _ensure_column(conn, "paper_sessions", "mode", "TEXT NOT NULL DEFAULT 'SIMULATION'")
@@ -627,6 +698,25 @@ def init_db() -> None:
         _ensure_column(conn, "risk_logs", "read_status", "TEXT NOT NULL DEFAULT 'UNREAD'")
         _ensure_column(conn, "risk_logs", "resolved_at", "TEXT")
         _ensure_column(conn, "risk_logs", "resolution_action", "TEXT")
+        _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "daily_loss_limit_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "daily_loss_limit_krw", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "available_krw_balance", "REAL")
+        _ensure_column(conn, "decision_snapshots", "exposure_limit_blocked", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_intents", "risk_preview_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "order_intents", "policy_preview_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "order_intents", "pilot_order_cap_krw", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_intents", "promotion_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "order_intents", "promotion_status", "TEXT NOT NULL DEFAULT 'SHADOW_ONLY'")
+        conn.execute(
+            """
+            INSERT INTO bot_operation_policy (
+                market, auto_trading_enabled, max_total_exposure_krw, daily_loss_limit_pct
+            ) VALUES ('KRW-BTC', 0, 500000, 3)
+            ON CONFLICT(market) DO NOTHING
+            """
+        )
         conn.execute(
             """
             UPDATE candidate_strategies
@@ -1899,6 +1989,17 @@ def load_risk_logs(limit: int = 100, exchange: str = "bithumb", market: str = "K
     return logs
 
 
+def load_risk_log(log_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM risk_logs WHERE id = ?", (log_id,)).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["allowed"] = bool(item.get("allowed"))
+    item["checks"] = json.loads(item.pop("checks_json") or "{}")
+    return item
+
+
 def update_risk_log_resolution(log_id: int, action: str) -> dict | None:
     normalized = action.upper()
     if normalized not in {"READ", "IGNORE", "RETRY"}:
@@ -2866,6 +2967,306 @@ def load_forward_session(session_id: int, conn: sqlite3.Connection | None = None
     finally:
         if owns_connection:
             conn.close()
+
+
+def _json_load(value: str | None, fallback):
+    try:
+        return json.loads(value or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+
+
+def _normalize_decision_snapshot(row: dict) -> dict:
+    row["positive_reasons"] = _json_load(row.pop("positive_reasons_json", "[]"), [])
+    row["negative_reasons"] = _json_load(row.pop("negative_reasons_json", "[]"), [])
+    row["blockers"] = _json_load(row.pop("blockers_json", "[]"), [])
+    row["raw_features"] = _json_load(row.pop("raw_features_json", "{}"), {})
+    row["external_factors"] = _json_load(row.pop("external_factors_json", "{}"), {})
+    row["internal_signals"] = _json_load(row.pop("internal_signals_json", "{}"), {})
+    row["exposure_limit_blocked"] = bool(row.get("exposure_limit_blocked"))
+    return row
+
+
+def _normalize_order_intent(row: dict) -> dict:
+    row["blockers"] = _json_load(row.pop("blockers_json", "[]"), [])
+    row["risk_preview"] = _json_load(row.pop("risk_preview_json", "{}"), {})
+    row["policy_preview"] = _json_load(row.pop("policy_preview_json", "{}"), {})
+    row["promotion_blockers"] = _json_load(row.pop("promotion_blockers_json", "[]"), [])
+    return row
+
+
+def load_bot_operation_policy(market: str = "KRW-BTC") -> dict:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM bot_operation_policy WHERE market = ?", (market,)).fetchone()
+        if row is None:
+            now_utc = _utc_now()
+            conn.execute(
+                """
+                INSERT INTO bot_operation_policy (
+                    market, auto_trading_enabled, max_total_exposure_krw,
+                    daily_loss_limit_pct, created_at, updated_at
+                ) VALUES (?, 0, 500000, 3, ?, ?)
+                """,
+                (market, now_utc, now_utc),
+            )
+            row = conn.execute("SELECT * FROM bot_operation_policy WHERE market = ?", (market,)).fetchone()
+        policy = dict(row)
+        policy["auto_trading_enabled"] = bool(policy.get("auto_trading_enabled"))
+        policy["daily_loss_limit_krw"] = (
+            float(policy.get("max_total_exposure_krw") or 0.0)
+            * float(policy.get("daily_loss_limit_pct") or 0.0)
+            / 100
+        )
+        return policy
+
+
+def update_bot_operation_policy(market: str = "KRW-BTC", updates: dict | None = None) -> dict:
+    updates = updates or {}
+    allowed = {"auto_trading_enabled", "max_total_exposure_krw", "daily_loss_limit_pct"}
+    values = {key: updates[key] for key in allowed if key in updates}
+    if "max_total_exposure_krw" in values and float(values["max_total_exposure_krw"]) <= 0:
+        raise ValueError("max_total_exposure_krw must be greater than 0.")
+    if "daily_loss_limit_pct" in values:
+        pct = float(values["daily_loss_limit_pct"])
+        if pct <= 0 or pct > 100:
+            raise ValueError("daily_loss_limit_pct must be greater than 0 and less than or equal to 100.")
+        values["daily_loss_limit_pct"] = pct
+    if "auto_trading_enabled" in values:
+        values["auto_trading_enabled"] = 1 if bool(values["auto_trading_enabled"]) else 0
+    load_bot_operation_policy(market)
+    if values:
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        params = [*values.values(), _utc_now(), market]
+        with get_connection() as conn:
+            conn.execute(
+                f"""
+                UPDATE bot_operation_policy
+                SET {assignments}, updated_at = ?
+                WHERE market = ?
+                """,
+                params,
+            )
+    return load_bot_operation_policy(market)
+
+
+def insert_decision_snapshot(snapshot: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO decision_snapshots (
+                decided_at, exchange, market, timeframe, candle_time_utc, candle_time_kst,
+                selected_strategy_id, selected_strategy_name, legacy_signal, market_regime,
+                current_bot_position_qty, current_bot_position_value_krw, current_exposure_pct,
+                target_exposure_pct, action_hint, confidence_score, risk_score,
+                one_line_summary, positive_reasons_json, negative_reasons_json,
+                blockers_json, raw_features_json, external_factors_json, internal_signals_json,
+                max_total_exposure_krw, daily_loss_limit_pct, daily_loss_limit_krw,
+                available_krw_balance, exposure_limit_blocked, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.get("decided_at", now_utc),
+                snapshot.get("exchange", "bithumb"),
+                snapshot.get("market", "KRW-BTC"),
+                snapshot.get("timeframe", "5m"),
+                snapshot.get("candle_time_utc"),
+                snapshot.get("candle_time_kst"),
+                snapshot.get("selected_strategy_id"),
+                snapshot.get("selected_strategy_name"),
+                snapshot.get("legacy_signal", "HOLD"),
+                snapshot.get("market_regime", "UNKNOWN"),
+                snapshot.get("current_bot_position_qty", 0.0),
+                snapshot.get("current_bot_position_value_krw", 0.0),
+                snapshot.get("current_exposure_pct", 0.0),
+                snapshot.get("target_exposure_pct", 0.0),
+                snapshot.get("action_hint", "WAIT"),
+                snapshot.get("confidence_score", 0.0),
+                snapshot.get("risk_score", 0.0),
+                snapshot.get("one_line_summary", ""),
+                json.dumps(snapshot.get("positive_reasons", []), ensure_ascii=False),
+                json.dumps(snapshot.get("negative_reasons", []), ensure_ascii=False),
+                json.dumps(snapshot.get("blockers", []), ensure_ascii=False),
+                json.dumps(snapshot.get("raw_features", {}), ensure_ascii=False),
+                json.dumps(snapshot.get("external_factors", {}), ensure_ascii=False),
+                json.dumps(snapshot.get("internal_signals", {}), ensure_ascii=False),
+                snapshot.get("max_total_exposure_krw", 0.0),
+                snapshot.get("daily_loss_limit_pct", 0.0),
+                snapshot.get("daily_loss_limit_krw", 0.0),
+                snapshot.get("available_krw_balance"),
+                1 if snapshot.get("exposure_limit_blocked") else 0,
+                now_utc,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def insert_order_intent(intent: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO order_intents (
+                decision_snapshot_id, exchange, market, side, action_hint,
+                current_value_krw, target_value_krw, delta_value_krw, target_qty,
+                order_type, limit_price, urgency, status, blockers_json,
+                risk_preview_json, policy_preview_json, pilot_order_cap_krw,
+                promotion_blockers_json, promotion_status, created_at, submitted_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intent["decision_snapshot_id"],
+                intent.get("exchange", "bithumb"),
+                intent.get("market", "KRW-BTC"),
+                intent.get("side", "NONE"),
+                intent.get("action_hint", "WAIT"),
+                intent.get("current_value_krw", 0.0),
+                intent.get("target_value_krw", 0.0),
+                intent.get("delta_value_krw", 0.0),
+                intent.get("target_qty"),
+                intent.get("order_type", "LIMIT"),
+                intent.get("limit_price"),
+                intent.get("urgency", "NORMAL"),
+                intent.get("status", "CREATED"),
+                json.dumps(intent.get("blockers", []), ensure_ascii=False),
+                json.dumps(intent.get("risk_preview", {}), ensure_ascii=False),
+                json.dumps(intent.get("policy_preview", {}), ensure_ascii=False),
+                intent.get("pilot_order_cap_krw", 0.0),
+                json.dumps(intent.get("promotion_blockers", []), ensure_ascii=False),
+                intent.get("promotion_status", "SHADOW_ONLY"),
+                now_utc,
+                intent.get("submitted_at"),
+                intent.get("completed_at"),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def update_order_intent(intent_id: int, updates: dict) -> dict | None:
+    allowed = {
+        "status",
+        "risk_preview_json",
+        "policy_preview_json",
+        "pilot_order_cap_krw",
+        "promotion_blockers_json",
+        "promotion_status",
+        "submitted_at",
+        "completed_at",
+    }
+    values = {key: updates[key] for key in allowed if key in updates}
+    if "risk_preview" in updates:
+        values["risk_preview_json"] = json.dumps(updates["risk_preview"], ensure_ascii=False)
+    if "policy_preview" in updates:
+        values["policy_preview_json"] = json.dumps(updates["policy_preview"], ensure_ascii=False)
+    if "promotion_blockers" in updates:
+        values["promotion_blockers_json"] = json.dumps(updates["promotion_blockers"], ensure_ascii=False)
+    if not values:
+        return None
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with get_connection() as conn:
+        conn.execute(f"UPDATE order_intents SET {assignments} WHERE id = ?", [*values.values(), intent_id])
+        row = conn.execute("SELECT * FROM order_intents WHERE id = ?", (intent_id,)).fetchone()
+    return _normalize_order_intent(dict(row)) if row else None
+
+
+def load_latest_decision_snapshot(market: str | None = None) -> dict | None:
+    params: list[object] = []
+    market_filter = ""
+    if market:
+        market_filter = "WHERE market = ?"
+        params.append(market)
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM decision_snapshots
+            {market_filter}
+            ORDER BY decided_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot = _normalize_decision_snapshot(dict(row))
+        intents = conn.execute(
+            """
+            SELECT *
+            FROM order_intents
+            WHERE decision_snapshot_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (snapshot["id"],),
+        ).fetchall()
+        snapshot["order_intents"] = [_normalize_order_intent(dict(item)) for item in intents]
+        return snapshot
+
+
+def load_decision_snapshots(*, market: str | None = None, limit: int = 50, offset: int = 0, from_time: str | None = None, to_time: str | None = None) -> list[dict]:
+    filters: list[str] = []
+    params: list[object] = []
+    if market:
+        filters.append("market = ?")
+        params.append(market)
+    if from_time:
+        filters.append("decided_at >= ?")
+        params.append(from_time)
+    if to_time:
+        filters.append("decided_at <= ?")
+        params.append(to_time)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    params.extend([limit, offset])
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM decision_snapshots
+            {where}
+            ORDER BY decided_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        snapshots = [_normalize_decision_snapshot(dict(row)) for row in rows]
+        if not snapshots:
+            return []
+        ids = [snapshot["id"] for snapshot in snapshots]
+        placeholders = ",".join("?" for _ in ids)
+        intent_rows = conn.execute(
+            f"""
+            SELECT *
+            FROM order_intents
+            WHERE decision_snapshot_id IN ({placeholders})
+            ORDER BY created_at DESC, id DESC
+            """,
+            ids,
+        ).fetchall()
+    intents_by_snapshot: dict[int, list[dict]] = {int(snapshot["id"]): [] for snapshot in snapshots}
+    for item in intent_rows:
+        intent = _normalize_order_intent(dict(item))
+        intents_by_snapshot.setdefault(int(intent["decision_snapshot_id"]), []).append(intent)
+    for snapshot in snapshots:
+        snapshot["order_intents"] = intents_by_snapshot.get(int(snapshot["id"]), [])
+    return snapshots
+
+
+def load_decision_snapshot(decision_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM decision_snapshots WHERE id = ?", (decision_id,)).fetchone()
+        if row is None:
+            return None
+        snapshot = _normalize_decision_snapshot(dict(row))
+        intents = conn.execute(
+            """
+            SELECT *
+            FROM order_intents
+            WHERE decision_snapshot_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (decision_id,),
+        ).fetchall()
+    snapshot["order_intents"] = [_normalize_order_intent(dict(item)) for item in intents]
+    return snapshot
 
 
 def save_paper_session(result: dict) -> int:
