@@ -359,6 +359,7 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
     risk_result = "ALLOWED"
     reason = ""
     balance_mismatch = None
+    balances = None
     if candidate is None:
         risk_result = "EXIT_CANDIDATE_NOT_FOUND"
     elif position is None:
@@ -438,6 +439,8 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
             candidate_strategy_id=int(candidate["candidate_strategy_id"]),
             candle_time_utc=candidate.get("candle_time_utc"),
             signal=candidate.get("reason"),
+            market_snapshot={"price": float(candidate.get("target_exit_price") or 0.0)},
+            balances=balances,
             balance_mismatch=balance_mismatch,
             manual_confirmed=manual_confirmed,
             is_auto=is_auto_exit,

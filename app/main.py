@@ -1122,6 +1122,7 @@ async def preview_live_order(payload: LiveOrderPreviewRequest) -> dict:
         base_result=preview,
         mode=current_live_mode(),
         market_snapshot=snapshot,
+        balances=balances,
         manual_confirmed=False,
         is_auto=False,
     )
@@ -1213,6 +1214,7 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
         base_result=final_risk,
         mode=current_live_mode(),
         market_snapshot=snapshot,
+        balances=balances,
         manual_confirmed=True,
         is_auto=False,
     )

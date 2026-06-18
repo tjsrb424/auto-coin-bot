@@ -224,6 +224,11 @@ type RiskDashboard = {
     open_position_count?: number;
     balance_mismatch_detected?: boolean;
   };
+  config?: {
+    max_daily_loss_percent?: number;
+    max_daily_loss_krw?: number;
+    account_equity_krw?: number;
+  };
   risk_logs?: Array<{
     id?: number;
     risk_level?: string;
@@ -2585,6 +2590,7 @@ function AutoRiskPanel({
 }) {
   const risk = data.risk?.risk_state;
   const dailyLoss = Math.abs(risk?.daily_loss_percent ?? 0);
+  const maxDailyLossPercent = data.risk?.config?.max_daily_loss_percent ?? 20;
   const maxOrder = data.liveStrategy?.max_order_krw ?? null;
   const latestRecovery = data.recoveryEvents[0];
   const latestMismatch = latestRecovery?.event_type === "BALANCE_MISMATCH" ? latestRecovery : undefined;
@@ -2609,8 +2615,8 @@ function AutoRiskPanel({
           {importPositionError && <em>{importPositionError}</em>}
         </div>
       )}
-      <div className="ref-auto-risk-row"><span>개정 리스크</span><b>{dailyLoss.toFixed(0)}% / 30%</b></div>
-      <div className="ref-auto-bar"><i style={{ width: `${Math.min(dailyLoss / 30 * 100, 100)}%` }} /></div>
+      <div className="ref-auto-risk-row"><span>개정 리스크</span><b>{dailyLoss.toFixed(2)}% / {maxDailyLossPercent.toFixed(0)}%</b></div>
+      <div className="ref-auto-bar"><i style={{ width: `${Math.min(dailyLoss / Math.max(maxDailyLossPercent, 1) * 100, 100)}%` }} /></div>
       <div className="ref-auto-risk-row"><span>일일 손익 한도</span><b>{formatKrw(maxOrder)}</b></div>
       <div className="ref-auto-bar"><i style={{ width: "38%" }} /></div>
       <div className="ref-auto-risk-foot">

@@ -22,6 +22,7 @@ from app.live_broker import is_emergency_stopped
 class RiskConfig:
     max_daily_loss_percent: float
     max_daily_loss_krw: float
+    account_equity_krw: float
     max_orders_per_day: int
     max_entry_orders_per_day: int
     max_exit_orders_per_day: int
@@ -42,8 +43,9 @@ class RiskConfig:
     @classmethod
     def from_env(cls) -> "RiskConfig":
         return cls(
-            max_daily_loss_percent=float(os.getenv("RISK_MAX_DAILY_LOSS_PERCENT", "1")),
+            max_daily_loss_percent=float(os.getenv("RISK_MAX_DAILY_LOSS_PERCENT", "20")),
             max_daily_loss_krw=float(os.getenv("RISK_MAX_DAILY_LOSS_KRW", "10000")),
+            account_equity_krw=float(os.getenv("RISK_ACCOUNT_EQUITY_KRW", "300000")),
             max_orders_per_day=int(os.getenv("RISK_MAX_ORDERS_PER_DAY", "3")),
             max_entry_orders_per_day=int(os.getenv("RISK_MAX_ENTRY_ORDERS_PER_DAY", "2")),
             max_exit_orders_per_day=int(os.getenv("RISK_MAX_EXIT_ORDERS_PER_DAY", "3")),
@@ -73,7 +75,13 @@ def get_risk_dashboard(exchange: str = "bithumb", market: str = "KRW-BTC") -> di
     return {"risk_state": state, "risk_logs": load_risk_logs(50, exchange, market), "config": RiskConfig.from_env().__dict__}
 
 
-def compute_risk_state(exchange: str = "bithumb", market: str = "KRW-BTC", *, balance_mismatch: bool | None = None) -> dict:
+def compute_risk_state(
+    exchange: str = "bithumb",
+    market: str = "KRW-BTC",
+    *,
+    balance_mismatch: bool | None = None,
+    account_equity_krw: float | None = None,
+) -> dict:
     config = RiskConfig.from_env()
     date = kst_date()
     start_utc, end_utc = _kst_day_bounds_utc(date)
@@ -131,7 +139,9 @@ def compute_risk_state(exchange: str = "bithumb", market: str = "KRW-BTC", *, ba
     realized = float(pnl_row["realized_pnl"] or 0.0)
     unrealized = float(pnl_row["unrealized_pnl"] or 0.0)
     total_pnl = realized + unrealized
-    daily_loss_percent = abs(min(total_pnl, 0.0)) / max(config.max_daily_loss_krw, 1.0) * 100
+    daily_loss_krw = abs(min(total_pnl, 0.0))
+    daily_loss_basis_krw = _daily_loss_basis_krw(account_equity_krw, config)
+    daily_loss_percent = daily_loss_krw / daily_loss_basis_krw * 100
     open_order_count = len(load_reconcilable_live_order_logs(exchange, market))
     open_position_count = len(load_open_live_positions(exchange, market))
     partial_fill = partial is not None
@@ -147,7 +157,7 @@ def compute_risk_state(exchange: str = "bithumb", market: str = "KRW-BTC", *, ba
         (config.max_orders_per_day > 0 and daily_order_count >= config.max_orders_per_day)
         or (config.max_entry_orders_per_day > 0 and daily_entry_count >= config.max_entry_orders_per_day)
         or (config.max_exit_orders_per_day > 0 and daily_exit_count >= config.max_exit_orders_per_day)
-        or abs(min(total_pnl, 0.0)) >= config.max_daily_loss_krw
+        or daily_loss_krw >= config.max_daily_loss_krw
         or daily_loss_percent >= config.max_daily_loss_percent
     ):
         status = "BLOCKED"
@@ -162,6 +172,7 @@ def compute_risk_state(exchange: str = "bithumb", market: str = "KRW-BTC", *, ba
         "daily_unrealized_pnl": unrealized,
         "daily_total_pnl": total_pnl,
         "daily_loss_percent": daily_loss_percent,
+        "daily_loss_basis_krw": daily_loss_basis_krw,
         "daily_order_count": daily_order_count,
         "daily_entry_count": daily_entry_count,
         "daily_exit_count": daily_exit_count,
@@ -192,6 +203,8 @@ def check_order_risk(
     candle_time_utc: str | None = None,
     signal: str | None = None,
     market_snapshot: dict | None = None,
+    balances: dict | None = None,
+    account_equity_krw: float | None = None,
     balance_mismatch: bool | None = None,
     manual_confirmed: bool = False,
     is_auto: bool = False,
@@ -200,7 +213,17 @@ def check_order_risk(
     market = str(order.get("market", "KRW-BTC"))
     side = str(order.get("side", "")).upper()
     config = RiskConfig.from_env()
-    state = compute_risk_state(exchange, market, balance_mismatch=balance_mismatch)
+    effective_account_equity_krw = (
+        account_equity_krw
+        if account_equity_krw is not None
+        else estimate_account_equity_krw(balances, market_snapshot, market)
+    )
+    state = compute_risk_state(
+        exchange,
+        market,
+        balance_mismatch=balance_mismatch,
+        account_equity_krw=effective_account_equity_krw,
+    )
     result = _standard_result(base_result, config)
     checks: dict[str, dict] = {}
 
@@ -343,8 +366,28 @@ def check_order_risk(
         }
     )
     if not result["allowed"]:
-        compute_risk_state(exchange, market, balance_mismatch=state["balance_mismatch_detected"])
+        compute_risk_state(
+            exchange,
+            market,
+            balance_mismatch=state["balance_mismatch_detected"],
+            account_equity_krw=effective_account_equity_krw,
+        )
     return result
+
+
+def estimate_account_equity_krw(
+    balances: dict | None,
+    market_snapshot: dict | None = None,
+    market: str = "KRW-BTC",
+) -> float:
+    if not balances:
+        return 0.0
+    total = _balance_total(balances, "KRW")
+    base_currency = market.split("-")[-1] if "-" in market else "BTC"
+    price = _float((market_snapshot or {}).get("price")) or _float((market_snapshot or {}).get("trade_price"))
+    if price > 0:
+        total += _balance_total(balances, base_currency) * price
+    return total
 
 
 def standardize_risk_result(result: dict) -> dict:
@@ -435,6 +478,27 @@ def market_condition_block(market_snapshot: dict | None, config: RiskConfig) -> 
     if config.require_completed_candle and market_snapshot.get("complete") is False:
         return "BLOCKED_INCOMPLETE_CANDLE"
     return None
+
+
+def _daily_loss_basis_krw(account_equity_krw: float | None, config: RiskConfig) -> float:
+    equity = _float(account_equity_krw)
+    if equity <= 0:
+        equity = config.account_equity_krw
+    return max(equity, 1.0)
+
+
+def _balance_total(balances: dict | None, currency: str) -> float:
+    if not balances:
+        return 0.0
+    target = currency.upper()
+    for item in balances.get("balances", []) or []:
+        if str(item.get("currency", "")).upper() == target:
+            return _float(item.get("balance")) + _float(item.get("locked"))
+    by_currency = balances.get("by_currency") or {}
+    item = by_currency.get(target) or by_currency.get(target.lower())
+    if isinstance(item, dict):
+        return _float(item.get("balance")) + _float(item.get("locked"))
+    return 0.0
 
 
 def _standard_result(result: dict | None, config: RiskConfig) -> dict:

@@ -78,6 +78,109 @@ class RiskManagerTests(unittest.TestCase):
         self.assertEqual(result["block_code"], "BLOCKED_DAILY_LOSS_LIMIT")
         self.assertEqual(compute_risk_state()["status"], "BLOCKED")
 
+    def test_daily_loss_percent_uses_account_equity_basis(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "STOPPED",
+                "auto_enabled": False,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSED",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 99_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": -100,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-16T00:00:00Z",
+                "closed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        env = {
+            "RISK_MAX_DAILY_LOSS_PERCENT": "1",
+            "RISK_MAX_DAILY_LOSS_KRW": "10000",
+            "RISK_ACCOUNT_EQUITY_KRW": "300000",
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            state = compute_risk_state()
+            result = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+
+        self.assertAlmostEqual(state["daily_loss_basis_krw"], 300_000)
+        self.assertAlmostEqual(state["daily_loss_percent"], 100 / 300_000 * 100)
+        self.assertTrue(result["allowed"])
+
+    def test_daily_loss_percent_uses_live_balance_equity_when_available(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "STOPPED",
+                "auto_enabled": False,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSED",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 99_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": -300,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-16T00:00:00Z",
+                "closed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        balances = {"balances": [{"currency": "KRW", "balance": "1000", "locked": "0"}]}
+        env = {
+            "RISK_MAX_DAILY_LOSS_PERCENT": "20",
+            "RISK_MAX_DAILY_LOSS_KRW": "10000",
+            "RISK_ACCOUNT_EQUITY_KRW": "300000",
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = check_order_risk(
+                order=order(),
+                purpose="ENTRY",
+                base_result={"allowed": True},
+                balances=balances,
+                is_auto=True,
+            )
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["block_code"], "BLOCKED_DAILY_LOSS_LIMIT")
+
     def test_daily_order_count_blocks(self) -> None:
         for index in range(3):
             payload = {

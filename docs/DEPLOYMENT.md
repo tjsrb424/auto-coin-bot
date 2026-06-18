@@ -495,6 +495,8 @@ Policy:
 - `AUTO_MAX_ORDERS_PER_DAY=0` means no daily auto entry order count limit.
 - `AUTO_CANCEL_UNFILLED_AFTER_SECONDS=60`
 - Amount must stay within `AUTO_MAX_ORDER_KRW`
+- `RISK_MAX_DAILY_LOSS_PERCENT` is measured against account equity. Live order checks use the fetched exchange balance and dashboard-only checks fall back to `RISK_ACCOUNT_EQUITY_KRW`.
+- `RISK_MAX_DAILY_LOSS_KRW` remains a separate absolute daily loss stop and can block before the percentage limit.
 
 Flow:
 

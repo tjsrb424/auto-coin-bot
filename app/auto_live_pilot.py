@@ -305,6 +305,7 @@ async def _submit_pilot_order(session: dict, candidate: dict, candle: dict, sign
             "trade_price_volume": float(candle.get("candle_acc_trade_price") or 0.0),
             "complete": True,
         },
+        balances=balances,
         is_auto=True,
     )
     if not risk["allowed"]:
