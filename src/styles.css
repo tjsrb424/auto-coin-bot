@@ -1444,11 +1444,11 @@ body {
 .ref-bot-info-grid {
   position: absolute;
   right: 18px;
-  top: 55px;
+  top: 50px;
   display: grid;
   width: 282px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 10px;
+  gap: 6px 10px;
 }
 
 .ref-bot-info-grid p {
@@ -1481,6 +1481,50 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ref-bot-info-grid .ref-bot-loss-card {
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 2px 7px;
+  padding-block: 4px;
+}
+
+.ref-bot-loss-card > span,
+.ref-bot-loss-card > strong {
+  align-self: center;
+}
+
+.ref-bot-loss-card > em {
+  display: flex;
+  grid-column: 1 / -1;
+  justify-content: space-between;
+  color: #8f9db1;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.ref-bot-loss-card > em b {
+  color: #dbe5f2;
+  font-size: 9px;
+}
+
+.ref-bot-loss-card > i {
+  display: block;
+  grid-column: 1 / -1;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(35, 50, 70, 0.9);
+}
+
+.ref-bot-loss-card > i small {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #35d66a, #f0c84b 62%, #ff4d66);
 }
 
 .ref-detail-button {

@@ -1410,6 +1410,9 @@ function BotStatusPanel({ data, onOpenAutoTrade }: { data: DashboardData; onOpen
   const autoRunning = isRuntimeRunning(data);
   const riskState = data.risk?.risk_state;
   const dailyPnl = riskState?.daily_total_pnl ?? data.paper?.balance?.total_pnl ?? null;
+  const dailyLossPercent = Math.abs(riskState?.daily_loss_percent ?? 0);
+  const maxDailyLossPercent = data.risk?.config?.max_daily_loss_percent ?? 20;
+  const dailyLossBarWidth = Math.min(dailyLossPercent / Math.max(maxDailyLossPercent, 1) * 100, 100);
   const strategyName = data.liveStrategy?.session?.strategy_name ?? data.autoPilot?.session?.strategy_name ?? data.candidates[0]?.name ?? "-";
   const ordersToday = data.liveStrategy?.session?.orders_created_today ?? data.autoPilot?.session?.orders_created_today;
   const maxOrders = data.liveStrategy?.session?.max_orders_per_day ?? data.autoPilot?.session?.max_orders_per_day;
@@ -1441,7 +1444,12 @@ function BotStatusPanel({ data, onOpenAutoTrade }: { data: DashboardData; onOpen
         <p><span>거래소</span><b>{exchangeName}</b></p>
         <p><span>오늘 주문</span><b>{orderText}</b></p>
         <p><span>현재 전략</span><b>{strategyName}</b></p>
-        <p><span>오늘 손익</span><strong className={(dailyPnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(dailyPnl)}</strong></p>
+        <p className="ref-bot-loss-card">
+          <span>오늘 손익</span>
+          <strong className={(dailyPnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(dailyPnl)}</strong>
+          <em>일 손실률 <b>{dailyLossPercent.toFixed(2)}% / {maxDailyLossPercent.toFixed(0)}%</b></em>
+          <i><small style={{ width: `${dailyLossBarWidth}%` }} /></i>
+        </p>
       </div>
     </RefPanel>
   );
