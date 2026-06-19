@@ -737,6 +737,11 @@ function formatKrw(value?: number | null) {
   return new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(value);
 }
 
+function formatOrderLimit(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  return value >= 999_999_999 ? "제한없음" : formatKrw(value);
+}
+
 function formatSignedKrw(value?: number | null) {
   if (value == null || !Number.isFinite(value)) return "-";
   const sign = value > 0 ? "+" : "";
@@ -3049,7 +3054,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     },
     {
       label: "주문 한도",
-      value: formatKrw(maxOrder),
+      value: formatOrderLimit(maxOrder),
       detail: `남은 한도 ${formatKrw(remainingExposure)} · 현재 포지션 ${formatKrw(positionValue)}`,
       tone: "cyan"
     },
@@ -3182,7 +3187,7 @@ function AutoRiskPanel({
       )}
       <div className="ref-auto-risk-row"><span>개정 리스크</span><b>{dailyLoss.toFixed(2)}% / {maxDailyLossPercent.toFixed(0)}%</b></div>
       <div className="ref-auto-bar"><i style={{ width: `${Math.min(dailyLoss / Math.max(maxDailyLossPercent, 1) * 100, 100)}%` }} /></div>
-      <div className="ref-auto-risk-row"><span>일일 손익 한도</span><b>{formatKrw(maxOrder)}</b></div>
+      <div className="ref-auto-risk-row"><span>일일 손익 한도</span><b>{formatOrderLimit(maxOrder)}</b></div>
       <div className="ref-auto-bar"><i style={{ width: "38%" }} /></div>
       <div className="ref-auto-risk-row"><span>운용정책 사용률</span><b>{formatRatioPercent(policyUsage)}</b></div>
       <div className="ref-auto-risk-foot">
@@ -4019,7 +4024,7 @@ function AnalysisView({ data }: { data: DashboardData }) {
             <p><span>목표금액</span><b>{formatKrw(intent.target_value_krw)}</b></p>
             <p><span>지정가</span><b>{formatKrw(intent.limit_price)}</b></p>
             <p><span>승격상태</span><b>{promotionStatusLabel(intent.promotion_status ?? data.smartEngineStatus?.promotion_status)}</b></p>
-            <p><span>제한주문상한</span><b>{formatKrw(intent.pilot_order_cap_krw)}</b></p>
+            <p><span>제한주문상한</span><b>{formatOrderLimit(intent.pilot_order_cap_krw)}</b></p>
             <p><span>리허설</span><b>{rehearsal ? `${rehearsal.allowed ? "통과" : "차단"} · ${rehearsal.blockers?.[0] ?? "사유 없음"}` : "-"}</b></p>
           </div>
         ) : (

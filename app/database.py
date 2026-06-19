@@ -2482,6 +2482,8 @@ def update_live_position(position_id: int, updates: dict) -> None:
         "status",
         "exit_order_uuid",
         "current_price",
+        "entry_volume",
+        "entry_amount_krw",
         "unrealized_pnl",
         "realized_pnl",
         "closed_at",

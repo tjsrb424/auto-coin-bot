@@ -15,6 +15,7 @@ from app.database import (
     has_unresolved_live_order,
     insert_live_recovery_event,
     load_filled_entry_order_logs_without_position,
+    load_live_position,
     load_live_position_by_entry_order_uuid,
     load_live_recovery_events,
     load_latest_live_strategy_session,
@@ -24,6 +25,7 @@ from app.database import (
     pause_running_live_strategy_sessions_on_startup,
     update_live_strategy_session,
     update_live_order_log,
+    update_live_position,
 )
 from app.live_broker import _balance_amount, get_live_broker
 from app.upbit import fetch_tickers
@@ -211,18 +213,62 @@ def apply_reconciled_order_status(log: dict, status: ReconciledOrderStatus, sour
             "filled_amount_krw": status.filled_amount_krw,
         },
     )
-    if status.status == "FILLED":
-        updated = {
-            **log,
-            "status": status.status,
-            "order_uuid": _order_uuid(status.raw) or log.get("order_uuid"),
-            "executed_volume": status.executed_volume,
-            "remaining_volume": status.remaining_volume,
-            "filled_amount_krw": status.filled_amount_krw,
-            "paid_fee": status.paid_fee,
-            "exchange_response_payload": status.raw,
-        }
+    updated = {
+        **log,
+        "status": status.status,
+        "order_uuid": _order_uuid(status.raw) or log.get("order_uuid"),
+        "executed_volume": status.executed_volume,
+        "remaining_volume": status.remaining_volume,
+        "filled_amount_krw": status.filled_amount_krw,
+        "paid_fee": status.paid_fee,
+        "exchange_response_payload": status.raw,
+    }
+    if _is_exit_order(updated):
+        sync_exit_order_position(updated, status)
+    elif status.status == "FILLED":
         ensure_filled_entry_order_position(updated, source=f"{source}_POSITION_SYNC")
+
+
+def sync_exit_order_position(log: dict, status: ReconciledOrderStatus) -> None:
+    position_id = log.get("position_id")
+    if not position_id:
+        return
+    position = load_live_position(int(position_id))
+    if position is None:
+        return
+    entry_volume = _float(position.get("entry_volume"))
+    entry_amount = _float(position.get("entry_amount_krw"))
+    entry_price = _float(position.get("entry_price"))
+    entry_basis = (entry_amount * min(status.executed_volume / entry_volume, 1.0)) if entry_volume > 0 else entry_price * status.executed_volume
+    actual_pnl = status.filled_amount_krw - entry_basis - status.paid_fee
+    if status.status == "FILLED":
+        update_live_order_log(str(log["request_id"]), {"actual_pnl": actual_pnl})
+        realized_pnl = _float(position.get("realized_pnl")) + actual_pnl
+        remaining_volume = max(entry_volume - status.executed_volume, 0.0)
+        if remaining_volume <= BALANCE_MISMATCH_VOLUME_TOLERANCE:
+            update_live_position(int(position_id), {"status": "CLOSED", "realized_pnl": realized_pnl, "closed_at": _utc_now()})
+            return
+        remaining_amount = max(entry_amount - entry_basis, 0.0)
+        current_price = status.filled_amount_krw / status.executed_volume if status.executed_volume > 0 else position.get("current_price")
+        update_live_position(
+            int(position_id),
+            {
+                "status": "OPEN",
+                "entry_volume": remaining_volume,
+                "entry_amount_krw": remaining_amount,
+                "current_price": current_price,
+                "realized_pnl": realized_pnl,
+                "exit_order_uuid": None,
+            },
+        )
+    elif status.status == "PARTIALLY_FILLED":
+        update_live_position(int(position_id), {"status": "CLOSING"})
+    elif status.status == "CANCELED":
+        update_live_position(int(position_id), {"status": "MANUAL_REVIEW_REQUIRED"})
+
+
+def _is_exit_order(log: dict) -> bool:
+    return str(log.get("order_purpose") or "").upper() == "EXIT" or str(log.get("side") or "").upper() in {"SELL", "ASK"}
 
 
 async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC") -> dict:

@@ -24,7 +24,7 @@ from app.database import (
     update_live_strategy_session,
 )
 from app.live_broker import LiveTradingConfig, _available_balance, get_live_broker, masked_exchange_request
-from app.live_recovery import is_timeout_exception, log_recovery_event, normalize_exchange_order, reconcile_balances
+from app.live_recovery import is_timeout_exception, log_recovery_event, normalize_exchange_order, reconcile_balances, sync_exit_order_position
 from app.risk_manager import check_order_risk
 
 logger = logging.getLogger("uvicorn.error")
@@ -296,16 +296,9 @@ async def reconcile_exit_order(request_id: str) -> dict | None:
         },
     )
     candidate_id = log.get("exit_candidate_id")
-    position_id = log.get("position_id")
     if candidate_id:
         update_exit_candidate(int(candidate_id), {"status": _candidate_status_for_order(status.status), "risk_result": status.status})
-    if position_id:
-        if status.status == "FILLED":
-            update_live_position(int(position_id), {"status": "CLOSED", "realized_pnl": actual_pnl, "closed_at": _utc_now()})
-        elif status.status == "PARTIALLY_FILLED":
-            update_live_position(int(position_id), {"status": "CLOSING"})
-        elif status.status == "CANCELED":
-            update_live_position(int(position_id), {"status": "MANUAL_REVIEW_REQUIRED"})
+    sync_exit_order_position({**log, "actual_pnl": actual_pnl}, status)
     return {"status": status.status, "raw": raw}
 
 

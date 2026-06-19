@@ -152,6 +152,125 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ensure_filled_entry_order_positions("bithumb", "KRW-BTC"), {"created": 0, "attached": 0, "skipped": 0})
         self.assertEqual(len(database.load_open_live_positions("bithumb", "KRW-BTC")), 1)
 
+    def test_filled_exit_reconciliation_closes_position(self) -> None:
+        session_id = create_strategy_session()
+        position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSING",
+                "entry_order_uuid": "entry-1",
+                "exit_order_uuid": "exit-1",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 10_000,
+                "current_price": 100_000_000,
+            }
+        )
+        database.insert_live_order_log(
+            {
+                **order_log("exit-test"),
+                "session_id": session_id,
+                "side": "SELL",
+                "status": "SUBMITTED",
+                "order_uuid": "exit-1",
+                "position_id": position_id,
+                "order_purpose": "EXIT",
+            }
+        )
+        current = database.get_live_order_log("exit-test")
+        assert current is not None
+
+        apply_reconciled_order_status(
+            current,
+            normalize_exchange_order(
+                {
+                    "uuid": "exit-1",
+                    "state": "done",
+                    "price": "101000000",
+                    "volume": "0.0001",
+                    "executed_volume": "0.0001",
+                    "remaining_volume": "0",
+                    "paid_fee": "4",
+                }
+            ),
+            "TEST_EXIT_RECONCILE",
+        )
+
+        updated = database.get_live_order_log("exit-test")
+        assert updated is not None
+        self.assertEqual(updated["status"], "FILLED")
+        self.assertEqual(updated["actual_pnl"], 96)
+        position = database.load_live_position(position_id)
+        assert position is not None
+        self.assertEqual(position["status"], "CLOSED")
+        self.assertEqual(position["realized_pnl"], 96)
+        self.assertIsNotNone(position["closed_at"])
+        self.assertEqual(database.load_open_live_positions("bithumb", "KRW-BTC"), [])
+
+    def test_filled_partial_exit_reconciliation_reduces_position(self) -> None:
+        session_id = create_strategy_session()
+        position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSING",
+                "entry_order_uuid": "entry-1",
+                "exit_order_uuid": "exit-1",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.0002,
+                "entry_amount_krw": 20_000,
+                "current_price": 100_000_000,
+            }
+        )
+        database.insert_live_order_log(
+            {
+                **order_log("partial-exit-test"),
+                "session_id": session_id,
+                "side": "SELL",
+                "status": "SUBMITTED",
+                "order_uuid": "exit-1",
+                "position_id": position_id,
+                "order_purpose": "EXIT",
+            }
+        )
+        current = database.get_live_order_log("partial-exit-test")
+        assert current is not None
+
+        apply_reconciled_order_status(
+            current,
+            normalize_exchange_order(
+                {
+                    "uuid": "exit-1",
+                    "state": "done",
+                    "price": "101000000",
+                    "volume": "0.00015",
+                    "executed_volume": "0.00015",
+                    "remaining_volume": "0",
+                    "paid_fee": "4",
+                }
+            ),
+            "TEST_PARTIAL_EXIT_RECONCILE",
+        )
+
+        updated = database.get_live_order_log("partial-exit-test")
+        assert updated is not None
+        self.assertEqual(updated["actual_pnl"], 146)
+        position = database.load_live_position(position_id)
+        assert position is not None
+        self.assertEqual(position["status"], "OPEN")
+        self.assertAlmostEqual(position["entry_volume"], 0.00005)
+        self.assertAlmostEqual(position["entry_amount_krw"], 5_000)
+        self.assertEqual(position["realized_pnl"], 146)
+        self.assertIsNone(position["exit_order_uuid"])
+        self.assertEqual(len(database.load_open_live_positions("bithumb", "KRW-BTC")), 1)
+
     async def test_startup_recovery_pauses_running_sessions(self) -> None:
         database.create_auto_live_pilot_session(
             {
