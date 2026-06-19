@@ -377,11 +377,16 @@ type AnalysisDecision = {
   conservative_target_exposure_pct?: number;
   final_target_exposure_source?: string;
   current_position_pnl_pct?: number;
+  core_exposure_pct?: number;
+  core_exposure_applied?: boolean;
+  core_exposure_broken_by_panic?: boolean;
   highest_price_since_entry?: number | null;
   trailing_stop_price?: number | null;
   partial_take_profit_triggered?: boolean;
   pyramiding_allowed?: boolean;
   aggressive_blockers?: string[];
+  aggressive_buy_blockers?: string[];
+  aggressive_warnings?: string[];
   confidence_score?: number;
   risk_score?: number;
   positive_reasons?: string[];
@@ -4115,6 +4120,8 @@ function AnalysisView({ data }: { data: DashboardData }) {
   const shadowRows = data.shadowReport?.recent_rows ?? [];
   const rehearsal = intent?.policy_preview?.rehearsal as { allowed?: boolean; blockers?: string[]; daily_smart_order_count?: number; risk_score?: number } | undefined;
   const noAveragingDownBlocked = Boolean(intent?.no_averaging_down_blocked ?? latest.aggressive_blockers?.includes("SMART_AGGRESSIVE_NO_AVERAGING_DOWN"));
+  const aggressiveBuyBlockers = latest?.aggressive_buy_blockers?.length ? latest.aggressive_buy_blockers : latest?.aggressive_blockers ?? [];
+  const aggressiveWarnings = latest?.aggressive_warnings?.length ? latest.aggressive_warnings : [];
 
   if (!latest) {
     return (
@@ -4151,6 +4158,7 @@ function AnalysisView({ data }: { data: DashboardData }) {
           <p><span>현재</span><b>{formatRatioPercent(latest.current_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.current_exposure_pct ?? 0, 0), 100)}%` }} /></p>
           <p><span>보수형</span><b>{formatRatioPercent(latest.conservative_target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.conservative_target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
           <p><span>공격형</span><b>{formatRatioPercent(latest.aggressive_target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.aggressive_target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
+          <p><span>코어 BTC</span><b>{formatRatioPercent(latest.core_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.core_exposure_pct ?? 0, 0), 100)}%` }} /></p>
           <p><span>목표</span><b>{formatRatioPercent(latest.target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
         </div>
         <small>출처 {latest.final_target_exposure_source ?? "-"} · 포지션 수익률 {formatPercent((latest.current_position_pnl_pct ?? 0) / 100)} · {formatNumber(latest.current_bot_position_qty, 8)} BTC · {formatKrw(latest.current_bot_position_value_krw)} KRW</small>
@@ -4159,6 +4167,8 @@ function AnalysisView({ data }: { data: DashboardData }) {
         <h3>공격형 관리</h3>
         <div>
           <p><span>피라미딩</span><b>{latest.pyramiding_allowed ? "허용 후보" : "비허용"}</b></p>
+          <p><span>코어 적용</span><b>{latest.core_exposure_applied ? "적용" : "미적용"}</b></p>
+          <p><span>패닉 core break</span><b>{latest.core_exposure_broken_by_panic ? "발동" : "미발동"}</b></p>
           <p><span>손실 물타기 차단</span><b>{noAveragingDownBlocked ? "차단" : "해당 없음"}</b></p>
           <p><span>부분익절</span><b>{latest.partial_take_profit_triggered ? "후보" : "대기"}</b></p>
           <p><span>트레일링 스탑</span><b>{latest.trailing_stop_price ? `${formatKrw(latest.trailing_stop_price)} KRW` : "-"}</b></p>
@@ -4193,6 +4203,10 @@ function AnalysisView({ data }: { data: DashboardData }) {
           const code = extractPolicyBlockCode(blocker);
           return <p key={`blocker-${index}`}>{code ? `정책 차단 · ${policyBlockText(code, blocker)}` : blocker}</p>;
         })}
+        <h3>공격 매수 차단</h3>
+        {(aggressiveBuyBlockers.length ? aggressiveBuyBlockers : ["차단 사유 없음"]).map((blocker, index) => <p key={`aggressive-buy-blocker-${index}`}>{blocker}</p>)}
+        <h3>공격 경고</h3>
+        {(aggressiveWarnings.length ? aggressiveWarnings : ["경고 없음"]).map((warning, index) => <p key={`aggressive-warning-${index}`}>{warning}</p>)}
       </RefPanel>
       <RefPanel className="ref-analysis-intent">
         <h3>주문 후보</h3>

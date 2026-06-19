@@ -15,6 +15,7 @@ from app.smart_readiness import build_limited_readiness
 from app.smart_signal_engine import aggregate_signal_score, evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
 from app.smart_attack import apply_aggressive_target_layer, calculate_attack_score
+from app.smart_decision import _order_intent
 
 
 class SmartEngineComponentTests(unittest.TestCase):
@@ -306,6 +307,7 @@ class SmartEngineComponentTests(unittest.TestCase):
         )
         self.assertGreaterEqual(attack["attack_score"], 80)
         self.assertGreater(result["target_exposure_pct"], 40)
+        self.assertEqual(result["aggressive_target_exposure_pct"], 85)
         self.assertEqual(result["final_target_exposure_source"], "AGGRESSIVE")
         self.assertEqual(result["action_hint"], "BUY_MORE")
 
@@ -393,6 +395,93 @@ class SmartEngineComponentTests(unittest.TestCase):
         )
         self.assertIn(result["action_hint"], {"EXIT", "REDUCE"})
         self.assertEqual(result["final_target_exposure_source"], "TRAILING_EXIT")
+
+    def test_core_exposure_applies_in_range(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_MIN_CORE_EXPOSURE_PCT": "30"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="RANGE",
+                conservative_target_exposure_pct=18,
+                attack_result={"attack_score": 20, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=0,
+                current_position_pnl_pct=0,
+                current_price=100,
+                highest_price_since_entry=None,
+                risk_blockers=[],
+            )
+        self.assertGreaterEqual(result["target_exposure_pct"], 30)
+        self.assertEqual(result["final_target_exposure_source"], "CORE")
+        self.assertTrue(result["core_exposure_applied"])
+
+    def test_core_exposure_reduces_in_trend_down(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_MIN_CORE_EXPOSURE_PCT": "30", "SMART_TREND_DOWN_CORE_EXPOSURE_PCT": "15"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="TREND_DOWN",
+                conservative_target_exposure_pct=70,
+                attack_result={"attack_score": 80, "attack_mode": "MAX_AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": ["SMART_AGGRESSIVE_TREND_DOWN_BLOCKED"], "score_breakdown": {}},
+                current_exposure_pct=30,
+                current_position_pnl_pct=0,
+                current_price=101,
+                highest_price_since_entry=101,
+                risk_blockers=[],
+            )
+        self.assertLessEqual(result["target_exposure_pct"], 15)
+        self.assertEqual(result["final_target_exposure_source"], "CORE_REDUCED")
+
+    def test_panic_can_break_core_exposure(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_PANIC_CAN_BREAK_CORE": "true"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="PANIC",
+                conservative_target_exposure_pct=30,
+                attack_result={"attack_score": 20, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": ["SMART_AGGRESSIVE_PANIC_BLOCKED"], "score_breakdown": {}},
+                current_exposure_pct=30,
+                current_position_pnl_pct=-1,
+                current_price=100,
+                highest_price_since_entry=105,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 0)
+        self.assertTrue(result["core_exposure_broken_by_panic"])
+        self.assertEqual(result["action_hint"], "EXIT")
+
+    def test_trend_down_buy_blocker_does_not_block_reduce_intent(self) -> None:
+        snapshot = {
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "target_exposure_pct": 15,
+            "current_exposure_pct": 30,
+            "action_hint": "REDUCE",
+            "attack_score": 80,
+            "attack_mode": "MAX_AGGRESSIVE",
+            "final_target_exposure_source": "CORE_REDUCED",
+            "aggressive_buy_blockers": ["SMART_AGGRESSIVE_TREND_DOWN_BLOCKED"],
+            "aggressive_warnings": ["SMART_AGGRESSIVE_TREND_DOWN_BLOCKED"],
+        }
+        intent = _order_intent(snapshot_id=1, snapshot=snapshot, max_total_exposure_krw=100_000, current_value=30_000, current_price=100, blockers=["SMART_AGGRESSIVE_TREND_DOWN_BLOCKED"])
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent["side"], "ASK")
+        self.assertEqual(intent["status"], "CREATED")
+        self.assertNotIn("SMART_AGGRESSIVE_TREND_DOWN_BLOCKED", intent["blockers"])
+        self.assertIn("SMART_AGGRESSIVE_TREND_DOWN_BLOCKED", intent["policy_preview"]["aggressive_warnings"])
+
+    def test_overheated_buy_blocker_does_not_block_take_profit_intent(self) -> None:
+        snapshot = {
+            "exchange": "bithumb",
+            "market": "KRW-BTC",
+            "target_exposure_pct": 49,
+            "current_exposure_pct": 70,
+            "action_hint": "TAKE_PROFIT_PARTIAL",
+            "attack_score": 40,
+            "attack_mode": "OFF",
+            "final_target_exposure_source": "PARTIAL_TAKE_PROFIT",
+            "partial_take_profit_pct": 30,
+            "aggressive_buy_blockers": ["SMART_AGGRESSIVE_OVERHEATED_BLOCKED"],
+            "aggressive_warnings": ["SMART_AGGRESSIVE_OVERHEATED_BLOCKED"],
+        }
+        intent = _order_intent(snapshot_id=1, snapshot=snapshot, max_total_exposure_krw=100_000, current_value=70_000, current_price=100, blockers=["SMART_AGGRESSIVE_OVERHEATED_BLOCKED"])
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent["side"], "ASK")
+        self.assertEqual(intent["status"], "CREATED")
+        self.assertNotIn("SMART_AGGRESSIVE_OVERHEATED_BLOCKED", intent["blockers"])
 
     def test_limited_readiness_summarizes_preflight_checks(self) -> None:
         readiness = self.build_readiness_with_empty_db(

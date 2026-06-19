@@ -93,12 +93,15 @@ def calculate_attack_score(
     else:
         mode = "OFF"
 
+    buy_blockers = list(dict.fromkeys(blockers))
     return {
         "attack_score": score,
         "attack_mode": mode,
         "positive_reasons": positives,
         "negative_reasons": negatives,
-        "blockers": list(dict.fromkeys(blockers)),
+        "blockers": buy_blockers,
+        "aggressive_buy_blockers": buy_blockers,
+        "aggressive_warnings": buy_blockers,
         "score_breakdown": breakdown,
         "current_exposure_pct": _float(current_exposure_pct),
     }
@@ -119,7 +122,10 @@ def apply_aggressive_target_layer(
     current = _float(current_exposure_pct)
     conservative = _float(conservative_target_exposure_pct)
     pnl = _float(current_position_pnl_pct)
-    blockers = list(dict.fromkeys([*(risk_blockers or []), *((attack_result or {}).get("blockers") or [])]))
+    risk_blockers = list(dict.fromkeys(risk_blockers or []))
+    aggressive_buy_blockers = list(dict.fromkeys((attack_result or {}).get("aggressive_buy_blockers") or (attack_result or {}).get("blockers") or []))
+    aggressive_warnings = list(dict.fromkeys((attack_result or {}).get("aggressive_warnings") or aggressive_buy_blockers))
+    blockers = list(dict.fromkeys([*risk_blockers, *aggressive_buy_blockers]))
     positives = list((attack_result or {}).get("positive_reasons") or [])
     negatives = list((attack_result or {}).get("negative_reasons") or [])
     attack_mode = str((attack_result or {}).get("attack_mode") or "OFF")
@@ -128,7 +134,7 @@ def apply_aggressive_target_layer(
     aggressive_target = _aggressive_target(regime, attack_mode)
     final_target = conservative
     source = "CONSERVATIVE"
-    if _aggressive_allowed(regime, attack_mode, blockers):
+    if _aggressive_allowed(regime, attack_mode, [*risk_blockers, *aggressive_buy_blockers]):
         final_target = max(conservative, aggressive_target)
         source = "AGGRESSIVE" if final_target > conservative else "CONSERVATIVE"
 
@@ -136,22 +142,44 @@ def apply_aggressive_target_layer(
     if _env_bool("SMART_NO_AVERAGING_DOWN", True) and current > 0 and pnl < 0 and final_target > current:
         no_averaging_down = True
         blockers.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
+        aggressive_buy_blockers.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
+        aggressive_warnings.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
         negatives.append("Current position is losing, so aggressive add-buy is blocked.")
         final_target = current
         source = "RISK_REDUCED"
 
-    if blockers and final_target > current:
+    core_enabled = _env_bool("SMART_CORE_EXPOSURE_ENABLED", False)
+    core_exposure_pct = _core_exposure_pct(regime) if core_enabled else 0.0
+    core_exposure_applied = False
+    core_exposure_broken_by_panic = False
+    core_override_blocked = _core_override_blocked(risk_blockers)
+
+    if risk_blockers and final_target > current:
         final_target = current
         source = "RISK_REDUCED"
     if regime == "PANIC":
         final_target = 0.0
         source = "RISK_REDUCED"
+        if core_enabled and _env_bool("SMART_PANIC_CAN_BREAK_CORE", True):
+            core_exposure_broken_by_panic = True
     elif regime == "TREND_DOWN":
-        final_target = min(final_target, 10.0)
-        source = "RISK_REDUCED" if final_target < conservative else source
+        reduced_core = core_exposure_pct if core_enabled else 10.0
+        final_target = min(final_target, reduced_core)
+        source = "CORE_REDUCED" if core_enabled else ("RISK_REDUCED" if final_target < conservative else source)
     elif regime == "OVERHEATED" and final_target > current:
         final_target = current
         source = "RISK_REDUCED"
+
+    if core_enabled and not core_override_blocked and regime not in {"PANIC", "TREND_DOWN"} and core_exposure_pct > 0:
+        if regime == "OVERHEATED":
+            if current >= core_exposure_pct and final_target < core_exposure_pct:
+                final_target = core_exposure_pct
+                source = "CORE"
+                core_exposure_applied = True
+        elif final_target < core_exposure_pct:
+            final_target = core_exposure_pct
+            source = "CORE"
+            core_exposure_applied = True
 
     pyramid_min = _float(os.getenv("SMART_PYRAMID_MIN_PNL_PCT"), 0.3)
     pyramiding_allowed = current > 0 and pnl >= pyramid_min and attack_score >= _float(os.getenv("SMART_ATTACK_SCORE_ENTRY"), ATTACK_ENTRY_DEFAULT) and not no_averaging_down and regime in {"BREAKOUT", "TREND_UP", "RANGE"}
@@ -176,14 +204,18 @@ def apply_aggressive_target_layer(
     else:
         tp1 = _float(os.getenv("SMART_PARTIAL_TAKE_PROFIT_1_PCT"), 0.8)
         tp2 = _float(os.getenv("SMART_PARTIAL_TAKE_PROFIT_2_PCT"), 1.5)
-        strong_breakout_hold = regime == "BREAKOUT" and attack_score >= _float(os.getenv("SMART_ATTACK_SCORE_MAX"), ATTACK_MAX_DEFAULT)
-        if current > 0 and pnl >= tp2:
+        strong_breakout_hold = regime == "BREAKOUT" and attack_score >= _float(os.getenv("SMART_ATTACK_SCORE_MAX"), ATTACK_MAX_DEFAULT) and pnl >= 2.5
+        if current > 0 and strong_breakout_hold:
+            final_target = current
+            target_source = "TRAILING_HOLD"
+            positives.append("Strong BREAKOUT profit is managed by trailing hold before partial take-profit.")
+        elif current > 0 and pnl >= tp2:
             partial_take_profit_triggered = True
-            partial_take_profit_pct = 25.0
-            final_target = min(final_target, current * 0.75)
+            partial_take_profit_pct = 30.0
+            final_target = min(final_target, current * 0.7)
             target_source = "PARTIAL_TAKE_PROFIT"
             negatives.append("Profit exceeds the second partial-take threshold, so partial profit is preferred.")
-        elif current > 0 and pnl >= tp1 and (regime == "OVERHEATED" or attack_mode in {"OFF", "WATCH"} or not strong_breakout_hold):
+        elif current > 0 and pnl >= tp1:
             partial_take_profit_triggered = True
             partial_take_profit_pct = 20.0
             final_target = min(final_target, current * 0.8)
@@ -204,6 +236,8 @@ def apply_aggressive_target_layer(
         "positive_reasons": positives,
         "negative_reasons": negatives,
         "blockers": list(dict.fromkeys(blockers)),
+        "aggressive_buy_blockers": list(dict.fromkeys(aggressive_buy_blockers)),
+        "aggressive_warnings": list(dict.fromkeys(aggressive_warnings)),
         "highest_price_since_entry": round(highest, 8) if highest else None,
         "trailing_stop_price": round(trailing_stop_price, 8) if trailing_stop_price else None,
         "trailing_stop_pct": trailing_pct,
@@ -211,16 +245,19 @@ def apply_aggressive_target_layer(
         "partial_take_profit_pct": partial_take_profit_pct,
         "pyramiding_allowed": pyramiding_allowed,
         "no_averaging_down_blocked": no_averaging_down,
+        "core_exposure_pct": round(max(min(core_exposure_pct, 100.0), 0.0), 4),
+        "core_exposure_applied": core_exposure_applied,
+        "core_exposure_broken_by_panic": core_exposure_broken_by_panic,
     }
 
 
 def _aggressive_target(regime: str, mode: str) -> float:
     if regime == "BREAKOUT":
-        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_BREAKOUT"), 75.0) if mode == "MAX_AGGRESSIVE" else 60.0 if mode == "AGGRESSIVE" else 0.0
+        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_BREAKOUT"), 85.0) if mode == "MAX_AGGRESSIVE" else 70.0 if mode == "AGGRESSIVE" else 0.0
     if regime == "TREND_UP":
-        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_TREND_UP"), 65.0) if mode == "MAX_AGGRESSIVE" else 50.0 if mode == "AGGRESSIVE" else 0.0
+        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_TREND_UP"), 75.0) if mode == "MAX_AGGRESSIVE" else 60.0 if mode == "AGGRESSIVE" else 0.0
     if regime == "RANGE":
-        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_RANGE"), 30.0) if mode in {"AGGRESSIVE", "MAX_AGGRESSIVE"} else 0.0
+        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_RANGE"), 45.0) if mode in {"AGGRESSIVE", "MAX_AGGRESSIVE"} else 0.0
     if regime == "TREND_DOWN":
         return 10.0
     if regime == "PANIC":
@@ -237,6 +274,8 @@ def _aggressive_allowed(regime: str, mode: str, blockers: list[str]) -> bool:
 def _action_hint(current: float, target: float, source: str) -> str:
     if source == "PARTIAL_TAKE_PROFIT":
         return "TAKE_PROFIT_PARTIAL"
+    if source == "TRAILING_HOLD":
+        return "TRAILING_HOLD"
     if source == "TRAILING_EXIT":
         return "EXIT" if target <= 0 else "REDUCE"
     delta = target - current
@@ -249,13 +288,38 @@ def _action_hint(current: float, target: float, source: str) -> str:
 
 
 def _trailing_stop_pct(regime: str) -> float:
-    default = {
-        "BREAKOUT": 0.9,
-        "TREND_UP": 0.7,
-        "RANGE": 0.5,
-        "OVERHEATED": 0.4,
-    }.get(regime, _float(os.getenv("SMART_TRAILING_STOP_PCT"), 0.7))
-    return _float(os.getenv("SMART_TRAILING_STOP_PCT"), default)
+    default = _float(os.getenv("SMART_TRAILING_STOP_PCT_DEFAULT"), _float(os.getenv("SMART_TRAILING_STOP_PCT"), 0.7))
+    env_name = {
+        "BREAKOUT": "SMART_TRAILING_STOP_PCT_BREAKOUT",
+        "TREND_UP": "SMART_TRAILING_STOP_PCT_TREND_UP",
+        "RANGE": "SMART_TRAILING_STOP_PCT_RANGE",
+        "OVERHEATED": "SMART_TRAILING_STOP_PCT_OVERHEATED",
+    }.get(regime)
+    if env_name:
+        return _float(os.getenv(env_name), default)
+    return default
+
+
+def _core_exposure_pct(regime: str) -> float:
+    if regime == "PANIC":
+        return _float(os.getenv("SMART_PANIC_CORE_EXPOSURE_PCT"), 0.0)
+    if regime == "TREND_DOWN":
+        return _float(os.getenv("SMART_TREND_DOWN_CORE_EXPOSURE_PCT"), 15.0)
+    if regime == "OVERHEATED":
+        return _float(os.getenv("SMART_OVERHEATED_CORE_EXPOSURE_PCT"), 30.0)
+    return _float(os.getenv("SMART_MIN_CORE_EXPOSURE_PCT"), 30.0)
+
+
+def _core_override_blocked(risk_blockers: list[str]) -> bool:
+    critical = {
+        "SMART_RISK_SCORE_HIGH",
+        "SMART_DAILY_LOSS_LIMIT_REACHED",
+        "EMERGENCY_STOPPED",
+        "BLOCKED",
+        "SMART_POLICY_AUTO_TRADING_DISABLED",
+        "SMART_EXCHANGE_NOTICE_RISK_BLOCK",
+    }
+    return any(str(blocker) in critical for blocker in risk_blockers)
 
 
 def _add(breakdown: dict[str, float], positives: list[str], key: str, value: float, condition: bool, reason: str) -> None:

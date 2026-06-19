@@ -128,7 +128,12 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
         "partial_take_profit_triggered": aggressive_result["partial_take_profit_triggered"],
         "partial_take_profit_pct": aggressive_result["partial_take_profit_pct"],
         "pyramiding_allowed": aggressive_result["pyramiding_allowed"],
-        "aggressive_blockers": attack_result["blockers"],
+        "aggressive_blockers": aggressive_result.get("aggressive_buy_blockers", attack_result["blockers"]),
+        "aggressive_buy_blockers": aggressive_result.get("aggressive_buy_blockers", attack_result["blockers"]),
+        "aggressive_warnings": aggressive_result.get("aggressive_warnings", attack_result["blockers"]),
+        "core_exposure_pct": aggressive_result.get("core_exposure_pct", 0.0),
+        "core_exposure_applied": aggressive_result.get("core_exposure_applied", False),
+        "core_exposure_broken_by_panic": aggressive_result.get("core_exposure_broken_by_panic", False),
     }
     snapshot_id = insert_decision_snapshot(snapshot)
     intent = _order_intent(
@@ -297,11 +302,12 @@ def _order_intent(*, snapshot_id: int, snapshot: dict, max_total_exposure_krw: f
     min_delta_pct = _float(os.getenv("SMART_MIN_REBALANCE_DELTA_PCT"), 5.0)
     delta_pct = abs(float(snapshot["target_exposure_pct"]) - float(snapshot["current_exposure_pct"]))
     action = str(snapshot["action_hint"])
-    intent_blockers = list(blockers)
+    side = "BID" if delta > 0 else ("ASK" if delta < 0 else "NONE")
+    aggressive_buy_blockers = set(snapshot.get("aggressive_buy_blockers") or snapshot.get("aggressive_blockers") or [])
+    intent_blockers = [blocker for blocker in blockers if side == "BID" or blocker not in aggressive_buy_blockers]
     if abs(delta) < min_delta_krw or delta_pct < min_delta_pct:
         intent_blockers.append("SMART_MIN_REBALANCE_DELTA")
         action = "HOLD_POSITION" if current_value > 0 else "WAIT"
-    side = "BID" if delta > 0 else ("ASK" if delta < 0 else "NONE")
     if side == "BID" and current_value >= max_total_exposure_krw:
         intent_blockers.append("SMART_MAX_TOTAL_EXPOSURE_REACHED")
     if side == "BID" and current_value + abs(delta) > max_total_exposure_krw:
@@ -347,6 +353,11 @@ def _order_intent(*, snapshot_id: int, snapshot: dict, max_total_exposure_krw: f
             "partial_take_profit_pct": snapshot.get("partial_take_profit_pct", 0.0),
             "trailing_stop_price": snapshot.get("trailing_stop_price"),
             "position_pnl_pct": snapshot.get("current_position_pnl_pct", 0.0),
+            "core_exposure_pct": snapshot.get("core_exposure_pct", 0.0),
+            "core_exposure_applied": bool(snapshot.get("core_exposure_applied")),
+            "core_exposure_broken_by_panic": bool(snapshot.get("core_exposure_broken_by_panic")),
+            "aggressive_buy_blockers": list(snapshot.get("aggressive_buy_blockers") or []),
+            "aggressive_warnings": list(snapshot.get("aggressive_warnings") or []),
         },
     }
 

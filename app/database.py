@@ -645,6 +645,11 @@ def init_db() -> None:
                 partial_take_profit_triggered INTEGER NOT NULL DEFAULT 0,
                 pyramiding_allowed INTEGER NOT NULL DEFAULT 0,
                 aggressive_blockers_json TEXT NOT NULL DEFAULT '[]',
+                aggressive_buy_blockers_json TEXT NOT NULL DEFAULT '[]',
+                aggressive_warnings_json TEXT NOT NULL DEFAULT '[]',
+                core_exposure_pct REAL NOT NULL DEFAULT 0,
+                core_exposure_applied INTEGER NOT NULL DEFAULT 0,
+                core_exposure_broken_by_panic INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -757,6 +762,11 @@ def init_db() -> None:
         _ensure_column(conn, "decision_snapshots", "partial_take_profit_triggered", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "pyramiding_allowed", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "aggressive_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "decision_snapshots", "aggressive_buy_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "decision_snapshots", "aggressive_warnings_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "decision_snapshots", "core_exposure_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "core_exposure_applied", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "core_exposure_broken_by_panic", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_intents", "risk_preview_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "order_intents", "policy_preview_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "order_intents", "pilot_order_cap_krw", "REAL NOT NULL DEFAULT 0")
@@ -3185,9 +3195,15 @@ def _normalize_decision_snapshot(row: dict) -> dict:
     row["internal_signals"] = _json_load(row.pop("internal_signals_json", "{}"), {})
     row["attack_score_breakdown"] = _json_load(row.pop("attack_score_breakdown_json", "{}"), {})
     row["aggressive_blockers"] = _json_load(row.pop("aggressive_blockers_json", "[]"), [])
+    row["aggressive_buy_blockers"] = _json_load(row.pop("aggressive_buy_blockers_json", "[]"), row["aggressive_blockers"])
+    if not row["aggressive_buy_blockers"] and row["aggressive_blockers"]:
+        row["aggressive_buy_blockers"] = row["aggressive_blockers"]
+    row["aggressive_warnings"] = _json_load(row.pop("aggressive_warnings_json", "[]"), [])
     row["exposure_limit_blocked"] = bool(row.get("exposure_limit_blocked"))
     row["partial_take_profit_triggered"] = bool(row.get("partial_take_profit_triggered"))
     row["pyramiding_allowed"] = bool(row.get("pyramiding_allowed"))
+    row["core_exposure_applied"] = bool(row.get("core_exposure_applied"))
+    row["core_exposure_broken_by_panic"] = bool(row.get("core_exposure_broken_by_panic"))
     return row
 
 
@@ -3293,8 +3309,10 @@ def insert_decision_snapshot(snapshot: dict) -> int:
                 conservative_target_exposure_pct, final_target_exposure_source,
                 current_position_pnl_pct, highest_price_since_entry, trailing_stop_price,
                 partial_take_profit_triggered, pyramiding_allowed, aggressive_blockers_json,
+                aggressive_buy_blockers_json, aggressive_warnings_json, core_exposure_pct,
+                core_exposure_applied, core_exposure_broken_by_panic,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.get("decided_at", now_utc),
@@ -3338,6 +3356,11 @@ def insert_decision_snapshot(snapshot: dict) -> int:
                 1 if snapshot.get("partial_take_profit_triggered") else 0,
                 1 if snapshot.get("pyramiding_allowed") else 0,
                 json.dumps(snapshot.get("aggressive_blockers", []), ensure_ascii=False),
+                json.dumps(snapshot.get("aggressive_buy_blockers", snapshot.get("aggressive_blockers", [])), ensure_ascii=False),
+                json.dumps(snapshot.get("aggressive_warnings", []), ensure_ascii=False),
+                snapshot.get("core_exposure_pct", 0.0),
+                1 if snapshot.get("core_exposure_applied") else 0,
+                1 if snapshot.get("core_exposure_broken_by_panic") else 0,
                 now_utc,
             ),
         )
