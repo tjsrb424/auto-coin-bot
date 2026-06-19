@@ -14,6 +14,7 @@ from app.smart_promotion import evaluate_promotion, evaluate_rehearsal_preview
 from app.smart_readiness import build_limited_readiness
 from app.smart_signal_engine import aggregate_signal_score, evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
+from app.smart_attack import apply_aggressive_target_layer, calculate_attack_score
 
 
 class SmartEngineComponentTests(unittest.TestCase):
@@ -274,6 +275,124 @@ class SmartEngineComponentTests(unittest.TestCase):
         )
         self.assertLessEqual(result["target_exposure_pct"], 20)
         self.assertIn("SMART_EXCHANGE_NOTICE_RISK_BLOCK", result["blockers"])
+
+    def test_aggressive_breakout_uses_higher_target(self) -> None:
+        attack = calculate_attack_score(
+            market_regime="BREAKOUT",
+            internal_signals={},
+            features={
+                "ma_5": 110,
+                "ma_20": 105,
+                "ma_60": 100,
+                "ma_20_slope": 0.2,
+                "volume_ratio_20": 1.8,
+                "recent_return_1h": 0.8,
+                "recent_return_24h": 2.0,
+            },
+            external_factors={"providers": {"btc_usd_momentum": {"value": 2.0, "stale": False}, "fear_greed_score": {"value": 55, "stale": False}}},
+            risk_score=35,
+            current_position_pnl_pct=0.4,
+            current_exposure_pct=10,
+        )
+        result = apply_aggressive_target_layer(
+            market_regime="BREAKOUT",
+            conservative_target_exposure_pct=40,
+            attack_result=attack,
+            current_exposure_pct=10,
+            current_position_pnl_pct=0.0,
+            current_price=100,
+            highest_price_since_entry=None,
+            risk_blockers=[],
+        )
+        self.assertGreaterEqual(attack["attack_score"], 80)
+        self.assertGreater(result["target_exposure_pct"], 40)
+        self.assertEqual(result["final_target_exposure_source"], "AGGRESSIVE")
+        self.assertEqual(result["action_hint"], "BUY_MORE")
+
+    def test_aggressive_trend_down_is_blocked(self) -> None:
+        attack = calculate_attack_score(
+            market_regime="TREND_DOWN",
+            internal_signals={},
+            features={"ma_5": 110, "ma_20": 105, "ma_60": 100, "ma_20_slope": 0.4, "volume_ratio_20": 2.0, "recent_return_1h": 1.2, "recent_return_24h": 4.0},
+            external_factors={"providers": {"btc_usd_momentum": {"value": 3.0, "stale": False}, "fear_greed_score": {"value": 50, "stale": False}}},
+            risk_score=35,
+            current_position_pnl_pct=1.0,
+            current_exposure_pct=30,
+        )
+        result = apply_aggressive_target_layer(
+            market_regime="TREND_DOWN",
+            conservative_target_exposure_pct=70,
+            attack_result=attack,
+            current_exposure_pct=30,
+            current_position_pnl_pct=1.0,
+            current_price=100,
+            highest_price_since_entry=101,
+            risk_blockers=[],
+        )
+        self.assertLessEqual(result["target_exposure_pct"], 10)
+        self.assertIn("SMART_AGGRESSIVE_TREND_DOWN_BLOCKED", result["blockers"])
+
+    def test_aggressive_blocks_averaging_down(self) -> None:
+        attack = {"attack_score": 90, "attack_mode": "MAX_AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}}
+        result = apply_aggressive_target_layer(
+            market_regime="BREAKOUT",
+            conservative_target_exposure_pct=40,
+            attack_result=attack,
+            current_exposure_pct=30,
+            current_position_pnl_pct=-0.5,
+            current_price=100,
+            highest_price_since_entry=102,
+            risk_blockers=[],
+        )
+        self.assertLessEqual(result["target_exposure_pct"], 30)
+        self.assertNotEqual(result["action_hint"], "BUY_MORE")
+        self.assertIn("SMART_AGGRESSIVE_NO_AVERAGING_DOWN", result["blockers"])
+
+    def test_aggressive_allows_profitable_pyramiding(self) -> None:
+        attack = {"attack_score": 78, "attack_mode": "AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}}
+        result = apply_aggressive_target_layer(
+            market_regime="BREAKOUT",
+            conservative_target_exposure_pct=40,
+            attack_result=attack,
+            current_exposure_pct=20,
+            current_position_pnl_pct=0.6,
+            current_price=101,
+            highest_price_since_entry=101,
+            risk_blockers=[],
+        )
+        self.assertTrue(result["pyramiding_allowed"])
+        self.assertEqual(result["action_hint"], "BUY_MORE")
+
+    def test_aggressive_creates_partial_take_profit_candidate(self) -> None:
+        attack = {"attack_score": 40, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": ["SMART_AGGRESSIVE_OVERHEATED_BLOCKED"], "score_breakdown": {}}
+        result = apply_aggressive_target_layer(
+            market_regime="OVERHEATED",
+            conservative_target_exposure_pct=70,
+            attack_result=attack,
+            current_exposure_pct=70,
+            current_position_pnl_pct=1.6,
+            current_price=102.8,
+            highest_price_since_entry=103,
+            risk_blockers=[],
+        )
+        self.assertEqual(result["action_hint"], "TAKE_PROFIT_PARTIAL")
+        self.assertEqual(result["final_target_exposure_source"], "PARTIAL_TAKE_PROFIT")
+        self.assertTrue(result["partial_take_profit_triggered"])
+
+    def test_aggressive_trailing_stop_candidate(self) -> None:
+        attack = {"attack_score": 72, "attack_mode": "AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}}
+        result = apply_aggressive_target_layer(
+            market_regime="TREND_UP",
+            conservative_target_exposure_pct=60,
+            attack_result=attack,
+            current_exposure_pct=60,
+            current_position_pnl_pct=2.0,
+            current_price=102.2,
+            highest_price_since_entry=103,
+            risk_blockers=[],
+        )
+        self.assertIn(result["action_hint"], {"EXIT", "REDUCE"})
+        self.assertEqual(result["final_target_exposure_source"], "TRAILING_EXIT")
 
     def test_limited_readiness_summarizes_preflight_checks(self) -> None:
         readiness = self.build_readiness_with_empty_db(

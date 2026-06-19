@@ -772,7 +772,7 @@ async def _submit_smart_intent_order(
         daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
         risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
     )
-    promotion["policy_preview"] = {**promotion.get("policy_preview", {}), **cap_preview}
+    promotion["policy_preview"] = {**(intent.get("policy_preview") or {}), **promotion.get("policy_preview", {}), **cap_preview}
     if intent_id:
         update_order_intent(
             int(intent_id),
@@ -898,6 +898,7 @@ async def _submit_smart_intent_sell_order(
         daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
         risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
     )
+    promotion["policy_preview"] = {**(intent.get("policy_preview") or {}), **promotion.get("policy_preview", {})}
     if intent_id:
         update_order_intent(int(intent_id), {**promotion, "status": "READY_FOR_LIVE" if promotion["promotion_status"] in {"READY_FOR_LIMITED", "READY_FOR_LIVE"} else "BLOCKED"})
     if promotion["promotion_status"] not in {"READY_FOR_LIMITED", "READY_FOR_LIVE"}:

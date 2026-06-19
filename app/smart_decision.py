@@ -13,6 +13,7 @@ from app.database import (
     insert_order_intent,
     load_bot_operation_policy,
     load_open_live_positions,
+    update_live_position,
 )
 from app.risk_manager import compute_risk_state
 from app.shadow_report import build_shadow_report
@@ -21,6 +22,7 @@ from app.smart_market_regime import classify_market_regime
 from app.smart_promotion import evaluate_promotion, smart_engine_live_mode
 from app.smart_signal_engine import evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
+from app.smart_attack import apply_aggressive_target_layer, calculate_attack_score
 
 
 DEFAULT_MARKET = "KRW-BTC"
@@ -35,7 +37,10 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
     max_total_exposure = max(_float(policy.get("max_total_exposure_krw"), 500_000.0), 1.0)
     daily_loss_limit_pct = _float(policy.get("daily_loss_limit_pct"), 3.0)
     daily_loss_limit_krw = max_total_exposure * daily_loss_limit_pct / 100
-    position_qty, position_value = _current_bot_position(session.get("exchange", "bithumb"), session.get("market", DEFAULT_MARKET), current_price)
+    position_metrics = _current_bot_position_metrics(session.get("exchange", "bithumb"), session.get("market", DEFAULT_MARKET), current_price, market_regime)
+    position_qty = position_metrics["qty"]
+    position_value = position_metrics["value"]
+    current_position_pnl_pct = position_metrics["pnl_pct"]
     current_exposure = _pct(position_value, max_total_exposure)
     risk_state = compute_risk_state(str(session.get("exchange") or "bithumb"), str(session.get("market") or DEFAULT_MARKET))
     risk_score = _risk_score(features, risk_state)
@@ -53,12 +58,31 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
         external_factors=external_factors,
     )
     external_factors["target_adjustment_pct"] = target_result.get("external_factor_adjustment_pct", 0.0)
-    target_exposure = target_result["target_exposure_pct"]
-    reasons = [*regime_positives, *target_result["positive_reasons"]]
-    negatives = [*regime_negatives, *target_result["negative_reasons"]]
-    blockers = list(target_result["blockers"])
+    attack_result = calculate_attack_score(
+        market_regime=market_regime,
+        internal_signals=internal_signals,
+        features=features,
+        external_factors=external_factors,
+        risk_score=risk_score,
+        current_position_pnl_pct=current_position_pnl_pct,
+        current_exposure_pct=current_exposure,
+    )
+    aggressive_result = apply_aggressive_target_layer(
+        market_regime=market_regime,
+        conservative_target_exposure_pct=target_result["target_exposure_pct"],
+        attack_result=attack_result,
+        current_exposure_pct=current_exposure,
+        current_position_pnl_pct=current_position_pnl_pct,
+        current_price=current_price,
+        highest_price_since_entry=position_metrics.get("highest_price_since_entry"),
+        risk_blockers=list(target_result["blockers"]),
+    )
+    target_exposure = aggressive_result["target_exposure_pct"]
+    reasons = [*regime_positives, *target_result["positive_reasons"], *aggressive_result["positive_reasons"]]
+    negatives = [*regime_negatives, *target_result["negative_reasons"], *aggressive_result["negative_reasons"]]
+    blockers = list(aggressive_result["blockers"])
     confidence = _confidence_score(features, market_regime, legacy_signal)
-    action_hint = _action_hint(current_exposure, target_exposure)
+    action_hint = aggressive_result["action_hint"]
     if _shadow_mode_enabled():
         blockers = [*blockers, "SMART_SHADOW_MODE"]
     one_line = _summary(action_hint, market_regime, legacy_signal, blockers)
@@ -92,6 +116,19 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
         "daily_loss_limit_krw": daily_loss_limit_krw,
         "available_krw_balance": available_krw_balance,
         "exposure_limit_blocked": "SMART_MAX_TOTAL_EXPOSURE_REACHED" in blockers,
+        "attack_score": attack_result["attack_score"],
+        "attack_mode": attack_result["attack_mode"],
+        "attack_score_breakdown": attack_result["score_breakdown"],
+        "aggressive_target_exposure_pct": aggressive_result["aggressive_target_exposure_pct"],
+        "conservative_target_exposure_pct": aggressive_result["conservative_target_exposure_pct"],
+        "final_target_exposure_source": aggressive_result["final_target_exposure_source"],
+        "current_position_pnl_pct": current_position_pnl_pct,
+        "highest_price_since_entry": aggressive_result.get("highest_price_since_entry"),
+        "trailing_stop_price": aggressive_result.get("trailing_stop_price"),
+        "partial_take_profit_triggered": aggressive_result["partial_take_profit_triggered"],
+        "partial_take_profit_pct": aggressive_result["partial_take_profit_pct"],
+        "pyramiding_allowed": aggressive_result["pyramiding_allowed"],
+        "aggressive_blockers": attack_result["blockers"],
     }
     snapshot_id = insert_decision_snapshot(snapshot)
     intent = _order_intent(
@@ -293,6 +330,24 @@ def _order_intent(*, snapshot_id: int, snapshot: dict, max_total_exposure_krw: f
         "urgency": "NORMAL",
         "status": "BLOCKED" if intent_blockers else "CREATED",
         "blockers": intent_blockers,
+        "attack_score": snapshot.get("attack_score", 0.0),
+        "attack_mode": snapshot.get("attack_mode", "OFF"),
+        "target_source": snapshot.get("final_target_exposure_source", "CONSERVATIVE"),
+        "pyramiding_allowed": bool(snapshot.get("pyramiding_allowed")),
+        "no_averaging_down_blocked": "SMART_AGGRESSIVE_NO_AVERAGING_DOWN" in intent_blockers,
+        "partial_take_profit_pct": snapshot.get("partial_take_profit_pct", 0.0),
+        "trailing_stop_price": snapshot.get("trailing_stop_price"),
+        "position_pnl_pct": snapshot.get("current_position_pnl_pct", 0.0),
+        "policy_preview": {
+            "attack_score": snapshot.get("attack_score", 0.0),
+            "attack_mode": snapshot.get("attack_mode", "OFF"),
+            "target_source": snapshot.get("final_target_exposure_source", "CONSERVATIVE"),
+            "pyramiding_allowed": bool(snapshot.get("pyramiding_allowed")),
+            "no_averaging_down_blocked": "SMART_AGGRESSIVE_NO_AVERAGING_DOWN" in intent_blockers,
+            "partial_take_profit_pct": snapshot.get("partial_take_profit_pct", 0.0),
+            "trailing_stop_price": snapshot.get("trailing_stop_price"),
+            "position_pnl_pct": snapshot.get("current_position_pnl_pct", 0.0),
+        },
     }
 
 
@@ -392,15 +447,63 @@ def _summary(action_hint: str, market_regime: str, legacy_signal: dict, blockers
     return f"{market_regime} 시장에서 {signal} 신호가 유지되어 현재는 관망 판단입니다."
 
 
-def _current_bot_position(exchange: str, market: str, price: float) -> tuple[float, float]:
+def _current_bot_position_metrics(exchange: str, market: str, price: float, market_regime: str) -> dict:
     qty = 0.0
     value = 0.0
+    cost = 0.0
+    highest_prices: list[float] = []
+    trailing_prices: list[float] = []
+    trailing_pct = _trailing_stop_pct(market_regime)
+    now = _utc_now()
     for position in load_open_live_positions(exchange, market):
         volume = _float(position.get("entry_volume"), 0.0)
-        current_price = _float(position.get("current_price"), price) or price
+        current_price = price if price > 0 else _float(position.get("current_price"), 0.0)
+        entry_price = _float(position.get("entry_price"), 0.0)
+        entry_amount = _float(position.get("entry_amount_krw"), entry_price * volume)
+        highest = max(
+            _float(position.get("highest_price_since_entry"), 0.0),
+            entry_price,
+            current_price,
+            price,
+        )
+        trailing_stop = highest * (1 - trailing_pct / 100) if highest > 0 else 0.0
+        unrealized = (current_price - entry_price) * volume if entry_price > 0 else 0.0
         qty += volume
         value += volume * current_price
-    return qty, value
+        cost += entry_amount
+        if highest:
+            highest_prices.append(highest)
+        if trailing_stop:
+            trailing_prices.append(trailing_stop)
+        if position.get("id"):
+            update_live_position(
+                int(position["id"]),
+                {
+                    "current_price": current_price,
+                    "unrealized_pnl": unrealized,
+                    "highest_price_since_entry": highest,
+                    "trailing_stop_price": trailing_stop,
+                    "trailing_stop_pct": trailing_pct,
+                    "last_trailing_update_at": now,
+                },
+            )
+    return {
+        "qty": qty,
+        "value": value,
+        "pnl_pct": _pct(value - cost, cost) if cost > 0 else 0.0,
+        "highest_price_since_entry": max(highest_prices) if highest_prices else None,
+        "trailing_stop_price": max(trailing_prices) if trailing_prices else None,
+    }
+
+
+def _trailing_stop_pct(market_regime: str) -> float:
+    default = {
+        "BREAKOUT": 0.9,
+        "TREND_UP": 0.7,
+        "RANGE": 0.5,
+        "OVERHEATED": 0.4,
+    }.get(str(market_regime or "").upper(), 0.7)
+    return _float(os.getenv("SMART_TRAILING_STOP_PCT"), default)
 
 
 def _shadow_mode_enabled() -> bool:

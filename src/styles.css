@@ -750,13 +750,14 @@ body {
   left: 1392px;
   top: 88px;
   width: 242px;
-  height: 190px;
+  height: 250px;
   padding: 20px;
   overflow: hidden;
 }
 
 .ref-analysis-decision h3,
 .ref-analysis-exposure h3,
+.ref-analysis-aggressive h3,
 .ref-analysis-reasons h3,
 .ref-analysis-blockers h3,
 .ref-analysis-intent h3,
@@ -783,6 +784,7 @@ body {
 }
 
 .ref-analysis-decision p,
+.ref-analysis-aggressive p,
 .ref-analysis-intent p {
   display: grid;
   grid-template-columns: minmax(78px, auto) minmax(0, 1fr);
@@ -794,6 +796,7 @@ body {
 }
 
 .ref-analysis-decision p span,
+.ref-analysis-aggressive p span,
 .ref-analysis-intent p span {
   min-width: 0;
   overflow: hidden;
@@ -802,6 +805,7 @@ body {
 }
 
 .ref-analysis-decision b,
+.ref-analysis-aggressive b,
 .ref-analysis-intent b {
   min-width: 0;
   overflow: hidden;
@@ -814,8 +818,8 @@ body {
 
 .ref-analysis-bars p {
   position: relative;
-  height: 32px;
-  margin: 0 0 13px;
+  height: 28px;
+  margin: 0 0 9px;
   overflow: hidden;
   border: 1px solid #23364e;
   border-radius: 5px;
@@ -827,7 +831,7 @@ body {
   position: relative;
   z-index: 1;
   display: inline-flex;
-  height: 30px;
+  height: 26px;
   align-items: center;
   padding: 0 10px;
   color: #dbe7f7;
@@ -3073,6 +3077,30 @@ body {
   border-top: 1px solid rgba(52, 72, 96, 0.38);
   text-align: right;
   white-space: nowrap;
+}
+
+.ref-analysis-aggressive {
+  left: 1118px;
+  top: 298px;
+  width: 132px;
+  height: 302px;
+  padding: 18px;
+  overflow: hidden;
+}
+
+.ref-analysis-aggressive div {
+  display: grid;
+  gap: 4px;
+}
+
+.ref-analysis-aggressive p {
+  grid-template-columns: 1fr;
+  gap: 2px;
+  margin: 0;
+}
+
+.ref-analysis-aggressive b {
+  text-align: left;
 }
 
 .ref-rebalance-summary {

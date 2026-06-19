@@ -429,6 +429,10 @@ def init_db() -> None:
                 realized_pnl REAL NOT NULL,
                 stop_loss_price REAL NOT NULL,
                 take_profit_price REAL NOT NULL,
+                highest_price_since_entry REAL,
+                trailing_stop_price REAL,
+                trailing_stop_pct REAL,
+                last_trailing_update_at TEXT,
                 opened_at TEXT,
                 closed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -629,6 +633,18 @@ def init_db() -> None:
                 daily_loss_limit_krw REAL NOT NULL DEFAULT 0,
                 available_krw_balance REAL,
                 exposure_limit_blocked INTEGER NOT NULL DEFAULT 0,
+                attack_score REAL NOT NULL DEFAULT 0,
+                attack_mode TEXT NOT NULL DEFAULT 'OFF',
+                attack_score_breakdown_json TEXT NOT NULL DEFAULT '{}',
+                aggressive_target_exposure_pct REAL NOT NULL DEFAULT 0,
+                conservative_target_exposure_pct REAL NOT NULL DEFAULT 0,
+                final_target_exposure_source TEXT NOT NULL DEFAULT 'CONSERVATIVE',
+                current_position_pnl_pct REAL NOT NULL DEFAULT 0,
+                highest_price_since_entry REAL,
+                trailing_stop_price REAL,
+                partial_take_profit_triggered INTEGER NOT NULL DEFAULT 0,
+                pyramiding_allowed INTEGER NOT NULL DEFAULT 0,
+                aggressive_blockers_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -653,6 +669,14 @@ def init_db() -> None:
                 pilot_order_cap_krw REAL NOT NULL DEFAULT 0,
                 promotion_blockers_json TEXT NOT NULL DEFAULT '[]',
                 promotion_status TEXT NOT NULL DEFAULT 'SHADOW_ONLY',
+                attack_score REAL NOT NULL DEFAULT 0,
+                attack_mode TEXT NOT NULL DEFAULT 'OFF',
+                target_source TEXT NOT NULL DEFAULT 'CONSERVATIVE',
+                pyramiding_allowed INTEGER NOT NULL DEFAULT 0,
+                no_averaging_down_blocked INTEGER NOT NULL DEFAULT 0,
+                partial_take_profit_pct REAL NOT NULL DEFAULT 0,
+                trailing_stop_price REAL,
+                position_pnl_pct REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 submitted_at TEXT,
                 completed_at TEXT,
@@ -711,17 +735,41 @@ def init_db() -> None:
         _ensure_column(conn, "risk_logs", "read_status", "TEXT NOT NULL DEFAULT 'UNREAD'")
         _ensure_column(conn, "risk_logs", "resolved_at", "TEXT")
         _ensure_column(conn, "risk_logs", "resolution_action", "TEXT")
+        _ensure_column(conn, "live_positions", "highest_price_since_entry", "REAL")
+        _ensure_column(conn, "live_positions", "trailing_stop_price", "REAL")
+        _ensure_column(conn, "live_positions", "trailing_stop_pct", "REAL")
+        _ensure_column(conn, "live_positions", "last_trailing_update_at", "TEXT")
         _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "daily_loss_limit_pct", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "daily_loss_limit_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "available_krw_balance", "REAL")
         _ensure_column(conn, "decision_snapshots", "exposure_limit_blocked", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "attack_score", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "attack_mode", "TEXT NOT NULL DEFAULT 'OFF'")
+        _ensure_column(conn, "decision_snapshots", "attack_score_breakdown_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "decision_snapshots", "aggressive_target_exposure_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "conservative_target_exposure_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "final_target_exposure_source", "TEXT NOT NULL DEFAULT 'CONSERVATIVE'")
+        _ensure_column(conn, "decision_snapshots", "current_position_pnl_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "highest_price_since_entry", "REAL")
+        _ensure_column(conn, "decision_snapshots", "trailing_stop_price", "REAL")
+        _ensure_column(conn, "decision_snapshots", "partial_take_profit_triggered", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "pyramiding_allowed", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "decision_snapshots", "aggressive_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "order_intents", "risk_preview_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "order_intents", "policy_preview_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "order_intents", "pilot_order_cap_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_intents", "promotion_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "order_intents", "promotion_status", "TEXT NOT NULL DEFAULT 'SHADOW_ONLY'")
+        _ensure_column(conn, "order_intents", "attack_score", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_intents", "attack_mode", "TEXT NOT NULL DEFAULT 'OFF'")
+        _ensure_column(conn, "order_intents", "target_source", "TEXT NOT NULL DEFAULT 'CONSERVATIVE'")
+        _ensure_column(conn, "order_intents", "pyramiding_allowed", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_intents", "no_averaging_down_blocked", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_intents", "partial_take_profit_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_intents", "trailing_stop_price", "REAL")
+        _ensure_column(conn, "order_intents", "position_pnl_pct", "REAL NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_smart_rehearsal_reviews_latest
@@ -2364,8 +2412,10 @@ def create_live_position(position: dict) -> int:
                 session_id, exchange, market, candidate_strategy_id, strategy_name,
                 status, entry_order_uuid, exit_order_uuid, entry_price, entry_volume,
                 entry_amount_krw, current_price, unrealized_pnl, realized_pnl,
-                stop_loss_price, take_profit_price, opened_at, closed_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stop_loss_price, take_profit_price, highest_price_since_entry,
+                trailing_stop_price, trailing_stop_pct, last_trailing_update_at,
+                opened_at, closed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position["session_id"],
@@ -2384,6 +2434,10 @@ def create_live_position(position: dict) -> int:
                 position.get("realized_pnl", 0.0),
                 position.get("stop_loss_price", 0.0),
                 position.get("take_profit_price", 0.0),
+                position.get("highest_price_since_entry"),
+                position.get("trailing_stop_price"),
+                position.get("trailing_stop_pct"),
+                position.get("last_trailing_update_at"),
                 position.get("opened_at", now_utc),
                 position.get("closed_at"),
                 now_utc,
@@ -2486,6 +2540,10 @@ def update_live_position(position_id: int, updates: dict) -> None:
         "entry_amount_krw",
         "unrealized_pnl",
         "realized_pnl",
+        "highest_price_since_entry",
+        "trailing_stop_price",
+        "trailing_stop_pct",
+        "last_trailing_update_at",
         "closed_at",
     }
     values = {key: value for key, value in updates.items() if key in allowed}
@@ -3125,7 +3183,11 @@ def _normalize_decision_snapshot(row: dict) -> dict:
     row["raw_features"] = _json_load(row.pop("raw_features_json", "{}"), {})
     row["external_factors"] = _json_load(row.pop("external_factors_json", "{}"), {})
     row["internal_signals"] = _json_load(row.pop("internal_signals_json", "{}"), {})
+    row["attack_score_breakdown"] = _json_load(row.pop("attack_score_breakdown_json", "{}"), {})
+    row["aggressive_blockers"] = _json_load(row.pop("aggressive_blockers_json", "[]"), [])
     row["exposure_limit_blocked"] = bool(row.get("exposure_limit_blocked"))
+    row["partial_take_profit_triggered"] = bool(row.get("partial_take_profit_triggered"))
+    row["pyramiding_allowed"] = bool(row.get("pyramiding_allowed"))
     return row
 
 
@@ -3134,6 +3196,8 @@ def _normalize_order_intent(row: dict) -> dict:
     row["risk_preview"] = _json_load(row.pop("risk_preview_json", "{}"), {})
     row["policy_preview"] = _json_load(row.pop("policy_preview_json", "{}"), {})
     row["promotion_blockers"] = _json_load(row.pop("promotion_blockers_json", "[]"), [])
+    row["pyramiding_allowed"] = bool(row.get("pyramiding_allowed"))
+    row["no_averaging_down_blocked"] = bool(row.get("no_averaging_down_blocked"))
     return row
 
 
@@ -3224,8 +3288,13 @@ def insert_decision_snapshot(snapshot: dict) -> int:
                 one_line_summary, positive_reasons_json, negative_reasons_json,
                 blockers_json, raw_features_json, external_factors_json, internal_signals_json,
                 max_total_exposure_krw, daily_loss_limit_pct, daily_loss_limit_krw,
-                available_krw_balance, exposure_limit_blocked, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                available_krw_balance, exposure_limit_blocked, attack_score, attack_mode,
+                attack_score_breakdown_json, aggressive_target_exposure_pct,
+                conservative_target_exposure_pct, final_target_exposure_source,
+                current_position_pnl_pct, highest_price_since_entry, trailing_stop_price,
+                partial_take_profit_triggered, pyramiding_allowed, aggressive_blockers_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.get("decided_at", now_utc),
@@ -3257,6 +3326,18 @@ def insert_decision_snapshot(snapshot: dict) -> int:
                 snapshot.get("daily_loss_limit_krw", 0.0),
                 snapshot.get("available_krw_balance"),
                 1 if snapshot.get("exposure_limit_blocked") else 0,
+                snapshot.get("attack_score", 0.0),
+                snapshot.get("attack_mode", "OFF"),
+                json.dumps(snapshot.get("attack_score_breakdown", {}), ensure_ascii=False),
+                snapshot.get("aggressive_target_exposure_pct", 0.0),
+                snapshot.get("conservative_target_exposure_pct", 0.0),
+                snapshot.get("final_target_exposure_source", "CONSERVATIVE"),
+                snapshot.get("current_position_pnl_pct", 0.0),
+                snapshot.get("highest_price_since_entry"),
+                snapshot.get("trailing_stop_price"),
+                1 if snapshot.get("partial_take_profit_triggered") else 0,
+                1 if snapshot.get("pyramiding_allowed") else 0,
+                json.dumps(snapshot.get("aggressive_blockers", []), ensure_ascii=False),
                 now_utc,
             ),
         )
@@ -3273,8 +3354,11 @@ def insert_order_intent(intent: dict) -> int:
                 current_value_krw, target_value_krw, delta_value_krw, target_qty,
                 order_type, limit_price, urgency, status, blockers_json,
                 risk_preview_json, policy_preview_json, pilot_order_cap_krw,
-                promotion_blockers_json, promotion_status, created_at, submitted_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                promotion_blockers_json, promotion_status, attack_score, attack_mode,
+                target_source, pyramiding_allowed, no_averaging_down_blocked,
+                partial_take_profit_pct, trailing_stop_price, position_pnl_pct,
+                created_at, submitted_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 intent["decision_snapshot_id"],
@@ -3296,6 +3380,14 @@ def insert_order_intent(intent: dict) -> int:
                 intent.get("pilot_order_cap_krw", 0.0),
                 json.dumps(intent.get("promotion_blockers", []), ensure_ascii=False),
                 intent.get("promotion_status", "SHADOW_ONLY"),
+                intent.get("attack_score", 0.0),
+                intent.get("attack_mode", "OFF"),
+                intent.get("target_source", "CONSERVATIVE"),
+                1 if intent.get("pyramiding_allowed") else 0,
+                1 if intent.get("no_averaging_down_blocked") else 0,
+                intent.get("partial_take_profit_pct", 0.0),
+                intent.get("trailing_stop_price"),
+                intent.get("position_pnl_pct", 0.0),
                 now_utc,
                 intent.get("submitted_at"),
                 intent.get("completed_at"),

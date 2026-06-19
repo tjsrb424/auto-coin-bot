@@ -347,6 +347,14 @@ type OrderIntent = {
   pilot_order_cap_krw?: number;
   promotion_blockers?: string[];
   promotion_status?: string;
+  attack_score?: number;
+  attack_mode?: string;
+  target_source?: string;
+  pyramiding_allowed?: boolean;
+  no_averaging_down_blocked?: boolean;
+  partial_take_profit_pct?: number;
+  trailing_stop_price?: number | null;
+  position_pnl_pct?: number;
   created_at?: string;
 };
 
@@ -362,6 +370,18 @@ type AnalysisDecision = {
   max_total_exposure_krw?: number;
   current_exposure_pct?: number;
   target_exposure_pct?: number;
+  attack_score?: number;
+  attack_mode?: string;
+  attack_score_breakdown?: Record<string, unknown>;
+  aggressive_target_exposure_pct?: number;
+  conservative_target_exposure_pct?: number;
+  final_target_exposure_source?: string;
+  current_position_pnl_pct?: number;
+  highest_price_since_entry?: number | null;
+  trailing_stop_price?: number | null;
+  partial_take_profit_triggered?: boolean;
+  pyramiding_allowed?: boolean;
+  aggressive_blockers?: string[];
   confidence_score?: number;
   risk_score?: number;
   positive_reasons?: string[];
@@ -4094,6 +4114,7 @@ function AnalysisView({ data }: { data: DashboardData }) {
   const shadowSummary = data.shadowReport?.summary;
   const shadowRows = data.shadowReport?.recent_rows ?? [];
   const rehearsal = intent?.policy_preview?.rehearsal as { allowed?: boolean; blockers?: string[]; daily_smart_order_count?: number; risk_score?: number } | undefined;
+  const noAveragingDownBlocked = Boolean(intent?.no_averaging_down_blocked ?? latest.aggressive_blockers?.includes("SMART_AGGRESSIVE_NO_AVERAGING_DOWN"));
 
   if (!latest) {
     return (
@@ -4118,6 +4139,8 @@ function AnalysisView({ data }: { data: DashboardData }) {
         <div>
           <p><span>시장상태</span><b>{latest.market_regime ?? "-"}</b></p>
           <p><span>기존 전략</span><b>{latest.legacy_signal ?? "-"}</b></p>
+          <p><span>공격모드</span><b>{latest.attack_mode ?? "-"}</b></p>
+          <p><span>공격점수</span><b>{formatNumber(latest.attack_score, 1)}</b></p>
           <p><span>확신도</span><b>{formatNumber(latest.confidence_score, 1)}</b></p>
           <p><span>위험점수</span><b>{formatNumber(latest.risk_score, 1)}</b></p>
         </div>
@@ -4126,9 +4149,22 @@ function AnalysisView({ data }: { data: DashboardData }) {
         <h3>보유비중</h3>
         <div className="ref-analysis-bars">
           <p><span>현재</span><b>{formatRatioPercent(latest.current_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.current_exposure_pct ?? 0, 0), 100)}%` }} /></p>
+          <p><span>보수형</span><b>{formatRatioPercent(latest.conservative_target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.conservative_target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
+          <p><span>공격형</span><b>{formatRatioPercent(latest.aggressive_target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.aggressive_target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
           <p><span>목표</span><b>{formatRatioPercent(latest.target_exposure_pct)}</b><i style={{ width: `${Math.min(Math.max(latest.target_exposure_pct ?? 0, 0), 100)}%` }} /></p>
         </div>
-        <small>봇 포지션 {formatNumber(latest.current_bot_position_qty, 8)} BTC · {formatKrw(latest.current_bot_position_value_krw)} KRW</small>
+        <small>출처 {latest.final_target_exposure_source ?? "-"} · 포지션 수익률 {formatPercent((latest.current_position_pnl_pct ?? 0) / 100)} · {formatNumber(latest.current_bot_position_qty, 8)} BTC · {formatKrw(latest.current_bot_position_value_krw)} KRW</small>
+      </RefPanel>
+      <RefPanel className="ref-analysis-aggressive">
+        <h3>공격형 관리</h3>
+        <div>
+          <p><span>피라미딩</span><b>{latest.pyramiding_allowed ? "허용 후보" : "비허용"}</b></p>
+          <p><span>손실 물타기 차단</span><b>{noAveragingDownBlocked ? "차단" : "해당 없음"}</b></p>
+          <p><span>부분익절</span><b>{latest.partial_take_profit_triggered ? "후보" : "대기"}</b></p>
+          <p><span>트레일링 스탑</span><b>{latest.trailing_stop_price ? `${formatKrw(latest.trailing_stop_price)} KRW` : "-"}</b></p>
+          <p><span>최고가</span><b>{latest.highest_price_since_entry ? `${formatKrw(latest.highest_price_since_entry)} KRW` : "-"}</b></p>
+          <p><span>주문 출처</span><b>{intent?.target_source ?? latest.final_target_exposure_source ?? "-"}</b></p>
+        </div>
       </RefPanel>
       <RefPanel className="ref-analysis-reasons">
         <h3>판단 근거</h3>
@@ -4169,6 +4205,8 @@ function AnalysisView({ data }: { data: DashboardData }) {
             <p><span>지정가</span><b>{formatKrw(intent.limit_price)}</b></p>
             <p><span>승격상태</span><b>{promotionStatusLabel(intent.promotion_status ?? data.smartEngineStatus?.promotion_status)}</b></p>
             <p><span>제한주문상한</span><b>{formatOrderLimit(intent.pilot_order_cap_krw)}</b></p>
+            <p><span>공격점수</span><b>{formatNumber(intent.attack_score ?? latest.attack_score, 1)} · {intent.attack_mode ?? latest.attack_mode ?? "-"}</b></p>
+            <p><span>익절/트레일링</span><b>{intent.partial_take_profit_pct ? `${formatNumber(intent.partial_take_profit_pct, 1)}% 익절` : intent.trailing_stop_price ? `${formatKrw(intent.trailing_stop_price)} KRW` : "-"}</b></p>
             <p><span>리허설</span><b>{rehearsal ? `${rehearsal.allowed ? "통과" : "차단"} · ${rehearsal.blockers?.[0] ?? "사유 없음"}` : "-"}</b></p>
           </div>
         ) : (
