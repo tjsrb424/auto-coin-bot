@@ -358,6 +358,8 @@ type AnalysisDecision = {
   legacy_signal?: string;
   current_bot_position_qty?: number;
   current_bot_position_value_krw?: number;
+  available_krw_balance?: number | null;
+  max_total_exposure_krw?: number;
   current_exposure_pct?: number;
   target_exposure_pct?: number;
   confidence_score?: number;
@@ -529,6 +531,8 @@ type DashboardData = {
   shadowReport: ShadowReport | null;
   smartEngineStatus: {
     live_mode?: string;
+    decision?: AnalysisDecision | null;
+    latest_intent?: OrderIntent | null;
     promotion_status?: string;
     promotion_blockers?: string[];
     readiness?: ShadowReport["summary"];
@@ -1028,6 +1032,55 @@ function policyBlockText(code?: string | null, fallback?: string | null) {
   if (normalized) return policyBlockReasonLabels[normalized] ?? statusLabel(normalized);
   if (isOpenOrderWaitCode(code) || isOpenOrderWaitCode(fallback)) return "기존 매수 주문 체결 대기";
   return fallback ?? statusLabel(code);
+}
+
+function riskSeverityLabel(value?: string | null) {
+  const labels: Record<string, string> = {
+    LOW: "낮음",
+    MEDIUM: "보통",
+    HIGH: "높음",
+    CRITICAL: "긴급",
+    INFO: "정보",
+    WARNING: "주의",
+    OK: "정상"
+  };
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return labels[normalized] ?? (value ? statusLabel(value) : "정상");
+}
+
+function riskLogIsPolicy(log: Pick<RiskLog, "block_code" | "block_reason" | "policy_block_detail">) {
+  return Boolean(log.policy_block_detail || extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason));
+}
+
+function riskLogTypeLabel(log: Pick<RiskLog, "allowed" | "block_code" | "block_reason" | "policy_block_detail">) {
+  if (isOpenOrderWaitLog(log)) return "주문 대기";
+  if (riskLogIsPolicy(log)) return "정책 차단";
+  return log.allowed ? "리스크 점검" : "리스크 차단";
+}
+
+function riskLogMessage(log: Pick<RiskLog, "allowed" | "risk_level" | "block_code" | "block_reason" | "policy_block_detail">) {
+  if (isOpenOrderWaitLog(log)) return "기존 매수 주문이 체결/취소될 때까지 신규 매수를 보류합니다.";
+  if (riskLogIsPolicy(log)) return policyBlockText(log.block_code, log.block_reason);
+  if (!log.allowed) return log.block_reason ?? log.block_code ?? "리스크 조건에 의해 차단됐습니다.";
+  return `리스크 점검 통과 · ${riskSeverityLabel(log.risk_level)}`;
+}
+
+function riskLogTone(log: Pick<RiskLog, "allowed" | "risk_level" | "block_code" | "block_reason" | "policy_block_detail">): "green" | "amber" | "red" | "cyan" | "neutral" {
+  if (isOpenOrderWaitLog(log)) return "cyan";
+  if (riskLogIsPolicy(log)) return "amber";
+  if (!log.allowed) return "red";
+  const severity = String(log.risk_level ?? "").toUpperCase();
+  if (["HIGH", "CRITICAL"].includes(severity)) return "amber";
+  return "green";
+}
+
+function riskLogDotType(log: Pick<RiskLog, "allowed" | "risk_level" | "block_code" | "block_reason" | "policy_block_detail">) {
+  const tone = riskLogTone(log);
+  if (tone === "green") return "ok";
+  if (tone === "cyan") return "info";
+  if (tone === "amber") return "warn";
+  if (tone === "red") return "danger";
+  return "info";
 }
 
 function isOpenOrderWaitLog(log: Pick<RiskLog, "block_code" | "block_reason">) {
@@ -2018,6 +2071,20 @@ type PortfolioAssetRow = {
   targetAllocation: number;
 };
 
+type PortfolioRebalanceRow = {
+  symbol: string;
+  allocation: number;
+  target: number;
+  suggestion: number;
+};
+
+type PortfolioTrendData = {
+  values: number[];
+  labels: string[];
+  sourceLabel: string;
+  hasHistory: boolean;
+};
+
 const portfolioAssets: PortfolioAssetRow[] = [
   { symbol: "BTC", name: "비트코인", color: "#ffab16", qty: 0.35255, average: 70150000, current: 89240000, value: 16076000, pnl: 6904706, returnRate: 0.2744, allocation: 0.565, change24h: 0.0235, sector: "레이어 1", targetAllocation: 0.5 },
   { symbol: "ETH", name: "이더리움", color: "#596dff", qty: 2.15, average: 3072000, current: 2660000, value: 5720000, pnl: -886800, returnRate: -0.134, allocation: 0.201, change24h: 0.0182, sector: "스마트 계약", targetAllocation: 0.25 },
@@ -2062,6 +2129,10 @@ function portfolioMeta(symbol: string, index = 0) {
   };
 }
 
+function boundedRatio(value: number) {
+  return Math.min(Math.max(value, 0), 1);
+}
+
 function marketPriceFor(data: DashboardData, symbol: string) {
   return data.liveBalances?.prices?.[`KRW-${symbol}`] ?? null;
 }
@@ -2093,6 +2164,7 @@ function buildPortfolioRows(data: DashboardData, fallbackTotal: number) {
       const current = symbol === "KRW" ? 1 : price?.price ?? null;
       const average = symbol === "KRW" ? 1 : entry.avg_buy_price && entry.avg_buy_price > 0 ? entry.avg_buy_price : null;
       const value = symbol === "KRW" ? qty : current != null ? qty * current : average != null ? qty * average : 0;
+      if (symbol !== "KRW" && value <= 0) return null;
       const cost = average != null ? qty * average : null;
       const pnl = symbol === "KRW" ? 0 : cost != null && current != null ? value - cost : null;
       return {
@@ -2144,10 +2216,48 @@ function buildSectorRows(rows: PortfolioAssetRow[]) {
     .slice(0, 5);
 }
 
-function buildRebalanceRows(rows: PortfolioAssetRow[], total: number) {
-  const targetSum = rows.reduce((sum, row) => sum + row.targetAllocation, 0) || 1;
+function latestSmartDecision(data: DashboardData) {
+  return data.smartEngineStatus?.decision ?? data.analysisLatest ?? data.analysisHistory[0] ?? null;
+}
+
+function latestSmartIntent(data: DashboardData) {
+  return data.smartEngineStatus?.latest_intent ?? latestSmartDecision(data)?.order_intents?.[0] ?? null;
+}
+
+function smartTargetPortfolioRatio(data: DashboardData, total: number) {
+  const decision = latestSmartDecision(data);
+  const intent = latestSmartIntent(data);
+  if (total <= 0) return null;
+  if (typeof intent?.target_value_krw === "number" && Number.isFinite(intent.target_value_krw)) {
+    return boundedRatio(intent.target_value_krw / total);
+  }
+  if (
+    typeof decision?.max_total_exposure_krw === "number"
+    && decision.max_total_exposure_krw > 0
+    && typeof decision.target_exposure_pct === "number"
+    && Number.isFinite(decision.target_exposure_pct)
+  ) {
+    return boundedRatio((decision.max_total_exposure_krw * decision.target_exposure_pct / 100) / total);
+  }
+  return typeof decision?.target_exposure_pct === "number" && Number.isFinite(decision.target_exposure_pct)
+    ? boundedRatio(decision.target_exposure_pct / 100)
+    : null;
+}
+
+function buildRebalanceRows(rows: PortfolioAssetRow[], total: number, data: DashboardData): PortfolioRebalanceRow[] {
+  const targetExposure = smartTargetPortfolioRatio(data, total);
+  const lockedNonCore = rows
+    .filter((row) => row.symbol !== "KRW" && row.symbol !== "BTC")
+    .reduce((sum, row) => sum + row.allocation, 0);
+  const coreBudget = Math.max(1 - lockedNonCore, 0);
+  const targetBtc = targetExposure == null ? null : Math.min(targetExposure, coreBudget);
+  const targetKrw = targetBtc == null ? null : Math.max(coreBudget - targetBtc, 0);
   return rows.slice(0, 6).map((row) => {
-    const target = row.targetAllocation / targetSum;
+    let target = row.allocation;
+    if (targetBtc != null && targetKrw != null) {
+      if (row.symbol === "BTC") target = targetBtc;
+      else if (row.symbol === "KRW") target = targetKrw;
+    }
     const suggestion = (target - row.allocation) * total;
     return { symbol: row.symbol, allocation: row.allocation, target, suggestion };
   });
@@ -2155,13 +2265,14 @@ function buildRebalanceRows(rows: PortfolioAssetRow[], total: number) {
 
 function buildContributionRows(rows: PortfolioAssetRow[]) {
   const withPnl = rows.filter((row) => row.pnl != null && row.symbol !== "KRW");
-  const top = [...withPnl].sort((a, b) => (b.pnl ?? 0) - (a.pnl ?? 0)).slice(0, 3);
-  const bottom = [...withPnl].sort((a, b) => (a.pnl ?? 0) - (b.pnl ?? 0)).slice(0, 3);
+  const top = [...withPnl].filter((row) => (row.pnl ?? 0) > 0).sort((a, b) => (b.pnl ?? 0) - (a.pnl ?? 0)).slice(0, 3);
+  const bottom = [...withPnl].filter((row) => (row.pnl ?? 0) < 0).sort((a, b) => (a.pnl ?? 0) - (b.pnl ?? 0)).slice(0, 3);
   return { top, bottom };
 }
 
-function portfolioTrend(data: DashboardData, total: number) {
-  const source = (data.paper?.equity_curve?.length ? data.paper.equity_curve : data.forward?.equity_curve) ?? [];
+function portfolioTrend(data: DashboardData, total: number): PortfolioTrendData {
+  const hasPaperCurve = Boolean(data.paper?.equity_curve?.length);
+  const source = (hasPaperCurve ? data.paper?.equity_curve : data.forward?.equity_curve) ?? [];
   const curve = source
     .filter((point) => point.equity != null && Number.isFinite(point.equity))
     .slice(-30)
@@ -2172,10 +2283,19 @@ function portfolioTrend(data: DashboardData, total: number) {
       ? [...curve.map((point) => point.value), total]
       : curve.map((point) => point.value);
     const labelValues = curve.map((point) => point.time ?? "");
-    return { values, labels: values.length > labelValues.length ? [...labelValues, data.updatedAt ?? ""] : labelValues };
+    return {
+      values,
+      labels: values.length > labelValues.length ? [...labelValues, data.updatedAt ?? ""] : labelValues,
+      sourceLabel: hasPaperCurve ? "Paper equity curve" : "Forward equity curve",
+      hasHistory: true
+    };
   }
-  const ratios = [0.845, 0.86, 0.83, 0.855, 0.848, 0.872, 0.862, 0.881, 0.898, 0.927, 0.914, 0.936, 0.944, 0.969, 0.986, 0.952, 0.947, 0.962, 0.972, 1];
-  return { values: ratios.map((ratio) => total * ratio), labels: [] };
+  return {
+    values: [total, total],
+    labels: [data.updatedAt ?? "", data.updatedAt ?? ""],
+    sourceLabel: data.liveBalances?.balance_fetch_status === "SUCCESS" ? "실잔고 현재 스냅샷" : "실잔고 대기",
+    hasHistory: false
+  };
 }
 
 function formatAxisDate(value?: string) {
@@ -2219,8 +2339,9 @@ function PortfolioTrendChart({ total, values, labels }: { total: number; values:
   }).join(" ");
   const pointList = points.split(" ");
   const lastPoint = pointList[pointList.length - 1]?.split(",").map(Number) ?? [width - 24, 40];
+  const uniqueLabels = Array.from(new Set(labels.filter(Boolean)));
   const axisLabels = [0, 1, 2, 3, 4, 5, 6].map((item) => {
-    if (labels.length < 2) return ["04-24", "04-29", "06-04", "06-09", "06-14", "06-19", "06-24"][item];
+    if (labels.length < 2 || uniqueLabels.length <= 1) return item === 3 ? (formatAxisDate(uniqueLabels[0]) || "현재") : "";
     const index = Math.round((item / 6) * (labels.length - 1));
     return formatAxisDate(labels[index]);
   });
@@ -2282,8 +2403,25 @@ function PortfolioView({
   const trendEnd = trend.values[trend.values.length - 1] ?? total;
   const trendPnl = trendEnd - trendStart;
   const trendReturn = trendStart > 0 ? trendPnl / trendStart : null;
-  const rebalanceRows = buildRebalanceRows(rows, total);
+  const smartIntent = latestSmartIntent(data);
+  const smartTargetRatio = smartTargetPortfolioRatio(data, total);
+  const rebalanceRows = buildRebalanceRows(rows, total, data);
   const estimatedFee = rebalanceRows.reduce((sum, row) => sum + Math.abs(row.suggestion), 0) * 0.0005;
+  const largestSuggestion = rebalanceRows.reduce((max, row) => Math.max(max, Math.abs(row.suggestion)), 0);
+  const intentDelta = Math.abs(smartIntent?.delta_value_krw ?? 0);
+  const rebalanceNeeded = smartTargetRatio != null && (intentDelta >= 5_000 || largestSuggestion >= 5_000) && String(smartIntent?.side ?? "").toUpperCase() !== "NONE";
+  const rebalanceSummary = smartTargetRatio == null
+    ? "최근 Smart 목표 대기"
+    : rebalanceNeeded
+      ? "리밸런싱 후보 있음"
+      : "현재 유지 권장";
+  const smartIntentSide = String(smartIntent?.side ?? "").toUpperCase();
+  const smartIntentLabel = smartIntentSide && smartIntentSide !== "NONE"
+    ? `${statusLabel(smartIntent?.side)} 후보 ${formatSignedKrw(smartIntent?.delta_value_krw)} KRW`
+    : "주문 후보 없음";
+  const rebalanceDetail = smartTargetRatio == null
+    ? "자동 판단 스냅샷이 쌓이면 목표 비중을 표시합니다."
+    : `${smartIntentLabel} · 목표 BTC ${formatRatioPercent(smartTargetRatio)}`;
   const sectorRows = buildSectorRows(rows);
   const contributions = buildContributionRows(rows);
   const riskState = data.risk?.risk_state;
@@ -2315,19 +2453,20 @@ function PortfolioView({
 
       <RefPanel className="ref-portfolio-trend">
         <div className="ref-portfolio-panel-head"><h3>포트폴리오 자산 추이</h3><div><button>1일</button><button>7일</button><button className="is-active">30일</button><button>90일</button><button>전체</button></div></div>
-        <span>자산 (KRW)</span>
+        <span>자산 (KRW) · {trend.sourceLabel}</span>
         <PortfolioTrendChart total={total} values={trend.values} labels={trend.labels} />
         <div className="ref-portfolio-trend-summary">
-          <p><span>기간 시작</span><b>{formatKrw(trendStart)}</b></p>
-          <p><span>기간 종료</span><b>{formatKrw(trendEnd)}</b></p>
-          <p><span>변동액</span><b className={trendPnl >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(trendPnl)}</b></p>
-          <p><span>수익률</span><b className={trendPnl >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(trendReturn)}</b></p>
+          <p><span>{trend.hasHistory ? "기간 시작" : "스냅샷 시작"}</span><b>{formatKrw(trendStart)}</b></p>
+          <p><span>{trend.hasHistory ? "기간 종료" : "현재 평가액"}</span><b>{formatKrw(trendEnd)}</b></p>
+          <p><span>{trend.hasHistory ? "변동액" : "확정 변동"}</span><b className={trendPnl >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(trendPnl)}</b></p>
+          <p><span>{trend.hasHistory ? "수익률" : "스냅샷 수익률"}</span><b className={trendPnl >= 0 ? "ref-positive" : "ref-negative"}>{formatPercent(trendReturn)}</b></p>
         </div>
       </RefPanel>
 
       <RefPanel className="ref-portfolio-rebalance">
         <div className="ref-portfolio-panel-head"><h3>리밸런싱 제안</h3><span>업데이트: {formatKstTime(data.updatedAt)} ↻</span></div>
         <div className="ref-rebalance-tabs"><button className="is-active">권장 조정</button><button>사용자 설정</button></div>
+        <div className="ref-rebalance-summary"><b>{rebalanceSummary}</b><span>{rebalanceDetail}</span></div>
         <table><thead><tr><th>자산</th><th>현재 비중</th><th>권장 비중</th><th>조정 제안</th></tr></thead><tbody>{rebalanceRows.map((row) => <tr key={row.symbol}><td>{row.symbol}</td><td>{formatRatioPercent(row.allocation)}</td><td>{formatRatioPercent(row.target)}</td><td className={row.suggestion >= 0 ? "ref-positive" : "ref-negative"}>{formatSignedKrw(row.suggestion)} KRW</td></tr>)}</tbody></table>
         <p><span>예상 거래 비용</span><b>{formatKrw(estimatedFee)} KRW</b></p>
         <button className="ref-rebalance-action" type="button" onClick={onSimulate}>권장 리밸런싱 실행 / 시뮬레이션</button>
@@ -2354,12 +2493,23 @@ function PortfolioView({
 
       <RefPanel className="ref-portfolio-contribution">
         <div className="ref-portfolio-panel-head"><h3>수익 기여도 TOP 3 / BOTTOM 3</h3><span>상세 보기 ›</span></div>
-        <div>
-          {[0, 1, 2].map((index) => {
-            const top = contributions.top[index];
-            const bottom = contributions.bottom[index];
-            return <p key={index}><b>{top?.symbol ?? "-"}</b><span className={(top?.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{top ? `${formatSignedKrw(top.pnl)} KRW` : "-"}</span><b>{bottom?.symbol ?? "-"}</b><span className={(bottom?.pnl ?? 0) >= 0 ? "ref-positive" : "ref-negative"}>{bottom ? `${formatSignedKrw(bottom.pnl)} KRW` : "-"}</span></p>;
-          })}
+        <div className="ref-contribution-grid">
+          <section>
+            <b>TOP 3</b>
+            <div>
+              {contributions.top.length
+                ? contributions.top.map((asset) => <p key={`top-${asset.symbol}`}><span>{asset.symbol}</span><em className="ref-positive">{formatSignedKrw(asset.pnl)} KRW</em></p>)
+                : <p className="ref-contribution-empty"><span>-</span><em>수익 기여 자산 없음</em></p>}
+            </div>
+          </section>
+          <section>
+            <b>BOTTOM 3</b>
+            <div>
+              {contributions.bottom.length
+                ? contributions.bottom.map((asset) => <p key={`bottom-${asset.symbol}`}><span>{asset.symbol}</span><em className="ref-negative">{formatSignedKrw(asset.pnl)} KRW</em></p>)
+                : <p className="ref-contribution-empty"><span>-</span><em>손실 기여 자산 없음</em></p>}
+            </div>
+          </section>
         </div>
       </RefPanel>
     </>
@@ -2716,13 +2866,9 @@ function LogPanel({ data }: { data: DashboardData }) {
   const riskLogs = (data.risk?.risk_logs ?? []).slice(0, 7).map((log) => ({
     key: `risk-${log.id ?? log.created_at ?? ""}-${log.block_code ?? log.risk_level ?? ""}`,
     createdAt: log.created_at,
-    type: log.allowed ? "ok" : isOpenOrderWaitLog(log) ? "info" : extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason) ? "warn" : "danger",
+    type: riskLogDotType(log),
     time: formatKstTime(log.created_at),
-    text: isOpenOrderWaitLog(log)
-      ? "BTC/KRW 기존 매수 주문 체결 대기"
-      : extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)
-      ? `정책 차단 · ${policyBlockText(log.block_code, log.block_reason)}`
-      : log.block_reason ?? log.block_code ?? log.risk_level ?? "리스크 로그"
+    text: riskLogMessage(log)
   }));
   const orderLogs = data.liveOrders.slice(0, 7).map((order) => ({
     key: `order-${order.request_id ?? order.id ?? order.created_at ?? ""}`,
@@ -2787,18 +2933,15 @@ function AlertsView({ data }: { data: DashboardData }) {
             <tbody>
               {logs.length === 0 && <tr><td colSpan={5}>최근 리스크 로그 없음</td></tr>}
               {logs.slice(0, 50).map((log) => {
-                const code = extractPolicyBlockCode(log.block_code) ?? log.block_code ?? log.risk_level ?? "RISK_CHECK";
-                const isWaitingOpenOrder = isOpenOrderWaitLog(log);
-                const isPolicy = Boolean(log.policy_block_detail || extractPolicyBlockCode(log.block_code));
-                const typeLabel = isWaitingOpenOrder ? "주문 대기" : isPolicy ? "정책 차단" : statusLabel(code);
-                const message = isPolicy ? policyBlockText(code, log.block_reason) : log.block_reason ?? "정상";
+                const typeLabel = riskLogTypeLabel(log);
+                const message = riskLogMessage(log);
                 const readLabel = log.read_status === "READ" || log.allowed ? "읽음" : log.read_status === "IGNORED" ? "무시됨" : "미해결";
                 return (
                   <tr key={log.id ?? log.created_at} className={`${selected?.id === log.id ? "is-selected" : ""} ${!log.allowed ? "is-alert" : ""}`} onClick={() => setSelectedId(log.id ?? null)}>
                     <td>{formatKstShort(log.created_at)}</td>
-                    <td><RefStatusBadge value={isWaitingOpenOrder ? "대기" : statusLabel(log.risk_level ?? (log.allowed ? "OK" : "BLOCKED"))} tone={log.allowed ? "green" : isWaitingOpenOrder ? "cyan" : isPolicy ? "amber" : "red"} /></td>
+                    <td><RefStatusBadge value={riskSeverityLabel(log.risk_level ?? (log.allowed ? "OK" : "BLOCKED"))} tone={riskLogTone(log)} /></td>
                     <td title={typeLabel}>{typeLabel}</td>
-                    <td title={message}>{isWaitingOpenOrder ? "기존 매수 주문이 체결/취소될 때까지 신규 매수를 보류합니다." : message}</td>
+                    <td title={message}>{message}</td>
                     <td>{readLabel}</td>
                   </tr>
                 );
@@ -2814,12 +2957,14 @@ function AlertsView({ data }: { data: DashboardData }) {
         </div>
         {selected ? (
           <div className="ref-alert-detail-body">
-            <strong>{selected.policy_block_detail?.summary ?? selected.block_reason ?? selected.block_code ?? "리스크 로그"}</strong>
+            <strong>{selected.policy_block_detail?.summary ?? riskLogMessage(selected)}</strong>
             <p><span>발생 시간</span><b>{formatKstShort(selected.created_at)}</b></p>
+            <p><span>심각도</span><b>{riskSeverityLabel(selected.risk_level ?? (selected.allowed ? "OK" : "BLOCKED"))}</b></p>
+            <p><span>유형</span><b>{riskLogTypeLabel(selected)}</b></p>
             <p><span>차단 코드</span><b>{selected.block_code ?? "-"}</b></p>
             <p><span>상태</span><b>{selected.allowed ? "허용" : "차단"}</b></p>
             <PolicyBlockDetailGrid detail={selected.policy_block_detail} />
-            {!selected.policy_block_detail && <em>정책 차단이 아닌 일반 리스크 로그입니다.</em>}
+            {!selected.policy_block_detail && <em>{selected.allowed ? "차단이 아닌 일반 리스크 점검 통과 로그입니다." : "정책 차단이 아닌 일반 리스크 차단 로그입니다."}</em>}
           </div>
         ) : (
           <div className="ref-alert-detail-body empty">선택할 알림이 없습니다.</div>
@@ -3299,11 +3444,9 @@ function AutoBottomPanels({ data }: { data: DashboardData }) {
     })),
     ...data.risk?.risk_logs?.slice(0, 2).map((log) => ({
       time: formatKstTime(log.created_at),
-      strategy: extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason) ? "Policy" : "Risk",
+      strategy: riskLogIsPolicy(log) ? "Policy" : "Risk",
       market: "-",
-      type: extractPolicyBlockCode(log.block_code) || extractPolicyBlockCode(log.block_reason)
-        ? policyBlockText(log.block_code, log.block_reason)
-        : statusLabel(log.block_code ?? log.risk_level ?? "-"),
+      type: riskLogMessage(log),
       price: "-",
       status: log.allowed ? "OK" : "BLOCKED"
     })) ?? []

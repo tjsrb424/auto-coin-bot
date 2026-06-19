@@ -2799,18 +2799,18 @@ body {
 
 .ref-portfolio-sector {
   left: 1257px;
-  top: 622px;
+  top: 620px;
   width: 406px;
-  height: 176px;
+  height: 158px;
   overflow: hidden;
   padding: 14px 14px;
 }
 
 .ref-portfolio-contribution {
   left: 1257px;
-  top: 808px;
+  top: 788px;
   width: 406px;
-  height: 132px;
+  height: 152px;
   overflow: hidden;
   padding: 14px 14px;
 }
@@ -3050,7 +3050,7 @@ body {
 
 .ref-portfolio-rebalance table {
   width: 100%;
-  margin-top: 10px;
+  margin-top: 7px;
   border-collapse: collapse;
   color: #c7d1df;
   font-size: 12px;
@@ -3069,9 +3069,34 @@ body {
 }
 
 .ref-portfolio-rebalance td {
-  height: 24px;
+  height: 22px;
   border-top: 1px solid rgba(52, 72, 96, 0.38);
   text-align: right;
+  white-space: nowrap;
+}
+
+.ref-rebalance-summary {
+  display: grid;
+  gap: 3px;
+  margin-top: 9px;
+  border: 1px solid rgba(52, 72, 96, 0.5);
+  border-radius: 5px;
+  background: rgba(10, 19, 31, 0.42);
+  padding: 8px 10px;
+}
+
+.ref-rebalance-summary b {
+  color: #f4f7ff;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.ref-rebalance-summary span {
+  color: #9eacbe;
+  font-size: 11px;
+  font-weight: 750;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -3280,16 +3305,10 @@ body {
   line-height: 1.05;
 }
 
-.ref-portfolio-sector > div {
+.ref-portfolio-sector > div:not(.ref-portfolio-panel-head) {
   display: grid;
   gap: 6px;
   margin-top: 10px;
-}
-
-.ref-portfolio-contribution > div {
-  display: grid;
-  gap: 5px;
-  margin-top: 8px;
 }
 
 .ref-portfolio-sector p {
@@ -3325,24 +3344,61 @@ body {
   white-space: nowrap;
 }
 
-.ref-portfolio-contribution p {
+.ref-contribution-grid {
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) 38px minmax(0, 1fr);
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.ref-contribution-grid section {
+  display: grid;
+  grid-template-rows: 18px 1fr;
+  gap: 7px;
+  min-width: 0;
+}
+
+.ref-contribution-grid section > b {
+  color: #f4f7ff;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.ref-contribution-grid section > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ref-contribution-grid p {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
   gap: 8px;
+  min-width: 0;
   margin: 0;
   color: #cbd5e1;
-  font-size: 10.5px;
-  line-height: 1.08;
+  font-size: 11px;
+  line-height: 1.1;
 }
 
-.ref-portfolio-contribution b {
+.ref-contribution-grid p span {
   color: #f4f7ff;
+  font-weight: 900;
 }
 
-.ref-portfolio-contribution span {
+.ref-contribution-grid p em {
   overflow: hidden;
+  text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.ref-contribution-grid .ref-contribution-empty em {
+  color: #8f9db1;
+  font-weight: 750;
 }
 
 .ref-trades-panel {
