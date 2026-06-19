@@ -18,7 +18,7 @@ from app.risk_manager import compute_risk_state
 from app.shadow_report import build_shadow_report
 from app.smart_external_factors import load_external_factors
 from app.smart_market_regime import classify_market_regime
-from app.smart_promotion import evaluate_promotion
+from app.smart_promotion import evaluate_promotion, smart_engine_live_mode
 from app.smart_signal_engine import evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
 
@@ -26,7 +26,7 @@ from app.smart_target_exposure import calculate_target_exposure
 DEFAULT_MARKET = "KRW-BTC"
 
 
-def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict], candle: dict, legacy_signal: dict) -> dict:
+def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict], candle: dict, legacy_signal: dict, available_krw_balance: float | None = None) -> dict:
     frame = candles_to_frame(candles)
     features = _build_features(frame)
     market_regime, regime_positives, regime_negatives = classify_market_regime(features)
@@ -90,7 +90,7 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
         "max_total_exposure_krw": max_total_exposure,
         "daily_loss_limit_pct": daily_loss_limit_pct,
         "daily_loss_limit_krw": daily_loss_limit_krw,
-        "available_krw_balance": None,
+        "available_krw_balance": available_krw_balance,
         "exposure_limit_blocked": "SMART_MAX_TOTAL_EXPOSURE_REACHED" in blockers,
     }
     snapshot_id = insert_decision_snapshot(snapshot)
@@ -404,6 +404,9 @@ def _current_bot_position(exchange: str, market: str, price: float) -> tuple[flo
 
 
 def _shadow_mode_enabled() -> bool:
+    mode = smart_engine_live_mode()
+    if mode != "shadow":
+        return False
     return os.getenv("SMART_ENGINE_SHADOW_MODE", "true").lower() != "false"
 
 

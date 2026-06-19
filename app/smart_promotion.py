@@ -10,11 +10,18 @@ from app.risk_manager import RiskConfig
 READY_RECOMMENDATION = "READY_FOR_LIMITED_PILOT_REVIEW"
 LIVE_MODE_SHADOW = "shadow"
 LIVE_MODE_LIMITED = "limited"
+LIVE_MODE_LIVE = "live"
+LIVE_MODE_AUTONOMOUS_LIVE = "autonomous_live"
 
 
 def smart_engine_live_mode() -> str:
     value = os.getenv("SMART_ENGINE_LIVE_MODE", LIVE_MODE_SHADOW).strip().lower()
-    return value if value in {LIVE_MODE_SHADOW, LIVE_MODE_LIMITED} else LIVE_MODE_SHADOW
+    return value if value in {LIVE_MODE_SHADOW, LIVE_MODE_LIMITED, LIVE_MODE_LIVE, LIVE_MODE_AUTONOMOUS_LIVE} else LIVE_MODE_SHADOW
+
+
+def is_smart_live_mode(value: str | None = None) -> bool:
+    mode = (value or smart_engine_live_mode()).strip().lower()
+    return mode in {LIVE_MODE_LIMITED, LIVE_MODE_LIVE, LIVE_MODE_AUTONOMOUS_LIVE}
 
 
 def evaluate_rehearsal_preview(
@@ -55,18 +62,19 @@ def evaluate_promotion(
     is_buy = side in {"BID", "BUY"}
     is_sell = side in {"ASK", "SELL"}
     remaining = max(max_total - current_value, 0.0)
-    cap_candidates = [max_total * 0.2, _float(risk_config.max_order_krw), remaining]
-    if available_krw is not None:
-        cap_candidates.append(max(_float(available_krw), 0.0))
+    is_limited_mode = mode == LIVE_MODE_LIMITED
+    is_full_live_mode = mode in {LIVE_MODE_LIVE, LIVE_MODE_AUTONOMOUS_LIVE}
+    mode_cap = max_total * 0.2 if is_limited_mode else max_total
+    cap_candidates = [mode_cap, _float(risk_config.max_order_krw), remaining]
     pilot_cap = max(min([value for value in cap_candidates if value >= 0], default=0.0), 0.0) if is_buy else current_value
     blockers: list[str] = []
-    if mode != LIVE_MODE_LIMITED:
+    if not is_smart_live_mode(mode):
         blockers.append("SMART_LIVE_MODE_SHADOW")
     if not policy.get("auto_trading_enabled"):
         blockers.append("SMART_POLICY_AUTO_TRADING_DISABLED")
     if not is_buy and not is_sell:
         blockers.append("SMART_LIMITED_SIDE_UNSUPPORTED")
-    if shadow_recommendation != READY_RECOMMENDATION:
+    if is_limited_mode and shadow_recommendation != READY_RECOMMENDATION:
         blockers.append("SMART_SHADOW_REPORT_NOT_READY")
     if risk_preview is None:
         blockers.append("SMART_RISK_PREVIEW_MISSING")
@@ -76,14 +84,17 @@ def evaluate_promotion(
         blockers.append("SMART_ORDER_AMOUNT_ZERO")
     if is_buy and requested > pilot_cap:
         blockers.append("SMART_PILOT_ORDER_CAP_EXCEEDED")
+    if is_buy and available_krw is not None and requested > max(_float(available_krw), 0.0):
+        blockers.append("SMART_INSUFFICIENT_KRW_BALANCE")
     if is_sell and current_qty <= 0:
         blockers.append("SMART_SELL_POSITION_MISSING")
     if is_sell and requested_qty > current_qty + 1e-12:
         blockers.append("SMART_SELL_QTY_EXCEEDS_POSITION")
-    rehearsal = _evaluate_rehearsal(requested_order_krw=requested, risk_score=_float(risk_score, _float(snapshot.get("risk_score"))), daily_smart_order_count=daily_smart_order_count, now_utc=now_utc) if is_buy else _sell_rehearsal_preview(requested, requested_qty, current_qty, now_utc)
-    if is_buy:
+    rehearsal = _evaluate_rehearsal(requested_order_krw=requested, risk_score=_float(risk_score, _float(snapshot.get("risk_score"))), daily_smart_order_count=daily_smart_order_count, now_utc=now_utc) if is_buy and is_limited_mode else _sell_rehearsal_preview(requested, requested_qty, current_qty, now_utc)
+    if is_buy and is_limited_mode:
         blockers.extend(rehearsal["blockers"])
-    status = "READY_FOR_LIMITED" if mode == LIVE_MODE_LIMITED and not blockers else ("SHADOW_ONLY" if mode != LIVE_MODE_LIMITED else "BLOCKED")
+    ready_status = "READY_FOR_LIMITED" if is_limited_mode else "READY_FOR_LIVE" if is_full_live_mode else "SHADOW_ONLY"
+    status = ready_status if is_smart_live_mode(mode) and not blockers else ("SHADOW_ONLY" if not is_smart_live_mode(mode) else "BLOCKED")
     return {
         "promotion_status": status,
         "promotion_blockers": list(dict.fromkeys(blockers)),

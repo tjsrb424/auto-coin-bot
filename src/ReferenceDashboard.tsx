@@ -314,6 +314,7 @@ type RuntimeStatus = {
   live_trading_enabled?: boolean;
   live_auto_trading_enabled?: boolean;
   auto_strategy_pilot_enabled?: boolean;
+  smart_autonomous_trading_enabled?: boolean;
   runtime_status?: "OFF" | "RUNNING" | "PAUSED" | "STOPPED" | "EMERGENCY_STOPPED" | string;
   strategy_status?: string;
   emergency_stop?: boolean;
@@ -3454,8 +3455,8 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
     <>
       <RefPanel className="ref-ops-summary">
         <span>Bot Operation Policy</span>
-        <h2>{autoTradingEnabled ? "자동매매 정책 ON" : "자동매매 정책 OFF"}</h2>
-        <p>{marketDisplay(policy?.market)} · 마지막 수정 {formatKstShort(policy?.updated_at)}</p>
+        <h2>Smart Autonomous Live</h2>
+        <p>{autoTradingEnabled ? "자동매매 ON" : "자동매매 OFF"} · {marketDisplay(policy?.market)} · 마지막 수정 {formatKstShort(policy?.updated_at)}</p>
         {(message || error) && <strong className={error ? "is-error" : ""}>{error ?? message}</strong>}
       </RefPanel>
       <RefPanel className="ref-ops-form">
@@ -3508,7 +3509,7 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
         {policy?.balance_error && <em>{policy.balance_error}</em>}
       </RefPanel>
       <RefPanel className="ref-ops-readiness">
-        <h3>limited 전환 점검</h3>
+        <h3>Smart Engine 점검</h3>
         <strong className={readiness?.can_enable_limited ? "is-ready" : "is-blocked"}>
           {smartReadinessLabel(readiness?.status)}
         </strong>
@@ -4359,14 +4360,9 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
       if (isAutoTradingOn) {
         await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/stop");
       } else {
-        const candidate = data.candidates.find((item) => item.id > 0 && item.market === MARKET && item.status !== "INACTIVE")
-          ?? data.candidates.find((item) => item.id > 0 && item.market === MARKET)
-          ?? data.candidates.find((item) => item.id > 0);
-        if (!candidate) throw new Error("시작할 전략이 없습니다.");
-        const confirmation = window.prompt("자동매매를 시작하려면 확인 문구를 입력하세요: AUTO STRATEGY ENABLE")?.trim();
+        const confirmation = window.prompt("Smart Autonomous Live를 시작하려면 확인 문구를 입력하세요: AUTO STRATEGY ENABLE")?.trim();
         if (confirmation !== "AUTO STRATEGY ENABLE") throw new Error("확인 문구가 일치하지 않아 자동매매 시작을 취소했습니다.");
         const body = await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/start", {
-          candidate_strategy_id: candidate.id,
           confirmation,
           order_confirmation: "PLACE AUTO LIVE ORDER"
         });
@@ -4379,7 +4375,7 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
     } finally {
       setIsAutoToggling(false);
     }
-  }, [data.candidates, isAutoToggling, isAutoTradingOn, refresh]);
+  }, [isAutoToggling, isAutoTradingOn, refresh]);
 
   const importExchangePosition = React.useCallback(async () => {
     if (isImportingPosition) return;

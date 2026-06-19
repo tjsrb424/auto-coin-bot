@@ -141,6 +141,7 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
             exchange="bithumb",
             live_auto_trading_enabled=True,
             auto_strategy_pilot_enabled=True,
+            smart_autonomous_trading_enabled=True,
             allowed_exchange="bithumb",
             allowed_market="KRW-BTC",
             allowed_order_type="limit",
@@ -177,14 +178,14 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
             patch("app.live_strategy_pilot.insert_candles"),
             patch("app.live_strategy_pilot.load_candles", return_value=[candle]),
             patch("app.live_strategy_pilot._latest_signal", return_value={"signal": "SELL", "reason": "test"}),
-            patch("app.live_strategy_pilot._record_smart_shadow_decision", return_value={"order_intents": [{"side": "ASK"}]}),
+            patch("app.live_strategy_pilot._record_smart_decision", new=AsyncMock(return_value={"order_intents": [{"side": "ASK"}]})),
             patch("app.live_strategy_pilot.smart_engine_live_mode", return_value="limited"),
-            patch("app.live_strategy_pilot._submit_smart_limited_order", new=submit_mock),
+            patch("app.live_strategy_pilot._submit_smart_intent_order", new=submit_mock),
         ):
             await _process_open_position(session, position, config, live_config)
 
         submit_mock.assert_awaited_once()
-        passed_live_config = submit_mock.await_args.args[5]
+        passed_live_config = submit_mock.await_args.args[4]
         self.assertTrue(hasattr(passed_live_config, "fee_rate"))
         self.assertIs(passed_live_config, live_config)
 

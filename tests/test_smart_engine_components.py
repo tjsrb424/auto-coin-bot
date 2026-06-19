@@ -126,6 +126,34 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertIn("SMART_REHEARSAL_RISK_SCORE_TOO_HIGH", result["promotion_blockers"])
         self.assertFalse(result["policy_preview"]["rehearsal"]["allowed"])
 
+    def test_promotion_live_mode_allows_ready_for_live_without_shadow_report(self) -> None:
+        with patch.dict(os.environ, {"SMART_ENGINE_LIVE_MODE": "live", "RISK_MAX_ORDER_KRW": "300000"}, clear=False):
+            result = evaluate_promotion(
+                intent={"side": "BID", "delta_value_krw": 120_000},
+                snapshot={"current_bot_position_value_krw": 0, "risk_score": 35},
+                policy={"auto_trading_enabled": True, "max_total_exposure_krw": 500_000},
+                risk_preview={"allowed": True},
+                available_krw=500_000,
+                now_utc=datetime(2026, 6, 18, 3, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(result["promotion_status"], "READY_FOR_LIVE")
+        self.assertNotIn("SMART_SHADOW_REPORT_NOT_READY", result["promotion_blockers"])
+
+    def test_promotion_records_smart_insufficient_krw_balance(self) -> None:
+        with patch.dict(os.environ, {"SMART_ENGINE_LIVE_MODE": "live", "RISK_MAX_ORDER_KRW": "300000"}, clear=False):
+            result = evaluate_promotion(
+                intent={"side": "BID", "delta_value_krw": 120_000},
+                snapshot={"current_bot_position_value_krw": 0, "risk_score": 35},
+                policy={"auto_trading_enabled": True, "max_total_exposure_krw": 500_000},
+                risk_preview={"allowed": True},
+                available_krw=50_000,
+                now_utc=datetime(2026, 6, 18, 3, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(result["promotion_status"], "BLOCKED")
+        self.assertIn("SMART_INSUFFICIENT_KRW_BALANCE", result["promotion_blockers"])
+
     def test_rehearsal_daily_limit_zero_means_unlimited(self) -> None:
         with patch.dict(os.environ, {"SMART_REHEARSAL_MAX_DAILY_ORDERS": "0"}, clear=False):
             rehearsal = evaluate_rehearsal_preview(

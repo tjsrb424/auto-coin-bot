@@ -241,6 +241,7 @@ def _runtime_status_payload(request: Request) -> dict:
         "live_trading_enabled": live_config.live_trading_enabled,
         "live_auto_trading_enabled": bool(strategy.get("live_auto_trading_enabled") or auto.get("live_auto_trading_enabled")),
         "auto_strategy_pilot_enabled": bool(strategy.get("auto_strategy_pilot_enabled")),
+        "smart_autonomous_trading_enabled": bool(strategy.get("smart_autonomous_trading_enabled")),
         "runtime_status": runtime_status,
         "strategy_status": raw_status or "STOPPED",
         "emergency_stop": is_emergency_stopped(),
@@ -453,13 +454,13 @@ class AutoLivePilotStartRequest(BaseModel):
 
 
 class LiveStrategyPilotStartRequest(BaseModel):
-    candidate_strategy_id: int
+    candidate_strategy_id: int | None = None
     confirmation: str = ""
     order_confirmation: str = ""
 
 
 class RuntimeStartRequest(BaseModel):
-    candidate_strategy_id: int
+    candidate_strategy_id: int | None = None
     confirmation: str = ""
     order_confirmation: str = ""
 
