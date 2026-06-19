@@ -568,6 +568,80 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
     return None
 
 
+def _smart_bid_cap_preview(
+    *,
+    original_delta_value_krw: float,
+    amount_requested_krw: float,
+    capped_order_amount_krw: float,
+    hard_cap_krw: float,
+    mode_cap_krw: float,
+    max_order_krw: float,
+    max_live_order_krw: float,
+    remaining_exposure_krw: float,
+    available_krw_balance: float,
+) -> dict:
+    return {
+        "original_delta_value_krw": original_delta_value_krw,
+        "amount_requested_krw": amount_requested_krw,
+        "capped_order_amount_krw": max(capped_order_amount_krw, 0.0),
+        "hard_cap_krw": max(hard_cap_krw, 0.0),
+        "mode_cap_krw": max(mode_cap_krw, 0.0),
+        "max_order_krw": max_order_krw,
+        "max_live_order_krw": max_live_order_krw,
+        "remaining_exposure_krw": max(remaining_exposure_krw, 0.0),
+        "available_krw_balance": max(available_krw_balance, 0.0),
+        "cap_applied": capped_order_amount_krw < amount_requested_krw,
+    }
+
+
+def _smart_bid_cap_blocker(
+    *,
+    amount_requested: float,
+    available_krw: float,
+    remaining_exposure: float,
+    hard_cap: float,
+    min_order_krw: float,
+) -> str:
+    if amount_requested <= 0:
+        return "SMART_ORDER_AMOUNT_ZERO"
+    if available_krw <= 0 or available_krw < min_order_krw:
+        return "SMART_INSUFFICIENT_KRW_BALANCE"
+    if remaining_exposure <= 0:
+        return "SMART_MAX_TOTAL_EXPOSURE_REACHED"
+    if hard_cap <= 0 or hard_cap < min_order_krw:
+        return "SMART_ORDER_CAP_ZERO"
+    return "SMART_ORDER_CAP_ZERO"
+
+
+def _block_smart_intent_order(
+    session: dict,
+    intent_id: Any,
+    blocker: str,
+    candle_time_utc: str | None,
+    signal: dict | None,
+    cap_preview: dict,
+) -> None:
+    if intent_id:
+        update_order_intent(
+            int(intent_id),
+            {
+                "status": "BLOCKED",
+                "promotion_status": "BLOCKED",
+                "promotion_blockers": [blocker],
+                "policy_preview": cap_preview,
+            },
+        )
+    _insert_blocked_log(
+        session,
+        blocker,
+        blocker,
+        candle_time_utc,
+        signal,
+        preview={"risk_result": blocker, "fee_estimate": 0.0, "policy_preview": cap_preview},
+    )
+    update_live_strategy_session(int(session["id"]), {"last_risk_result": blocker, "last_order_status": "BLOCKED"})
+
+
 async def _submit_smart_intent_order(
     session: dict,
     candle: dict,
@@ -623,8 +697,30 @@ async def _submit_smart_intent_order(
     available_krw = _available_balance(balances, "KRW")
     mode = smart_engine_live_mode()
     mode_cap = max_total * 0.2 if mode == "limited" else max_total
-    hard_cap = min(mode_cap, config.max_order_krw, live_config.max_live_order_krw, max(max_total - current_value, 0.0))
-    amount = amount_requested
+    remaining_exposure = max(max_total - current_value, 0.0)
+    hard_cap = min(mode_cap, config.max_order_krw, live_config.max_live_order_krw, remaining_exposure, available_krw)
+    amount = min(amount_requested, hard_cap)
+    cap_preview = _smart_bid_cap_preview(
+        original_delta_value_krw=_float(intent.get("delta_value_krw")),
+        amount_requested_krw=amount_requested,
+        capped_order_amount_krw=amount,
+        hard_cap_krw=hard_cap,
+        mode_cap_krw=mode_cap,
+        max_order_krw=config.max_order_krw,
+        max_live_order_krw=live_config.max_live_order_krw,
+        remaining_exposure_krw=remaining_exposure,
+        available_krw_balance=available_krw,
+    )
+    if amount <= 0 or amount < live_config.min_order_krw:
+        blocker = _smart_bid_cap_blocker(
+            amount_requested=amount_requested,
+            available_krw=available_krw,
+            remaining_exposure=remaining_exposure,
+            hard_cap=hard_cap,
+            min_order_krw=live_config.min_order_krw,
+        )
+        _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
+        return True
     price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))
     request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
     order = {
@@ -676,6 +772,7 @@ async def _submit_smart_intent_order(
         daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
         risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
     )
+    promotion["policy_preview"] = {**promotion.get("policy_preview", {}), **cap_preview}
     if intent_id:
         update_order_intent(
             int(intent_id),
