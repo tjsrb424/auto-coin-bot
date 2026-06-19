@@ -1209,12 +1209,11 @@ async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
             update_live_strategy_session(
                 int(session["id"]),
                 {
-                    "status": "STOPPED",
-                    "auto_enabled": False,
+                    "status": "RUNNING",
+                    "auto_enabled": True,
                     "current_open_order_uuid": None,
                     "last_order_status": "CANCELED",
                     "last_risk_result": "AUTO_CANCELED_UNFILLED",
-                    "stopped_at": _utc_now(),
                 },
             )
             return
@@ -1348,7 +1347,8 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
     logs = load_live_order_logs(300, include_canonical_with_events=True)
     request_id = None
     for item in logs:
-        if item.get("order_uuid") == order_uuid and str(item.get("request_id", "")).startswith("strategy-") and not _is_strategy_order_event_request(str(item.get("request_id", ""))):
+        request_id_value = str(item.get("request_id", ""))
+        if item.get("order_uuid") == order_uuid and not _is_strategy_order_event_request(request_id_value):
             request_id = item["request_id"]
             break
     if request_id is None:

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from app import database
 from app.live_broker import LiveTradingConfig
-from app.live_strategy_pilot import LiveStrategyConfig, _process_session, _submit_smart_intent_order, start_live_strategy_pilot
+from app.live_strategy_pilot import LiveStrategyConfig, _manage_open_order, _process_session, _submit_smart_intent_order, start_live_strategy_pilot
 
 
 def candle() -> dict:
@@ -259,6 +259,90 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SMART_INSUFFICIENT_KRW_BALANCE", intent["promotion_blockers"])
         self.assertTrue(intent["policy_preview"]["cap_applied"])
         self.assertEqual(intent["policy_preview"]["available_krw_balance"], 5_000)
+
+    async def test_unfilled_limit_cancel_keeps_smart_runtime_running(self) -> None:
+        session = self.create_smart_session()
+        database.insert_live_order_log(
+            {
+                "request_id": "smart-test-unfilled",
+                "session_id": session["id"],
+                "candidate_strategy_id": 0,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "price": 100_000_000,
+                "volume": 0.0001,
+                "amount_krw": 10_000,
+                "risk_result": "ALLOWED",
+                "status": "SUBMITTED",
+                "order_uuid": "unfilled-order-uuid",
+            }
+        )
+        database.update_live_strategy_session(
+            int(session["id"]),
+            {
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "current_open_order_uuid": "unfilled-order-uuid",
+                "last_order_status": "SUBMITTED",
+                "last_order_time_utc": "2020-01-01T00:00:00Z",
+            },
+        )
+        session = database.load_latest_live_strategy_session()
+        assert session is not None
+        broker = AsyncMock()
+        broker.get_order.return_value = {
+            "uuid": "unfilled-order-uuid",
+            "state": "wait",
+            "volume": "0.0001",
+            "remaining_volume": "0.0001",
+            "executed_volume": "0",
+        }
+        broker.cancel_order.return_value = {
+            "uuid": "unfilled-order-uuid",
+            "state": "cancel",
+            "volume": "0.0001",
+            "remaining_volume": "0.0001",
+            "executed_volume": "0",
+        }
+        config = LiveStrategyConfig(
+            exchange="bithumb",
+            live_auto_trading_enabled=True,
+            auto_strategy_pilot_enabled=True,
+            smart_autonomous_trading_enabled=True,
+            allowed_exchange="bithumb",
+            allowed_market="KRW-BTC",
+            allowed_order_type="limit",
+            max_order_krw=30_000,
+            max_orders_per_day=0,
+            max_open_position_count=1,
+            cooldown_seconds=0,
+            require_completed_candle=False,
+            cancel_unfilled_after_seconds=60,
+            entry_price_offset_percent=0.3,
+            stop_loss_percent=0.7,
+            take_profit_percent=1.0,
+            max_hold_minutes=60,
+            exit_enabled=True,
+            market_order_enabled=False,
+        )
+
+        with patch("app.live_strategy_pilot.BithumbBroker", return_value=broker):
+            await _manage_open_order(session, config)
+
+        broker.cancel_order.assert_awaited_once_with("unfilled-order-uuid")
+        updated = database.load_latest_live_strategy_session()
+        assert updated is not None
+        self.assertEqual(updated["status"], "RUNNING")
+        self.assertTrue(updated["auto_enabled"])
+        self.assertIsNone(updated["current_open_order_uuid"])
+        self.assertEqual(updated["last_order_status"], "CANCELED")
+        self.assertEqual(updated["last_risk_result"], "AUTO_CANCELED_UNFILLED")
+        self.assertIsNone(updated["stopped_at"])
+        order_log = database.get_live_order_log("smart-test-unfilled")
+        assert order_log is not None
+        self.assertEqual(order_log["status"], "CANCELED")
 
 
 if __name__ == "__main__":
