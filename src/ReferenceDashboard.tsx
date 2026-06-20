@@ -748,7 +748,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     };
 
     void guardedRefresh();
-    const intervalId = window.setInterval(() => void guardedRefresh(), 30_000);
+    const intervalId = window.setInterval(() => void guardedRefresh(), 10_000);
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
