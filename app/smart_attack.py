@@ -198,9 +198,23 @@ def apply_aggressive_target_layer(
         target_source = "TRAILING_EXIT"
         negatives.append("PANIC market triggers exit preference over trailing hold.")
     elif current > 0 and trailing_stop_price > 0 and _float(current_price) <= trailing_stop_price:
-        final_target = min(final_target, max(current * 0.5, 0.0))
-        target_source = "TRAILING_EXIT"
-        negatives.append("Current price touched the trailing stop candidate.")
+        if core_enabled and not core_override_blocked and core_exposure_pct > 0 and regime in {"BREAKOUT", "TREND_UP", "RANGE"}:
+            if current <= core_exposure_pct:
+                final_target = current
+                target_source = source
+                positives.append("Trailing stop touched, but current exposure is already at or below core exposure.")
+            else:
+                final_target = min(final_target, core_exposure_pct)
+                target_source = "TRAILING_EXIT"
+                negatives.append("Current price touched the trailing stop candidate, so exposure is reduced toward core.")
+        elif core_enabled and not core_override_blocked and core_exposure_pct > 0 and regime == "TREND_DOWN":
+            final_target = min(final_target, core_exposure_pct)
+            target_source = "TRAILING_EXIT"
+            negatives.append("Current price touched the trailing stop candidate in TREND_DOWN, so exposure is reduced to reduced core.")
+        else:
+            final_target = min(final_target, max(current * 0.5, 0.0))
+            target_source = "TRAILING_EXIT"
+            negatives.append("Current price touched the trailing stop candidate.")
     else:
         tp1 = _float(os.getenv("SMART_PARTIAL_TAKE_PROFIT_1_PCT"), 0.8)
         tp2 = _float(os.getenv("SMART_PARTIAL_TAKE_PROFIT_2_PCT"), 1.5)

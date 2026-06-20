@@ -443,6 +443,69 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertTrue(result["core_exposure_broken_by_panic"])
         self.assertEqual(result["action_hint"], "EXIT")
 
+    def test_trailing_does_not_reduce_when_below_core_in_range(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_MIN_CORE_EXPOSURE_PCT": "30", "SMART_TRAILING_STOP_PCT_RANGE": "0.5"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="RANGE",
+                conservative_target_exposure_pct=18,
+                attack_result={"attack_score": 20, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=4,
+                current_position_pnl_pct=0.2,
+                current_price=99.4,
+                highest_price_since_entry=100,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 4)
+        self.assertEqual(result["action_hint"], "HOLD_POSITION")
+        self.assertNotEqual(result["final_target_exposure_source"], "TRAILING_EXIT")
+
+    def test_trailing_reduces_to_core_when_above_core(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_MIN_CORE_EXPOSURE_PCT": "30", "SMART_TRAILING_STOP_PCT_RANGE": "0.5"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="RANGE",
+                conservative_target_exposure_pct=45,
+                attack_result={"attack_score": 20, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=40,
+                current_position_pnl_pct=0.2,
+                current_price=99.4,
+                highest_price_since_entry=100,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 30)
+        self.assertEqual(result["action_hint"], "REDUCE")
+        self.assertEqual(result["final_target_exposure_source"], "TRAILING_EXIT")
+
+    def test_trailing_panic_ignores_core_and_exits(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_PANIC_CAN_BREAK_CORE": "true"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="PANIC",
+                conservative_target_exposure_pct=30,
+                attack_result={"attack_score": 20, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": ["SMART_AGGRESSIVE_PANIC_BLOCKED"], "score_breakdown": {}},
+                current_exposure_pct=30,
+                current_position_pnl_pct=-1,
+                current_price=99,
+                highest_price_since_entry=105,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 0)
+        self.assertEqual(result["action_hint"], "EXIT")
+        self.assertTrue(result["core_exposure_broken_by_panic"])
+
+    def test_trailing_trend_down_reduces_to_reduced_core(self) -> None:
+        with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_TREND_DOWN_CORE_EXPOSURE_PCT": "15"}, clear=False):
+            result = apply_aggressive_target_layer(
+                market_regime="TREND_DOWN",
+                conservative_target_exposure_pct=70,
+                attack_result={"attack_score": 80, "attack_mode": "MAX_AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": ["SMART_AGGRESSIVE_TREND_DOWN_BLOCKED"], "score_breakdown": {}},
+                current_exposure_pct=40,
+                current_position_pnl_pct=0,
+                current_price=99,
+                highest_price_since_entry=101,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 15)
+        self.assertEqual(result["action_hint"], "REDUCE")
+
     def test_trend_down_buy_blocker_does_not_block_reduce_intent(self) -> None:
         snapshot = {
             "exchange": "bithumb",
