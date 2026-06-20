@@ -457,7 +457,116 @@ class SmartEngineComponentTests(unittest.TestCase):
             )
         self.assertEqual(result["target_exposure_pct"], 4)
         self.assertEqual(result["action_hint"], "HOLD_POSITION")
+        self.assertFalse(result["core_exposure_applied"])
+        self.assertEqual(result["final_target_exposure_source"], "RISK_REDUCED")
         self.assertNotEqual(result["final_target_exposure_source"], "TRAILING_EXIT")
+
+    def test_trend_up_core_accumulation_ignores_losing_pnl_and_trailing_touch(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SMART_CORE_EXPOSURE_ENABLED": "true",
+                "SMART_MIN_CORE_EXPOSURE_PCT": "30",
+                "SMART_NO_AVERAGING_DOWN": "true",
+                "SMART_TRAILING_STOP_PCT_TREND_UP": "0.5",
+                "SMART_MIN_REBALANCE_DELTA_PCT": "2",
+            },
+            clear=False,
+        ):
+            result = apply_aggressive_target_layer(
+                market_regime="TREND_UP",
+                conservative_target_exposure_pct=20,
+                attack_result={"attack_score": 30, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=1.3,
+                current_position_pnl_pct=-0.5,
+                current_price=99.4,
+                highest_price_since_entry=100,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 30)
+        self.assertEqual(result["final_target_exposure_source"], "CORE")
+        self.assertTrue(result["core_exposure_applied"])
+        self.assertEqual(result["action_hint"], "BUY_MORE")
+        self.assertNotIn("SMART_AGGRESSIVE_NO_AVERAGING_DOWN", result["blockers"])
+
+    def test_breakout_losing_pnl_blocks_only_above_core_accumulation(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SMART_CORE_EXPOSURE_ENABLED": "true",
+                "SMART_MIN_CORE_EXPOSURE_PCT": "30",
+                "SMART_NO_AVERAGING_DOWN": "true",
+                "SMART_AGGRESSIVE_MAX_EXPOSURE_BREAKOUT": "85",
+                "SMART_TRAILING_STOP_PCT_BREAKOUT": "0.5",
+                "SMART_MIN_REBALANCE_DELTA_PCT": "2",
+            },
+            clear=False,
+        ):
+            result = apply_aggressive_target_layer(
+                market_regime="BREAKOUT",
+                conservative_target_exposure_pct=20,
+                attack_result={"attack_score": 90, "attack_mode": "MAX_AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=1.3,
+                current_position_pnl_pct=-0.5,
+                current_price=99.4,
+                highest_price_since_entry=100,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 30)
+        self.assertEqual(result["final_target_exposure_source"], "CORE")
+        self.assertEqual(result["action_hint"], "BUY_MORE")
+        self.assertNotIn("SMART_AGGRESSIVE_NO_AVERAGING_DOWN", result["blockers"])
+        self.assertIn("SMART_AGGRESSIVE_NO_AVERAGING_DOWN", result["aggressive_warnings"])
+
+    def test_trend_up_losing_pnl_blocks_add_buy_above_core(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SMART_CORE_EXPOSURE_ENABLED": "true",
+                "SMART_MIN_CORE_EXPOSURE_PCT": "30",
+                "SMART_NO_AVERAGING_DOWN": "true",
+                "SMART_AGGRESSIVE_MAX_EXPOSURE_TREND_UP": "75",
+            },
+            clear=False,
+        ):
+            result = apply_aggressive_target_layer(
+                market_regime="TREND_UP",
+                conservative_target_exposure_pct=40,
+                attack_result={"attack_score": 90, "attack_mode": "MAX_AGGRESSIVE", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=35,
+                current_position_pnl_pct=-0.5,
+                current_price=100,
+                highest_price_since_entry=100,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 35)
+        self.assertEqual(result["action_hint"], "HOLD_POSITION")
+        self.assertIn("SMART_AGGRESSIVE_NO_AVERAGING_DOWN", result["blockers"])
+
+    def test_range_trailing_below_core_has_consistent_non_core_source(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SMART_CORE_EXPOSURE_ENABLED": "true",
+                "SMART_MIN_CORE_EXPOSURE_PCT": "30",
+                "SMART_TRAILING_STOP_PCT_RANGE": "0.5",
+            },
+            clear=False,
+        ):
+            result = apply_aggressive_target_layer(
+                market_regime="RANGE",
+                conservative_target_exposure_pct=20,
+                attack_result={"attack_score": 20, "attack_mode": "OFF", "positive_reasons": [], "negative_reasons": [], "blockers": [], "score_breakdown": {}},
+                current_exposure_pct=1.3,
+                current_position_pnl_pct=-0.5,
+                current_price=99.4,
+                highest_price_since_entry=100,
+                risk_blockers=[],
+            )
+        self.assertEqual(result["target_exposure_pct"], 1.3)
+        self.assertEqual(result["action_hint"], "HOLD_POSITION")
+        self.assertEqual(result["final_target_exposure_source"], "RISK_REDUCED")
+        self.assertFalse(result["core_exposure_applied"])
 
     def test_trailing_reduces_to_core_when_above_core(self) -> None:
         with patch.dict(os.environ, {"SMART_CORE_EXPOSURE_ENABLED": "true", "SMART_MIN_CORE_EXPOSURE_PCT": "30", "SMART_TRAILING_STOP_PCT_RANGE": "0.5"}, clear=False):

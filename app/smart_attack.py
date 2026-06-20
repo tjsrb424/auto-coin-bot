@@ -131,6 +131,18 @@ def apply_aggressive_target_layer(
     attack_mode = str((attack_result or {}).get("attack_mode") or "OFF")
     attack_score = _float((attack_result or {}).get("attack_score"))
 
+    core_enabled = _env_bool("SMART_CORE_EXPOSURE_ENABLED", False)
+    core_exposure_pct = _core_exposure_pct(regime) if core_enabled else 0.0
+    core_exposure_applied = False
+    core_exposure_broken_by_panic = False
+    core_override_blocked = _core_override_blocked(risk_blockers)
+    core_accumulation_allowed = (
+        core_enabled
+        and not core_override_blocked
+        and core_exposure_pct > 0
+        and regime in {"BREAKOUT", "TREND_UP", "RANGE"}
+    )
+
     aggressive_target = _aggressive_target(regime, attack_mode)
     final_target = conservative
     source = "CONSERVATIVE"
@@ -141,18 +153,18 @@ def apply_aggressive_target_layer(
     no_averaging_down = False
     if _env_bool("SMART_NO_AVERAGING_DOWN", True) and current > 0 and pnl < 0 and final_target > current:
         no_averaging_down = True
-        blockers.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
-        aggressive_buy_blockers.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
         aggressive_warnings.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
         negatives.append("Current position is losing, so aggressive add-buy is blocked.")
-        final_target = current
-        source = "RISK_REDUCED"
-
-    core_enabled = _env_bool("SMART_CORE_EXPOSURE_ENABLED", False)
-    core_exposure_pct = _core_exposure_pct(regime) if core_enabled else 0.0
-    core_exposure_applied = False
-    core_exposure_broken_by_panic = False
-    core_override_blocked = _core_override_blocked(risk_blockers)
+        allowed_accumulation_target = max(current, core_exposure_pct) if core_accumulation_allowed else current
+        if final_target > allowed_accumulation_target:
+            final_target = allowed_accumulation_target
+            if final_target <= current:
+                blockers.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
+                aggressive_buy_blockers.append("SMART_AGGRESSIVE_NO_AVERAGING_DOWN")
+                source = "RISK_REDUCED"
+            elif core_accumulation_allowed and final_target <= core_exposure_pct:
+                source = "CORE"
+                core_exposure_applied = True
 
     if risk_blockers and final_target > current:
         final_target = current
@@ -200,9 +212,14 @@ def apply_aggressive_target_layer(
     elif current > 0 and trailing_stop_price > 0 and _float(current_price) <= trailing_stop_price:
         if core_enabled and not core_override_blocked and core_exposure_pct > 0 and regime in {"BREAKOUT", "TREND_UP", "RANGE"}:
             if current <= core_exposure_pct:
-                final_target = current
-                target_source = source
-                positives.append("Trailing stop touched, but current exposure is already at or below core exposure.")
+                if regime in {"BREAKOUT", "TREND_UP"} and final_target > current:
+                    target_source = source
+                    positives.append("Trailing stop touched, but trend regime keeps core accumulation target active.")
+                else:
+                    final_target = current
+                    target_source = "RISK_REDUCED"
+                    core_exposure_applied = False
+                    positives.append("Trailing stop touched, but current exposure is already at or below core exposure.")
             else:
                 final_target = min(final_target, core_exposure_pct)
                 target_source = "TRAILING_EXIT"
