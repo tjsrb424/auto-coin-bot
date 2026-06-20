@@ -24,3 +24,8 @@ api-server*.log
 vite.config.js
 vite.config.d.ts
 .DS_Store
+*.pem
+*.key
+*.ppk
+id_rsa
+id_ed25519
