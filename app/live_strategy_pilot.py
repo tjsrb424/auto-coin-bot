@@ -97,6 +97,9 @@ class LiveStrategyConfig:
     cancel_unfilled_after_seconds: int
     entry_price_offset_percent: float
     core_entry_price_offset_percent: float
+    core_marketable_limit_enabled: bool
+    core_marketable_limit_max_slippage_pct: float
+    core_marketable_limit_price_buffer_pct: float
     stop_loss_percent: float
     take_profit_percent: float
     max_hold_minutes: int
@@ -123,6 +126,9 @@ class LiveStrategyConfig:
             cancel_unfilled_after_seconds=int(os.getenv("AUTO_CANCEL_UNFILLED_AFTER_SECONDS", os.getenv("AUTO_CANCEL_AFTER_SECONDS", "60"))),
             entry_price_offset_percent=entry_price_offset_percent,
             core_entry_price_offset_percent=float(os.getenv("SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT", str(entry_price_offset_percent))),
+            core_marketable_limit_enabled=os.getenv("SMART_CORE_MARKETABLE_LIMIT_ENABLED", "false").lower() == "true",
+            core_marketable_limit_max_slippage_pct=float(os.getenv("SMART_CORE_MARKETABLE_LIMIT_MAX_SLIPPAGE_PCT", "0.15")),
+            core_marketable_limit_price_buffer_pct=float(os.getenv("SMART_CORE_MARKETABLE_LIMIT_PRICE_BUFFER_PCT", "0.02")),
             stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.7")),
             take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.0")),
             max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "60")),
@@ -705,12 +711,85 @@ def _smart_bid_price_preview(
         "entry_offset_percent": entry_offset_percent,
         "core_entry_offset_percent": config.core_entry_price_offset_percent,
         "auto_entry_offset_percent": config.entry_price_offset_percent,
+        "price_buffer_pct": config.core_marketable_limit_price_buffer_pct,
+        "max_slippage_pct": config.core_marketable_limit_max_slippage_pct,
         "price_gap_pct": (price_gap_krw / current_price * 100) if current_price > 0 else None,
         "price_gap_krw": price_gap_krw,
         "best_bid": orderbook_top.get("best_bid"),
         "best_ask": orderbook_top.get("best_ask"),
         "spread_krw": orderbook_top.get("spread_krw"),
         "spread_pct": orderbook_top.get("spread_pct"),
+        "marketable_limit_enabled": False,
+        "marketable_limit_fallback_reason": None,
+    }
+
+
+def _round_krw_price_up(price: float) -> float:
+    if price <= 0:
+        return 0.0
+    if price >= 1_000_000:
+        unit = 1000
+    elif price >= 100_000:
+        unit = 100
+    elif price >= 10_000:
+        unit = 10
+    else:
+        unit = 1
+    return float(((int(price) + unit - 1) // unit) * unit)
+
+
+def _smart_bid_price_policy(
+    *,
+    current_price: float,
+    config: LiveStrategyConfig,
+    core_accumulation: bool,
+    orderbook_top: dict,
+) -> tuple[float, dict]:
+    fallback_offset = config.core_entry_price_offset_percent if core_accumulation else config.entry_price_offset_percent
+    fallback_price = _round_krw_price(current_price * (1 - fallback_offset / 100))
+    fallback_preview = _smart_bid_price_preview(
+        current_price=current_price,
+        order_price=fallback_price,
+        entry_offset_percent=fallback_offset,
+        config=config,
+        core_accumulation=core_accumulation,
+        orderbook_top=orderbook_top,
+    )
+    if not core_accumulation:
+        return fallback_price, fallback_preview
+    if not config.core_marketable_limit_enabled:
+        return fallback_price, {**fallback_preview, "marketable_limit_fallback_reason": "MARKETABLE_LIMIT_DISABLED"}
+    best_ask = _float(orderbook_top.get("best_ask"))
+    if best_ask <= 0:
+        reason = "ORDERBOOK_UNAVAILABLE" if orderbook_top.get("best_ask") is None else "BEST_ASK_INVALID"
+        return fallback_price, {
+            **fallback_preview,
+            "price_policy": "CORE_MARKETABLE_LIMIT_FALLBACK_OFFSET",
+            "marketable_limit_enabled": True,
+            "marketable_limit_fallback_reason": reason,
+        }
+    marketable_price = max(best_ask, _round_krw_price_up(best_ask * (1 + config.core_marketable_limit_price_buffer_pct / 100)))
+    max_price = current_price * (1 + config.core_marketable_limit_max_slippage_pct / 100)
+    if current_price > 0 and marketable_price > max_price:
+        return fallback_price, {
+            **fallback_preview,
+            "price_policy": "CORE_MARKETABLE_LIMIT_FALLBACK_OFFSET",
+            "marketable_limit_enabled": True,
+            "marketable_limit_fallback_reason": "BEST_ASK_TOO_FAR_FROM_CURRENT",
+        }
+    marketable_preview = _smart_bid_price_preview(
+        current_price=current_price,
+        order_price=marketable_price,
+        entry_offset_percent=0.0,
+        config=config,
+        core_accumulation=core_accumulation,
+        orderbook_top=orderbook_top,
+    )
+    return marketable_price, {
+        **marketable_preview,
+        "price_policy": "CORE_MARKETABLE_LIMIT",
+        "marketable_limit_enabled": True,
+        "marketable_limit_fallback_reason": None,
     }
 
 
@@ -722,6 +801,10 @@ def _smart_submitted_request_payload(order: dict, price_preview: dict, config: L
         "submitted_best_bid": price_preview.get("best_bid"),
         "submitted_best_ask": price_preview.get("best_ask"),
         "entry_offset_percent": price_preview.get("entry_offset_percent"),
+        "price_policy": price_preview.get("price_policy"),
+        "price_buffer_pct": price_preview.get("price_buffer_pct"),
+        "max_slippage_pct": price_preview.get("max_slippage_pct"),
+        "marketable_limit_fallback_reason": price_preview.get("marketable_limit_fallback_reason"),
         "cancel_unfilled_after_seconds": config.cancel_unfilled_after_seconds,
     }
 
@@ -866,16 +949,12 @@ async def _submit_smart_intent_order(
         _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
         return True
     core_accumulation = _smart_core_accumulation_bid(intent, smart_snapshot)
-    entry_offset_percent = config.core_entry_price_offset_percent if core_accumulation else config.entry_price_offset_percent
-    price = _round_krw_price(current_price * (1 - entry_offset_percent / 100))
     try:
         orderbook_top = await _bithumb_orderbook_top(str(session.get("market") or "KRW-BTC"))
     except Exception:
         orderbook_top = {"best_bid": None, "best_ask": None, "spread_krw": None, "spread_pct": None}
-    price_preview = _smart_bid_price_preview(
+    price, price_preview = _smart_bid_price_policy(
         current_price=current_price,
-        order_price=price,
-        entry_offset_percent=entry_offset_percent,
         config=config,
         core_accumulation=core_accumulation,
         orderbook_top=orderbook_top,

@@ -127,6 +127,10 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         core_exposure_applied: bool = False,
         orderbook_top: dict | None = None,
         orderbook_error: bool = False,
+        marketable_enabled: str = "false",
+        max_slippage_pct: str = "0.15",
+        price_buffer_pct: str = "0.02",
+        max_order_krw: str = "30000",
     ) -> tuple[AsyncMock, dict]:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
         session = self.create_smart_session()
@@ -153,10 +157,10 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "LIVE_AUTO_TRADING_ENABLED": "true",
             "SMART_AUTONOMOUS_TRADING_ENABLED": "true",
             "SMART_ENGINE_LIVE_MODE": "live",
-            "AUTO_MAX_ORDER_KRW": "30000",
-            "MAX_LIVE_ORDER_KRW": "30000",
+            "AUTO_MAX_ORDER_KRW": max_order_krw,
+            "MAX_LIVE_ORDER_KRW": max_order_krw,
             "MIN_LIVE_ORDER_KRW": min_order_krw,
-            "RISK_MAX_ORDER_KRW": "30000",
+            "RISK_MAX_ORDER_KRW": max_order_krw,
             "RISK_MAX_ORDERS_PER_DAY": "0",
             "RISK_MAX_ENTRY_ORDERS_PER_DAY": "0",
             "RISK_MIN_COOLDOWN_SECONDS": "0",
@@ -166,6 +170,9 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "RISK_MIN_AVG_5M_VOLUME_KRW": "0",
             "RISK_REQUIRE_ORDER_CHANCE_SUCCESS": "false",
             "AUTO_ENTRY_PRICE_OFFSET_PERCENT": auto_entry_offset,
+            "SMART_CORE_MARKETABLE_LIMIT_ENABLED": marketable_enabled,
+            "SMART_CORE_MARKETABLE_LIMIT_MAX_SLIPPAGE_PCT": max_slippage_pct,
+            "SMART_CORE_MARKETABLE_LIMIT_PRICE_BUFFER_PCT": price_buffer_pct,
         }
         if core_entry_offset is not None:
             env["SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT"] = core_entry_offset
@@ -533,6 +540,103 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(intent["policy_preview"]["best_bid"])
         self.assertIsNone(intent["policy_preview"]["best_ask"])
 
+    async def test_core_bid_uses_marketable_limit_when_best_ask_is_within_slippage(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=150_000,
+            current_value=0,
+            available_krw=300_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            orderbook_top={"best_bid": 99_980_000, "best_ask": 100_020_000, "spread_krw": 40_000, "spread_pct": 0.04},
+            marketable_enabled="true",
+            max_slippage_pct="0.15",
+            price_buffer_pct="0.02",
+            max_order_krw="100000",
+        )
+
+        order = broker.place_order.await_args.args[0]
+        intent = snapshot["order_intents"][0]
+        preview = intent["policy_preview"]
+        self.assertEqual(preview["price_policy"], "CORE_MARKETABLE_LIMIT")
+        self.assertGreaterEqual(order["price"], preview["best_ask"])
+        self.assertEqual(order["price"], preview["order_price"])
+        self.assertEqual(order["amount_krw"], 100_000)
+        self.assertEqual(preview["marketable_limit_fallback_reason"], None)
+
+    async def test_core_bid_falls_back_when_best_ask_exceeds_max_slippage(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            orderbook_top={"best_bid": 100_000_000, "best_ask": 100_400_000, "spread_krw": 400_000, "spread_pct": 0.3992},
+            marketable_enabled="true",
+            max_slippage_pct="0.15",
+            price_buffer_pct="0.02",
+        )
+
+        order = broker.place_order.await_args.args[0]
+        intent = snapshot["order_intents"][0]
+        preview = intent["policy_preview"]
+        self.assertEqual(order["price"], 99_900_000)
+        self.assertEqual(preview["price_policy"], "CORE_MARKETABLE_LIMIT_FALLBACK_OFFSET")
+        self.assertEqual(preview["marketable_limit_fallback_reason"], "BEST_ASK_TOO_FAR_FROM_CURRENT")
+
+    async def test_core_bid_falls_back_when_orderbook_lookup_fails(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            orderbook_error=True,
+            marketable_enabled="true",
+            max_slippage_pct="0.15",
+            price_buffer_pct="0.02",
+        )
+
+        order = broker.place_order.await_args.args[0]
+        intent = snapshot["order_intents"][0]
+        preview = intent["policy_preview"]
+        self.assertEqual(order["price"], 99_900_000)
+        self.assertEqual(preview["price_policy"], "CORE_MARKETABLE_LIMIT_FALLBACK_OFFSET")
+        self.assertEqual(preview["marketable_limit_fallback_reason"], "ORDERBOOK_UNAVAILABLE")
+
+    async def test_marketable_limit_policy_preview_records_top_of_book_and_fallback_reason(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            orderbook_top={"best_bid": 99_980_000, "best_ask": 100_020_000, "spread_krw": 40_000, "spread_pct": 0.04},
+            marketable_enabled="true",
+            max_slippage_pct="0.15",
+            price_buffer_pct="0.02",
+        )
+
+        order = broker.place_order.await_args.args[0]
+        intent = snapshot["order_intents"][0]
+        preview = intent["policy_preview"]
+        self.assertEqual(preview["price_policy"], "CORE_MARKETABLE_LIMIT")
+        self.assertEqual(preview["best_bid"], 99_980_000)
+        self.assertEqual(preview["best_ask"], 100_020_000)
+        self.assertEqual(preview["order_price"], order["price"])
+        self.assertIsNone(preview["marketable_limit_fallback_reason"])
+
     async def test_unfilled_limit_cancel_keeps_smart_runtime_running(self) -> None:
         session = self.create_smart_session()
         database.insert_live_order_log(
@@ -595,6 +699,9 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             cancel_unfilled_after_seconds=60,
             entry_price_offset_percent=0.3,
             core_entry_price_offset_percent=0.3,
+            core_marketable_limit_enabled=False,
+            core_marketable_limit_max_slippage_pct=0.15,
+            core_marketable_limit_price_buffer_pct=0.02,
             stop_loss_percent=0.7,
             take_profit_percent=1.0,
             max_hold_minutes=60,
