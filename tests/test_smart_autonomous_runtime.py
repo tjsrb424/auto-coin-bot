@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,7 +59,18 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         assert session is not None
         return {**session, "id": session_id}
 
-    def create_intent(self, *, amount_requested: float, current_value: float, max_total: float = 500_000, side: str = "BID", action_hint: str = "BUY_MORE") -> tuple[int, dict]:
+    def create_intent(
+        self,
+        *,
+        amount_requested: float,
+        current_value: float,
+        max_total: float = 500_000,
+        side: str = "BID",
+        action_hint: str = "BUY_MORE",
+        target_source: str = "CONSERVATIVE",
+        core_exposure_pct: float = 0.0,
+        core_exposure_applied: bool = False,
+    ) -> tuple[int, dict]:
         snapshot_id = database.insert_decision_snapshot(
             {
                 "exchange": "bithumb",
@@ -71,6 +83,9 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "daily_loss_limit_pct": 3,
                 "daily_loss_limit_krw": max_total * 0.03,
                 "risk_score": 35,
+                "final_target_exposure_source": target_source,
+                "core_exposure_pct": core_exposure_pct,
+                "core_exposure_applied": core_exposure_applied,
             }
         )
         intent = {
@@ -88,14 +103,40 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "urgency": "NORMAL",
             "status": "CREATED",
             "promotion_status": "READY_FOR_LIVE",
+            "target_source": target_source,
+            "policy_preview": {
+                "target_source": target_source,
+                "core_exposure_pct": core_exposure_pct,
+                "core_exposure_applied": core_exposure_applied,
+            },
         }
         intent_id = database.insert_order_intent(intent)
         return snapshot_id, {**intent, "id": intent_id}
 
-    async def submit_bid_intent(self, *, amount_requested: float, current_value: float, available_krw: float, min_order_krw: str = "5000") -> tuple[AsyncMock, dict]:
+    async def submit_bid_intent(
+        self,
+        *,
+        amount_requested: float,
+        current_value: float,
+        available_krw: float,
+        min_order_krw: str = "5000",
+        auto_entry_offset: str = "0.3",
+        core_entry_offset: str | None = None,
+        target_source: str = "CONSERVATIVE",
+        core_exposure_pct: float = 0.0,
+        core_exposure_applied: bool = False,
+        orderbook_top: dict | None = None,
+        orderbook_error: bool = False,
+    ) -> tuple[AsyncMock, dict]:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
         session = self.create_smart_session()
-        snapshot_id, intent = self.create_intent(amount_requested=amount_requested, current_value=current_value)
+        snapshot_id, intent = self.create_intent(
+            amount_requested=amount_requested,
+            current_value=current_value,
+            target_source=target_source,
+            core_exposure_pct=core_exposure_pct,
+            core_exposure_applied=core_exposure_applied,
+        )
         broker = AsyncMock()
         broker.get_balances.return_value = {
             "by_currency": {
@@ -124,8 +165,19 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "RISK_MIN_CURRENT_1M_VOLUME_KRW": "0",
             "RISK_MIN_AVG_5M_VOLUME_KRW": "0",
             "RISK_REQUIRE_ORDER_CHANCE_SUCCESS": "false",
+            "AUTO_ENTRY_PRICE_OFFSET_PERCENT": auto_entry_offset,
         }
-        with patch.dict("os.environ", env, clear=False), patch("app.live_strategy_pilot.get_live_broker", return_value=broker):
+        if core_entry_offset is not None:
+            env["SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT"] = core_entry_offset
+        orderbook_top = orderbook_top or {"best_bid": 99_900_000, "best_ask": 100_000_000, "spread_krw": 100_000, "spread_pct": 0.10005}
+        orderbook_mock = AsyncMock(side_effect=RuntimeError("orderbook failed")) if orderbook_error else AsyncMock(return_value=orderbook_top)
+        with (
+            patch.dict("os.environ", env, clear=False),
+            patch("app.live_strategy_pilot.get_live_broker", return_value=broker),
+            patch("app.live_strategy_pilot._bithumb_orderbook_top", new=orderbook_mock),
+        ):
+            if core_entry_offset is None:
+                os.environ.pop("SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT", None)
             config = LiveStrategyConfig.from_env()
             live_config = LiveTradingConfig.for_exchange("bithumb")
             await _submit_smart_intent_order(
@@ -140,6 +192,10 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "market": "KRW-BTC",
                     "current_bot_position_value_krw": current_value,
                     "current_bot_position_qty": current_value / 100_000_000,
+                    "current_exposure_pct": current_value / 500_000 * 100,
+                    "final_target_exposure_source": target_source,
+                    "core_exposure_pct": core_exposure_pct,
+                    "core_exposure_applied": core_exposure_applied,
                     "max_total_exposure_krw": 500_000,
                     "risk_score": 35,
                     "order_intents": [intent],
@@ -380,6 +436,103 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent["status"], "SUBMITTED")
         self.assertEqual(intent["promotion_status"], "SUBMITTED")
 
+    async def test_core_bid_uses_core_entry_offset(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+        )
+
+        order = broker.place_order.await_args.args[0]
+        self.assertEqual(order["price"], 99_900_000)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["policy_preview"]["price_policy"], "CORE_ACCUMULATION_LIMIT")
+        self.assertEqual(intent["policy_preview"]["entry_offset_percent"], 0.1)
+
+    async def test_general_bid_uses_auto_entry_offset(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=200_000,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="AGGRESSIVE",
+            core_exposure_pct=30,
+            core_exposure_applied=False,
+        )
+
+        order = broker.place_order.await_args.args[0]
+        self.assertEqual(order["price"], 99_700_000)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["policy_preview"]["price_policy"], "DEFAULT_PASSIVE_LIMIT")
+        self.assertEqual(intent["policy_preview"]["entry_offset_percent"], 0.3)
+
+    async def test_core_offset_falls_back_to_auto_offset_when_env_is_missing(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset=None,
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+        )
+
+        order = broker.place_order.await_args.args[0]
+        self.assertEqual(order["price"], 99_700_000)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["policy_preview"]["entry_offset_percent"], 0.3)
+        self.assertEqual(intent["policy_preview"]["core_entry_offset_percent"], 0.3)
+
+    async def test_bid_policy_preview_records_price_context(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+        )
+
+        order = broker.place_order.await_args.args[0]
+        intent = snapshot["order_intents"][0]
+        preview = intent["policy_preview"]
+        self.assertEqual(preview["price_policy"], "CORE_ACCUMULATION_LIMIT")
+        self.assertEqual(preview["entry_offset_percent"], 0.1)
+        self.assertEqual(preview["current_price"], 100_000_000)
+        self.assertEqual(preview["order_price"], order["price"])
+        self.assertAlmostEqual(preview["price_gap_pct"], 0.1)
+        log = database.get_live_order_log(order["request_id"])
+        assert log is not None
+        self.assertEqual(log["exchange_request_payload_masked"]["submitted_price"], order["price"])
+        self.assertEqual(log["exchange_request_payload_masked"]["submitted_best_bid"], 99_900_000)
+
+    async def test_orderbook_failure_keeps_bid_submission_alive_with_null_top_of_book(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            auto_entry_offset="0.3",
+            core_entry_offset="0.1",
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            orderbook_error=True,
+        )
+
+        broker.place_order.assert_awaited_once()
+        intent = snapshot["order_intents"][0]
+        self.assertIsNone(intent["policy_preview"]["best_bid"])
+        self.assertIsNone(intent["policy_preview"]["best_ask"])
+
     async def test_unfilled_limit_cancel_keeps_smart_runtime_running(self) -> None:
         session = self.create_smart_session()
         database.insert_live_order_log(
@@ -441,6 +594,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             require_completed_candle=False,
             cancel_unfilled_after_seconds=60,
             entry_price_offset_percent=0.3,
+            core_entry_price_offset_percent=0.3,
             stop_loss_percent=0.7,
             take_profit_percent=1.0,
             max_hold_minutes=60,

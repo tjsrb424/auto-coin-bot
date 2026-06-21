@@ -152,6 +152,7 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
             require_completed_candle=False,
             cancel_unfilled_after_seconds=60,
             entry_price_offset_percent=0.3,
+            core_entry_price_offset_percent=0.3,
             stop_loss_percent=0.7,
             take_profit_percent=1.0,
             max_hold_minutes=60,

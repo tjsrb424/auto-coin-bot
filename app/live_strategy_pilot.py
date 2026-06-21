@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 
+import httpx
+
 from app.backtest import candles_to_frame
 from app.database import (
     count_live_strategy_orders_today,
@@ -94,6 +96,7 @@ class LiveStrategyConfig:
     require_completed_candle: bool
     cancel_unfilled_after_seconds: int
     entry_price_offset_percent: float
+    core_entry_price_offset_percent: float
     stop_loss_percent: float
     take_profit_percent: float
     max_hold_minutes: int
@@ -103,6 +106,7 @@ class LiveStrategyConfig:
     @classmethod
     def from_env(cls) -> "LiveStrategyConfig":
         live_feature_allowed = os.getenv("APP_ENV", "development").lower() == "production" or os.getenv("ALLOW_DEV_LIVE_TRADING", "false").lower() == "true"
+        entry_price_offset_percent = float(os.getenv("AUTO_ENTRY_PRICE_OFFSET_PERCENT", os.getenv("AUTO_BUY_PRICE_OFFSET_PERCENT", "0.3")))
         return cls(
             exchange=os.getenv("EXCHANGE", os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb")).strip().lower(),
             live_auto_trading_enabled=live_feature_allowed and os.getenv("LIVE_AUTO_TRADING_ENABLED", "false").lower() == "true",
@@ -117,7 +121,8 @@ class LiveStrategyConfig:
             cooldown_seconds=int(os.getenv("AUTO_COOLDOWN_SECONDS", "1800")),
             require_completed_candle=os.getenv("AUTO_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
             cancel_unfilled_after_seconds=int(os.getenv("AUTO_CANCEL_UNFILLED_AFTER_SECONDS", os.getenv("AUTO_CANCEL_AFTER_SECONDS", "60"))),
-            entry_price_offset_percent=float(os.getenv("AUTO_ENTRY_PRICE_OFFSET_PERCENT", os.getenv("AUTO_BUY_PRICE_OFFSET_PERCENT", "0.3"))),
+            entry_price_offset_percent=entry_price_offset_percent,
+            core_entry_price_offset_percent=float(os.getenv("SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT", str(entry_price_offset_percent))),
             stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.7")),
             take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.0")),
             max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "60")),
@@ -638,6 +643,89 @@ def _mark_smart_dust_intent(
     update_live_strategy_session(int(session["id"]), {"last_risk_result": blocker, "last_order_status": "BLOCKED"})
 
 
+def _smart_core_accumulation_bid(intent: dict, smart_snapshot: dict) -> bool:
+    policy_preview = intent.get("policy_preview") or {}
+    target_source = str(
+        smart_snapshot.get("final_target_exposure_source")
+        or intent.get("target_source")
+        or policy_preview.get("target_source")
+        or ""
+    ).upper()
+    if target_source == "CORE":
+        return True
+    if bool(smart_snapshot.get("core_exposure_applied")) or bool(policy_preview.get("core_exposure_applied")):
+        return True
+    current_exposure_pct = _float(smart_snapshot.get("current_exposure_pct"))
+    core_exposure_pct = _float(smart_snapshot.get("core_exposure_pct", policy_preview.get("core_exposure_pct")))
+    return core_exposure_pct > 0 and current_exposure_pct < core_exposure_pct
+
+
+async def _bithumb_orderbook_top(market: str) -> dict:
+    empty = {"best_bid": None, "best_ask": None, "spread_krw": None, "spread_pct": None}
+    base_url = os.getenv("BITHUMB_BASE_URL", "https://api.bithumb.com").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{base_url}/v1/orderbook", params={"markets": market})
+        if response.status_code >= 400:
+            return empty
+        payload = response.json()
+        first = payload[0] if isinstance(payload, list) and payload else payload if isinstance(payload, dict) else {}
+        units = first.get("orderbook_units") if isinstance(first, dict) else None
+        top = units[0] if isinstance(units, list) and units else {}
+        best_bid = _float(top.get("bid_price")) if isinstance(top, dict) else 0.0
+        best_ask = _float(top.get("ask_price")) if isinstance(top, dict) else 0.0
+        if best_bid <= 0 or best_ask <= 0:
+            return empty
+        spread = best_ask - best_bid
+        mid = (best_ask + best_bid) / 2
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_krw": spread,
+            "spread_pct": (spread / mid * 100) if mid > 0 else None,
+        }
+    except Exception:
+        return empty
+
+
+def _smart_bid_price_preview(
+    *,
+    current_price: float,
+    order_price: float,
+    entry_offset_percent: float,
+    config: LiveStrategyConfig,
+    core_accumulation: bool,
+    orderbook_top: dict,
+) -> dict:
+    price_gap_krw = current_price - order_price
+    return {
+        "price_policy": "CORE_ACCUMULATION_LIMIT" if core_accumulation else "DEFAULT_PASSIVE_LIMIT",
+        "current_price": current_price,
+        "order_price": order_price,
+        "entry_offset_percent": entry_offset_percent,
+        "core_entry_offset_percent": config.core_entry_price_offset_percent,
+        "auto_entry_offset_percent": config.entry_price_offset_percent,
+        "price_gap_pct": (price_gap_krw / current_price * 100) if current_price > 0 else None,
+        "price_gap_krw": price_gap_krw,
+        "best_bid": orderbook_top.get("best_bid"),
+        "best_ask": orderbook_top.get("best_ask"),
+        "spread_krw": orderbook_top.get("spread_krw"),
+        "spread_pct": orderbook_top.get("spread_pct"),
+    }
+
+
+def _smart_submitted_request_payload(order: dict, price_preview: dict, config: LiveStrategyConfig) -> dict:
+    return {
+        **masked_exchange_request(order),
+        "submitted_price": order.get("price"),
+        "submitted_current_price": price_preview.get("current_price"),
+        "submitted_best_bid": price_preview.get("best_bid"),
+        "submitted_best_ask": price_preview.get("best_ask"),
+        "entry_offset_percent": price_preview.get("entry_offset_percent"),
+        "cancel_unfilled_after_seconds": config.cancel_unfilled_after_seconds,
+    }
+
+
 def _block_smart_intent_order(
     session: dict,
     intent_id: Any,
@@ -777,7 +865,22 @@ async def _submit_smart_intent_order(
             return True
         _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
         return True
-    price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))
+    core_accumulation = _smart_core_accumulation_bid(intent, smart_snapshot)
+    entry_offset_percent = config.core_entry_price_offset_percent if core_accumulation else config.entry_price_offset_percent
+    price = _round_krw_price(current_price * (1 - entry_offset_percent / 100))
+    try:
+        orderbook_top = await _bithumb_orderbook_top(str(session.get("market") or "KRW-BTC"))
+    except Exception:
+        orderbook_top = {"best_bid": None, "best_ask": None, "spread_krw": None, "spread_pct": None}
+    price_preview = _smart_bid_price_preview(
+        current_price=current_price,
+        order_price=price,
+        entry_offset_percent=entry_offset_percent,
+        config=config,
+        core_accumulation=core_accumulation,
+        orderbook_top=orderbook_top,
+    )
+    cap_preview = {**cap_preview, **price_preview}
     request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
     order = {
         "request_id": request_id,
@@ -814,6 +917,7 @@ async def _submit_smart_intent_order(
         balances=balances,
         is_auto=True,
     )
+    risk_preview["policy_preview"] = {**(risk_preview.get("policy_preview") or {}), **cap_preview}
     try:
         recommendation = build_shadow_report(str(session.get("market") or "KRW-BTC"), limit=100).get("summary", {}).get("recommendation")
     except Exception:
@@ -848,7 +952,7 @@ async def _submit_smart_intent_order(
                 "status": "SUBMITTED",
                 "risk_result": "ALLOWED",
                 "order_uuid": order_uuid,
-                "exchange_request_payload_masked": masked_exchange_request(order),
+                "exchange_request_payload_masked": _smart_submitted_request_payload(order, price_preview, config),
                 "exchange_response_payload": response,
             },
         )
@@ -1403,18 +1507,36 @@ def _log_payload(session: dict, status: str, risk_result: str, candle_time_utc: 
 def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
     logs = load_live_order_logs(300, include_canonical_with_events=True)
     request_id = None
+    order_log = None
     for item in logs:
         request_id_value = str(item.get("request_id", ""))
         if item.get("order_uuid") == order_uuid and not _is_strategy_order_event_request(request_id_value):
             request_id = item["request_id"]
+            order_log = item
             break
     if request_id is None:
         return
     reconciled = normalize_exchange_order(response)
+    exchange_request_payload_masked = dict((order_log or {}).get("exchange_request_payload_masked") or {})
+    if status == "CANCELED":
+        if reconciled.executed_volume > 0 and reconciled.remaining_volume > 0:
+            cancel_reason = "PARTIAL_FILL_REMAINDER_CANCELED"
+        elif str(response.get("state") or "").lower() in {"cancel", "canceled", "cancelled"}:
+            cancel_reason = "AUTO_CANCEL_UNFILLED_TIMEOUT"
+        else:
+            cancel_reason = "EXCHANGE_CANCELED"
+        exchange_request_payload_masked.update(
+            {
+                "executed_volume": reconciled.executed_volume,
+                "remaining_volume": reconciled.remaining_volume,
+                "cancel_reason": cancel_reason,
+            }
+        )
     update_live_order_log(
         request_id,
         {
             "status": status,
+            "exchange_request_payload_masked": exchange_request_payload_masked,
             "exchange_response_payload": response,
             "order_uuid": order_uuid,
             "executed_volume": reconciled.executed_volume,
