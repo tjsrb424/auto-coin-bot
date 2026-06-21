@@ -617,6 +617,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         order_log = database.get_live_order_log("smart-test-unfilled")
         assert order_log is not None
         self.assertEqual(order_log["status"], "CANCELED")
+        self.assertEqual(order_log["exchange_request_payload_masked"]["cancel_reason"], "AUTO_CANCEL_UNFILLED_TIMEOUT")
 
 
 if __name__ == "__main__":

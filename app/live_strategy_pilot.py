@@ -1366,7 +1366,7 @@ async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
                 )
                 update_live_strategy_session(int(session["id"]), {"status": "PAUSED", "auto_enabled": False, "last_order_status": "CANCEL_FAILED", "last_risk_result": "ORDER_CANCEL_FAILED"})
                 return
-            _update_order_by_uuid(order_uuid, "CANCELED", cancel_response)
+            _update_order_by_uuid(order_uuid, "CANCELED", {**cancel_response, "cancel_reason": "AUTO_CANCEL_UNFILLED_TIMEOUT"})
             update_live_strategy_session(
                 int(session["id"]),
                 {
@@ -1519,7 +1519,9 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
     reconciled = normalize_exchange_order(response)
     exchange_request_payload_masked = dict((order_log or {}).get("exchange_request_payload_masked") or {})
     if status == "CANCELED":
-        if reconciled.executed_volume > 0 and reconciled.remaining_volume > 0:
+        if response.get("cancel_reason"):
+            cancel_reason = str(response["cancel_reason"])
+        elif reconciled.executed_volume > 0 and reconciled.remaining_volume > 0:
             cancel_reason = "PARTIAL_FILL_REMAINDER_CANCELED"
         elif str(response.get("state") or "").lower() in {"cancel", "canceled", "cancelled"}:
             cancel_reason = "AUTO_CANCEL_UNFILLED_TIMEOUT"
