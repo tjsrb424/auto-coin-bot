@@ -604,13 +604,38 @@ def _smart_bid_cap_blocker(
 ) -> str:
     if amount_requested <= 0:
         return "SMART_ORDER_AMOUNT_ZERO"
+    if amount_requested < min_order_krw:
+        return "SMART_ORDER_AMOUNT_BELOW_MIN"
     if available_krw <= 0 or available_krw < min_order_krw:
         return "SMART_INSUFFICIENT_KRW_BALANCE"
     if remaining_exposure <= 0:
         return "SMART_MAX_TOTAL_EXPOSURE_REACHED"
-    if hard_cap <= 0 or hard_cap < min_order_krw:
+    if remaining_exposure < min_order_krw:
+        return "SMART_REMAINING_EXPOSURE_BELOW_MIN"
+    if hard_cap <= 0:
         return "SMART_ORDER_CAP_ZERO"
-    return "SMART_ORDER_CAP_ZERO"
+    if hard_cap < min_order_krw:
+        return "SMART_CAPPED_ORDER_BELOW_MIN"
+    return "SMART_CAPPED_ORDER_BELOW_MIN"
+
+
+def _mark_smart_dust_intent(
+    session: dict,
+    intent_id: Any,
+    blocker: str,
+    policy_preview: dict,
+) -> None:
+    if intent_id:
+        update_order_intent(
+            int(intent_id),
+            {
+                "status": "BLOCKED",
+                "promotion_status": "DUST_HOLD",
+                "promotion_blockers": [blocker],
+                "policy_preview": policy_preview,
+            },
+        )
+    update_live_strategy_session(int(session["id"]), {"last_risk_result": blocker, "last_order_status": "BLOCKED"})
 
 
 def _block_smart_intent_order(
@@ -657,6 +682,36 @@ async def _submit_smart_intent_order(
         return False
     intent_id = intent.get("id")
     side = str(intent.get("side") or "").upper()
+    current_price = float(candle["trade_price"])
+    amount_requested = abs(_float(intent.get("delta_value_krw")))
+    if side in {"BID", "BUY"} and 0 < amount_requested < live_config.min_order_krw:
+        _mark_smart_dust_intent(
+            session,
+            intent_id,
+            "SMART_ORDER_AMOUNT_BELOW_MIN",
+            {
+                "amount_requested_krw": amount_requested,
+                "min_order_krw": live_config.min_order_krw,
+                "dust_side": "BUY",
+            },
+        )
+        return True
+    if side in {"ASK", "SELL"}:
+        sell_requested = amount_requested
+        if sell_requested <= 0 and current_price > 0:
+            sell_requested = abs(_float(intent.get("target_qty"))) * current_price
+        if 0 < sell_requested < live_config.min_order_krw:
+            _mark_smart_dust_intent(
+                session,
+                intent_id,
+                "SMART_SELL_AMOUNT_BELOW_MIN",
+                {
+                    "amount_requested_krw": sell_requested,
+                    "min_order_krw": live_config.min_order_krw,
+                    "dust_side": "SELL",
+                },
+            )
+            return True
     if any(
         has_live_strategy_order_for_signal(int(session["id"]), int(session["candidate_strategy_id"]), str(session.get("market") or "KRW-BTC"), candle["candle_time_utc"], signal.get("signal", "HOLD"), order_side)
         for order_side in ("BUY", "SELL")
@@ -690,8 +745,6 @@ async def _submit_smart_intent_order(
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
         return True
-    current_price = float(candle["trade_price"])
-    amount_requested = abs(_float(intent.get("delta_value_krw")))
     max_total = _float(smart_snapshot.get("max_total_exposure_krw"))
     current_value = _float(smart_snapshot.get("current_bot_position_value_krw"))
     available_krw = _available_balance(balances, "KRW")
@@ -719,6 +772,9 @@ async def _submit_smart_intent_order(
             hard_cap=hard_cap,
             min_order_krw=live_config.min_order_krw,
         )
+        if blocker in {"SMART_ORDER_AMOUNT_BELOW_MIN", "SMART_CAPPED_ORDER_BELOW_MIN"}:
+            _mark_smart_dust_intent(session, intent_id, blocker, cap_preview)
+            return True
         _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
         return True
     price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))

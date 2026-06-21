@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from app import database
 from app.live_broker import LiveTradingConfig
-from app.live_strategy_pilot import LiveStrategyConfig, _manage_open_order, _process_session, _submit_smart_intent_order, start_live_strategy_pilot
+from app.live_strategy_pilot import LiveStrategyConfig, _manage_open_order, _process_session, _smart_bid_cap_blocker, _submit_smart_intent_order, start_live_strategy_pilot
 
 
 def candle() -> dict:
@@ -28,12 +28,15 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
+        self.env_patch = patch.dict("os.environ", {"DATABASE_URL": ""}, clear=False)
+        self.env_patch.start()
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()
         database.init_db()
 
     def tearDown(self) -> None:
         self.db_patch.stop()
+        self.env_patch.stop()
         self.tmp.cleanup()
 
     def create_smart_session(self) -> dict:
@@ -55,7 +58,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         assert session is not None
         return {**session, "id": session_id}
 
-    def create_intent(self, *, amount_requested: float, current_value: float, max_total: float = 500_000) -> tuple[int, dict]:
+    def create_intent(self, *, amount_requested: float, current_value: float, max_total: float = 500_000, side: str = "BID", action_hint: str = "BUY_MORE") -> tuple[int, dict]:
         snapshot_id = database.insert_decision_snapshot(
             {
                 "exchange": "bithumb",
@@ -74,8 +77,8 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "decision_snapshot_id": snapshot_id,
             "exchange": "bithumb",
             "market": "KRW-BTC",
-            "side": "BID",
-            "action_hint": "BUY_MORE",
+            "side": side,
+            "action_hint": action_hint,
             "current_value_krw": current_value,
             "target_value_krw": current_value + amount_requested,
             "delta_value_krw": amount_requested,
@@ -143,6 +146,59 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         return broker, database.load_decision_snapshot(snapshot_id)
+
+    def live_order_log_count(self) -> int:
+        with database.get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM live_order_logs").fetchone()
+        return int(row["count"])
+
+    def test_smart_bid_cap_blocker_classifies_below_min_requested_amount(self) -> None:
+        self.assertEqual(
+            _smart_bid_cap_blocker(
+                amount_requested=0.08,
+                available_krw=287_000,
+                remaining_exposure=987_000,
+                hard_cap=100_000,
+                min_order_krw=5_000,
+            ),
+            "SMART_ORDER_AMOUNT_BELOW_MIN",
+        )
+
+    def test_smart_bid_cap_blocker_classifies_zero_hard_cap(self) -> None:
+        self.assertEqual(
+            _smart_bid_cap_blocker(
+                amount_requested=10_000,
+                available_krw=287_000,
+                remaining_exposure=987_000,
+                hard_cap=0,
+                min_order_krw=5_000,
+            ),
+            "SMART_ORDER_CAP_ZERO",
+        )
+
+    def test_smart_bid_cap_blocker_classifies_insufficient_krw(self) -> None:
+        self.assertEqual(
+            _smart_bid_cap_blocker(
+                amount_requested=10_000,
+                available_krw=4_999,
+                remaining_exposure=987_000,
+                hard_cap=4_999,
+                min_order_krw=5_000,
+            ),
+            "SMART_INSUFFICIENT_KRW_BALANCE",
+        )
+
+    def test_smart_bid_cap_blocker_classifies_remaining_exposure_below_min(self) -> None:
+        self.assertEqual(
+            _smart_bid_cap_blocker(
+                amount_requested=10_000,
+                available_krw=287_000,
+                remaining_exposure=4_999,
+                hard_cap=4_999,
+                min_order_krw=5_000,
+            ),
+            "SMART_REMAINING_EXPOSURE_BELOW_MIN",
+        )
 
     def test_start_runtime_without_candidate_uses_smart_autonomous_session(self) -> None:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True})
@@ -259,6 +315,70 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SMART_INSUFFICIENT_KRW_BALANCE", intent["promotion_blockers"])
         self.assertTrue(intent["policy_preview"]["cap_applied"])
         self.assertEqual(intent["policy_preview"]["available_krw_balance"], 5_000)
+
+    async def test_dust_bid_updates_intent_without_live_order_log(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(amount_requested=0.08, current_value=12_000, available_krw=287_000)
+
+        broker.get_balances.assert_not_awaited()
+        broker.place_order.assert_not_awaited()
+        self.assertEqual(self.live_order_log_count(), 0)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "BLOCKED")
+        self.assertEqual(intent["promotion_status"], "DUST_HOLD")
+        self.assertEqual(intent["promotion_blockers"], ["SMART_ORDER_AMOUNT_BELOW_MIN"])
+        self.assertEqual(intent["policy_preview"]["amount_requested_krw"], 0.08)
+
+    async def test_dust_ask_updates_intent_without_live_order_log(self) -> None:
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
+        session = self.create_smart_session()
+        snapshot_id, intent = self.create_intent(amount_requested=-0.49, current_value=12_000, side="ASK", action_hint="HOLD_POSITION")
+        broker = AsyncMock()
+        latest = candle()
+        env = {
+            "APP_ENV": "production",
+            "LIVE_TRADING_ENABLED": "true",
+            "LIVE_AUTO_TRADING_ENABLED": "true",
+            "SMART_AUTONOMOUS_TRADING_ENABLED": "true",
+            "SMART_ENGINE_LIVE_MODE": "live",
+            "MIN_LIVE_ORDER_KRW": "5000",
+        }
+        with patch.dict("os.environ", env, clear=False), patch("app.live_strategy_pilot.get_live_broker", return_value=broker):
+            await _submit_smart_intent_order(
+                session,
+                latest,
+                {"signal": "HOLD", "reason": "smart test"},
+                LiveStrategyConfig.from_env(),
+                LiveTradingConfig.for_exchange("bithumb"),
+                {
+                    "id": snapshot_id,
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "current_bot_position_value_krw": 12_000,
+                    "current_bot_position_qty": 0.00012415,
+                    "max_total_exposure_krw": 500_000,
+                    "risk_score": 35,
+                    "order_intents": [intent],
+                },
+            )
+
+        broker.get_balances.assert_not_awaited()
+        self.assertEqual(self.live_order_log_count(), 0)
+        updated = database.load_decision_snapshot(snapshot_id)
+        assert updated is not None
+        updated_intent = updated["order_intents"][0]
+        self.assertEqual(updated_intent["status"], "BLOCKED")
+        self.assertEqual(updated_intent["promotion_status"], "DUST_HOLD")
+        self.assertEqual(updated_intent["promotion_blockers"], ["SMART_SELL_AMOUNT_BELOW_MIN"])
+
+    async def test_normal_bid_still_uses_live_order_flow(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(amount_requested=100_000, current_value=0, available_krw=200_000)
+
+        broker.get_balances.assert_awaited_once()
+        broker.place_order.assert_awaited_once()
+        self.assertGreater(self.live_order_log_count(), 0)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "SUBMITTED")
+        self.assertEqual(intent["promotion_status"], "SUBMITTED")
 
     async def test_unfilled_limit_cancel_keeps_smart_runtime_running(self) -> None:
         session = self.create_smart_session()
