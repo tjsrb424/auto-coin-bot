@@ -153,6 +153,7 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
             cancel_unfilled_after_seconds=60,
             entry_price_offset_percent=0.3,
             core_entry_price_offset_percent=0.3,
+            core_order_cooldown_seconds=60,
             core_marketable_limit_enabled=False,
             core_marketable_limit_max_slippage_pct=0.15,
             core_marketable_limit_price_buffer_pct=0.02,

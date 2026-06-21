@@ -93,6 +93,7 @@ class LiveStrategyConfig:
     max_orders_per_day: int
     max_open_position_count: int
     cooldown_seconds: int
+    core_order_cooldown_seconds: int
     require_completed_candle: bool
     cancel_unfilled_after_seconds: int
     entry_price_offset_percent: float
@@ -122,6 +123,7 @@ class LiveStrategyConfig:
             max_orders_per_day=int(os.getenv("AUTO_MAX_ORDERS_PER_DAY", "3")),
             max_open_position_count=int(os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "1")),
             cooldown_seconds=int(os.getenv("AUTO_COOLDOWN_SECONDS", "1800")),
+            core_order_cooldown_seconds=int(os.getenv("SMART_CORE_ORDER_COOLDOWN_SECONDS", os.getenv("AUTO_COOLDOWN_SECONDS", "1800"))),
             require_completed_candle=os.getenv("AUTO_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
             cancel_unfilled_after_seconds=int(os.getenv("AUTO_CANCEL_UNFILLED_AFTER_SECONDS", os.getenv("AUTO_CANCEL_AFTER_SECONDS", "60"))),
             entry_price_offset_percent=entry_price_offset_percent,
@@ -205,6 +207,7 @@ def live_strategy_status() -> dict:
         "max_order_krw": config.max_order_krw,
         "max_orders_per_day": config.max_orders_per_day,
         "max_open_position_count": config.max_open_position_count,
+        "core_order_cooldown_seconds": config.core_order_cooldown_seconds,
         "cancel_unfilled_after_seconds": config.cancel_unfilled_after_seconds,
         "entry_price_offset_percent": config.entry_price_offset_percent,
         "exit_enabled": config.exit_enabled,
@@ -356,7 +359,7 @@ async def _process_session(session: dict) -> None:
         await _process_open_position(session, strategy_position, config, live_config)
         return
 
-    blocked = await _precheck_block_reason(session, config, live_config)
+    blocked = await _precheck_block_reason(session, config, live_config, check_cooldown=not _is_smart_order_mode(session))
     if blocked:
         _insert_blocked_log(session, blocked, blocked, None, None)
         updates = {"last_risk_result": blocked, "last_order_status": "BLOCKED"}
@@ -543,7 +546,7 @@ async def _record_smart_decision(*, session: dict, candidate: dict, candles: lis
         return None
 
 
-async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> str | None:
+async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig, *, check_cooldown: bool = True) -> str | None:
     if is_emergency_stopped():
         return "BLOCKED_EMERGENCY_STOP"
     if not live_config.live_trading_enabled:
@@ -574,7 +577,7 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
     if recovery_block:
         return recovery_block
     last_order_time = session.get("last_order_time_utc")
-    if last_order_time and _seconds_since(str(last_order_time)) < config.cooldown_seconds:
+    if check_cooldown and last_order_time and _seconds_since(str(last_order_time)) < config.cooldown_seconds:
         return "BLOCKED_COOLDOWN"
     return None
 
@@ -664,6 +667,45 @@ def _smart_core_accumulation_bid(intent: dict, smart_snapshot: dict) -> bool:
     current_exposure_pct = _float(smart_snapshot.get("current_exposure_pct"))
     core_exposure_pct = _float(smart_snapshot.get("core_exposure_pct", policy_preview.get("core_exposure_pct")))
     return core_exposure_pct > 0 and current_exposure_pct < core_exposure_pct
+
+
+def _smart_cooldown_preview(session: dict, config: LiveStrategyConfig, *, core_accumulation: bool) -> dict | None:
+    last_order_time = session.get("last_order_time_utc")
+    if not last_order_time:
+        return None
+    seconds_since = _seconds_since(str(last_order_time))
+    cooldown_seconds = config.core_order_cooldown_seconds if core_accumulation else config.cooldown_seconds
+    remaining = max(cooldown_seconds - seconds_since, 0.0)
+    if remaining <= 0:
+        return None
+    return {
+        "cooldown_seconds_applied": cooldown_seconds,
+        "cooldown_type": "CORE_ACCUMULATION" if core_accumulation else "DEFAULT",
+        "last_order_time_utc": last_order_time,
+        "seconds_since_last_order": seconds_since,
+        "remaining_cooldown_seconds": remaining,
+    }
+
+
+def _block_smart_intent_cooldown(
+    session: dict,
+    intent: dict,
+    blocker: str,
+    cooldown_preview: dict,
+) -> None:
+    intent_id = intent.get("id")
+    policy_preview = {**(intent.get("policy_preview") or {}), **cooldown_preview}
+    if intent_id:
+        update_order_intent(
+            int(intent_id),
+            {
+                "status": "BLOCKED",
+                "promotion_status": "BLOCKED",
+                "promotion_blockers": [blocker],
+                "policy_preview": policy_preview,
+            },
+        )
+    update_live_strategy_session(int(session["id"]), {"last_risk_result": blocker, "last_order_status": "BLOCKED", "status": "RUNNING"})
 
 
 async def _bithumb_orderbook_top(market: str) -> dict:
@@ -883,6 +925,12 @@ async def _submit_smart_intent_order(
                 },
             )
             return True
+    core_accumulation_bid = side in {"BID", "BUY"} and _smart_core_accumulation_bid(intent, smart_snapshot)
+    cooldown_preview = _smart_cooldown_preview(session, config, core_accumulation=core_accumulation_bid)
+    if cooldown_preview:
+        blocker = "SMART_CORE_COOLDOWN" if core_accumulation_bid else "BLOCKED_COOLDOWN"
+        _block_smart_intent_cooldown(session, intent, blocker, cooldown_preview)
+        return True
     if any(
         has_live_strategy_order_for_signal(int(session["id"]), int(session["candidate_strategy_id"]), str(session.get("market") or "KRW-BTC"), candle["candle_time_utc"], signal.get("signal", "HOLD"), order_side)
         for order_side in ("BUY", "SELL")
@@ -948,7 +996,7 @@ async def _submit_smart_intent_order(
             return True
         _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
         return True
-    core_accumulation = _smart_core_accumulation_bid(intent, smart_snapshot)
+    core_accumulation = core_accumulation_bid
     try:
         orderbook_top = await _bithumb_orderbook_top(str(session.get("market") or "KRW-BTC"))
     except Exception:

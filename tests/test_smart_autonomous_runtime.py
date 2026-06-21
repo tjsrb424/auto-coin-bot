@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -131,9 +132,17 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         max_slippage_pct: str = "0.15",
         price_buffer_pct: str = "0.02",
         max_order_krw: str = "30000",
+        auto_cooldown_seconds: str = "1800",
+        core_order_cooldown_seconds: str | None = None,
+        last_order_time_utc: str | None = None,
+        seconds_since_last_order: float | None = None,
     ) -> tuple[AsyncMock, dict]:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
         session = self.create_smart_session()
+        if last_order_time_utc is not None:
+            database.update_live_strategy_session(int(session["id"]), {"last_order_time_utc": last_order_time_utc})
+            session = database.load_latest_live_strategy_session()
+            assert session is not None
         snapshot_id, intent = self.create_intent(
             amount_requested=amount_requested,
             current_value=current_value,
@@ -173,18 +182,25 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "SMART_CORE_MARKETABLE_LIMIT_ENABLED": marketable_enabled,
             "SMART_CORE_MARKETABLE_LIMIT_MAX_SLIPPAGE_PCT": max_slippage_pct,
             "SMART_CORE_MARKETABLE_LIMIT_PRICE_BUFFER_PCT": price_buffer_pct,
+            "AUTO_COOLDOWN_SECONDS": auto_cooldown_seconds,
         }
         if core_entry_offset is not None:
             env["SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT"] = core_entry_offset
+        if core_order_cooldown_seconds is not None:
+            env["SMART_CORE_ORDER_COOLDOWN_SECONDS"] = core_order_cooldown_seconds
         orderbook_top = orderbook_top or {"best_bid": 99_900_000, "best_ask": 100_000_000, "spread_krw": 100_000, "spread_pct": 0.10005}
         orderbook_mock = AsyncMock(side_effect=RuntimeError("orderbook failed")) if orderbook_error else AsyncMock(return_value=orderbook_top)
+        seconds_context = patch("app.live_strategy_pilot._seconds_since", return_value=seconds_since_last_order) if seconds_since_last_order is not None else nullcontext()
         with (
             patch.dict("os.environ", env, clear=False),
             patch("app.live_strategy_pilot.get_live_broker", return_value=broker),
             patch("app.live_strategy_pilot._bithumb_orderbook_top", new=orderbook_mock),
+            seconds_context,
         ):
             if core_entry_offset is None:
                 os.environ.pop("SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT", None)
+            if core_order_cooldown_seconds is None:
+                os.environ.pop("SMART_CORE_ORDER_COOLDOWN_SECONDS", None)
             config = LiveStrategyConfig.from_env()
             live_config = LiveTradingConfig.for_exchange("bithumb")
             await _submit_smart_intent_order(
@@ -637,6 +653,97 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(preview["order_price"], order["price"])
         self.assertIsNone(preview["marketable_limit_fallback_reason"])
 
+    async def test_core_bid_uses_core_order_cooldown_seconds(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            auto_cooldown_seconds="1800",
+            core_order_cooldown_seconds="600",
+            last_order_time_utc="2026-06-19T03:00:00Z",
+            seconds_since_last_order=700,
+        )
+
+        broker.place_order.assert_awaited_once()
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "SUBMITTED")
+
+    async def test_general_bid_uses_default_order_cooldown_seconds(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=200_000,
+            available_krw=200_000,
+            target_source="AGGRESSIVE",
+            core_exposure_pct=30,
+            core_exposure_applied=False,
+            auto_cooldown_seconds="1800",
+            core_order_cooldown_seconds="600",
+            last_order_time_utc="2026-06-19T03:00:00Z",
+            seconds_since_last_order=700,
+        )
+
+        broker.get_balances.assert_not_awaited()
+        broker.place_order.assert_not_awaited()
+        self.assertEqual(self.live_order_log_count(), 0)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "BLOCKED")
+        self.assertEqual(intent["promotion_status"], "BLOCKED")
+        self.assertEqual(intent["promotion_blockers"], ["BLOCKED_COOLDOWN"])
+        self.assertEqual(intent["policy_preview"]["cooldown_seconds_applied"], 1800)
+        self.assertEqual(intent["policy_preview"]["cooldown_type"], "DEFAULT")
+
+    async def test_core_bid_cooldown_falls_back_to_default_when_env_is_missing(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            auto_cooldown_seconds="1800",
+            core_order_cooldown_seconds=None,
+            last_order_time_utc="2026-06-19T03:00:00Z",
+            seconds_since_last_order=700,
+        )
+
+        broker.get_balances.assert_not_awaited()
+        broker.place_order.assert_not_awaited()
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "BLOCKED")
+        self.assertEqual(intent["promotion_blockers"], ["SMART_CORE_COOLDOWN"])
+        self.assertEqual(intent["policy_preview"]["cooldown_seconds_applied"], 1800)
+        self.assertEqual(intent["policy_preview"]["cooldown_type"], "CORE_ACCUMULATION")
+
+    async def test_core_cooldown_blocks_intent_without_live_order_log(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=100_000,
+            current_value=0,
+            available_krw=200_000,
+            target_source="CORE",
+            core_exposure_pct=30,
+            core_exposure_applied=True,
+            auto_cooldown_seconds="1800",
+            core_order_cooldown_seconds="600",
+            last_order_time_utc="2026-06-19T03:00:00Z",
+            seconds_since_last_order=500,
+        )
+
+        broker.get_balances.assert_not_awaited()
+        broker.place_order.assert_not_awaited()
+        self.assertEqual(self.live_order_log_count(), 0)
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "BLOCKED")
+        self.assertEqual(intent["promotion_status"], "BLOCKED")
+        self.assertEqual(intent["promotion_blockers"], ["SMART_CORE_COOLDOWN"])
+        self.assertEqual(intent["policy_preview"]["cooldown_seconds_applied"], 600)
+        self.assertEqual(intent["policy_preview"]["cooldown_type"], "CORE_ACCUMULATION")
+        self.assertEqual(intent["policy_preview"]["last_order_time_utc"], "2026-06-19T03:00:00Z")
+        self.assertEqual(intent["policy_preview"]["seconds_since_last_order"], 500)
+        self.assertEqual(intent["policy_preview"]["remaining_cooldown_seconds"], 100)
+
     async def test_unfilled_limit_cancel_keeps_smart_runtime_running(self) -> None:
         session = self.create_smart_session()
         database.insert_live_order_log(
@@ -699,6 +806,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             cancel_unfilled_after_seconds=60,
             entry_price_offset_percent=0.3,
             core_entry_price_offset_percent=0.3,
+            core_order_cooldown_seconds=60,
             core_marketable_limit_enabled=False,
             core_marketable_limit_max_slippage_pct=0.15,
             core_marketable_limit_price_buffer_pct=0.02,
