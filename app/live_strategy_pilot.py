@@ -56,6 +56,7 @@ from app.live_recovery import (
     reconcile_order_log,
     log_recovery_event,
     recent_recovery_events,
+    sync_open_orders,
 )
 from app.live_exit import (
     LiveExitConfig,
@@ -297,6 +298,10 @@ def run_live_strategy_tick() -> None:
 
 
 async def process_live_strategy_sessions() -> None:
+    try:
+        await sync_open_orders("bithumb", "KRW-BTC")
+    except Exception as exc:
+        logger.warning("[live-strategy] pending order reconciliation failed error=%s", exc)
     for session in load_running_live_strategy_sessions():
         try:
             await _process_session(session)

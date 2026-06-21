@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,8 +15,11 @@ from app.live_recovery import (
     is_timeout_exception,
     normalize_exchange_order,
     reconcile_balances,
+    reconcile_order_log,
     run_startup_live_recovery_async,
+    sync_open_orders,
 )
+from app.risk_manager import compute_risk_state
 
 
 def order_log(request_id: str = "strategy-test") -> dict:
@@ -63,12 +67,15 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
+        self.env_patch = patch.dict(os.environ, {"DATABASE_URL": ""}, clear=False)
+        self.env_patch.start()
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()
         database.init_db()
 
     def tearDown(self) -> None:
         self.db_patch.stop()
+        self.env_patch.stop()
         self.tmp.cleanup()
 
     def test_normalize_partial_fill_records_execution_amounts(self) -> None:
@@ -270,6 +277,140 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position["realized_pnl"], 146)
         self.assertIsNone(position["exit_order_uuid"])
         self.assertEqual(len(database.load_open_live_positions("bithumb", "KRW-BTC")), 1)
+
+    def test_partially_filled_exit_reconciliation_reduces_position_and_keeps_closing(self) -> None:
+        session_id = create_strategy_session()
+        position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSING",
+                "entry_order_uuid": "entry-1",
+                "exit_order_uuid": "exit-1",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.0002,
+                "entry_amount_krw": 20_000,
+                "current_price": 100_000_000,
+            }
+        )
+        database.insert_live_order_log(
+            {
+                **order_log("partial-wait-exit-test"),
+                "session_id": session_id,
+                "side": "SELL",
+                "status": "SUBMITTED",
+                "order_uuid": "exit-1",
+                "position_id": position_id,
+                "order_purpose": "EXIT",
+            }
+        )
+        current = database.get_live_order_log("partial-wait-exit-test")
+        assert current is not None
+
+        apply_reconciled_order_status(
+            current,
+            normalize_exchange_order(
+                {
+                    "uuid": "exit-1",
+                    "state": "wait",
+                    "price": "101000000",
+                    "volume": "0.0001",
+                    "executed_volume": "0.00005",
+                    "remaining_volume": "0.00005",
+                    "paid_fee": "2",
+                }
+            ),
+            "TEST_PARTIAL_WAIT_EXIT_RECONCILE",
+        )
+
+        updated = database.get_live_order_log("partial-wait-exit-test")
+        assert updated is not None
+        self.assertEqual(updated["status"], "PARTIALLY_FILLED")
+        position = database.load_live_position(position_id)
+        assert position is not None
+        self.assertEqual(position["status"], "CLOSING")
+        self.assertAlmostEqual(position["entry_volume"], 0.00015)
+        self.assertEqual(position["exit_order_uuid"], "exit-1")
+
+    async def test_sync_open_orders_reconciles_submitted_exit_without_session_open_uuid(self) -> None:
+        session_id = create_strategy_session()
+        database.update_live_strategy_session(session_id, {"current_open_order_uuid": None})
+        position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSING",
+                "entry_order_uuid": "entry-1",
+                "exit_order_uuid": "exit-1",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.0002,
+                "entry_amount_krw": 20_000,
+                "current_price": 100_000_000,
+            }
+        )
+        database.insert_live_order_log(
+            {
+                **order_log("exit-sync"),
+                "session_id": session_id,
+                "side": "SELL",
+                "status": "SUBMITTED",
+                "order_uuid": "exit-1",
+                "position_id": position_id,
+                "order_purpose": "EXIT",
+            }
+        )
+        broker = AsyncMock()
+        broker.list_open_orders.return_value = {"orders": []}
+        broker.get_order.return_value = {
+            "uuid": "exit-1",
+            "state": "done",
+            "price": "101000000",
+            "volume": "0.00015",
+            "executed_volume": "0.00015",
+            "remaining_volume": "0",
+            "paid_fee": "4",
+        }
+
+        with patch("app.live_recovery.get_live_broker", return_value=broker):
+            result = await sync_open_orders("bithumb", "KRW-BTC")
+
+        self.assertEqual(result["reconciled_count"], 1)
+        broker.get_order.assert_awaited_once_with("exit-1")
+        updated = database.get_live_order_log("exit-sync")
+        assert updated is not None
+        self.assertEqual(updated["status"], "FILLED")
+        self.assertEqual(updated["risk_result"], "EXCHANGE_FILLED_SYNCED")
+        position = database.load_live_position(position_id)
+        assert position is not None
+        self.assertEqual(position["status"], "OPEN")
+        self.assertAlmostEqual(position["entry_volume"], 0.00005)
+        self.assertIsNone(position["exit_order_uuid"])
+        risk = compute_risk_state("bithumb", "KRW-BTC")
+        self.assertEqual(risk["open_order_count"], 0)
+
+    async def test_order_not_found_marks_pending_order_stale_without_deleting(self) -> None:
+        database.insert_live_order_log(order_log("missing-order"))
+        current = database.get_live_order_log("missing-order")
+        assert current is not None
+        broker = AsyncMock()
+        broker.get_order.side_effect = RuntimeError("404 order_not_found")
+
+        with patch("app.live_recovery.get_live_broker", return_value=broker):
+            status = await reconcile_order_log(current, source="TEST_MISSING_ORDER")
+
+        self.assertEqual(status.status, "STALE_CANCELED")
+        updated = database.get_live_order_log("missing-order")
+        assert updated is not None
+        self.assertEqual(updated["status"], "STALE_CANCELED")
+        self.assertEqual(updated["risk_result"], "STALE_CANCELED")
+        self.assertEqual(updated["order_uuid"], "order-1")
+        self.assertEqual(database.load_live_recovery_events(1)[0]["event_type"], "ORDER_NOT_FOUND_STALE_CANCELED")
 
     async def test_startup_recovery_pauses_running_sessions(self) -> None:
         database.create_auto_live_pilot_session(

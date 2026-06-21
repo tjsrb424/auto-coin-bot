@@ -164,6 +164,27 @@ async def reconcile_order_log(log: dict, source: str = "ORDER_STATUS_RECONCILIAT
     try:
         raw_status = await broker.get_order(order_uuid)
     except Exception as exc:
+        if _is_order_not_found_error(exc):
+            update_live_order_log(
+                str(log["request_id"]),
+                {
+                    "status": "STALE_CANCELED",
+                    "risk_result": "STALE_CANCELED",
+                    "error_message": "Exchange order was not found during reconciliation; marked stale without deleting DB history.",
+                },
+            )
+            log_recovery_event(
+                "ORDER_NOT_FOUND_STALE_CANCELED",
+                "WARNING",
+                "Pending order was not found on exchange and was marked stale canceled.",
+                exchange=exchange,
+                market=str(log.get("market") or "KRW-BTC"),
+                session_id=log.get("session_id"),
+                request_id=log.get("request_id"),
+                order_uuid=order_uuid,
+                payload={"status": log.get("status")},
+            )
+            return ReconciledOrderStatus("STALE_CANCELED", _float(log.get("executed_volume")), _float(log.get("remaining_volume")), _float(log.get("filled_amount_krw")), _float(log.get("paid_fee")), {})
         log_recovery_event(
             "API_ERROR",
             "ERROR",
@@ -216,6 +237,9 @@ def apply_reconciled_order_status(log: dict, status: ReconciledOrderStatus, sour
     updated = {
         **log,
         "status": status.status,
+        "_previous_executed_volume": _float(log.get("executed_volume")),
+        "_previous_filled_amount_krw": _float(log.get("filled_amount_krw")),
+        "_previous_paid_fee": _float(log.get("paid_fee")),
         "order_uuid": _order_uuid(status.raw) or log.get("order_uuid"),
         "executed_volume": status.executed_volume,
         "remaining_volume": status.remaining_volume,
@@ -230,41 +254,61 @@ def apply_reconciled_order_status(log: dict, status: ReconciledOrderStatus, sour
 
 
 def sync_exit_order_position(log: dict, status: ReconciledOrderStatus) -> None:
-    position_id = log.get("position_id")
-    if not position_id:
-        return
-    position = load_live_position(int(position_id))
+    position = _position_for_exit_order(log)
     if position is None:
         return
+    position_id = int(position["id"])
     entry_volume = _float(position.get("entry_volume"))
     entry_amount = _float(position.get("entry_amount_krw"))
     entry_price = _float(position.get("entry_price"))
-    entry_basis = (entry_amount * min(status.executed_volume / entry_volume, 1.0)) if entry_volume > 0 else entry_price * status.executed_volume
-    actual_pnl = status.filled_amount_krw - entry_basis - status.paid_fee
-    if status.status == "FILLED":
+    previous_executed = _float(log.get("_previous_executed_volume"))
+    previous_filled_amount = _float(log.get("_previous_filled_amount_krw"))
+    previous_paid_fee = _float(log.get("_previous_paid_fee"))
+    fill_volume = max(status.executed_volume - previous_executed, 0.0)
+    filled_amount_delta = max(status.filled_amount_krw - previous_filled_amount, 0.0)
+    paid_fee_delta = max(status.paid_fee - previous_paid_fee, 0.0)
+    if fill_volume <= 0 and status.status in {"FILLED", "PARTIALLY_FILLED"}:
+        return
+    entry_basis = (entry_amount * min(fill_volume / entry_volume, 1.0)) if entry_volume > 0 else entry_price * fill_volume
+    actual_pnl = filled_amount_delta - entry_basis - paid_fee_delta
+    if status.status in {"FILLED", "PARTIALLY_FILLED"}:
         update_live_order_log(str(log["request_id"]), {"actual_pnl": actual_pnl})
         realized_pnl = _float(position.get("realized_pnl")) + actual_pnl
-        remaining_volume = max(entry_volume - status.executed_volume, 0.0)
+        remaining_volume = max(entry_volume - fill_volume, 0.0)
         if remaining_volume <= BALANCE_MISMATCH_VOLUME_TOLERANCE:
-            update_live_position(int(position_id), {"status": "CLOSED", "realized_pnl": realized_pnl, "closed_at": _utc_now()})
+            update_live_position(position_id, {"status": "CLOSED", "realized_pnl": realized_pnl, "closed_at": _utc_now(), "exit_order_uuid": None})
             return
         remaining_amount = max(entry_amount - entry_basis, 0.0)
-        current_price = status.filled_amount_krw / status.executed_volume if status.executed_volume > 0 else position.get("current_price")
+        current_price = filled_amount_delta / fill_volume if fill_volume > 0 else position.get("current_price")
+        raw_state = str(status.raw.get("state") or status.raw.get("status") or "").lower()
+        still_waiting = status.status == "PARTIALLY_FILLED" and raw_state not in {"cancel", "canceled", "cancelled"}
         update_live_position(
-            int(position_id),
+            position_id,
             {
-                "status": "OPEN",
+                "status": "CLOSING" if still_waiting else "OPEN",
                 "entry_volume": remaining_volume,
                 "entry_amount_krw": remaining_amount,
                 "current_price": current_price,
                 "realized_pnl": realized_pnl,
-                "exit_order_uuid": None,
+                "exit_order_uuid": log.get("order_uuid") if still_waiting else None,
             },
         )
-    elif status.status == "PARTIALLY_FILLED":
-        update_live_position(int(position_id), {"status": "CLOSING"})
     elif status.status == "CANCELED":
-        update_live_position(int(position_id), {"status": "MANUAL_REVIEW_REQUIRED"})
+        update_live_position(position_id, {"status": "OPEN", "exit_order_uuid": None})
+
+
+def _position_for_exit_order(log: dict) -> dict | None:
+    position_id = log.get("position_id")
+    if position_id:
+        position = load_live_position(int(position_id))
+        if position is not None:
+            return position
+    order_uuid = str(log.get("order_uuid") or "")
+    if order_uuid:
+        for position in load_open_live_positions(str(log.get("exchange") or "bithumb"), str(log.get("market") or "KRW-BTC")):
+            if str(position.get("exit_order_uuid") or "") == order_uuid:
+                return position
+    return None
 
 
 def _is_exit_order(log: dict) -> bool:
@@ -574,9 +618,18 @@ def log_recovery_event(
 def _risk_result_for_status(status: str, fallback: str) -> str:
     if status == "PARTIALLY_FILLED":
         return "PARTIAL_FILL_REQUIRES_RECOVERY"
-    if status in {"WAITING", "FILLED", "CANCELED"}:
+    if status == "FILLED":
+        return "EXCHANGE_FILLED_SYNCED"
+    if status == "CANCELED":
+        return "EXCHANGE_CANCELED_SYNCED"
+    if status == "WAITING":
         return "ALLOWED"
     return fallback
+
+
+def _is_order_not_found_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "not_found" in message or "not found" in message or "404" in message
 
 
 def _adopt_position_in_relevant_session(log: dict, position_id: int, risk_result: str) -> None:
