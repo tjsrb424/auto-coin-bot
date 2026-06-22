@@ -122,7 +122,11 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         }
         broker.get_order_chance.return_value = {"market": "KRW-BTC"}
 
-        with patch("app.live_recovery.get_live_broker", return_value=broker), patch("app.live_exit.get_live_broker", return_value=broker):
+        with (
+            patch("app.live_recovery.get_live_broker", return_value=broker),
+            patch("app.live_exit.get_live_broker", return_value=broker),
+            patch("app.capital_snapshot.get_live_broker", return_value=broker),
+        ):
             result = await create_exit_order_preview(int(candidate["id"]), manual_confirmed=True)
 
         self.assertTrue(result["ok"])

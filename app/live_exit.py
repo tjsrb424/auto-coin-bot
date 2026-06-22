@@ -351,6 +351,7 @@ async def manage_exit_order_timeout(position: dict, config: LiveExitConfig | Non
 
 async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, manual_confirmed: bool, is_auto_exit: bool) -> dict:
     config = LiveExitConfig.from_env()
+    live_config = LiveTradingConfig.for_exchange(str((candidate or {}).get("exchange") or "bithumb"))
     risk_result = "ALLOWED"
     reason = ""
     balance_mismatch = None
