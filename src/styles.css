@@ -7504,7 +7504,7 @@ input:disabled {
   left: 0;
   top: 0;
   width: 1430px;
-  height: 232px;
+  height: 260px;
   overflow: hidden;
   padding: 14px 18px;
 }
@@ -7698,7 +7698,7 @@ input:disabled {
 .ref-scheduler-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 78px;
-  min-height: 66px;
+  min-height: 78px;
   align-items: center;
   gap: 7px 8px;
   overflow: hidden;
@@ -7748,34 +7748,34 @@ input:disabled {
 
 .ref-backtest-markets {
   left: 0;
-  top: 252px;
+  top: 280px;
   width: 454px;
-  height: 572px;
+  height: 544px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-ranking {
   left: 474px;
-  top: 252px;
+  top: 280px;
   width: 626px;
-  height: 572px;
+  height: 544px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-selector {
   left: 1120px;
-  top: 252px;
+  top: 280px;
   width: 310px;
-  height: 572px;
+  height: 544px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-market-list {
   display: grid;
-  max-height: 510px;
+  max-height: 482px;
   gap: 8px;
   margin-top: 14px;
   overflow: auto;

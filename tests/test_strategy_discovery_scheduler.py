@@ -168,6 +168,28 @@ class StrategyDiscoverySchedulerTests(unittest.TestCase):
         self.assertEqual(status["deep_validation"]["status"], "IDLE")
         self.assertEqual(status["promotion_selector"]["status"], "IDLE")
 
+    def test_promotion_selector_retries_after_missing_table_migration_error(self) -> None:
+        calls = []
+
+        async def fake_pipeline(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("no such table: paper_forward_sessions")
+            return {
+                "enrolled": {"enrolled": []},
+                "promoted": {"promoted": [], "blocked": []},
+                "selector": {"decision": "BLOCKED", "blockers": ["NO_LIVE_ELIGIBLE_CANDIDATE"]},
+            }
+
+        with patch("app.strategy_discovery_scheduler.run_strategy_promotion_pipeline_async", fake_pipeline), \
+            patch("app.strategy_discovery_scheduler.init_db") as init:
+            state = asyncio.run(run_promotion_selector_scheduler_once())
+
+        self.assertEqual(len(calls), 2)
+        init.assert_called_once()
+        self.assertEqual(state["status"], "COMPLETED")
+        self.assertEqual(state["last_result"]["selector_decision"], "BLOCKED")
+
 
 if __name__ == "__main__":
     unittest.main()

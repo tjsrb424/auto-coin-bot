@@ -10,6 +10,7 @@ from app.database import (
     count_candidate_strategies_created_since,
     find_duplicate_candidate_strategy,
     finish_scheduler_task,
+    init_db,
     insert_candles,
     load_bot_operation_policy,
     load_candidate_strategies,
@@ -436,7 +437,13 @@ async def run_promotion_selector_scheduler_once() -> dict:
     if not acquired:
         return {"task_name": PROMOTION_TASK, "status": "SKIPPED", "reason": "LOCKED", "current": current}
     try:
-        result = await run_strategy_promotion_pipeline_async(exchange=str(config["exchange"]))
+        try:
+            result = await run_strategy_promotion_pipeline_async(exchange=str(config["exchange"]))
+        except Exception as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            init_db()
+            result = await run_strategy_promotion_pipeline_async(exchange=str(config["exchange"]))
         selector = result.get("selector", {})
         best = selector.get("best_candidate") or {}
         policy = load_bot_operation_policy(best.get("market") or "KRW-BTC")
@@ -509,4 +516,3 @@ def run_deep_validation_scheduler_tick() -> None:
 
 def run_promotion_selector_scheduler_tick() -> None:
     asyncio.run(run_promotion_selector_scheduler_once())
-
