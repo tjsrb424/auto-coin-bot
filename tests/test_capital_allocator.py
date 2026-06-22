@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database
-from app.capital_allocator import run_capital_allocator_once
+from app.capital_allocator import capital_allocator_status, run_capital_allocator_once
 
 
 def candidate_payload(market: str = "KRW-ETH", status: str = "LIVE_ELIGIBLE", score: float = 95.0) -> dict:
@@ -157,6 +157,46 @@ class CapitalAllocatorTests(unittest.TestCase):
         slots = database.load_position_slots(5, "bithumb")
 
         self.assertEqual(slots[0]["status"], "EMPTY")
+
+    def test_status_reconciles_existing_open_position(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {"short_window": 5, "long_window": 20},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 20_000,
+                "max_orders_per_day": 3,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "strategy_name": "ma_cross",
+                "status": "OPEN",
+                "entry_order_uuid": "open-position-test",
+                "entry_price": 1000,
+                "entry_volume": 10,
+                "entry_amount_krw": 10_000,
+                "current_price": 1010,
+                "stop_loss_price": 900,
+                "take_profit_price": 1100,
+            }
+        )
+
+        status = capital_allocator_status("bithumb")
+
+        self.assertEqual(status["open_slot_count"], 1)
+        self.assertEqual(status["slots"][0]["status"], "OPEN")
+        self.assertEqual(status["slots"][0]["market"], "KRW-ETH")
 
 
 if __name__ == "__main__":

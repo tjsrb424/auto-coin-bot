@@ -3746,7 +3746,8 @@ def reconcile_position_slots(max_slots: int = 5, exchange: str = "bithumb") -> l
             """,
             (now_utc, now_utc, exchange),
         )
-        for position in positions:
+        for position_row in positions:
+            position = dict(position_row)
             position_id = int(position["id"])
             current_value = float(position["current_price"] or 0.0) * float(position["entry_volume"] or 0.0)
             existing = conn.execute(
