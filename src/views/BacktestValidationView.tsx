@@ -347,6 +347,16 @@ export function BacktestValidationView({ exchange }: Props) {
     }
     return formatReasonLabel(item);
   };
+  const switchLogReasonLabel = (log: NonNullable<AutoStrategySelectorStatus["recent_switch_logs"]>[number]) => {
+    const rawReason = log.blocked_reason?.split(",")[0]?.trim() || log.reason || "";
+    if (rawReason === "POLICY_AUTO_TRADING_DISABLED") {
+      return currentAutoTradingEnabled
+        ? "과거 평가 당시 자동매매 OFF로 적용 보류. 현재는 ON입니다."
+        : "현재 자동매매 OFF라 적용을 보류했습니다.";
+    }
+    if (rawReason) return formatReasonLabel(rawReason);
+    return formatDateTime(log.created_at);
+  };
 
   return (
     <section className={`ref-backtest-view${busy ? " is-busy" : ""}`}>
@@ -468,7 +478,7 @@ export function BacktestValidationView({ exchange }: Props) {
             <p key={log.id}>
               <b>{formatSwitchDecision(log.decision)}</b>
               <span>{log.to_candidate ? `${log.to_candidate.market} · ${formatStrategyLabel(log.to_candidate.strategy)}` : (log.to_market ?? "-")}</span>
-              <em>{log.blocked_reason ? formatReasonLabel(log.blocked_reason.split(",")[0]?.trim()) : (log.reason || formatDateTime(log.created_at))}</em>
+              <em>{switchLogReasonLabel(log)}</em>
             </p>
           )) : <p><b>-</b><span>아직 교체 로그가 없습니다.</span><em>조건 충족 또는 보류 시 이곳에 표시됩니다.</em></p>}
         </div>
