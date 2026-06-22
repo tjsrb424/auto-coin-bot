@@ -24,6 +24,7 @@ services:
       dockerfile: Dockerfile.frontend
       args:
         VITE_API_BASE_URL: ""
+        APP_COMMIT: ${APP_COMMIT:-}
     depends_on:
       - backend
     ports:
