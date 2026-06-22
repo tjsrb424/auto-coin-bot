@@ -7504,7 +7504,7 @@ input:disabled {
   left: 0;
   top: 0;
   width: 1430px;
-  height: 344px;
+  height: 376px;
   overflow: hidden;
   padding: 14px 18px;
 }
@@ -7699,9 +7699,9 @@ input:disabled {
 .ref-scheduler-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 78px;
-  min-height: 78px;
+  min-height: 92px;
   align-items: center;
-  gap: 7px 8px;
+  gap: 5px 8px;
   overflow: hidden;
   border: 1px solid rgba(49, 69, 93, 0.72);
   border-radius: 5px;
@@ -7741,6 +7741,11 @@ input:disabled {
   font-size: 11px;
   font-style: normal;
   font-weight: 800;
+}
+
+.ref-scheduler-card span {
+  grid-column: 1 / -1;
+  color: #c8d6e8;
 }
 
 .ref-scheduler-card em {
@@ -7813,34 +7818,34 @@ input:disabled {
 
 .ref-backtest-markets {
   left: 0;
-  top: 364px;
+  top: 392px;
   width: 454px;
-  height: 460px;
+  height: 432px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-ranking {
   left: 474px;
-  top: 364px;
+  top: 392px;
   width: 626px;
-  height: 460px;
+  height: 432px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-selector {
   left: 1120px;
-  top: 364px;
+  top: 392px;
   width: 310px;
-  height: 460px;
+  height: 432px;
   overflow: auto;
   padding: 18px;
 }
 
 .ref-backtest-market-list {
   display: grid;
-  max-height: 398px;
+  max-height: 370px;
   gap: 8px;
   margin-top: 14px;
   overflow: auto;
