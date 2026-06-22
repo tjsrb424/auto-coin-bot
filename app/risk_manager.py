@@ -9,11 +9,13 @@ from app.database import (
     get_connection,
     has_open_live_position_for_strategy,
     insert_risk_log,
+    load_candidate_strategy,
     load_bot_operation_policy,
     load_latest_risk_state,
     load_open_live_positions,
     load_reconcilable_live_order_logs,
     load_risk_logs,
+    market_is_live_allowed,
     upsert_risk_state,
 )
 from app.live_broker import is_emergency_stopped
@@ -346,10 +348,28 @@ def check_order_risk(
     else:
         ok("mode_check", mode)
 
+    candidate = load_candidate_strategy(int(candidate_strategy_id)) if candidate_strategy_id is not None else None
+    candidate_status = str((candidate or {}).get("status") or "")
+    market_live_candidate_allowed = (
+        market == "KRW-BTC"
+        or (
+            bool(candidate)
+            and candidate_status in {"LIVE_ELIGIBLE", "LIVE_ACTIVE"}
+            and str(candidate.get("market")) == market
+            and market_is_live_allowed(exchange, market)
+        )
+    )
+
     if exchange != "bithumb":
         block("BLOCKED_EXCHANGE_NOT_ALLOWED", check_name="exchange_check")
-    elif market != "KRW-BTC":
-        block("BLOCKED_MARKET_NOT_ALLOWED", check_name="exchange_check")
+    elif not market_live_candidate_allowed:
+        block("BLOCKED_MARKET_NOT_ALLOWED", check_name="exchange_check", detail={
+            "market": market,
+            "candidate_strategy_id": candidate_strategy_id,
+            "candidate_status": candidate_status or None,
+            "requires_status": ["LIVE_ELIGIBLE", "LIVE_ACTIVE"],
+            "live_allowed_market": market_is_live_allowed(exchange, market),
+        })
     else:
         ok("exchange_check")
 

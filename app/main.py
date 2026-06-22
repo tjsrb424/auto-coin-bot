@@ -28,6 +28,7 @@ from app.auto_live_pilot import (
 from app.database import (
     clone_candidate_strategy,
     acquire_runtime_lock,
+    load_active_strategy_selection,
     create_forward_session_from_candidate,
     create_live_paper_session,
     delete_candidate_strategy,
@@ -43,6 +44,10 @@ from app.database import (
     insert_smart_rehearsal_review,
     insert_risk_log,
     insert_candles,
+    load_live_eligible_candidate_strategies,
+    load_market_universe,
+    load_market_universe_item,
+    load_market_universe_item_by_id,
     load_candidate_strategy,
     load_bot_operation_policy,
     load_latest_live_paper_session,
@@ -61,7 +66,10 @@ from app.database import (
     load_trade_history_logs,
     load_latest_paper_session,
     pause_running_forward_sessions_on_startup,
+    promote_candidate_strategy,
+    reject_candidate_strategy,
     release_runtime_lock,
+    save_strategy_validation_run,
     save_backtest,
     save_candidate_strategy,
     save_paper_session,
@@ -71,11 +79,13 @@ from app.database import (
     stop_latest_live_paper_session,
     stop_latest_paper_session,
     update_live_order_log,
+    update_market_universe_item,
     update_app_settings,
     update_bot_operation_policy,
     update_candidate_strategy,
     update_risk_log_resolution,
 )
+from app.auto_strategy_selector import auto_strategy_selector_status, evaluate_auto_strategy_selector
 from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
 from app.live_broker import (
@@ -111,6 +121,7 @@ from app.live_exit import (
     submit_exit_order,
 )
 from app.risk_manager import check_order_risk, compute_risk_state, enrich_policy_block_log, get_risk_dashboard
+from app.market_scanner import scan_market_universe
 from app.shadow_report import build_shadow_report
 from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
@@ -359,6 +370,37 @@ class StrategyValidationRequest(BaseModel):
     risk: dict[str, Any] = Field(default_factory=dict)
 
 
+class MultiMarketValidationRequest(BaseModel):
+    exchange: str = Field("upbit", pattern=r"^(upbit|bithumb)$")
+    markets: list[str] = Field(default_factory=list)
+    strategies: list[str] = Field(default_factory=lambda: ["ma_cross", "rsi", "volatility_breakout"])
+    timeframes: list[int] = Field(default_factory=lambda: [1, 5, 15, 60])
+    periods: list[str] = Field(default_factory=lambda: ["7d", "30d"])
+    risk: dict[str, Any] = Field(default_factory=dict)
+    max_markets: int = Field(10, ge=1, le=20)
+    auto_save_candidates: bool = True
+    min_score: float = 70.0
+    allow_live_eligible_promotion: bool = False
+
+
+class MarketScanRequest(BaseModel):
+    exchange: str = Field("upbit", pattern=r"^(upbit|bithumb)$")
+    top_n: int = Field(10, ge=1, le=20)
+    max_candidates: int = Field(20, ge=1, le=40)
+    min_24h_trade_price_krw: float = Field(500_000_000, ge=0)
+
+
+class MarketUniversePatchRequest(BaseModel):
+    status: str | None = None
+    is_enabled: bool | None = None
+    is_live_allowed: bool | None = None
+    is_auto_selectable: bool | None = None
+    scan_rank: int | None = None
+    score: float | None = None
+    reason: str | None = None
+    min_24h_trade_price_krw: float | None = None
+
+
 class CandidateStrategyRequest(BaseModel):
     name: str | None = None
     description: str = ""
@@ -376,6 +418,11 @@ class CandidateStrategyRequest(BaseModel):
     backtest_average_trade_pnl: float = 0.0
     warning: str = ""
     status: str = "ACTIVE"
+
+
+class CandidateAutoSaveRequest(BaseModel):
+    candidates: list[CandidateStrategyRequest] = Field(default_factory=list)
+    min_score: float = 70.0
 
 
 class CandidateStrategyUpdateRequest(BaseModel):
@@ -399,6 +446,16 @@ class CandidateStrategyUpdateRequest(BaseModel):
 
 class CandidateStrategyToggleRequest(BaseModel):
     status: str | None = None
+
+
+class CandidatePromotionRequest(BaseModel):
+    status: str | None = None
+    reason: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutoSelectorRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(upbit|bithumb)$")
 
 
 class AppSettingsRequest(BaseModel):
@@ -498,6 +555,63 @@ class ExitOrderSubmitRequest(BaseModel):
 
 class ExitOrderCancelRequest(BaseModel):
     request_id: str
+
+
+def _fatal_validation_warnings(warnings: list[str]) -> list[str]:
+    fatal_keywords = [
+        "MDD",
+        "loss",
+        "loss after fees",
+        "insufficient",
+        "API",
+        "volatility",
+        "liquidity",
+    ]
+    return [warning for warning in warnings if any(keyword.lower() in str(warning).lower() for keyword in fatal_keywords)]
+
+
+def _validation_row_passes_candidate_gate(row: dict, *, min_score: float = 70.0) -> bool:
+    metrics = row.get("metrics") or {}
+    warnings = [str(item) for item in row.get("warnings") or []]
+    return (
+        float(row.get("stability_score") or 0.0) >= min_score
+        and float(metrics.get("total_return") or 0.0) > 0
+        and float(metrics.get("mdd") or 0.0) <= 0.15
+        and not _fatal_validation_warnings(warnings)
+    )
+
+
+def _candidate_from_validation_row(row: dict, *, status: str = "BACKTEST_PASSED") -> dict:
+    metrics = row.get("metrics") or {}
+    warnings = [str(item) for item in row.get("warnings") or []]
+    return {
+        "name": f"{row['market']} {row['strategy']} {row['unit']}m {float(row.get('stability_score') or 0):.2f}pt",
+        "description": "Auto-saved from multi-market strategy validation.",
+        "strategy": row["strategy"],
+        "parameters": row.get("parameters") or {},
+        "unit": int(row["unit"]),
+        "market": row["market"],
+        "backtest_period": str(row.get("period_label") or "multi-market"),
+        "score": float(row.get("stability_score") or metrics.get("score") or 0.0),
+        "backtest_total_return": float(metrics.get("total_return") or 0.0),
+        "backtest_mdd": float(metrics.get("mdd") or 0.0),
+        "backtest_win_rate": float(metrics.get("win_rate") or 0.0),
+        "backtest_profit_factor": float(metrics.get("profit_factor") or 0.0),
+        "backtest_trade_count": int(metrics.get("trade_count") or 0),
+        "backtest_average_trade_pnl": (
+            float(metrics.get("total_return") or 0.0) / int(metrics.get("trade_count") or 1)
+        ),
+        "warning": ", ".join(warnings),
+        "status": status,
+    }
+
+
+def _annotate_validation_decisions(rows: list[dict], *, min_score: float) -> list[dict]:
+    annotated = []
+    for row in rows:
+        decision = "AUTO_SAVE" if _validation_row_passes_candidate_gate(row, min_score=min_score) else "REJECT"
+        annotated.append({**row, "decision": decision})
+    return annotated
 
 
 @asynccontextmanager
@@ -705,10 +819,48 @@ async def get_candles(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/markets/universe")
+def get_market_universe(
+    exchange: str | None = Query(None, pattern=r"^(upbit|bithumb)$"),
+    enabled_only: bool = Query(False),
+    auto_selectable_only: bool = Query(False),
+    live_allowed_only: bool = Query(False),
+    limit: int = Query(200, ge=1, le=500),
+) -> dict:
+    return {
+        "markets": load_market_universe(
+            exchange=exchange,
+            enabled_only=enabled_only,
+            auto_selectable_only=auto_selectable_only,
+            live_allowed_only=live_allowed_only,
+            limit=limit,
+        )
+    }
+
+
+@app.post("/api/markets/scan")
+async def scan_markets(payload: MarketScanRequest) -> dict:
+    try:
+        return await scan_market_universe(
+            exchange=payload.exchange,
+            top_n=payload.top_n,
+            max_candidates=payload.max_candidates,
+            min_24h_trade_price_krw=payload.min_24h_trade_price_krw,
+        )
+    except (UpbitClientError, ValueError) as exc:
+        raise HTTPException(status_code=502 if isinstance(exc, UpbitClientError) else 400, detail=str(exc)) from exc
+
+
+@app.patch("/api/markets/universe/{market_id}")
+def patch_market_universe(market_id: int, payload: MarketUniversePatchRequest) -> dict:
+    item = update_market_universe_item(market_id, {key: value for key, value in payload.model_dump(exclude_unset=True).items() if value is not None})
+    if item is None:
+        raise HTTPException(status_code=404, detail="Market universe item not found.")
+    return {"market": item}
+
+
 @app.post("/api/backtests")
 async def create_backtest(payload: BacktestRequest) -> dict:
-    if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="기본 지원 마켓은 KRW-BTC입니다.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -743,8 +895,6 @@ async def create_backtest(payload: BacktestRequest) -> dict:
 
 @app.post("/api/backtests/compare")
 async def compare_backtests(payload: BacktestCompareRequest) -> dict:
-    if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="백테스트 비교는 KRW-BTC만 지원합니다.")
     allowed = {"ma_cross", "rsi", "volatility_breakout"}
     strategies = [strategy for strategy in payload.strategies if strategy in allowed]
     if not strategies:
@@ -779,8 +929,6 @@ async def compare_backtests(payload: BacktestCompareRequest) -> dict:
 
 @app.post("/api/paper-trading/simulate")
 async def simulate_paper_trading(payload: PaperTradingRequest) -> dict:
-    if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="페이퍼 트레이딩은 KRW-BTC만 지원합니다.")
     try:
         fresh = await fetch_minute_candles(
             market=payload.market,
@@ -831,8 +979,6 @@ def latest_paper_trading() -> dict:
 
 @app.post("/api/strategy-validation/run")
 async def run_validation(payload: StrategyValidationRequest) -> dict:
-    if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="전략 검증은 KRW-BTC만 지원합니다.")
     if payload.strategy not in {"ma_cross", "rsi", "volatility_breakout"}:
         raise HTTPException(status_code=400, detail="지원하지 않는 전략입니다.")
     try:
@@ -860,10 +1006,91 @@ async def run_validation(payload: StrategyValidationRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/strategy-validation/multi-market")
+async def run_multi_market_validation(payload: MultiMarketValidationRequest) -> dict:
+    allowed = {"ma_cross", "rsi", "volatility_breakout"}
+    strategies = [strategy for strategy in payload.strategies if strategy in allowed]
+    if not strategies:
+        raise HTTPException(status_code=400, detail="No supported strategies were requested.")
+    markets = [market for market in dict.fromkeys(payload.markets) if market.startswith("KRW-")]
+    if not markets:
+        universe = load_market_universe(exchange=payload.exchange, enabled_only=True, auto_selectable_only=True, limit=payload.max_markets)
+        markets = [str(item["market"]) for item in universe]
+    if not markets:
+        markets = [DEFAULT_MARKET]
+    markets = markets[: payload.max_markets]
+
+    started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    all_rows: list[dict] = []
+    errors: list[dict] = []
+    saved_candidates: list[dict] = []
+    for market in markets:
+        for strategy in strategies:
+            try:
+                result = await run_strategy_validation(
+                    market=market,
+                    strategy=strategy,
+                    timeframes=payload.timeframes,
+                    periods=payload.periods,
+                    custom_start_time_utc=None,
+                    custom_end_time_utc=None,
+                    base_settings={},
+                    risk=payload.risk,
+                    load_period_candles=_load_period_candles,
+                )
+                all_rows.extend(_annotate_validation_decisions(result["rows"], min_score=payload.min_score))
+            except (UpbitClientError, ValueError) as exc:
+                errors.append({"market": market, "strategy": strategy, "error": str(exc)})
+
+    ranking = sorted(all_rows, key=lambda row: float(row.get("stability_score") or 0.0), reverse=True)
+    if payload.auto_save_candidates:
+        for row in ranking:
+            if row.get("decision") != "AUTO_SAVE":
+                continue
+            candidate_id = save_candidate_strategy(_candidate_from_validation_row(row, status="BACKTEST_PASSED"))
+            saved = load_candidate_strategy(candidate_id)
+            if saved:
+                saved_candidates.append(saved)
+            if len(saved_candidates) >= payload.max_markets:
+                break
+    finished_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    summary = {
+        "market_count": len(markets),
+        "strategy_count": len(strategies),
+        "row_count": len(ranking),
+        "saved_candidate_count": len(saved_candidates),
+        "error_count": len(errors),
+    }
+    run_id = save_strategy_validation_run(
+        {
+            "exchange": payload.exchange,
+            "market_count": len(markets),
+            "strategy_count": len(strategies),
+            "timeframes": payload.timeframes,
+            "periods": payload.periods,
+            "risk": payload.risk,
+            "request": payload.model_dump(),
+            "summary": summary,
+            "status": "COMPLETED_WITH_ERRORS" if errors else "COMPLETED",
+            "started_at": started_at,
+            "finished_at": finished_at,
+        },
+        ranking,
+    )
+    return {
+        "run_id": run_id,
+        "exchange": payload.exchange,
+        "markets": markets,
+        "strategies": strategies,
+        "summary": summary,
+        "rows": ranking,
+        "saved_candidates": saved_candidates,
+        "errors": errors,
+    }
+
+
 @app.post("/api/candidate-strategies")
 def create_candidate_strategy(payload: CandidateStrategyRequest) -> dict:
-    if payload.market != DEFAULT_MARKET:
-        raise HTTPException(status_code=400, detail="후보 전략은 KRW-BTC만 지원합니다.")
     candidate = payload.model_dump()
     candidate_id = save_candidate_strategy(candidate)
     return {"id": candidate_id, **candidate}
@@ -872,6 +1099,44 @@ def create_candidate_strategy(payload: CandidateStrategyRequest) -> dict:
 @app.get("/api/candidate-strategies")
 def list_candidate_strategies() -> dict:
     return {"candidates": load_candidate_strategies()}
+
+
+@app.get("/api/candidate-strategies/live-eligible")
+def list_live_eligible_candidate_strategies() -> dict:
+    return {"candidates": load_live_eligible_candidate_strategies()}
+
+
+@app.post("/api/candidate-strategies/auto-save")
+def auto_save_candidate_strategies(payload: CandidateAutoSaveRequest) -> dict:
+    saved = []
+    rejected = []
+    for request in payload.candidates:
+        candidate = request.model_dump()
+        gate_row = {
+            "market": candidate["market"],
+            "strategy": candidate["strategy"],
+            "unit": candidate["unit"],
+            "parameters": candidate["parameters"],
+            "period_label": candidate["backtest_period"],
+            "stability_score": candidate["score"],
+            "warnings": [candidate.get("warning", "")] if candidate.get("warning") else [],
+            "metrics": {
+                "total_return": candidate["backtest_total_return"],
+                "mdd": candidate["backtest_mdd"],
+                "win_rate": candidate["backtest_win_rate"],
+                "profit_factor": candidate["backtest_profit_factor"],
+                "trade_count": candidate["backtest_trade_count"],
+            },
+        }
+        if not _validation_row_passes_candidate_gate(gate_row, min_score=payload.min_score):
+            rejected.append({"candidate": candidate, "reason": "AUTO_SAVE_GATE_FAILED"})
+            continue
+        candidate["status"] = "BACKTEST_PASSED"
+        candidate_id = save_candidate_strategy(candidate)
+        saved_candidate = load_candidate_strategy(candidate_id)
+        if saved_candidate:
+            saved.append(saved_candidate)
+    return {"saved": saved, "rejected": rejected}
 
 
 @app.patch("/api/candidate-strategies/{candidate_id}")
@@ -901,6 +1166,48 @@ def toggle_candidate_strategy_endpoint(candidate_id: int, payload: CandidateStra
     return {"candidate": candidate}
 
 
+def _next_promotion_status(current_status: str, requested_status: str | None) -> str:
+    if requested_status:
+        return requested_status
+    flow = {
+        "DISCOVERED": "BACKTEST_RUNNING",
+        "BACKTEST_RUNNING": "BACKTEST_PASSED",
+        "BACKTEST_PASSED": "SHADOW_RUNNING",
+        "SHADOW_RUNNING": "SHADOW_PASSED",
+        "SHADOW_PASSED": "LIVE_ELIGIBLE",
+        "LIVE_ELIGIBLE": "LIVE_ACTIVE",
+        "LIVE_ACTIVE": "LIVE_ACTIVE",
+        "ACTIVE": "BACKTEST_PASSED",
+        "INACTIVE": "PAUSED",
+    }
+    return flow.get(current_status, "PAUSED")
+
+
+@app.post("/api/candidate-strategies/{candidate_id}/promote")
+def promote_candidate_strategy_endpoint(candidate_id: int, payload: CandidatePromotionRequest) -> dict:
+    current = load_candidate_strategy(candidate_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    current_status = str(current.get("status") or "ACTIVE")
+    to_status = _next_promotion_status(current_status, payload.status)
+    if to_status == "LIVE_ELIGIBLE" and current_status != "SHADOW_PASSED":
+        raise HTTPException(status_code=409, detail="Only SHADOW_PASSED candidates can be promoted to LIVE_ELIGIBLE.")
+    if to_status == "LIVE_ACTIVE" and current_status not in {"LIVE_ELIGIBLE", "LIVE_ACTIVE"}:
+        raise HTTPException(status_code=409, detail="Only LIVE_ELIGIBLE candidates can become LIVE_ACTIVE.")
+    candidate = promote_candidate_strategy(candidate_id, to_status, reason=payload.reason, metadata=payload.metadata)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    return {"candidate": candidate}
+
+
+@app.post("/api/candidate-strategies/{candidate_id}/reject")
+def reject_candidate_strategy_endpoint(candidate_id: int, payload: CandidatePromotionRequest) -> dict:
+    candidate = reject_candidate_strategy(candidate_id, reason=payload.reason, metadata=payload.metadata)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate strategy not found.")
+    return {"candidate": candidate}
+
+
 @app.delete("/api/candidate-strategies/{candidate_id}")
 def delete_candidate_strategy_endpoint(candidate_id: int) -> dict:
     current = load_candidate_strategy(candidate_id)
@@ -910,6 +1217,21 @@ def delete_candidate_strategy_endpoint(candidate_id: int) -> dict:
     if not deleted:
         raise HTTPException(status_code=409, detail="실행 이력이나 주문/포지션과 연결된 전략은 삭제할 수 없습니다. 비활성화를 사용하세요.")
     return {"ok": True, "deleted_id": candidate_id}
+
+
+@app.get("/api/auto-strategy-selector/status")
+def get_auto_strategy_selector_status(exchange: str = Query("bithumb", pattern=r"^(upbit|bithumb)$")) -> dict:
+    return auto_strategy_selector_status(exchange=exchange)
+
+
+@app.post("/api/auto-strategy-selector/evaluate")
+def evaluate_auto_strategy_selector_endpoint(payload: AutoSelectorRequest) -> dict:
+    return evaluate_auto_strategy_selector(exchange=payload.exchange, apply=False)
+
+
+@app.post("/api/auto-strategy-selector/apply-best")
+def apply_best_auto_strategy_endpoint(payload: AutoSelectorRequest) -> dict:
+    return evaluate_auto_strategy_selector(exchange=payload.exchange, apply=True)
 
 
 def _live_status(exchange: str | None = None) -> dict:

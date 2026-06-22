@@ -7491,3 +7491,252 @@ input:disabled {
     min-width: 180px;
   }
 }
+
+.ref-backtest-view {
+  position: absolute;
+  left: 218px;
+  top: 91px;
+  width: 1430px;
+  height: 824px;
+}
+
+.ref-backtest-command {
+  left: 0;
+  top: 0;
+  width: 1430px;
+  height: 154px;
+  padding: 20px 22px;
+}
+
+.ref-backtest-head,
+.ref-backtest-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #f3f7ff;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.ref-backtest-head span,
+.ref-backtest-title {
+  justify-content: flex-start;
+}
+
+.ref-backtest-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.ref-backtest-actions button,
+.ref-backtest-market-list button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid rgba(74, 98, 130, 0.82);
+  border-radius: 5px;
+  background: rgba(14, 27, 43, 0.82);
+  color: #dbe7f7;
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.ref-backtest-actions button {
+  height: 38px;
+  padding: 0 14px;
+}
+
+.ref-backtest-actions button:hover,
+.ref-backtest-market-list button:hover {
+  border-color: rgba(43, 149, 255, 0.78);
+  background: rgba(20, 42, 66, 0.92);
+}
+
+.ref-backtest-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.ref-backtest-message,
+.ref-backtest-error {
+  margin: 10px 0 0;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ref-backtest-message {
+  color: var(--ref-green);
+}
+
+.ref-backtest-error {
+  color: var(--ref-red);
+}
+
+.ref-backtest-kpis,
+.ref-selector-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.ref-backtest-kpis p,
+.ref-selector-summary p {
+  margin: 0;
+  border: 1px solid rgba(49, 69, 93, 0.72);
+  border-radius: 5px;
+  background: rgba(5, 12, 21, 0.48);
+  padding: 10px 12px;
+}
+
+.ref-backtest-kpis span,
+.ref-selector-summary span {
+  display: block;
+  color: var(--ref-muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.ref-backtest-kpis b,
+.ref-selector-summary b {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  color: #f7fbff;
+  font-size: 18px;
+  font-weight: 950;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-backtest-markets {
+  left: 0;
+  top: 174px;
+  width: 454px;
+  height: 650px;
+  padding: 18px;
+}
+
+.ref-backtest-ranking {
+  left: 474px;
+  top: 174px;
+  width: 626px;
+  height: 650px;
+  padding: 18px;
+}
+
+.ref-backtest-selector {
+  left: 1120px;
+  top: 174px;
+  width: 310px;
+  height: 650px;
+  padding: 18px;
+}
+
+.ref-backtest-market-list {
+  display: grid;
+  max-height: 590px;
+  gap: 8px;
+  margin-top: 14px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.ref-backtest-market-list button {
+  display: grid;
+  grid-template-columns: 86px 1fr 78px;
+  min-height: 58px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.ref-backtest-market-list button.is-selected {
+  border-color: rgba(24, 217, 111, 0.68);
+  background: rgba(24, 217, 111, 0.09);
+}
+
+.ref-backtest-market-list strong,
+.ref-backtest-market-list span,
+.ref-backtest-market-list em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-backtest-market-list em {
+  grid-column: 1 / -1;
+  color: var(--ref-muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.ref-backtest-empty {
+  color: var(--ref-muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.ref-backtest-ranking table {
+  width: 100%;
+  margin-top: 16px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.ref-backtest-ranking th,
+.ref-backtest-ranking td {
+  border-bottom: 1px solid rgba(49, 69, 93, 0.62);
+  padding: 10px 8px;
+  text-align: left;
+}
+
+.ref-backtest-ranking th {
+  color: var(--ref-muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.ref-selector-summary {
+  grid-template-columns: 1fr;
+}
+
+.ref-selector-blockers {
+  display: grid;
+  gap: 7px;
+  margin-top: 16px;
+}
+
+.ref-selector-blockers span {
+  border: 1px solid rgba(246, 168, 0, 0.28);
+  border-radius: 5px;
+  background: rgba(246, 168, 0, 0.08);
+  padding: 8px 9px;
+  color: #f6c35b;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.ref-saved-candidates {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.ref-saved-candidates p {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 5px 8px;
+  margin: 0;
+  border-top: 1px solid rgba(49, 69, 93, 0.52);
+  padding-top: 8px;
+  font-size: 12px;
+}
+
+.ref-saved-candidates .ref-status-chip {
+  grid-column: 1 / -1;
+  width: fit-content;
+}

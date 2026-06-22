@@ -24,6 +24,22 @@ TRADE_HISTORY_STATUSES = (
     "CANCELLED",
     "STALE_CANCELED",
 )
+DEFAULT_MARKET = "KRW-BTC"
+LEGACY_CANDIDATE_STATUSES = {"ACTIVE", "INACTIVE"}
+CANDIDATE_STATUSES = {
+    "DISCOVERED",
+    "BACKTEST_RUNNING",
+    "BACKTEST_PASSED",
+    "BACKTEST_FAILED",
+    "SHADOW_RUNNING",
+    "SHADOW_PASSED",
+    "LIVE_ELIGIBLE",
+    "LIVE_ACTIVE",
+    "PAUSED",
+    "REJECTED",
+    *LEGACY_CANDIDATE_STATUSES,
+}
+LIVE_CANDIDATE_STATUSES = {"LIVE_ELIGIBLE", "LIVE_ACTIVE"}
 
 DEFAULT_CANDIDATE_STRATEGIES = [
     {
@@ -239,6 +255,22 @@ def init_db() -> None:
                 FOREIGN KEY(run_id) REFERENCES validation_runs(id)
             );
 
+            CREATE TABLE IF NOT EXISTS strategy_validation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL DEFAULT 'upbit',
+                market_count INTEGER NOT NULL DEFAULT 0,
+                strategy_count INTEGER NOT NULL DEFAULT 0,
+                timeframes_json TEXT NOT NULL DEFAULT '[]',
+                periods_json TEXT NOT NULL DEFAULT '[]',
+                risk_json TEXT NOT NULL DEFAULT '{}',
+                request_json TEXT NOT NULL DEFAULT '{}',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'RUNNING',
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS candidate_strategies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy TEXT NOT NULL,
@@ -247,6 +279,74 @@ def init_db() -> None:
                 market TEXT NOT NULL,
                 backtest_period TEXT NOT NULL,
                 score REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS market_universe (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL DEFAULT 'upbit',
+                market TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quote_currency TEXT NOT NULL DEFAULT 'KRW',
+                status TEXT NOT NULL DEFAULT 'DISCOVERED',
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                is_live_allowed INTEGER NOT NULL DEFAULT 0,
+                is_auto_selectable INTEGER NOT NULL DEFAULT 1,
+                scan_rank INTEGER NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                min_24h_trade_price_krw REAL NOT NULL DEFAULT 0,
+                last_24h_trade_price_krw REAL NOT NULL DEFAULT 0,
+                last_price REAL NOT NULL DEFAULT 0,
+                last_change_rate REAL NOT NULL DEFAULT 0,
+                last_volatility_score REAL NOT NULL DEFAULT 0,
+                last_liquidity_score REAL NOT NULL DEFAULT 0,
+                last_risk_score REAL NOT NULL DEFAULT 0,
+                last_scanned_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(exchange, market)
+            );
+
+            CREATE TABLE IF NOT EXISTS candidate_strategy_promotions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_strategy_id INTEGER NOT NULL,
+                from_status TEXT NOT NULL,
+                to_status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                score REAL NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS active_strategy_selection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_strategy_id INTEGER NOT NULL,
+                market TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                unit INTEGER NOT NULL,
+                parameters_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'LIVE_ACTIVE',
+                selected_reason TEXT NOT NULL DEFAULT '',
+                selected_at TEXT NOT NULL,
+                replaced_candidate_strategy_id INTEGER,
+                cooldown_until TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS strategy_switch_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_candidate_strategy_id INTEGER,
+                to_candidate_strategy_id INTEGER,
+                from_market TEXT,
+                to_market TEXT,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                blocked_reason TEXT NOT NULL DEFAULT '',
+                score_delta REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -725,6 +825,13 @@ def init_db() -> None:
         _ensure_column(conn, "candidate_strategies", "description", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "candidate_strategies", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'")
         _ensure_column(conn, "candidate_strategies", "updated_at", "TEXT")
+        _ensure_column(conn, "strategy_validation_results", "decision", "TEXT NOT NULL DEFAULT 'OBSERVE'")
+        _ensure_column(conn, "strategy_validation_results", "total_return", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "strategy_validation_results", "mdd", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "strategy_validation_results", "win_rate", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "strategy_validation_results", "trade_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "strategy_validation_results", "profit_factor", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "strategy_validation_results", "source_run_table", "TEXT NOT NULL DEFAULT 'validation_runs'")
         _ensure_column(conn, "live_order_logs", "exchange", "TEXT NOT NULL DEFAULT 'upbit'")
         _ensure_column(conn, "live_order_logs", "session_id", "INTEGER")
         _ensure_column(conn, "live_order_logs", "candidate_strategy_id", "INTEGER")
@@ -795,6 +902,24 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_market_universe_selectable
+            ON market_universe(exchange, is_enabled, is_auto_selectable, is_live_allowed, score DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_candidate_strategies_status_score
+            ON candidate_strategies(status, score DESC, updated_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_active_strategy_selection_status
+            ON active_strategy_selection(status, selected_at DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
             INSERT INTO bot_operation_policy (
                 market, auto_trading_enabled, max_total_exposure_krw, daily_loss_limit_pct
             ) VALUES ('KRW-BTC', 0, 500000, 3)
@@ -825,6 +950,165 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def normalize_candidate_status(status: str | None, *, fallback: str = "ACTIVE") -> str:
+    normalized = str(status or fallback).strip().upper()
+    return normalized if normalized in CANDIDATE_STATUSES else fallback
+
+
+def _normalize_market_universe_row(row: dict) -> dict:
+    item = dict(row)
+    for key in ("is_enabled", "is_live_allowed", "is_auto_selectable"):
+        item[key] = bool(item.get(key))
+    return item
+
+
+def upsert_market_universe(items: list[dict]) -> int:
+    if not items:
+        return 0
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT INTO market_universe (
+                exchange, market, symbol, quote_currency, status, is_enabled,
+                is_live_allowed, is_auto_selectable, scan_rank, score, reason,
+                min_24h_trade_price_krw, last_24h_trade_price_krw, last_price,
+                last_change_rate, last_volatility_score, last_liquidity_score,
+                last_risk_score, last_scanned_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(exchange, market) DO UPDATE SET
+                symbol = excluded.symbol,
+                quote_currency = excluded.quote_currency,
+                status = excluded.status,
+                is_enabled = excluded.is_enabled,
+                is_auto_selectable = excluded.is_auto_selectable,
+                scan_rank = excluded.scan_rank,
+                score = excluded.score,
+                reason = excluded.reason,
+                min_24h_trade_price_krw = excluded.min_24h_trade_price_krw,
+                last_24h_trade_price_krw = excluded.last_24h_trade_price_krw,
+                last_price = excluded.last_price,
+                last_change_rate = excluded.last_change_rate,
+                last_volatility_score = excluded.last_volatility_score,
+                last_liquidity_score = excluded.last_liquidity_score,
+                last_risk_score = excluded.last_risk_score,
+                last_scanned_at = excluded.last_scanned_at,
+                updated_at = excluded.updated_at
+            """,
+            [
+                (
+                    item.get("exchange", "upbit"),
+                    item["market"],
+                    item.get("symbol") or str(item["market"]).split("-")[-1],
+                    item.get("quote_currency", "KRW"),
+                    item.get("status", "DISCOVERED"),
+                    1 if item.get("is_enabled", True) else 0,
+                    1 if item.get("is_live_allowed", False) else 0,
+                    1 if item.get("is_auto_selectable", True) else 0,
+                    int(item.get("scan_rank", 0) or 0),
+                    float(item.get("score", 0.0) or 0.0),
+                    item.get("reason", ""),
+                    float(item.get("min_24h_trade_price_krw", 0.0) or 0.0),
+                    float(item.get("last_24h_trade_price_krw", 0.0) or 0.0),
+                    float(item.get("last_price", 0.0) or 0.0),
+                    float(item.get("last_change_rate", 0.0) or 0.0),
+                    float(item.get("last_volatility_score", 0.0) or 0.0),
+                    float(item.get("last_liquidity_score", 0.0) or 0.0),
+                    float(item.get("last_risk_score", 0.0) or 0.0),
+                    item.get("last_scanned_at") or now_utc,
+                    now_utc,
+                )
+                for item in items
+            ],
+        )
+        return conn.total_changes - before
+
+
+def load_market_universe(*, exchange: str | None = None, enabled_only: bool = False, auto_selectable_only: bool = False, live_allowed_only: bool = False, limit: int = 200) -> list[dict]:
+    filters: list[str] = []
+    params: list[object] = []
+    if exchange:
+        filters.append("exchange = ?")
+        params.append(exchange)
+    if enabled_only:
+        filters.append("is_enabled = 1")
+    if auto_selectable_only:
+        filters.append("is_auto_selectable = 1")
+    if live_allowed_only:
+        filters.append("is_live_allowed = 1")
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM market_universe
+            {where}
+            ORDER BY scan_rank ASC, score DESC, market ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [_normalize_market_universe_row(dict(row)) for row in rows]
+
+
+def load_market_universe_item(exchange: str, market: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM market_universe WHERE exchange = ? AND market = ?",
+            (exchange, market),
+        ).fetchone()
+    return _normalize_market_universe_row(dict(row)) if row else None
+
+
+def load_market_universe_item_by_id(market_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM market_universe WHERE id = ?", (market_id,)).fetchone()
+    return _normalize_market_universe_row(dict(row)) if row else None
+
+
+def update_market_universe_item(market_id: int, updates: dict) -> dict | None:
+    allowed = {
+        "status",
+        "is_enabled",
+        "is_live_allowed",
+        "is_auto_selectable",
+        "scan_rank",
+        "score",
+        "reason",
+        "min_24h_trade_price_krw",
+    }
+    values = {key: value for key, value in updates.items() if key in allowed}
+    if not values:
+        return load_market_universe_item_by_id(market_id)
+    db_values = {}
+    for key, value in values.items():
+        db_values[key] = int(bool(value)) if key in {"is_enabled", "is_live_allowed", "is_auto_selectable"} else value
+    db_values["updated_at"] = _utc_now()
+    columns = ", ".join(f"{key} = ?" for key in db_values)
+    params = list(db_values.values()) + [market_id]
+    with get_connection() as conn:
+        cursor = conn.execute(f"UPDATE market_universe SET {columns} WHERE id = ?", params)
+        if cursor.rowcount == 0:
+            return None
+    return load_market_universe_item_by_id(market_id)
+
+
+def market_is_live_allowed(exchange: str, market: str) -> bool:
+    item = load_market_universe_item(exchange, market)
+    if item is None:
+        return market == DEFAULT_MARKET
+    return bool(item.get("is_enabled") and item.get("is_live_allowed"))
+
+
+def market_is_auto_selectable(exchange: str, market: str) -> bool:
+    item = load_market_universe_item(exchange, market)
+    if item is None:
+        return market == DEFAULT_MARKET
+    return bool(item.get("is_enabled") and item.get("is_auto_selectable"))
 
 
 def insert_candles(candles: list[dict]) -> int:
@@ -984,8 +1268,9 @@ def save_validation_run(market: str, strategy: str, request: dict, rows: list[di
             """
             INSERT INTO strategy_validation_results (
                 run_id, market, unit, strategy, parameters_json, period_label,
-                metrics_json, warnings_json, stability_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metrics_json, warnings_json, stability_score, decision,
+                total_return, mdd, win_rate, trade_count, profit_factor
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -998,6 +1283,72 @@ def save_validation_run(market: str, strategy: str, request: dict, rows: list[di
                     json.dumps(row["metrics"], ensure_ascii=False),
                     json.dumps(row["warnings"], ensure_ascii=False),
                     row["stability_score"],
+                    row.get("decision", "OBSERVE"),
+                    float(row.get("metrics", {}).get("total_return", 0.0) or 0.0),
+                    float(row.get("metrics", {}).get("mdd", 0.0) or 0.0),
+                    float(row.get("metrics", {}).get("win_rate", 0.0) or 0.0),
+                    int(row.get("metrics", {}).get("trade_count", 0) or 0),
+                    float(row.get("metrics", {}).get("profit_factor", 0.0) or 0.0),
+                )
+                for row in rows
+            ],
+        )
+        return run_id
+
+
+def save_strategy_validation_run(run: dict, rows: list[dict]) -> int:
+    now_utc = _utc_now()
+    summary = run.get("summary", {})
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO strategy_validation_runs (
+                exchange, market_count, strategy_count, timeframes_json,
+                periods_json, risk_json, request_json, summary_json,
+                status, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run.get("exchange", "upbit"),
+                int(run.get("market_count", 0) or 0),
+                int(run.get("strategy_count", 0) or 0),
+                json.dumps(run.get("timeframes", []), ensure_ascii=False),
+                json.dumps(run.get("periods", []), ensure_ascii=False),
+                json.dumps(run.get("risk", {}), ensure_ascii=False),
+                json.dumps(run.get("request", {}), ensure_ascii=False),
+                json.dumps(summary, ensure_ascii=False),
+                run.get("status", "COMPLETED"),
+                run.get("started_at") or now_utc,
+                run.get("finished_at") or now_utc,
+            ),
+        )
+        run_id = int(cursor.lastrowid)
+        conn.executemany(
+            """
+            INSERT INTO strategy_validation_results (
+                run_id, market, unit, strategy, parameters_json, period_label,
+                metrics_json, warnings_json, stability_score, decision,
+                total_return, mdd, win_rate, trade_count, profit_factor,
+                source_run_table
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'strategy_validation_runs')
+            """,
+            [
+                (
+                    run_id,
+                    row["market"],
+                    row["unit"],
+                    row["strategy"],
+                    json.dumps(row["parameters"], ensure_ascii=False),
+                    row["period_label"],
+                    json.dumps(row["metrics"], ensure_ascii=False),
+                    json.dumps(row.get("warnings", []), ensure_ascii=False),
+                    float(row.get("stability_score", 0.0) or 0.0),
+                    row.get("decision", "OBSERVE"),
+                    float(row.get("metrics", {}).get("total_return", 0.0) or 0.0),
+                    float(row.get("metrics", {}).get("mdd", 0.0) or 0.0),
+                    float(row.get("metrics", {}).get("win_rate", 0.0) or 0.0),
+                    int(row.get("metrics", {}).get("trade_count", 0) or 0),
+                    float(row.get("metrics", {}).get("profit_factor", 0.0) or 0.0),
                 )
                 for row in rows
             ],
@@ -1033,22 +1384,35 @@ def save_candidate_strategy(candidate: dict) -> int:
                 candidate.get("warning", ""),
                 candidate.get("name") or f"{candidate['strategy']} · {candidate['unit']}m · {float(candidate['score']):.2f}pt",
                 candidate.get("description", ""),
-                candidate.get("status", "ACTIVE"),
+                normalize_candidate_status(candidate.get("status"), fallback="ACTIVE"),
                 now_utc,
             ),
         )
         return int(cursor.lastrowid)
 
 
-def load_candidate_strategies(limit: int = 50) -> list[dict]:
+def load_candidate_strategies(limit: int = 50, *, statuses: list[str] | None = None, market: str | None = None) -> list[dict]:
+    filters: list[str] = []
+    params: list[object] = []
+    if statuses:
+        normalized = [normalize_candidate_status(status) for status in statuses]
+        placeholders = ", ".join("?" for _ in normalized)
+        filters.append(f"status IN ({placeholders})")
+        params.extend(normalized)
+    if market:
+        filters.append("market = ?")
+        params.append(market)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    params.append(limit)
     with get_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM candidate_strategies
+            {where}
             ORDER BY score DESC, updated_at DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            params,
         ).fetchall()
     candidates = []
     for row in rows:
@@ -1103,7 +1467,7 @@ def ensure_default_candidate_strategies() -> int:
                 candidate.get("warning", ""),
                 candidate["name"],
                 candidate.get("description", ""),
-                candidate.get("status", "ACTIVE"),
+                normalize_candidate_status(candidate.get("status"), fallback="ACTIVE"),
                 now_utc,
             )
             if row is None:
@@ -1183,6 +1547,8 @@ def update_candidate_strategy(candidate_id: int, updates: dict) -> dict | None:
     values = {key: value for key, value in updates.items() if key in allowed}
     if not values:
         return current
+    if "status" in values:
+        values["status"] = normalize_candidate_status(str(values["status"]), fallback=current.get("status", "ACTIVE"))
     db_values = {}
     for key, value in values.items():
         if key == "parameters":
@@ -1212,8 +1578,185 @@ def clone_candidate_strategy(candidate_id: int) -> dict | None:
 
 
 def set_candidate_strategy_status(candidate_id: int, status: str) -> dict | None:
-    normalized = "ACTIVE" if status.upper() == "ACTIVE" else "INACTIVE"
+    normalized = normalize_candidate_status(status, fallback="INACTIVE")
     return update_candidate_strategy(candidate_id, {"status": normalized})
+
+
+def record_candidate_promotion(
+    candidate_strategy_id: int,
+    *,
+    from_status: str,
+    to_status: str,
+    reason: str = "",
+    score: float = 0.0,
+    metadata: dict | None = None,
+) -> dict:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO candidate_strategy_promotions (
+                candidate_strategy_id, from_status, to_status, reason, score, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                candidate_strategy_id,
+                normalize_candidate_status(from_status, fallback=from_status),
+                normalize_candidate_status(to_status, fallback=to_status),
+                reason,
+                float(score or 0.0),
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute("SELECT * FROM candidate_strategy_promotions WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    item = dict(row)
+    item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+    return item
+
+
+def promote_candidate_strategy(candidate_id: int, to_status: str, *, reason: str = "", metadata: dict | None = None) -> dict | None:
+    current = load_candidate_strategy(candidate_id)
+    if current is None:
+        return None
+    from_status = str(current.get("status") or "ACTIVE")
+    normalized = normalize_candidate_status(to_status, fallback=from_status)
+    updated = update_candidate_strategy(candidate_id, {"status": normalized})
+    if updated is None:
+        return None
+    record_candidate_promotion(
+        candidate_id,
+        from_status=from_status,
+        to_status=normalized,
+        reason=reason,
+        score=float(updated.get("score") or 0.0),
+        metadata=metadata,
+    )
+    return updated
+
+
+def reject_candidate_strategy(candidate_id: int, *, reason: str = "", metadata: dict | None = None) -> dict | None:
+    return promote_candidate_strategy(candidate_id, "REJECTED", reason=reason, metadata=metadata)
+
+
+def load_live_eligible_candidate_strategies(limit: int = 50) -> list[dict]:
+    return load_candidate_strategies(limit, statuses=sorted(LIVE_CANDIDATE_STATUSES))
+
+
+def load_active_strategy_selection() -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM active_strategy_selection
+            WHERE status = 'LIVE_ACTIVE'
+            ORDER BY selected_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["parameters"] = json.loads(item.pop("parameters_json") or "{}")
+    return item
+
+
+def save_active_strategy_selection(candidate: dict, *, reason: str = "", replaced_candidate_strategy_id: int | None = None, cooldown_until: str | None = None) -> dict:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE active_strategy_selection
+            SET status = 'REPLACED',
+                updated_at = ?
+            WHERE status = 'LIVE_ACTIVE'
+            """,
+            (now_utc,),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO active_strategy_selection (
+                candidate_strategy_id, market, strategy, unit, parameters_json,
+                status, selected_reason, selected_at, replaced_candidate_strategy_id,
+                cooldown_until, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'LIVE_ACTIVE', ?, ?, ?, ?, ?)
+            """,
+            (
+                int(candidate["id"]),
+                candidate["market"],
+                candidate["strategy"],
+                int(candidate["unit"]),
+                json.dumps(candidate.get("parameters", {}), ensure_ascii=False),
+                reason,
+                now_utc,
+                replaced_candidate_strategy_id,
+                cooldown_until,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM active_strategy_selection WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    item = dict(row)
+    item["parameters"] = json.loads(item.pop("parameters_json") or "{}")
+    return item
+
+
+def record_strategy_switch(
+    *,
+    from_candidate_strategy_id: int | None,
+    to_candidate_strategy_id: int | None,
+    from_market: str | None,
+    to_market: str | None,
+    decision: str,
+    reason: str = "",
+    blocked_reason: str = "",
+    score_delta: float = 0.0,
+) -> dict:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO strategy_switch_logs (
+                from_candidate_strategy_id, to_candidate_strategy_id, from_market,
+                to_market, decision, reason, blocked_reason, score_delta
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                from_candidate_strategy_id,
+                to_candidate_strategy_id,
+                from_market,
+                to_market,
+                decision,
+                reason,
+                blocked_reason,
+                float(score_delta or 0.0),
+            ),
+        )
+        row = conn.execute("SELECT * FROM strategy_switch_logs WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def load_strategy_switch_logs(limit: int = 20) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM strategy_switch_logs
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_strategy_switches_today() -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS value
+            FROM strategy_switch_logs
+            WHERE decision = 'APPLIED'
+              AND date(created_at) = date('now')
+            """
+        ).fetchone()
+    return int(row["value"] or 0) if row else 0
 
 
 def delete_candidate_strategy(candidate_id: int) -> bool:

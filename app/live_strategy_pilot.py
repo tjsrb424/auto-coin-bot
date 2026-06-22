@@ -24,6 +24,7 @@ from app.database import (
     insert_candles,
     insert_live_order_log,
     insert_live_signal_log,
+    load_active_strategy_selection,
     load_candidate_strategy,
     load_bot_operation_policy,
     load_candles,
@@ -33,11 +34,13 @@ from app.database import (
     load_open_live_position_for_strategy,
     load_live_position_by_entry_order_uuid,
     load_running_live_strategy_sessions,
+    market_is_live_allowed,
     update_order_intent,
     update_live_order_log,
     update_live_position,
     update_live_strategy_session,
 )
+from app.auto_strategy_selector import evaluate_auto_strategy_selector
 from app.forward_paper import latest_completed_candle
 from app.live_broker import (
     BithumbBroker,
@@ -170,6 +173,17 @@ def _session_candidate(session: dict, config: LiveStrategyConfig) -> dict | None
     return load_candidate_strategy(int(candidate_id)) if candidate_id is not None else None
 
 
+def _session_market(session: dict, config: LiveStrategyConfig) -> str:
+    return str(session.get("market") or config.allowed_market or "KRW-BTC")
+
+
+def _active_selector_candidate() -> dict | None:
+    active = load_active_strategy_selection()
+    if not active:
+        return None
+    return load_candidate_strategy(int(active["candidate_strategy_id"]))
+
+
 def _neutral_legacy_signal() -> dict:
     return {
         "signal": "HOLD",
@@ -183,10 +197,11 @@ def live_strategy_status() -> dict:
     session = load_latest_live_strategy_session()
     if session and session.get("current_open_order_uuid"):
         session = _sync_live_strategy_order_status(session, config)
+    session_market = _session_market(session or {}, config)
     open_position = load_open_live_position(
         int(session["id"]) if session else None,
         config.allowed_exchange,
-        config.allowed_market,
+        session_market,
     )
     exit_state = live_exit_status(
         int(session["id"]) if session else None,
@@ -197,7 +212,7 @@ def live_strategy_status() -> dict:
         "position": open_position,
         **exit_state,
         "exchange": config.allowed_exchange,
-        "market": config.allowed_market,
+        "market": session_market,
         "current_mode": _mode(session),
         "live_trading_enabled": live_config.live_trading_enabled,
         "live_auto_trading_enabled": config.live_auto_trading_enabled,
@@ -225,21 +240,26 @@ def start_live_strategy_pilot(*, candidate_strategy_id: int | None = None, confi
     if order_confirmation != "PLACE AUTO LIVE ORDER":
         return {"ok": False, "message": "PLACE AUTO LIVE ORDER confirmation is required.", **live_strategy_status()}
     config = LiveStrategyConfig.from_env()
-    smart_autonomous = candidate_strategy_id is None
-    candidate = _smart_autonomous_candidate(config) if smart_autonomous else load_candidate_strategy(int(candidate_strategy_id))
+    active_candidate = _active_selector_candidate() if candidate_strategy_id is None else None
+    smart_autonomous = candidate_strategy_id is None and active_candidate is None
+    candidate = active_candidate or (_smart_autonomous_candidate(config) if smart_autonomous else load_candidate_strategy(int(candidate_strategy_id)))
     if candidate is None:
         return {"ok": False, "message": "Candidate strategy not found.", **live_strategy_status()}
-    if candidate["market"] != config.allowed_market:
-        return {"ok": False, "message": "Only KRW-BTC candidate strategies are allowed.", **live_strategy_status()}
+    candidate_market = str(candidate["market"])
+    candidate_status = str(candidate.get("status") or "")
+    if candidate_market != config.allowed_market and not (
+        candidate_status in {"LIVE_ELIGIBLE", "LIVE_ACTIVE"} and market_is_live_allowed(config.allowed_exchange, candidate_market)
+    ):
+        return {"ok": False, "message": "Candidate market is not live-allowed.", **live_strategy_status()}
     if config.allowed_exchange != "bithumb":
         return {"ok": False, "message": "AUTO_ALLOWED_EXCHANGE=bithumb 설정이 필요합니다.", **live_strategy_status()}
-    policy = load_bot_operation_policy(config.allowed_market)
+    policy = load_bot_operation_policy(candidate_market)
     if not policy.get("auto_trading_enabled"):
         return {"ok": False, "message": "bot_operation_policy.auto_trading_enabled is OFF.", **live_strategy_status()}
     session_id = create_live_strategy_session(
         {
             "exchange": config.allowed_exchange,
-            "market": config.allowed_market,
+            "market": candidate_market,
             "candidate_strategy_id": candidate["id"],
             "strategy_name": candidate["strategy"],
             "strategy_parameters": candidate.get("parameters", {}),
@@ -298,11 +318,14 @@ def run_live_strategy_tick() -> None:
 
 
 async def process_live_strategy_sessions() -> None:
+    config = LiveStrategyConfig.from_env()
+    sessions = load_running_live_strategy_sessions()
     try:
-        await sync_open_orders("bithumb", "KRW-BTC")
+        for market in sorted({_session_market(session, config) for session in sessions} or {"KRW-BTC"}):
+            await sync_open_orders("bithumb", market)
     except Exception as exc:
         logger.warning("[live-strategy] pending order reconciliation failed error=%s", exc)
-    for session in load_running_live_strategy_sessions():
+    for session in sessions:
         try:
             await _process_session(session)
         except Exception as exc:
@@ -317,6 +340,7 @@ async def process_live_strategy_sessions() -> None:
 async def _process_session(session: dict) -> None:
     config = LiveStrategyConfig.from_env()
     live_config = LiveTradingConfig.for_exchange(config.allowed_exchange)
+    session_market = _session_market(session, config)
 
     if is_emergency_stopped():
         await _handle_emergency(session)
@@ -326,13 +350,13 @@ async def _process_session(session: dict) -> None:
         await _manage_open_order(session, config)
         return
 
-    position = load_open_live_position(int(session["id"]), config.allowed_exchange, config.allowed_market)
+    position = load_open_live_position(int(session["id"]), config.allowed_exchange, session_market)
     if position:
         await _process_open_position(session, position, config, live_config)
         return
 
     if _is_smart_autonomous_session(session):
-        smart_position = load_open_live_position(None, config.allowed_exchange, config.allowed_market)
+        smart_position = load_open_live_position(None, config.allowed_exchange, session_market)
         if smart_position:
             update_live_strategy_session(
                 int(session["id"]),
@@ -348,7 +372,7 @@ async def _process_session(session: dict) -> None:
 
     strategy_position = load_open_live_position_for_strategy(
         config.allowed_exchange,
-        config.allowed_market,
+        session_market,
         int(session["candidate_strategy_id"]),
     )
     if strategy_position:
@@ -381,9 +405,9 @@ async def _process_session(session: dict) -> None:
         update_live_strategy_session(int(session["id"]), {"status": "ERROR", "last_risk_result": "BLOCKED_DUPLICATE_SIGNAL"})
         return
 
-    fresh = await fetch_minute_candles(market=config.allowed_market, unit=int(candidate["unit"]), count=300)
+    fresh = await fetch_minute_candles(market=session_market, unit=int(candidate["unit"]), count=300)
     insert_candles(fresh)
-    candles = load_candles(config.allowed_market, int(candidate["unit"]), 300)
+    candles = load_candles(session_market, int(candidate["unit"]), 300)
     latest = latest_completed_candle(candles, int(candidate["unit"])) if config.require_completed_candle else (candles[-1] if candles else None)
     if latest is None:
         return
@@ -421,7 +445,7 @@ async def _process_session(session: dict) -> None:
         return
 
     if signal["signal"] == "SELL":
-        position = load_open_live_position(int(session["id"]), config.allowed_exchange, config.allowed_market)
+        position = load_open_live_position(int(session["id"]), config.allowed_exchange, session_market)
         if position and not config.exit_enabled:
             update_live_position(int(position["id"]), {"status": "EXIT_CANDIDATE", "current_price": float(latest["trade_price"])})
             update_live_strategy_session(int(session["id"]), {"current_position_id": int(position["id"]), "last_risk_result": "EXIT_CANDIDATE_ONLY"})
@@ -443,9 +467,10 @@ async def _process_open_position(session: dict, position: dict, config: LiveStra
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_DUPLICATE_SIGNAL"})
         return
 
-    fresh = await fetch_minute_candles(market=config.allowed_market, unit=int(candidate["unit"]), count=300)
+    session_market = _session_market(session, config)
+    fresh = await fetch_minute_candles(market=session_market, unit=int(candidate["unit"]), count=300)
     insert_candles(fresh)
-    candles = load_candles(config.allowed_market, int(candidate["unit"]), 300)
+    candles = load_candles(session_market, int(candidate["unit"]), 300)
     latest = latest_completed_candle(candles, int(candidate["unit"])) if config.require_completed_candle else (candles[-1] if candles else None)
     if latest is None:
         return
@@ -552,6 +577,7 @@ async def _record_smart_decision(*, session: dict, candidate: dict, candles: lis
 
 
 async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig, *, check_cooldown: bool = True) -> str | None:
+    session_market = _session_market(session, config)
     if is_emergency_stopped():
         return "BLOCKED_EMERGENCY_STOP"
     if not live_config.live_trading_enabled:
@@ -562,9 +588,9 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_AUTO_STRATEGY_DISABLED"
     if config.allowed_exchange != "bithumb" or session["exchange"] != "bithumb":
         return "BLOCKED_EXCHANGE_NOT_ALLOWED"
-    if config.allowed_market != "KRW-BTC" or session["market"] != "KRW-BTC":
+    if session_market != "KRW-BTC" and not market_is_live_allowed("bithumb", session_market):
         return "BLOCKED_MARKET_NOT_ALLOWED"
-    if not load_bot_operation_policy(config.allowed_market).get("auto_trading_enabled"):
+    if not load_bot_operation_policy(session_market).get("auto_trading_enabled"):
         return "SMART_POLICY_AUTO_TRADING_DISABLED"
     if config.allowed_order_type != "limit":
         return "BLOCKED_ORDER_TYPE_NOT_ALLOWED"
@@ -572,13 +598,13 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_MARKET_ORDER_DISABLED"
     if not live_config.api_key_loaded:
         return "BLOCKED_ORDER_CHANCE_FAILED"
-    if config.max_orders_per_day > 0 and count_live_strategy_orders_today("bithumb", "KRW-BTC") >= config.max_orders_per_day:
+    if config.max_orders_per_day > 0 and count_live_strategy_orders_today("bithumb", session_market) >= config.max_orders_per_day:
         return "BLOCKED_MAX_ORDERS_PER_DAY"
-    if has_open_live_strategy_order("bithumb", "KRW-BTC"):
+    if has_open_live_strategy_order("bithumb", session_market):
         return "BLOCKED_OPEN_ORDER_EXISTS"
-    if not _is_smart_autonomous_session(session) and has_open_live_position_for_strategy("bithumb", "KRW-BTC", int(session["candidate_strategy_id"])):
+    if not _is_smart_autonomous_session(session) and has_open_live_position_for_strategy("bithumb", session_market, int(session["candidate_strategy_id"])):
         return "BLOCKED_OPEN_POSITION_EXISTS"
-    recovery_block = await auto_order_recovery_block_reason("bithumb", "KRW-BTC")
+    recovery_block = await auto_order_recovery_block_reason("bithumb", session_market)
     if recovery_block:
         return recovery_block
     last_order_time = session.get("last_order_time_utc")
@@ -901,6 +927,7 @@ async def _submit_smart_intent_order(
     intent_id = intent.get("id")
     side = str(intent.get("side") or "").upper()
     current_price = float(candle["trade_price"])
+    market = str(session.get("market") or "KRW-BTC")
     amount_requested = abs(_float(intent.get("delta_value_krw")))
     if side in {"BID", "BUY"} and 0 < amount_requested < live_config.min_order_krw:
         _mark_smart_dust_intent(
@@ -958,7 +985,7 @@ async def _submit_smart_intent_order(
     broker = get_live_broker("bithumb")
     try:
         balances = await broker.get_balances()
-        chance = await broker.get_order_chance("KRW-BTC")
+        chance = await broker.get_order_chance(market)
     except Exception as exc:
         _insert_blocked_log(session, "SMART_ORDER_CHANCE_FAILED", str(exc), candle["candle_time_utc"], signal)
         if intent_id:
@@ -1018,7 +1045,7 @@ async def _submit_smart_intent_order(
         "request_id": request_id,
         "client_order_id": request_id[:36],
         "exchange": "bithumb",
-        "market": "KRW-BTC",
+        "market": market,
         "side": "BUY",
         "ord_type": "limit",
         "order_type": "LIMIT",
@@ -1130,7 +1157,7 @@ async def _submit_smart_intent_sell_order(
     broker = get_live_broker("bithumb")
     try:
         balances = await broker.get_balances()
-        chance = await broker.get_order_chance("KRW-BTC")
+        chance = await broker.get_order_chance(market)
     except Exception as exc:
         _insert_blocked_log(session, "SMART_ORDER_CHANCE_FAILED", str(exc), candle["candle_time_utc"], signal)
         if intent_id:
@@ -1152,7 +1179,7 @@ async def _submit_smart_intent_sell_order(
         "request_id": request_id,
         "client_order_id": request_id[:36],
         "exchange": "bithumb",
-        "market": "KRW-BTC",
+        "market": market,
         "side": "SELL",
         "ord_type": "limit",
         "order_type": "LIMIT",
@@ -1217,9 +1244,10 @@ async def _submit_smart_intent_sell_order(
 
 async def _submit_entry_order(session: dict, candidate: dict, candle: dict, signal: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> None:
     broker = get_live_broker("bithumb")
+    market = str(session.get("market") or "KRW-BTC")
     try:
         balances = await broker.get_balances()
-        chance = await broker.get_order_chance("KRW-BTC")
+        chance = await broker.get_order_chance(market)
     except Exception as exc:
         _insert_blocked_log(session, "BLOCKED_ORDER_CHANCE_FAILED", str(exc), candle["candle_time_utc"], signal)
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_ORDER_CHANCE_FAILED", "last_order_status": "BLOCKED"})
@@ -1239,7 +1267,7 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         "request_id": request_id,
         "client_order_id": request_id[:36],
         "exchange": "bithumb",
-        "market": "KRW-BTC",
+        "market": market,
         "side": "BUY",
         "ord_type": "limit",
         "order_type": "LIMIT",
@@ -1261,7 +1289,7 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         risk["allowed"] = False
         risk["risk_result"] = "BLOCKED_MAX_ORDER_AMOUNT"
         risk["blocked_reason"] = "BLOCKED_MAX_ORDER_AMOUNT"
-    liquidity_snapshot = await one_minute_liquidity_snapshot(config.allowed_market, require_completed=config.require_completed_candle)
+    liquidity_snapshot = await one_minute_liquidity_snapshot(market, require_completed=config.require_completed_candle)
     market_snapshot = {
         "price": current_price,
         "range_rate": range_rate,

@@ -42,6 +42,7 @@ import {
   TrendingUp,
   Wallet
 } from "lucide-react";
+import { BacktestValidationView } from "./views/BacktestValidationView";
 
 const STAGE_WIDTH = 1672;
 const STAGE_HEIGHT = 941;
@@ -576,7 +577,7 @@ type DashboardData = {
   updatedAt: string | null;
 };
 
-type ReferenceView = "dashboard" | "auto-trade" | "analysis" | "operations" | "portfolio" | "trades" | "alerts";
+type ReferenceView = "dashboard" | "auto-trade" | "analysis" | "operations" | "portfolio" | "trades" | "backtest" | "alerts";
 
 const navItems = [
   { id: "dashboard", label: "대시보드", icon: Home },
@@ -1306,6 +1307,7 @@ function isRuntimeRunning(data: DashboardData) {
 }
 
 function autoRuntimeMs(data: DashboardData, now: number) {
+  if (!isRuntimeRunning(data)) return null;
   const sessions = [data.liveStrategy?.session, data.autoPilot?.session].filter(Boolean);
   const runningStarts = sessions
     .filter((session) => isRunning(session?.status))
@@ -1435,7 +1437,7 @@ function Sidebar({ activeView, onViewChange }: { activeView: ReferenceView; onVi
       <nav className="ref-nav">
         {navItems.map((item) => {
           const Icon = item.icon;
-          const isImplemented = item.id === "dashboard" || item.id === "auto-trade" || item.id === "analysis" || item.id === "operations" || item.id === "portfolio" || item.id === "trades" || item.id === "alerts";
+          const isImplemented = item.id === "dashboard" || item.id === "auto-trade" || item.id === "analysis" || item.id === "operations" || item.id === "portfolio" || item.id === "trades" || item.id === "backtest" || item.id === "alerts";
           const isActive = activeView === item.id;
           return (
             <button
@@ -3147,7 +3149,7 @@ function AutoStatusPanel({
   ]).size;
   const dailyPnl = data.risk?.risk_state?.daily_total_pnl ?? data.paper?.balance?.total_pnl ?? null;
   const totalPnl = data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
-  const runtimeText = formatRuntimeDuration(autoRuntimeMs(data, now));
+  const runtimeText = autoRunning ? formatRuntimeDuration(autoRuntimeMs(data, now)) : "-";
 
   return (
     <RefPanel className="ref-auto-status-panel">
@@ -3160,7 +3162,7 @@ function AutoStatusPanel({
         <p>봇이 {runningStrategies || 0}개 전략으로 {activeAssets || 0}개 자산을 모니터링합니다.</p>
         <div className="ref-auto-status-meta">
           <RefStatusBadge value={data.risk?.risk_state?.status === "OK" ? "정상 운영" : statusLabel(data.risk?.risk_state?.status ?? "WAITING")} tone={autoRunning ? "green" : statusTone(data.risk?.risk_state?.status)} />
-          <span>{autoRunning ? "가동 시간" : "최근 가동"} {runtimeText}</span>
+          <span>가동 시간 {runtimeText}</span>
         </div>
       </div>
       <div className="ref-auto-master">
@@ -4626,6 +4628,7 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
           {activeView === "operations" && <OperationsView data={data} refresh={refresh} />}
           {activeView === "portfolio" && <PortfolioView data={data} totalEquity={totalEquity} totalPnl={totalPnl} totalReturn={totalReturn} onSimulate={() => setActiveView("operations")} />}
           {activeView === "trades" && <TradeHistoryView data={data} refresh={refresh} />}
+          {activeView === "backtest" && <BacktestValidationView exchange={selectedExchange} />}
           {activeView === "alerts" && <AlertsView data={data} />}
         </div>
       </div>
