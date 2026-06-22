@@ -462,6 +462,24 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["blocking"])
         self.assertEqual(database.load_live_recovery_events(1)[0]["event_type"], "BALANCE_MISMATCH")
 
+    async def test_balance_mismatch_event_is_deduped(self) -> None:
+        broker = AsyncMock()
+        broker.get_balances.return_value = {
+            "by_currency": {"BTC": {"balance": 0.01, "locked": 0.0}},
+            "btc": {"balance": 0.01, "locked": 0.0},
+            "krw": {"balance": 0.0, "locked": 0.0},
+        }
+
+        with patch("app.live_recovery.get_live_broker", return_value=broker):
+            first = await reconcile_balances("bithumb", "KRW-BTC")
+            second = await reconcile_balances("bithumb", "KRW-BTC")
+
+        self.assertEqual(first["status"], "BALANCE_MISMATCH")
+        self.assertEqual(second["status"], "BALANCE_MISMATCH")
+        events = database.load_live_recovery_events(10)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "BALANCE_MISMATCH")
+
     async def test_balance_reconciliation_recovers_filled_entry_before_mismatch_check(self) -> None:
         session_id = create_strategy_session()
         database.insert_live_order_log(

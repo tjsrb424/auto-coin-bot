@@ -35,6 +35,7 @@ logger = logging.getLogger("uvicorn.error")
 OPEN_ORDER_STATES = {"SUBMITTED", "WAITING", "PARTIALLY_FILLED"}
 BALANCE_MISMATCH_VOLUME_TOLERANCE = 0.000001
 BALANCE_MISMATCH_RELATIVE_TOLERANCE = 0.01
+RECOVERY_EVENT_DEDUPE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -588,6 +589,55 @@ def recent_recovery_events(limit: int = 20) -> list[dict]:
     return load_live_recovery_events(limit)
 
 
+def _recovery_event_dedupe_seconds() -> int:
+    try:
+        return max(int(os.getenv("LIVE_RECOVERY_EVENT_DEDUPE_SECONDS", str(RECOVERY_EVENT_DEDUPE_SECONDS))), 0)
+    except (TypeError, ValueError):
+        return RECOVERY_EVENT_DEDUPE_SECONDS
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _balance_mismatch_signature(payload: dict | None) -> tuple:
+    payload = payload or {}
+    return (
+        round(_float(payload.get("internal_btc_position")), 12),
+        round(_float(payload.get("exchange_btc_total")), 12),
+        round(_float(payload.get("difference_btc")), 12),
+        int(payload.get("open_position_count") or 0),
+    )
+
+
+def _should_suppress_recovery_event(event_type: str, exchange: str, market: str, payload: dict | None) -> bool:
+    if event_type != "BALANCE_MISMATCH":
+        return False
+    dedupe_seconds = _recovery_event_dedupe_seconds()
+    if dedupe_seconds <= 0:
+        return False
+    now = datetime.now(timezone.utc)
+    current_signature = _balance_mismatch_signature(payload)
+    for event in load_live_recovery_events(10):
+        if event.get("event_type") != event_type:
+            continue
+        if str(event.get("exchange") or "") != exchange or str(event.get("market") or "") != market:
+            continue
+        created_at = _parse_utc(event.get("created_at"))
+        if created_at is None:
+            continue
+        if (now - created_at).total_seconds() > dedupe_seconds:
+            continue
+        if _balance_mismatch_signature(event.get("payload")) == current_signature:
+            return True
+    return False
+
+
 def log_recovery_event(
     event_type: str,
     severity: str,
@@ -600,6 +650,8 @@ def log_recovery_event(
     order_uuid: str | None = None,
     payload: dict | None = None,
 ) -> None:
+    if _should_suppress_recovery_event(event_type, exchange, market, payload):
+        return
     insert_live_recovery_event(
         {
             "event_type": event_type,

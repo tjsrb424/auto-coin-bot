@@ -94,7 +94,8 @@ jobs:
               AUTO_ORDER_RESERVATION_TTL_MINUTES=30 \
               AUTO_NEXT_ENTRY_TTL_MINUTES=360 \
               AUTO_CAPITAL_ALLOCATOR_LOCK_TTL_SECONDS=300 \
-              AUTO_CAPITAL_SNAPSHOT_MAX_AGE_SECONDS=10
+              AUTO_CAPITAL_SNAPSHOT_MAX_AGE_SECONDS=10 \
+              LIVE_RECOVERY_EVENT_DEDUPE_SECONDS=300
             COMPOSE_PARALLEL_LIMIT=1 sudo docker compose --env-file .env.production build backend
             sudo docker compose --env-file .env.production up -d backend
             APP_COMMIT=\$(git rev-parse --short HEAD) COMPOSE_PARALLEL_LIMIT=1 sudo docker compose --env-file .env.production build frontend
