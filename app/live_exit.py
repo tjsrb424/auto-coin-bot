@@ -23,7 +23,8 @@ from app.database import (
     update_live_position,
     update_live_strategy_session,
 )
-from app.live_broker import LiveTradingConfig, _available_balance, get_live_broker, masked_exchange_request
+from app.capital_snapshot import build_capital_snapshot_async, sellable_volume_for_position, snapshot_is_fresh
+from app.live_broker import LiveTradingConfig, get_live_broker, masked_exchange_request
 from app.live_recovery import is_timeout_exception, log_recovery_event, normalize_exchange_order, reconcile_balances, sync_exit_order_position
 from app.risk_manager import check_order_risk
 
@@ -68,6 +69,7 @@ def live_exit_status(session_id: int | None = None, position_id: int | None = No
     elif session_id is not None:
         candidate = load_latest_exit_candidate(session_id=session_id)
     config = LiveExitConfig.from_env()
+    live_config = LiveTradingConfig.for_exchange(str((candidate or {}).get("exchange") or "bithumb"))
     return {
         "exit_candidate": candidate,
         "auto_exit_enabled": config.exit_enabled,
@@ -359,8 +361,8 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
         risk_result = "BLOCKED_POSITION_NOT_OPEN"
     elif str(candidate.get("exchange")) != "bithumb":
         risk_result = "BLOCKED_EXCHANGE_NOT_ALLOWED"
-    elif str(candidate.get("market")) != "KRW-BTC":
-        risk_result = "BLOCKED_MARKET_NOT_ALLOWED"
+    elif str(candidate.get("market")) != str(position.get("market")):
+        risk_result = "BLOCKED_SELL_POSITION_NOT_FOUND"
     elif config.exit_order_type != "limit":
         risk_result = "BLOCKED_MARKET_ORDER_DISABLED"
     elif config.market_order_enabled:
@@ -387,8 +389,24 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
                 broker = get_live_broker(str(candidate["exchange"]))
                 balances = await broker.get_balances()
                 await broker.get_order_chance(str(candidate["market"]))
-                if _available_balance(balances, "BTC") + 1e-12 < float(candidate["volume"]):
-                    risk_result = "BLOCKED_INSUFFICIENT_POSITION"
+                snapshot = await build_capital_snapshot_async(str(candidate["exchange"]))
+                if not snapshot_is_fresh(snapshot):
+                    risk_result = "BLOCKED_SNAPSHOT_STALE"
+                else:
+                    sellable_volume = sellable_volume_for_position(snapshot, position)
+                    target_price = float(candidate.get("target_exit_price") or 0.0)
+                    if sellable_volume <= 0:
+                        risk_result = "BLOCKED_SELL_BALANCE_ZERO"
+                    elif sellable_volume + 1e-12 < float(candidate["volume"]):
+                        adjusted_amount = sellable_volume * target_price
+                        if adjusted_amount < live_config.min_order_krw:
+                            risk_result = "BLOCKED_SELL_VOLUME_BELOW_MIN"
+                        else:
+                            candidate = {
+                                **candidate,
+                                "volume": sellable_volume,
+                                "expected_amount_krw": adjusted_amount,
+                            }
             except Exception as exc:
                 risk_result = "BLOCKED_ORDER_CHANCE_FAILED"
                 reason = str(exc)

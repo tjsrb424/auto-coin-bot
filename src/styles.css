@@ -7504,7 +7504,7 @@ input:disabled {
   left: 0;
   top: 0;
   width: 1430px;
-  height: 510px;
+  height: 548px;
   overflow: hidden;
   padding: 14px 18px;
 }
@@ -7821,7 +7821,7 @@ input:disabled {
   grid-template-columns: 180px repeat(5, minmax(0, 1fr));
   align-items: center;
   gap: 7px 10px;
-  min-height: 76px;
+  min-height: 112px;
   margin-top: 10px;
   overflow: hidden;
   border: 1px solid rgba(43, 149, 255, 0.26);
@@ -7958,34 +7958,34 @@ input:disabled {
 
 .ref-backtest-markets {
   left: 0;
-  top: 526px;
+  top: 564px;
   width: 454px;
-  height: 298px;
+  height: 260px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-ranking {
   left: 474px;
-  top: 526px;
+  top: 564px;
   width: 626px;
-  height: 298px;
+  height: 260px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-selector {
   left: 1120px;
-  top: 526px;
+  top: 564px;
   width: 310px;
-  height: 298px;
+  height: 260px;
   overflow: auto;
   padding: 18px;
 }
 
 .ref-backtest-market-list {
   display: grid;
-  max-height: 236px;
+  max-height: 198px;
   gap: 8px;
   margin-top: 14px;
   overflow: auto;

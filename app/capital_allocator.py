@@ -4,6 +4,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from app.capital_snapshot import build_capital_snapshot
 from app.database import (
     acquire_scheduler_task_lock,
     create_capital_allocation_run,
@@ -123,28 +124,32 @@ def allocation_score(candidate: dict, config: dict | None = None) -> float:
 def capital_allocator_status(exchange: str | None = None) -> dict:
     config = allocator_config()
     exchange = exchange or str(config["exchange"])
-    policy = load_global_bot_operation_policy()
-    slots = load_position_slots(int(config["max_slots"]), exchange)
-    reservations = load_active_order_reservations(exchange)
-    open_positions = load_open_live_positions_for_exchange(exchange)
-    current_exposure = sum(_position_value(position) for position in open_positions)
-    pending_reserved = sum(float(item.get("amount_krw") or 0.0) for item in reservations)
-    max_total = float(policy.get("max_total_exposure_krw") or 0.0)
-    cash_reserve = max_total * float(config["cash_reserve_pct"]) / 100
-    remaining = max(max_total - current_exposure - pending_reserved, 0.0)
+    snapshot = build_capital_snapshot(exchange)
+    slots = snapshot.get("slots") or load_position_slots(int(config["max_slots"]), exchange)
+    reservations = snapshot.get("reservations") or load_active_order_reservations(exchange)
     return {
         "enabled": bool(config["enabled"]),
         "exchange": exchange,
-        "policy": policy,
+        "policy": load_global_bot_operation_policy(),
         "max_slots": int(config["max_slots"]),
         "open_slot_count": len([slot for slot in slots if str(slot.get("status")) != "EMPTY"]),
         "empty_slot_count": len([slot for slot in slots if str(slot.get("status")) == "EMPTY"]),
-        "max_total_exposure_krw": max_total,
-        "current_open_position_value_krw": current_exposure,
-        "pending_buy_reserved_krw": pending_reserved,
-        "available_krw_balance": None,
-        "remaining_exposure_krw": remaining,
-        "cash_reserve_krw": cash_reserve,
+        "max_total_exposure_krw": snapshot.get("max_total_exposure_krw", 0.0),
+        "current_open_position_value_krw": snapshot.get("db_open_position_value_krw", 0.0),
+        "db_open_position_value_krw": snapshot.get("db_open_position_value_krw", 0.0),
+        "exchange_position_value_krw": snapshot.get("exchange_position_value_krw", 0.0),
+        "pending_buy_reserved_krw": snapshot.get("pending_buy_reserved_krw", 0.0),
+        "pending_exchange_buy_order_krw": snapshot.get("pending_exchange_buy_order_krw", 0.0),
+        "available_krw_balance": snapshot.get("available_krw_balance"),
+        "available_budget_krw": snapshot.get("available_budget_krw", 0.0),
+        "remaining_exposure_krw": snapshot.get("remaining_exposure_krw", 0.0),
+        "cash_reserve_krw": snapshot.get("cash_reserve_krw", 0.0),
+        "balance_mismatch_detected": bool(snapshot.get("balance_mismatch_detected")),
+        "open_order_mismatch_detected": bool(snapshot.get("open_order_mismatch_detected")),
+        "snapshot_created_at": snapshot.get("created_at"),
+        "snapshot_error": snapshot.get("snapshot_error", ""),
+        "snapshot_warnings": snapshot.get("warnings", []),
+        "snapshot_blockers": snapshot.get("blockers", []),
         "slots": slots,
         "reservations": reservations,
         "next_entry_queue": load_next_entry_queue(20, ["QUEUED", "BLOCKED"]),
@@ -200,11 +205,10 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
             return {"ok": True, "run": run, "accepted": accepted, "blocked": blocked}
 
         policy = load_global_bot_operation_policy()
-        slots = reconcile_position_slots(int(config["max_slots"]), exchange)
-        open_positions = load_open_live_positions_for_exchange(exchange)
-        reservations = load_active_order_reservations(exchange)
+        snapshot = build_capital_snapshot(exchange)
+        slots = snapshot.get("slots") or reconcile_position_slots(int(config["max_slots"]), exchange)
+        open_positions = snapshot.get("positions") or load_open_live_positions_for_exchange(exchange)
         open_markets = {str(item.get("market")) for item in open_positions}
-        occupied_slots = [slot for slot in slots if str(slot.get("status")) != "EMPTY"]
         empty_slots = [slot for slot in slots if str(slot.get("status")) == "EMPTY"]
         candidates = [
             item
@@ -213,12 +217,11 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
         ]
         candidates = sorted(candidates, key=lambda item: allocation_score(item, config), reverse=True)
 
-        max_total = float(policy.get("max_total_exposure_krw") or 0.0)
-        current_exposure = sum(_position_value(position) for position in open_positions)
-        pending_reserved = sum(float(item.get("amount_krw") or 0.0) for item in reservations)
-        remaining = max(max_total - current_exposure - pending_reserved, 0.0)
-        cash_reserve = max_total * float(config["cash_reserve_pct"]) / 100
-        available_budget = max(remaining - cash_reserve, 0.0)
+        max_total = float(snapshot.get("max_total_exposure_krw") or policy.get("max_total_exposure_krw") or 0.0)
+        current_exposure = float(snapshot.get("db_open_position_value_krw") or 0.0)
+        pending_reserved = float(snapshot.get("pending_buy_reserved_krw") or 0.0)
+        remaining = float(snapshot.get("remaining_exposure_krw") or 0.0)
+        available_budget = float(snapshot.get("available_budget_krw") or 0.0)
         max_single = max_total * float(config["single_position_max_exposure_pct"]) / 100
         accepted_count = 0
 
@@ -245,11 +248,24 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 continue
 
             block_reason = _candidate_block_reason(candidate, exchange, open_markets, config)
+            if not block_reason and snapshot.get("snapshot_error"):
+                block_reason = "BLOCKED_SNAPSHOT_FAILED"
+            if not block_reason and snapshot.get("balance_mismatch_detected"):
+                block_reason = "BLOCKED_BALANCE_MISMATCH"
+            if not block_reason and snapshot.get("open_order_mismatch_detected"):
+                block_reason = "BLOCKED_OPEN_ORDER_MISMATCH"
             score = allocation_score(candidate, config)
             desired_order = min(max_single, max(float(config["min_order_krw"]), max_single * min(score, 100.0) / 100))
             approved_order = min(available_budget, desired_order, max_single, float(config["max_order_krw"]))
             if approved_order < float(config["min_order_krw"]) and not block_reason:
-                block_reason = "BLOCKED_CAPITAL_TOO_SMALL"
+                if snapshot.get("available_krw_balance") is None:
+                    block_reason = "BLOCKED_EXCHANGE_BALANCE_UNAVAILABLE"
+                elif float(snapshot.get("available_krw_balance") or 0.0) < float(config["min_order_krw"]):
+                    block_reason = "BLOCKED_INSUFFICIENT_KRW_BALANCE"
+                elif remaining < float(config["min_order_krw"]):
+                    block_reason = "BLOCKED_REMAINING_EXPOSURE_TOO_SMALL"
+                else:
+                    block_reason = "BLOCKED_CAPITAL_TOO_SMALL"
 
             insert_capital_allocation_decision(
                 {
@@ -353,6 +369,7 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 "max_total_exposure_krw": max_total,
                 "current_exposure_krw": current_exposure,
                 "pending_reserved_krw": pending_reserved,
+                "available_krw_balance": snapshot.get("available_krw_balance"),
                 "remaining_exposure_krw": remaining,
                 "empty_slot_count": len(empty_slots),
                 "candidate_count": len(candidates),
@@ -370,6 +387,7 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 "accepted_count": len(accepted),
                 "blocked_count": len(blocked),
                 "empty_slot_count": len(empty_slots),
+                "snapshot_error": snapshot.get("snapshot_error", ""),
             },
         )
         return {"ok": True, "run": run, "accepted": accepted, "blocked": blocked, "status": capital_allocator_status(exchange)}

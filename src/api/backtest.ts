@@ -4,6 +4,7 @@ import type {
   AutoStrategySelectorStatus,
   BotPolicy,
   CapitalAllocatorStatus,
+  CapitalSnapshotResponse,
   DbSchemaStatus,
   HealthStatus,
   MarketUniverseItem,
@@ -92,6 +93,10 @@ export function runAutonomousOrchestratorNow() {
 
 export function fetchCapitalAllocatorStatus(exchange: string) {
   return requestJson<CapitalAllocatorStatus>(`/api/capital-allocator/status?exchange=${exchange}`);
+}
+
+export function fetchCapitalSnapshot(exchange: string) {
+  return requestJson<CapitalSnapshotResponse>(`/api/capital-snapshot?exchange=${exchange}`);
 }
 
 export function runCapitalAllocatorNow(exchange: string) {

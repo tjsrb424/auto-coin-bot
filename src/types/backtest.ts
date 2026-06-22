@@ -238,13 +238,30 @@ export type CapitalAllocatorStatus = {
   empty_slot_count: number;
   max_total_exposure_krw: number;
   current_open_position_value_krw: number;
+  db_open_position_value_krw?: number;
+  exchange_position_value_krw?: number;
   pending_buy_reserved_krw: number;
+  pending_exchange_buy_order_krw?: number;
+  available_krw_balance?: number | null;
+  available_budget_krw?: number;
   remaining_exposure_krw: number;
   cash_reserve_krw: number;
+  balance_mismatch_detected?: boolean;
+  open_order_mismatch_detected?: boolean;
+  snapshot_created_at?: string | null;
+  snapshot_error?: string;
+  snapshot_warnings?: string[];
+  snapshot_blockers?: string[];
   slots: PositionSlot[];
   reservations: Record<string, unknown>[];
   next_entry_queue: NextEntryQueueItem[];
   required_edge_pct: number;
+};
+
+export type CapitalSnapshotResponse = {
+  snapshot: Record<string, unknown>;
+  warnings: string[];
+  blockers: string[];
 };
 
 export type AutonomousOrchestratorRunResponse =

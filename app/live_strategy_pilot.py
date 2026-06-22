@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.backtest import candles_to_frame
+from app.capital_snapshot import build_capital_snapshot_async, snapshot_is_fresh
 from app.database import (
     count_live_strategy_orders_today,
     create_live_position,
@@ -37,6 +38,7 @@ from app.database import (
     load_running_live_strategy_sessions,
     market_is_live_allowed,
     update_order_intent,
+    update_order_reservation_status,
     update_live_order_log,
     update_live_position,
     update_live_strategy_session,
@@ -1311,6 +1313,33 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
     price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))
     session_max_order_krw = float(session.get("max_order_krw") or config.max_order_krw)
     amount = min(session_max_order_krw, config.max_order_krw, live_config.max_live_order_krw)
+    try:
+        snapshot = await build_capital_snapshot_async("bithumb")
+    except Exception as exc:
+        snapshot = {"snapshot_error": str(exc), "available_budget_krw": 0.0, "blockers": ["BLOCKED_SNAPSHOT_FAILED"]}
+    if not snapshot_is_fresh(snapshot):
+        _insert_blocked_log(session, "BLOCKED_SNAPSHOT_STALE", "Capital snapshot is stale or failed.", candle["candle_time_utc"], signal)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_SNAPSHOT_STALE", "last_order_status": "BLOCKED"})
+        return
+    if snapshot.get("balance_mismatch_detected"):
+        _insert_blocked_log(session, "BLOCKED_BALANCE_MISMATCH", "Exchange balance and DB position mismatch.", candle["candle_time_utc"], signal)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_BALANCE_MISMATCH", "last_order_status": "BLOCKED"})
+        return
+    if snapshot.get("open_order_mismatch_detected"):
+        _insert_blocked_log(session, "BLOCKED_OPEN_ORDER_MISMATCH", "Exchange open orders and DB open orders mismatch.", candle["candle_time_utc"], signal)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_OPEN_ORDER_MISMATCH", "last_order_status": "BLOCKED"})
+        return
+    snapshot_budget = float(snapshot.get("available_budget_krw") or 0.0)
+    if snapshot_budget <= 0:
+        reason = "BLOCKED_EXCHANGE_BALANCE_UNAVAILABLE" if snapshot.get("available_krw_balance") is None else "BLOCKED_INSUFFICIENT_KRW_BALANCE"
+        _insert_blocked_log(session, reason, reason, candle["candle_time_utc"], signal)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": reason, "last_order_status": "BLOCKED"})
+        return
+    amount = min(amount, snapshot_budget)
+    if amount < live_config.min_order_krw:
+        _insert_blocked_log(session, "BLOCKED_CAPITAL_TOO_SMALL", "Snapshot budget is below minimum order amount.", candle["candle_time_utc"], signal)
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_CAPITAL_TOO_SMALL", "last_order_status": "BLOCKED"})
+        return
     volume = amount / price if price > 0 else 0.0
     request_id = f"strategy-{uuid.uuid4().hex[:24]}"
     order = {
@@ -1374,6 +1403,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
     try:
         response = await broker.place_order(order)
         order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
+        update_order_reservation_status(
+            candidate_strategy_id=int(session["candidate_strategy_id"]),
+            market=market,
+            status="ORDER_SUBMITTED",
+            previous_statuses=["RESERVED"],
+        )
         update_live_order_log(
             request_id,
             {
@@ -1403,6 +1438,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
                 updates: dict[str, Any] = {"last_order_status": reconciled.status}
                 if reconciled.status == "FILLED":
                     position_id = _create_position_from_order(session, reconciled.raw, config)
+                    update_order_reservation_status(
+                        candidate_strategy_id=int(session["candidate_strategy_id"]),
+                        market=market,
+                        status="FILLED",
+                        previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+                    )
                     updates.update(
                         {
                             "status": "RUNNING",
@@ -1426,6 +1467,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
                     "error_message": "Exchange request timed out; order status must be reconciled before any retry.",
                 },
             )
+            update_order_reservation_status(
+                candidate_strategy_id=int(session["candidate_strategy_id"]),
+                market=market,
+                status="ORDER_SUBMITTED",
+                previous_statuses=["RESERVED"],
+            )
             update_live_strategy_session(
                 int(session["id"]),
                 {
@@ -1445,6 +1492,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
             )
             return
         update_live_order_log(request_id, {"status": "FAILED", "risk_result": "BLOCKED_API_RESPONSE_ERROR", "error_message": str(exc)})
+        update_order_reservation_status(
+            candidate_strategy_id=int(session["candidate_strategy_id"]),
+            market=market,
+            status="FAILED",
+            previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+        )
         update_live_strategy_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "last_risk_result": "BLOCKED_API_RESPONSE_ERROR"})
 
 
@@ -1486,6 +1539,12 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
         _update_order_by_uuid(order_uuid, "FILLED", status)
         open_position = load_open_live_position(session_id, session.get("exchange", config.allowed_exchange), session.get("market", config.allowed_market))
         position_id = int(open_position["id"]) if open_position else _create_position_from_order(session, status, config)
+        update_order_reservation_status(
+            candidate_strategy_id=int(session["candidate_strategy_id"]),
+            market=str(session.get("market") or config.allowed_market),
+            status="FILLED",
+            previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+        )
         update_live_strategy_session(
             session_id,
             {
@@ -1501,6 +1560,12 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
 
     if state in {"cancel", "canceled", "cancelled"}:
         _update_order_by_uuid(order_uuid, "CANCELED", status)
+        update_order_reservation_status(
+            candidate_strategy_id=int(session["candidate_strategy_id"]),
+            market=str(session.get("market") or config.allowed_market),
+            status="CANCELED",
+            previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+        )
         update_live_strategy_session(
             session_id,
             {

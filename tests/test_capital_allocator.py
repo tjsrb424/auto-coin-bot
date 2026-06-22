@@ -57,6 +57,41 @@ def allow_market(market: str = "KRW-ETH") -> None:
     )
 
 
+def snapshot_payload(*, available_budget: float = 300_000, available_krw: float = 350_000) -> dict:
+    slots = database.load_position_slots(5, "bithumb")
+    positions = database.load_open_live_positions_for_exchange("bithumb")
+    reservations = database.load_active_order_reservations("bithumb")
+    return {
+        "exchange": "bithumb",
+        "created_at": "2026-06-22T00:00:00Z",
+        "snapshot_error": "",
+        "warnings": [],
+        "blockers": [],
+        "auto_trading_enabled": database.load_bot_operation_policy("KRW-BTC")["auto_trading_enabled"],
+        "max_total_exposure_krw": 500_000,
+        "daily_loss_limit_pct": 5,
+        "available_krw_balance": available_krw,
+        "cash_reserve_krw": 25_000,
+        "db_open_position_value_krw": 0,
+        "exchange_position_value_krw": 0,
+        "pending_buy_reserved_krw": 0,
+        "pending_exchange_buy_order_krw": 0,
+        "remaining_exposure_krw": 500_000,
+        "available_budget_krw": available_budget,
+        "open_position_count": len(positions),
+        "max_open_position_count": 5,
+        "empty_slot_count": len([slot for slot in slots if slot["status"] == "EMPTY"]),
+        "balance_mismatch_detected": False,
+        "open_order_mismatch_detected": False,
+        "positions": positions,
+        "balances": {"by_currency": {"KRW": {"balance": available_krw, "locked": 0}}},
+        "open_orders": [],
+        "db_open_orders": [],
+        "reservations": reservations,
+        "slots": slots,
+    }
+
+
 class CapitalAllocatorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -94,7 +129,8 @@ class CapitalAllocatorTests(unittest.TestCase):
         )
         before = database.load_bot_operation_policy("KRW-BTC")
 
-        with patch("app.capital_allocator.is_emergency_stopped", return_value=False):
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
             result = run_capital_allocator_once("TEST", exchange="bithumb")
 
         after = database.load_bot_operation_policy("KRW-BTC")
@@ -113,7 +149,8 @@ class CapitalAllocatorTests(unittest.TestCase):
             {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5},
         )
 
-        with patch("app.capital_allocator.is_emergency_stopped", return_value=False):
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
             result = run_capital_allocator_once("TEST", exchange="bithumb")
 
         self.assertTrue(result["ok"])
@@ -127,6 +164,21 @@ class CapitalAllocatorTests(unittest.TestCase):
         slots = database.load_position_slots(5, "bithumb")
         self.assertEqual(slots[0]["status"], "RESERVED")
         self.assertEqual(slots[0]["candidate_strategy_id"], candidate_id)
+
+    def test_available_krw_shortage_blocks_candidate(self) -> None:
+        database.save_candidate_strategy(candidate_payload())
+        database.update_bot_operation_policy(
+            "KRW-BTC",
+            {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5},
+        )
+
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload(available_budget=0, available_krw=1_000)):
+            result = run_capital_allocator_once("TEST", exchange="bithumb")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["accepted"]), 0)
+        self.assertEqual(result["blocked"][0]["blocked_reason"], "BLOCKED_INSUFFICIENT_KRW_BALANCE")
 
     def test_expired_order_reservation_releases_reserved_slot(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate_payload())

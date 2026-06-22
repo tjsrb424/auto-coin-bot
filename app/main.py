@@ -90,6 +90,7 @@ from app.database import (
 )
 from app.auto_strategy_selector import auto_strategy_selector_status, evaluate_auto_strategy_selector
 from app.capital_allocator import capital_allocator_status, run_capital_allocator_once
+from app.capital_snapshot import build_capital_snapshot_async
 from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
 from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strategy_promotion_pipeline
@@ -1304,6 +1305,27 @@ def apply_best_auto_strategy_endpoint(payload: AutoSelectorRequest) -> dict:
 @app.post("/api/strategy-promotion/run")
 def run_strategy_promotion_endpoint(payload: AutoSelectorRequest) -> dict:
     return run_strategy_promotion_pipeline(exchange=payload.exchange)
+
+
+@app.get("/api/capital-snapshot")
+async def get_capital_snapshot(exchange: str = Query("bithumb", pattern=r"^(upbit|bithumb)$")) -> dict:
+    snapshot = await build_capital_snapshot_async(exchange)
+    return {
+        "snapshot": snapshot,
+        "warnings": snapshot.get("warnings", []),
+        "blockers": snapshot.get("blockers", []),
+    }
+
+
+@app.post("/api/capital-snapshot/reconcile")
+async def reconcile_capital_snapshot(exchange: str = Query("bithumb", pattern=r"^(upbit|bithumb)$")) -> dict:
+    snapshot = await build_capital_snapshot_async(exchange)
+    return {
+        "ok": not snapshot.get("snapshot_error"),
+        "snapshot": snapshot,
+        "warnings": snapshot.get("warnings", []),
+        "blockers": snapshot.get("blockers", []),
+    }
 
 
 @app.get("/api/capital-allocator/status")

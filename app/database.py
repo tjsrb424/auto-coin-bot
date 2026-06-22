@@ -3910,6 +3910,36 @@ def load_active_order_reservations(exchange: str = "bithumb") -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def update_order_reservation_status(
+    *,
+    candidate_strategy_id: int | None = None,
+    market: str | None = None,
+    status: str,
+    previous_statuses: list[str] | None = None,
+) -> int:
+    previous_statuses = previous_statuses or ["RESERVED", "ORDER_SUBMITTED"]
+    filters = [f"status IN ({', '.join('?' for _ in previous_statuses)})"]
+    where_params: list[object] = [*previous_statuses]
+    if candidate_strategy_id is not None:
+        filters.append("candidate_strategy_id = ?")
+        where_params.append(candidate_strategy_id)
+    if market is not None:
+        filters.append("market = ?")
+        where_params.append(market)
+    with get_connection() as conn:
+        before = conn.total_changes
+        conn.execute(
+            f"""
+            UPDATE order_reservations
+            SET status = ?,
+                updated_at = ?
+            WHERE {' AND '.join(filters)}
+            """,
+            [status, _utc_now(), *where_params],
+        )
+        return conn.total_changes - before
+
+
 def create_capital_allocation_run(payload: dict) -> int:
     now_utc = _utc_now()
     with get_connection() as conn:
@@ -4369,6 +4399,22 @@ def has_unresolved_live_order_for_exchange(exchange: str) -> bool:
             (exchange,),
         ).fetchone()
     return row is not None
+
+
+def load_unresolved_live_order_logs_for_exchange(exchange: str = "bithumb") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
+            ORDER BY updated_at ASC, id ASC
+            """,
+            (exchange,),
+        ).fetchall()
+    return [_normalize_live_order_log(dict(row)) for row in rows]
 
 
 def load_reconcilable_live_order_logs(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:

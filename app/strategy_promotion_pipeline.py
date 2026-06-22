@@ -201,7 +201,7 @@ async def run_strategy_promotion_pipeline_async(*, exchange: str | None = None) 
     promoted = promote_shadow_candidates()
     from app.capital_allocator import run_capital_allocator_once
 
-    allocator = run_capital_allocator_once("PROMOTION_SELECTOR", exchange=exchange or _config()["exchange"])
+    allocator = await asyncio.to_thread(run_capital_allocator_once, "PROMOTION_SELECTOR", exchange=exchange or _config()["exchange"])
     selector = apply_selector_if_allowed(exchange=exchange)
     return {
         "ok": True,

@@ -114,6 +114,20 @@ function formatReasonLabel(reason?: string | null) {
     CHILD_RUNNING: "하위 작업이 이미 실행 중입니다.",
     ORCHESTRATOR_DISABLED: "자동 오케스트레이터가 꺼져 있습니다.",
     SKIPPED_LOCKED: "이미 자동 점검이 실행 중입니다.",
+    BLOCKED_EXCHANGE_BALANCE_UNAVAILABLE: "거래소 잔고를 확인하지 못해 매수를 보류했습니다.",
+    BLOCKED_INSUFFICIENT_KRW_BALANCE: "실제 KRW 잔고가 부족합니다.",
+    BLOCKED_REMAINING_EXPOSURE_TOO_SMALL: "총 노출 한도 잔여분이 부족합니다.",
+    BLOCKED_CASH_RESERVE_REQUIRED: "현금 보유 버퍼를 남겨야 해서 보류했습니다.",
+    BLOCKED_BALANCE_MISMATCH: "거래소 잔고와 DB 포지션이 다릅니다.",
+    BLOCKED_OPEN_ORDER_MISMATCH: "거래소 미체결 주문과 DB 주문이 다릅니다.",
+    BLOCKED_SELL_BALANCE_ZERO: "거래소에 매도 가능한 코인 잔고가 없습니다.",
+    BLOCKED_SELL_BALANCE_MISMATCH: "매도 수량과 거래소 잔고가 다릅니다.",
+    BLOCKED_SELL_OPEN_ORDER_EXISTS: "이미 매도 미체결 주문이 있습니다.",
+    BLOCKED_SELL_VOLUME_BELOW_MIN: "매도 가능 수량이 최소 주문금액보다 작습니다.",
+    BLOCKED_SNAPSHOT_STALE: "자금 스냅샷이 오래되어 주문을 보류했습니다.",
+    BLOCKED_SNAPSHOT_FAILED: "자금 스냅샷 생성에 실패해 주문을 보류했습니다.",
+    BLOCKED_EXPECTED_EDGE_BELOW_COST: "수수료와 슬리피지를 이길 기대값이 부족합니다.",
+    BLOCKED_CAPITAL_TOO_SMALL: "주문 가능 금액이 최소 주문금액보다 작습니다.",
     "SCAN PASSED": "스캔 통과",
     "LOW 24H TRADE PRICE": "24시간 거래대금 부족",
     "NO VALID CANDLE PRICES": "유효한 캔들 가격 없음",
@@ -440,9 +454,15 @@ export function BacktestValidationView({ exchange }: Props) {
         <div className="ref-capital-allocator-card">
           <strong><Bot size={15} /> 중앙 자금 배분</strong>
           <p><span>슬롯</span><b>{occupiedSlotCount}/{allocator?.max_slots ?? 5}</b></p>
+          <p><span>실제 KRW 잔고</span><b>{formatKrw(allocator?.available_krw_balance)}</b></p>
+          <p><span>사용 가능 예산</span><b>{formatKrw(allocator?.available_budget_krw)}</b></p>
           <p><span>남은 한도</span><b>{formatKrw(allocator?.remaining_exposure_krw)}</b></p>
           <p><span>예약 매수</span><b>{formatKrw(allocator?.pending_buy_reserved_krw)}</b></p>
+          <p><span>미체결 매수</span><b>{formatKrw(allocator?.pending_exchange_buy_order_krw)}</b></p>
+          <p><span>거래소 평가액</span><b>{formatKrw(allocator?.exchange_position_value_krw)}</b></p>
           <p><span>필요 기대값</span><b>{allocator ? `${allocator.required_edge_pct.toFixed(2)}%` : "-"}</b></p>
+          <p><span>잔고 상태</span><b>{allocator?.snapshot_error ? "조회 실패" : allocator?.balance_mismatch_detected || allocator?.open_order_mismatch_detected ? "확인 필요" : "정상"}</b></p>
+          <p><span>최근 스냅샷</span><b>{formatCompactDateTime(allocator?.snapshot_created_at)}</b></p>
           <p><span>NEXT_ENTRY</span><b>{nextEntryCount}개</b></p>
           <div className="ref-slot-row">
             {allocatorSlots.slice(0, allocator?.max_slots ?? 5).map((slot) => (
