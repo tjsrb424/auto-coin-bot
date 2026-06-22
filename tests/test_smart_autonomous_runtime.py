@@ -175,6 +175,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "RISK_MIN_COOLDOWN_SECONDS": "0",
             "RISK_BLOCK_ON_OPEN_ORDER": "false",
             "RISK_BLOCK_ON_OPEN_POSITION": "false",
+            "RISK_MIN_VOLUME_KRW": "0",
             "RISK_MIN_CURRENT_1M_VOLUME_KRW": "0",
             "RISK_MIN_AVG_5M_VOLUME_KRW": "0",
             "RISK_REQUIRE_ORDER_CHANCE_SUCCESS": "false",

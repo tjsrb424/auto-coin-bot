@@ -38,6 +38,10 @@ BALANCE_MISMATCH_RELATIVE_TOLERANCE = 0.01
 RECOVERY_EVENT_DEDUPE_SECONDS = 300
 
 
+def _market_symbol(market: str) -> str:
+    return str(market or "").split("-")[-1].upper()
+
+
 @dataclass(frozen=True)
 class ReconciledOrderStatus:
     status: str
@@ -326,10 +330,11 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
 
     position_sync = ensure_filled_entry_order_positions(exchange, market)
     internal_positions = load_open_live_positions(exchange, market)
-    internal_btc = sum(_float(position.get("entry_volume")) for position in internal_positions)
-    exchange_btc = _balance_amount(balances, "BTC")
-    tolerance = max(BALANCE_MISMATCH_VOLUME_TOLERANCE, abs(internal_btc) * BALANCE_MISMATCH_RELATIVE_TOLERANCE)
-    difference = exchange_btc - internal_btc
+    symbol = _market_symbol(market)
+    internal_volume = sum(_float(position.get("entry_volume")) for position in internal_positions)
+    exchange_total = _balance_amount(balances, symbol)
+    tolerance = max(BALANCE_MISMATCH_VOLUME_TOLERANCE, abs(internal_volume) * BALANCE_MISMATCH_RELATIVE_TOLERANCE)
+    difference = exchange_total - internal_volume
     mismatch = abs(difference) > tolerance
     status = {
         "status": "BALANCE_MISMATCH" if mismatch else "OK",
@@ -337,10 +342,15 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
         "blocking": mismatch,
         "exchange": exchange,
         "market": market,
-        "internal_btc_position": internal_btc,
-        "exchange_btc_total": exchange_btc,
-        "difference_btc": difference,
-        "tolerance_btc": tolerance,
+        "symbol": symbol,
+        "internal_position_volume": internal_volume,
+        "exchange_asset_total": exchange_total,
+        "difference_volume": difference,
+        "tolerance_volume": tolerance,
+        "internal_btc_position": internal_volume if symbol == "BTC" else 0.0,
+        "exchange_btc_total": exchange_total if symbol == "BTC" else 0.0,
+        "difference_btc": difference if symbol == "BTC" else 0.0,
+        "tolerance_btc": tolerance if symbol == "BTC" else 0.0,
         "open_position_count": len(internal_positions),
         "position_sync": position_sync,
         "checked_at": _utc_now(),
@@ -349,7 +359,7 @@ async def reconcile_balances(exchange: str = "bithumb", market: str = "KRW-BTC")
         log_recovery_event(
             "BALANCE_MISMATCH",
             "ERROR",
-            "Exchange BTC balance and internal LivePosition volume differ. New auto orders are blocked.",
+            f"Exchange {symbol} balance and internal LivePosition volume differ. New auto orders are blocked.",
             exchange=exchange,
             market=market,
             payload=status,

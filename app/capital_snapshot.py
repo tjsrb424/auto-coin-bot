@@ -42,6 +42,11 @@ def _float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
     return max(minimum, value)
 
 
+def _csv_env(name: str, default: str) -> set[str]:
+    raw = os.getenv(name, default)
+    return {item.strip().upper() for item in raw.split(",") if item.strip()}
+
+
 def _market_symbol(market: str) -> str:
     return str(market or "").split("-")[-1].upper()
 
@@ -103,6 +108,7 @@ async def build_capital_snapshot_async(exchange: str = "bithumb") -> dict:
     max_slots = _int_env("AUTO_MAX_OPEN_POSITION_COUNT", 5, minimum=1, maximum=20)
     cash_reserve_pct = _float_env("AUTO_CASH_RESERVE_PCT", 5.0)
     max_age_seconds = _int_env("AUTO_CAPITAL_SNAPSHOT_MAX_AGE_SECONDS", 10, minimum=1, maximum=300)
+    ignored_balance_symbols = _csv_env("AUTO_CAPITAL_SNAPSHOT_IGNORED_BALANCE_SYMBOLS", "P")
     positions = load_open_live_positions_for_exchange(exchange)
     reservations = load_active_order_reservations(exchange)
     db_orders = load_unresolved_live_order_logs_for_exchange(exchange)
@@ -146,23 +152,31 @@ async def build_capital_snapshot_async(exchange: str = "bithumb") -> dict:
 
     exchange_position_value = 0.0
     balance_mismatch = False
-    position_markets = {_market_symbol(str(position.get("market") or "")) for position in positions}
+    db_volume_by_symbol: dict[str, float] = {}
+    price_by_symbol: dict[str, float] = {}
     for position in positions:
         symbol = _market_symbol(str(position.get("market") or ""))
-        exchange_total = _balance_total(balances, symbol) if balances else 0.0
-        db_volume = float(position.get("entry_volume") or 0.0)
+        if not symbol:
+            continue
+        db_volume_by_symbol[symbol] = db_volume_by_symbol.get(symbol, 0.0) + float(position.get("entry_volume") or 0.0)
         price = float(position.get("current_price") or position.get("entry_price") or 0.0)
+        if price > 0:
+            price_by_symbol[symbol] = price
+    for symbol, db_volume in db_volume_by_symbol.items():
+        exchange_total = _balance_total(balances, symbol) if balances else 0.0
+        price = price_by_symbol.get(symbol, 0.0)
         exchange_position_value += exchange_total * price
-        if balances and db_volume > 0 and exchange_total <= 0:
+        tolerance = max(0.000001, abs(db_volume) * 0.01)
+        if balances and abs(exchange_total - db_volume) > tolerance:
             balance_mismatch = True
-            warnings.append(f"EXCHANGE_BALANCE_ZERO_FOR_OPEN_POSITION:{position.get('market')}")
+            warnings.append(f"EXCHANGE_BALANCE_MISMATCH:{symbol}")
     if balances:
         for symbol, item in (balances.get("by_currency") or {}).items():
-            if symbol == "KRW" or symbol in position_markets:
+            symbol = str(symbol).upper()
+            if symbol == "KRW" or symbol in ignored_balance_symbols or symbol in db_volume_by_symbol:
                 continue
             total = float(item.get("balance") or 0.0) + float(item.get("locked") or 0.0)
             if total > 0:
-                balance_mismatch = True
                 warnings.append(f"EXCHANGE_BALANCE_WITHOUT_DB_POSITION:{symbol}")
 
     db_order_ids = {str(order.get("order_uuid") or order.get("request_id") or "") for order in db_orders}

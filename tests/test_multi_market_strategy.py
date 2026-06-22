@@ -62,7 +62,14 @@ class MultiMarketStrategyTests(unittest.TestCase):
         self.db_path = Path(self.tmp.name) / "test.db"
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()
-        self.env_patch = patch.dict(os.environ, {"DATABASE_URL": ""}, clear=False)
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "",
+                "RISK_MIN_VOLUME_KRW": "0",
+            },
+            clear=False,
+        )
         self.env_patch.start()
         database.init_db()
 

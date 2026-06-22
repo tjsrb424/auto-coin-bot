@@ -218,6 +218,55 @@ class CapitalSnapshotTests(unittest.TestCase):
         self.assertIn("BLOCKED_BALANCE_MISMATCH", snapshot["blockers"])
         self.assertEqual(sellable_volume_for_position(snapshot, database.load_live_position(position_id)), 0)
 
+    def test_ignored_point_balance_and_grouped_positions_do_not_block(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload("KRW-BTC"))
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": candidate_id,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 20_000,
+                "max_orders_per_day": 3,
+            }
+        )
+        for volume in (0.00002410, 0.00010005):
+            database.create_live_position(
+                {
+                    "session_id": session_id,
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "candidate_strategy_id": candidate_id,
+                    "strategy_name": "ma_cross",
+                    "status": "OPEN",
+                    "entry_price": 96_722_000,
+                    "entry_volume": volume,
+                    "entry_amount_krw": 96_722_000 * volume,
+                    "current_price": 96_722_000,
+                    "stop_loss_price": 96_000_000,
+                    "take_profit_price": 98_000_000,
+                }
+            )
+        account = {
+            "by_currency": {
+                "KRW": {"balance": 100_000, "locked": 0.0},
+                "BTC": {"balance": 0.00012416, "locked": 0.0},
+                "P": {"balance": 6, "locked": 0.0},
+            },
+            "krw": {"balance": 100_000, "locked": 0.0},
+        }
+
+        snapshot = self.run_snapshot(account)
+
+        self.assertFalse(snapshot["balance_mismatch_detected"])
+        self.assertNotIn("BLOCKED_BALANCE_MISMATCH", snapshot["blockers"])
+        self.assertNotIn("EXCHANGE_BALANCE_WITHOUT_DB_POSITION:P", snapshot["warnings"])
+        self.assertAlmostEqual(snapshot["exchange_position_value_krw"], 96_722_000 * 0.00012416)
+
     def test_sellable_volume_uses_smaller_of_db_and_exchange_balance(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate_payload())
         session_id = database.create_live_strategy_session(
