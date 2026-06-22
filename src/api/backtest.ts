@@ -1,4 +1,6 @@
 import type {
+  AutonomousOrchestratorRunResponse,
+  AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
   MarketUniverseItem,
   MultiMarketValidationResponse,
@@ -59,6 +61,17 @@ export function fetchAutoStrategySelectorStatus(exchange: string) {
 
 export function fetchStrategyDiscoverySchedulerStatus() {
   return requestJson<StrategyDiscoverySchedulerStatus>("/api/strategy-discovery-scheduler/status");
+}
+
+export function fetchAutonomousOrchestratorStatus() {
+  return requestJson<AutonomousOrchestratorStatus>("/api/autonomous-orchestrator/status");
+}
+
+export function runAutonomousOrchestratorNow() {
+  return requestJson<AutonomousOrchestratorRunResponse>("/api/autonomous-orchestrator/run-now", {
+    method: "POST",
+    body: JSON.stringify({ reason: "MANUAL_RUN_NOW" })
+  });
 }
 
 export function evaluateAutoStrategySelector(exchange: string) {

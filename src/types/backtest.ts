@@ -139,3 +139,32 @@ export type StrategyDiscoverySchedulerStatus = {
   deep_validation: SchedulerTaskState;
   promotion_selector: SchedulerTaskState;
 };
+
+export type AutonomousOrchestratorStatus = {
+  config: Record<string, unknown>;
+  orchestrator: SchedulerTaskState;
+  scan: SchedulerTaskState;
+  fast_validation: SchedulerTaskState;
+  deep_validation: SchedulerTaskState;
+  promotion_selector: SchedulerTaskState;
+  recent_live_eligible?: CandidateStrategy[];
+  recent_live_active?: CandidateStrategy[];
+  active_selection?: {
+    candidate_strategy_id?: number;
+    market?: string;
+    strategy?: string;
+    unit?: number;
+    selected_reason?: string;
+    selected_at?: string;
+    candidate?: CandidateStrategy;
+  } | null;
+};
+
+export type AutonomousOrchestratorRunResponse =
+  | SchedulerTaskState
+  | {
+      task_name: string;
+      status: "SKIPPED_LOCKED" | string;
+      reason?: string;
+      current?: SchedulerTaskState | null;
+    };

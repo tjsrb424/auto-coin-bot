@@ -7504,7 +7504,7 @@ input:disabled {
   left: 0;
   top: 0;
   width: 1430px;
-  height: 260px;
+  height: 344px;
   overflow: hidden;
   padding: 14px 18px;
 }
@@ -7580,6 +7580,7 @@ input:disabled {
 
 .ref-backtest-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 12px;
 }
@@ -7746,36 +7747,100 @@ input:disabled {
   grid-column: 1 / -1;
 }
 
+.ref-orchestrator-card {
+  display: grid;
+  grid-template-columns: 210px repeat(6, minmax(0, 1fr));
+  align-items: center;
+  gap: 8px;
+  min-height: 68px;
+  margin-top: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(49, 69, 93, 0.72);
+  border-radius: 5px;
+  background: linear-gradient(90deg, rgba(15, 33, 52, 0.88), rgba(5, 12, 21, 0.42));
+  padding: 8px 10px;
+}
+
+.ref-orchestrator-card.green {
+  border-color: rgba(24, 217, 111, 0.28);
+}
+
+.ref-orchestrator-card.amber {
+  border-color: rgba(246, 195, 91, 0.42);
+}
+
+.ref-orchestrator-card.red {
+  border-color: rgba(255, 92, 92, 0.42);
+}
+
+.ref-orchestrator-card strong,
+.ref-orchestrator-card p,
+.ref-orchestrator-card span,
+.ref-orchestrator-card b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-orchestrator-card strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #f7fbff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.ref-orchestrator-card p {
+  margin: 0;
+}
+
+.ref-orchestrator-card span {
+  display: block;
+  color: var(--ref-muted);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ref-orchestrator-card b {
+  display: block;
+  margin-top: 5px;
+  color: #f7fbff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
 .ref-backtest-markets {
   left: 0;
-  top: 280px;
+  top: 364px;
   width: 454px;
-  height: 544px;
+  height: 460px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-ranking {
   left: 474px;
-  top: 280px;
+  top: 364px;
   width: 626px;
-  height: 544px;
+  height: 460px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-selector {
   left: 1120px;
-  top: 280px;
+  top: 364px;
   width: 310px;
-  height: 544px;
-  overflow: hidden;
+  height: 460px;
+  overflow: auto;
   padding: 18px;
 }
 
 .ref-backtest-market-list {
   display: grid;
-  max-height: 482px;
+  max-height: 398px;
   gap: 8px;
   margin-top: 14px;
   overflow: auto;

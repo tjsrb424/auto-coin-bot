@@ -5,12 +5,12 @@ import os
 import socket
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import ceil
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -92,10 +92,12 @@ from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strat
 from app.strategy_discovery_scheduler import (
     discovery_scheduler_config,
     discovery_scheduler_status,
-    run_deep_validation_scheduler_tick,
-    run_fast_validation_scheduler_tick,
-    run_market_scan_scheduler_tick,
-    run_promotion_selector_scheduler_tick,
+)
+from app.autonomous_orchestrator import (
+    autonomous_orchestrator_config,
+    autonomous_orchestrator_status,
+    run_autonomous_orchestrator_background,
+    run_autonomous_orchestrator_once,
 )
 from app.live_broker import (
     LiveBroker,
@@ -468,6 +470,10 @@ class AutoSelectorRequest(BaseModel):
     exchange: str = Field("bithumb", pattern=r"^(upbit|bithumb)$")
 
 
+class AutonomousOrchestratorRunRequest(BaseModel):
+    reason: str = "MANUAL_RUN_NOW"
+
+
 class AppSettingsRequest(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
@@ -680,54 +686,36 @@ async def lifespan(_: FastAPI):
         replace_existing=True,
     )
     discovery_config = discovery_scheduler_config()
+    orchestrator_config = autonomous_orchestrator_config()
     scheduler.add_job(
-        run_market_scan_scheduler_tick,
+        run_autonomous_orchestrator_background,
         "interval",
-        minutes=int(discovery_config["scan_interval_minutes"]),
-        id="market_scan_scheduler_tick",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        run_fast_validation_scheduler_tick,
-        "interval",
-        minutes=int(discovery_config["fast_interval_minutes"]),
-        id="fast_validation_scheduler_tick",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        run_deep_validation_scheduler_tick,
-        "cron",
-        hour=4,
-        minute=0,
-        id="deep_validation_scheduler_tick",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        run_promotion_selector_scheduler_tick,
-        "interval",
-        minutes=int(discovery_config["promotion_interval_minutes"]),
-        id="promotion_selector_scheduler_tick",
+        minutes=int(orchestrator_config["interval_minutes"]),
+        args=["SCHEDULED"],
+        id="autonomous_orchestrator_tick",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
     )
     scheduler.start()
+    if orchestrator_config["bootstrap_enabled"]:
+        scheduler.add_job(
+            run_autonomous_orchestrator_background,
+            "date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=90),
+            args=["SERVER_STARTUP"],
+            id="autonomous_orchestrator_bootstrap",
+            max_instances=1,
+            replace_existing=True,
+        )
     _.state.scheduler = scheduler
     _.state.scheduler_started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     logger.info("[paper-live] scheduler started interval_seconds=60")
     logger.info("[paper-forward] scheduler started interval_seconds=60")
     logger.info("[auto-live] pilot scheduler started interval_seconds=10")
     logger.info("[live-strategy] pilot scheduler started interval_seconds=10")
-    logger.info("[market-scan] scheduler started interval_minutes=%s", discovery_config["scan_interval_minutes"])
-    logger.info("[fast-validation] scheduler started interval_minutes=%s", discovery_config["fast_interval_minutes"])
-    logger.info("[deep-validation] scheduler started cron=04:00 Asia/Seoul")
-    logger.info("[promotion-selector] scheduler started interval_minutes=%s", discovery_config["promotion_interval_minutes"])
+    logger.info("[autonomous-orchestrator] scheduler started interval_minutes=%s", orchestrator_config["interval_minutes"])
+    logger.info("[autonomous-orchestrator] bootstrap_enabled=%s discovery_exchange=%s", orchestrator_config["bootstrap_enabled"], discovery_config["exchange"])
     try:
         yield
     finally:
@@ -777,7 +765,7 @@ def get_runtime_status(request: Request) -> dict:
 
 
 @app.post("/api/runtime/start")
-def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request) -> dict:
+def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request, background_tasks: BackgroundTasks) -> dict:
     if payload.confirmation != AUTO_STRATEGY_CONFIRMATION:
         raise HTTPException(status_code=400, detail=f"{AUTO_STRATEGY_CONFIRMATION} confirmation is required.")
     acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("admin-ui", request)
@@ -795,6 +783,8 @@ def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request) -> di
     )
     if result.get("ok") is False:
         release_runtime_lock(lock_id=RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
+    elif autonomous_orchestrator_config()["on_start_enabled"]:
+        background_tasks.add_task(run_autonomous_orchestrator_background, "RUNTIME_STARTED")
     return {**result, **_runtime_status_payload(request)}
 
 
@@ -1294,6 +1284,17 @@ def run_strategy_promotion_endpoint(payload: AutoSelectorRequest) -> dict:
 @app.get("/api/strategy-discovery-scheduler/status")
 def get_strategy_discovery_scheduler_status() -> dict:
     return discovery_scheduler_status()
+
+
+@app.get("/api/autonomous-orchestrator/status")
+def get_autonomous_orchestrator_status() -> dict:
+    return autonomous_orchestrator_status()
+
+
+@app.post("/api/autonomous-orchestrator/run-now")
+def run_autonomous_orchestrator_endpoint(payload: AutonomousOrchestratorRunRequest | None = None) -> dict:
+    reason = payload.reason if payload else "MANUAL_RUN_NOW"
+    return run_autonomous_orchestrator_once(reason=reason)
 
 
 def _live_status(exchange: str | None = None) -> dict:

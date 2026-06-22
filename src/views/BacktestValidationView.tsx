@@ -1,18 +1,20 @@
 import React from "react";
-import { BarChart3, Bot, RefreshCw, ShieldCheck, Target, TestTube2 } from "lucide-react";
+import { BarChart3, Bot, RefreshCw, ShieldCheck, Target, TestTube2, Zap } from "lucide-react";
 import {
   evaluateAutoStrategySelector,
+  fetchAutonomousOrchestratorStatus,
   fetchAutoStrategySelectorStatus,
   fetchMarketUniverse,
-  fetchStrategyDiscoverySchedulerStatus,
+  runAutonomousOrchestratorNow,
   runMultiMarketValidation,
   scanMarketUniverse
 } from "../api/backtest";
 import type {
+  AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
+  CandidateStrategy,
   MarketUniverseItem,
   MultiMarketValidationResponse,
-  StrategyDiscoverySchedulerStatus,
   SchedulerTaskState
 } from "../types/backtest";
 
@@ -94,6 +96,15 @@ function formatReasonLabel(reason?: string | null) {
     CANDIDATE_POOL_LIMIT: "후보 풀이 가득 차 저장을 보류했습니다.",
     DUPLICATE_CANDIDATE: "중복 후보라 저장하지 않았습니다.",
     NO_AUTO_SELECTABLE_MARKETS: "자동 검증 가능한 마켓이 없습니다.",
+    SERVER_STARTUP: "서버 시작 워밍업",
+    RUNTIME_STARTED: "자동매매 시작 직후",
+    SCHEDULED: "정기 자동 점검",
+    CANDIDATE_CREATED: "후보 생성 후속 처리",
+    LIVE_ELIGIBLE_CREATED: "실거래 후보 생성 후속 처리",
+    MANUAL_RUN_NOW: "수동 즉시 점검",
+    CHILD_RUNNING: "하위 작업이 이미 실행 중입니다.",
+    ORCHESTRATOR_DISABLED: "자동 오케스트레이터가 꺼져 있습니다.",
+    SKIPPED_LOCKED: "이미 자동 점검이 실행 중입니다.",
     "SCAN PASSED": "스캔 통과",
     "LOW 24H TRADE PRICE": "24시간 거래대금 부족",
     "NO VALID CANDLE PRICES": "유효한 캔들 가격 없음",
@@ -161,6 +172,7 @@ function schedulerLabel(task?: SchedulerTaskState | null) {
     COMPLETED_WITH_ERRORS: "일부 오류",
     FAILED: "실패",
     SKIPPED: "건너뜀",
+    SKIPPED_LOCKED: "실행 중",
     DISABLED: "꺼짐",
     LOCKED: "실행 보류",
   };
@@ -179,6 +191,16 @@ function schedulerSummary(task?: SchedulerTaskState | null) {
   if (typeof skipReason === "string" && skipReason) return formatReasonLabel(skipReason);
   if (typeof selectorDecision === "string" && selectorDecision) return `Selector ${formatStatusLabel(selectorDecision)}`;
   return task?.last_error || "최근 결과 없음";
+}
+
+function taskResultText(task: SchedulerTaskState | null | undefined, key: string) {
+  const value = task?.last_result?.[key];
+  return typeof value === "string" && value ? value : "";
+}
+
+function candidateSummary(candidate?: CandidateStrategy | null) {
+  if (!candidate) return "-";
+  return `${candidate.market} · ${formatStrategyLabel(candidate.strategy)} · ${Number(candidate.score ?? 0).toFixed(1)}점`;
 }
 
 function coinLogoUrls(symbol?: string | null) {
@@ -222,20 +244,20 @@ export function BacktestValidationView({ exchange }: Props) {
   const [selectedMarkets, setSelectedMarkets] = React.useState<string[]>([]);
   const [validation, setValidation] = React.useState<MultiMarketValidationResponse | null>(null);
   const [selector, setSelector] = React.useState<AutoStrategySelectorStatus | null>(null);
-  const [scheduler, setScheduler] = React.useState<StrategyDiscoverySchedulerStatus | null>(null);
+  const [orchestrator, setOrchestrator] = React.useState<AutonomousOrchestratorStatus | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const [marketResult, selectorResult, schedulerResult] = await Promise.all([
+    const [marketResult, selectorResult, orchestratorResult] = await Promise.all([
       fetchMarketUniverse(exchange),
       fetchAutoStrategySelectorStatus(exchange),
-      fetchStrategyDiscoverySchedulerStatus()
+      fetchAutonomousOrchestratorStatus()
     ]);
     setMarkets(marketResult.markets);
     setSelector(selectorResult);
-    setScheduler(schedulerResult);
+    setOrchestrator(orchestratorResult);
     setSelectedMarkets((current) => {
       if (current.length) return current.filter((market) => marketResult.markets.some((item) => item.market === market));
       return marketResult.markets.filter((item) => item.is_enabled && item.is_auto_selectable).slice(0, 5).map((item) => item.market);
@@ -270,6 +292,13 @@ export function BacktestValidationView({ exchange }: Props) {
   const enabledCount = markets.filter((item) => item.is_enabled).length;
   const liveAllowedCount = markets.filter((item) => item.is_live_allowed).length;
   const switchLogs = selector?.recent_switch_logs?.slice(0, 4) ?? [];
+  const latestEligible = orchestrator?.recent_live_eligible?.[0] ?? null;
+  const latestActive = orchestrator?.recent_live_active?.[0] ?? orchestrator?.active_selection?.candidate ?? null;
+  const orchestratorReason = taskResultText(orchestrator?.orchestrator, "reason") || "-";
+  const orchestratorSkip =
+    taskResultText(orchestrator?.orchestrator, "skip_reason") ||
+    taskResultText(orchestrator?.promotion_selector, "skip_reason") ||
+    taskResultText(orchestrator?.promotion_selector, "blocked_reason");
 
   return (
     <section className={`ref-backtest-view${busy ? " is-busy" : ""}`}>
@@ -291,6 +320,9 @@ export function BacktestValidationView({ exchange }: Props) {
           <button className={busy === "전략 선택 평가" ? "is-loading" : ""} onClick={() => runAction("전략 선택 평가", "자동 전략 선택 평가가 완료되었습니다.", async () => { setSelector(await evaluateAutoStrategySelector(exchange)); })} disabled={!!busy}>
             {busy === "전략 선택 평가" ? <span className="ref-loading-spinner" /> : <Bot size={16} />} 선택 평가
           </button>
+          <button className={busy === "자동 점검" ? "is-loading" : ""} onClick={() => runAction("자동 점검", "자동 점검이 완료되었습니다.", async () => { await runAutonomousOrchestratorNow(); await refresh(); })} disabled={!!busy}>
+            {busy === "자동 점검" ? <span className="ref-loading-spinner" /> : <Zap size={16} />} 즉시 자동 점검 실행
+          </button>
         </div>
         {(message || error) && <p className={error ? "ref-backtest-error" : "ref-backtest-message"}>{error ?? message}</p>}
         <div className="ref-backtest-kpis">
@@ -301,10 +333,10 @@ export function BacktestValidationView({ exchange }: Props) {
         </div>
         <div className="ref-scheduler-strip">
           {[
-            { label: "마켓 스캔", task: scheduler?.scan },
-            { label: "빠른 검증", task: scheduler?.fast_validation },
-            { label: "정밀 검증", task: scheduler?.deep_validation },
-            { label: "Selector", task: scheduler?.promotion_selector },
+            { label: "마켓 스캔", task: orchestrator?.scan },
+            { label: "빠른 검증", task: orchestrator?.fast_validation },
+            { label: "정밀 검증", task: orchestrator?.deep_validation },
+            { label: "Selector", task: orchestrator?.promotion_selector },
           ].map(({ label, task }) => (
             <div key={label} className={`ref-scheduler-card ${schedulerTone(task)}`}>
               <strong>{label}</strong>
@@ -314,6 +346,15 @@ export function BacktestValidationView({ exchange }: Props) {
               <em title={task?.last_error || schedulerSummary(task)}>{task?.last_error || schedulerSummary(task)}</em>
             </div>
           ))}
+        </div>
+        <div className={`ref-orchestrator-card ${schedulerTone(orchestrator?.orchestrator)}`}>
+          <strong><Bot size={15} /> Autonomous Orchestrator</strong>
+          <p><span>최근 실행</span><b>{formatReasonLabel(orchestratorReason)}</b></p>
+          <p><span>최근 결과</span><b>{schedulerSummary(orchestrator?.orchestrator)}</b></p>
+          <p><span>다음 실행</span><b>{formatCompactDateTime(orchestrator?.orchestrator?.next_run_at)}</b></p>
+          <p><span>최근 보류</span><b>{orchestratorSkip ? formatReasonLabel(orchestratorSkip) : "보류 없음"}</b></p>
+          <p><span>LIVE_ELIGIBLE</span><b>{candidateSummary(latestEligible)}</b></p>
+          <p><span>LIVE_ACTIVE</span><b>{candidateSummary(latestActive)}</b></p>
         </div>
       </div>
 
