@@ -80,6 +80,29 @@ jobs:
             git fetch origin main
             git checkout main
             git reset --hard origin/main
+            touch .env.production
+            upsert_env_var() {
+              key="\$1"
+              value="\$2"
+              if grep -qE "^\${key}=" .env.production; then
+                sed -i "s|^\${key}=.*|\${key}=\${value}|" .env.production
+              else
+                printf '%s=%s\n' "\$key" "\$value" >> .env.production
+              fi
+            }
+            upsert_env_var AUTO_MAX_OPEN_POSITION_COUNT 5
+            upsert_env_var AUTO_SELECTOR_MAX_OPEN_POSITIONS 5
+            upsert_env_var AUTO_CAPITAL_ALLOCATOR_ENABLED true
+            upsert_env_var AUTO_MAX_NEW_ENTRIES_PER_TICK 2
+            upsert_env_var AUTO_SINGLE_POSITION_MAX_EXPOSURE_PCT 45
+            upsert_env_var AUTO_CASH_RESERVE_PCT 5
+            upsert_env_var AUTO_MIN_EXPECTED_EDGE_PCT 0.45
+            upsert_env_var AUTO_FEE_RATE 0.0005
+            upsert_env_var AUTO_SLIPPAGE_RATE 0.0005
+            upsert_env_var AUTO_EDGE_SAFETY_MARGIN_PCT 0.15
+            upsert_env_var AUTO_ORDER_RESERVATION_TTL_MINUTES 30
+            upsert_env_var AUTO_NEXT_ENTRY_TTL_MINUTES 360
+            upsert_env_var AUTO_CAPITAL_ALLOCATOR_LOCK_TTL_SECONDS 300
             COMPOSE_PARALLEL_LIMIT=1 sudo docker compose --env-file .env.production build backend
             sudo docker compose --env-file .env.production up -d backend
             APP_COMMIT=\$(git rev-parse --short HEAD) COMPOSE_PARALLEL_LIMIT=1 sudo docker compose --env-file .env.production build frontend
