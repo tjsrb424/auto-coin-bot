@@ -160,7 +160,7 @@ When pressing ON in the UI:
 7. Candidate Strategy must exist.
 8. Market must be `KRW-BTC`.
 9. Order type must be `limit`.
-10. Enter confirmation text: `AUTO STRATEGY ENABLE`.
+10. Enter confirmation text: `돈은 속도가 아니라 규율로 지킨다`.
 11. Runtime changes to `RUNNING` only after all checks pass.
 12. Runtime lock is acquired in DB. If another instance owns a RUNNING lock, start is blocked.
 
@@ -203,7 +203,7 @@ The frontend must not store or override runtime state with `localStorage`.
 
 Allowed runtime mutation:
 
-- User clicks Auto Trading ON, enters `AUTO STRATEGY ENABLE`, and the frontend calls `POST /api/runtime/start`.
+- User clicks Auto Trading ON, enters `돈은 속도가 아니라 규율로 지킨다`, and the frontend calls `POST /api/runtime/start`.
 - User clicks Auto Trading OFF and the frontend calls `POST /api/runtime/stop`.
 
 Forbidden runtime mutation:
@@ -503,7 +503,7 @@ Flow:
 
 1. Select one Candidate Strategy.
 2. Click Auto Trading ON.
-3. Enter `AUTO STRATEGY ENABLE`.
+3. Enter `돈은 속도가 아니라 규율로 지킨다`.
 4. Confirm `/api/runtime/status` returns `runtime_status=RUNNING`.
 5. Wait for a completed candle BUY signal.
 6. Confirm Risk Manager allows it.

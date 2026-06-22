@@ -73,6 +73,21 @@ export type MultiMarketValidationResponse = {
   errors: Array<{ market: string; strategy: string; error: string }>;
 };
 
+export type StrategySwitchLog = {
+  id: number;
+  from_candidate_strategy_id?: number | null;
+  to_candidate_strategy_id?: number | null;
+  from_market?: string | null;
+  to_market?: string | null;
+  decision: string;
+  reason?: string;
+  blocked_reason?: string;
+  score_delta: number;
+  created_at: string;
+  from_candidate?: CandidateStrategy | null;
+  to_candidate?: CandidateStrategy | null;
+};
+
 export type AutoStrategySelectorStatus = {
   exchange: string;
   evaluated_at: string;
@@ -92,5 +107,5 @@ export type AutoStrategySelectorStatus = {
   } | null;
   score_delta: number;
   daily_switch_count: number;
-  recent_switch_logs?: Array<Record<string, unknown>>;
+  recent_switch_logs?: StrategySwitchLog[];
 };

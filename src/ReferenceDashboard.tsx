@@ -50,6 +50,7 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 const MARKET = "KRW-BTC";
 const CHART_UNIT = 15;
 const APP_BUILD_LABEL = `v${__APP_VERSION__} · ${__APP_COMMIT__}`;
+const AUTO_TRADING_CONFIRMATION = "돈은 속도가 아니라 규율로 지킨다";
 const CHART_TIMEFRAMES = [
   { label: "1m", unit: 1, disabled: false },
   { label: "15m", unit: 15, disabled: false },
@@ -4557,8 +4558,8 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
       if (isAutoTradingOn) {
         await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/stop");
       } else {
-        const confirmation = window.prompt("Smart Autonomous Live를 시작하려면 확인 문구를 입력하세요: AUTO STRATEGY ENABLE")?.trim();
-        if (confirmation !== "AUTO STRATEGY ENABLE") throw new Error("확인 문구가 일치하지 않아 자동매매 시작을 취소했습니다.");
+        const confirmation = window.prompt(`Smart Autonomous Live를 시작하려면 확인 문구를 입력하세요: ${AUTO_TRADING_CONFIRMATION}`)?.trim();
+        if (confirmation !== AUTO_TRADING_CONFIRMATION) throw new Error("확인 문구가 일치하지 않아 자동매매 시작을 취소했습니다.");
         const body = await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/start", {
           confirmation,
           order_confirmation: "PLACE AUTO LIVE ORDER"

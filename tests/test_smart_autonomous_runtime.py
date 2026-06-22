@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from app import database
 from app.live_broker import LiveTradingConfig
-from app.live_strategy_pilot import LiveStrategyConfig, _manage_open_order, _process_session, _smart_bid_cap_blocker, _submit_smart_intent_order, start_live_strategy_pilot
+from app.live_strategy_pilot import AUTO_STRATEGY_CONFIRMATION, LiveStrategyConfig, _manage_open_order, _process_session, _smart_bid_cap_blocker, _submit_smart_intent_order, start_live_strategy_pilot
 
 
 def candle() -> dict:
@@ -295,7 +295,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             patch("app.live_strategy_pilot.run_live_strategy_tick"),
         ):
             result = start_live_strategy_pilot(
-                confirmation="AUTO STRATEGY ENABLE",
+                confirmation=AUTO_STRATEGY_CONFIRMATION,
                 order_confirmation="PLACE AUTO LIVE ORDER",
             )
 

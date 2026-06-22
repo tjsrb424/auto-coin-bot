@@ -101,6 +101,28 @@ function formatReasonLabel(reason?: string | null) {
   return reason.replace(/_/g, " ");
 }
 
+function formatSwitchDecision(decision?: string | null) {
+  const normalized = String(decision ?? "").toUpperCase();
+  const labels: Record<string, string> = {
+    APPLIED: "적용됨",
+    APPLY: "적용 가능",
+    BLOCKED: "보류",
+  };
+  return labels[normalized] ?? formatStatusLabel(decision);
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ko-KR", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function Chip({ value, tone = "neutral" }: { value?: string; tone?: string }) {
   return <span className={`ref-status-chip ${tone}`}>{formatStatusLabel(value)}</span>;
 }
@@ -154,6 +176,7 @@ export function BacktestValidationView({ exchange }: Props) {
   const topRows = validation?.rows.slice(0, 8) ?? [];
   const enabledCount = markets.filter((item) => item.is_enabled).length;
   const liveAllowedCount = markets.filter((item) => item.is_live_allowed).length;
+  const switchLogs = selector?.recent_switch_logs?.slice(0, 4) ?? [];
 
   return (
     <section className="ref-backtest-view">
@@ -228,6 +251,16 @@ export function BacktestValidationView({ exchange }: Props) {
         </div>
         <div className="ref-selector-blockers">
           {(selector?.blockers?.length ? selector.blockers : ["차단 사유가 없습니다."]).slice(0, 6).map((item) => <span key={item}>{formatReasonLabel(item)}</span>)}
+        </div>
+        <div className="ref-switch-logs">
+          <strong>최근 교체 로그</strong>
+          {switchLogs.length ? switchLogs.map((log) => (
+            <p key={log.id}>
+              <b>{formatSwitchDecision(log.decision)}</b>
+              <span>{log.to_candidate ? `${log.to_candidate.market} · ${formatStrategyLabel(log.to_candidate.strategy)}` : (log.to_market ?? "-")}</span>
+              <em>{log.blocked_reason ? formatReasonLabel(log.blocked_reason.split(",")[0]?.trim()) : (log.reason || formatDateTime(log.created_at))}</em>
+            </p>
+          )) : <p><b>-</b><span>아직 교체 로그가 없습니다.</span><em>조건 충족 또는 보류 시 이곳에 표시됩니다.</em></p>}
         </div>
         {validation?.saved_candidates?.length ? (
           <div className="ref-saved-candidates">

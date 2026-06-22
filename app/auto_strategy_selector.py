@@ -7,12 +7,14 @@ from typing import Any
 from app.database import (
     count_strategy_switches_today,
     has_unresolved_live_order,
+    has_unresolved_live_order_for_exchange,
     load_active_strategy_selection,
     load_bot_operation_policy,
     load_live_eligible_candidate_strategies,
     load_market_universe_item,
     load_open_live_positions,
-    load_strategy_switch_logs,
+    load_open_live_positions_for_exchange,
+    load_strategy_switch_logs_with_candidates,
     market_is_live_allowed,
     market_is_auto_selectable,
     promote_candidate_strategy,
@@ -85,9 +87,9 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
         risk_state = compute_risk_state(exchange, market)
         if risk_state.get("status") in {"BLOCKED", "EMERGENCY_STOPPED"}:
             blockers.append("RISK_STATE_BLOCKED")
-        if risk_state.get("open_order_count", 0) > 0 or has_unresolved_live_order(exchange, market):
+        if risk_state.get("open_order_count", 0) > 0 or has_unresolved_live_order(exchange, market) or has_unresolved_live_order_for_exchange(exchange):
             blockers.append("UNRESOLVED_OPEN_ORDER")
-        if len(load_open_live_positions(exchange, market)) >= MAX_OPEN_POSITIONS:
+        if len(load_open_live_positions(exchange, market)) >= MAX_OPEN_POSITIONS or load_open_live_positions_for_exchange(exchange):
             blockers.append("OPEN_POSITION_LIMIT")
     else:
         risk_state = {}
@@ -126,7 +128,7 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
             "max_open_positions": MAX_OPEN_POSITIONS,
         },
         "risk_state": risk_state,
-        "recent_switch_logs": load_strategy_switch_logs(10),
+        "recent_switch_logs": load_strategy_switch_logs_with_candidates(10),
     }
     if not apply or not can_apply or best is None:
         if apply and not can_apply:

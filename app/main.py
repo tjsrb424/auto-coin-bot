@@ -88,6 +88,7 @@ from app.database import (
 from app.auto_strategy_selector import auto_strategy_selector_status, evaluate_auto_strategy_selector
 from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
+from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strategy_promotion_pipeline, run_strategy_promotion_scheduler_tick
 from app.live_broker import (
     LiveBroker,
     LiveBrokerError,
@@ -127,6 +128,7 @@ from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
+    AUTO_STRATEGY_CONFIRMATION,
     cancel_live_strategy_open_order,
     live_strategy_status,
     run_live_strategy_tick,
@@ -669,6 +671,15 @@ async def lifespan(_: FastAPI):
         coalesce=True,
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_strategy_promotion_scheduler_tick,
+        "interval",
+        seconds=int(os.getenv("AUTO_PROMOTION_PIPELINE_INTERVAL_SECONDS", "60")),
+        id="strategy_promotion_pipeline_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     scheduler.start()
     _.state.scheduler = scheduler
     _.state.scheduler_started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -676,6 +687,7 @@ async def lifespan(_: FastAPI):
     logger.info("[paper-forward] scheduler started interval_seconds=60")
     logger.info("[auto-live] pilot scheduler started interval_seconds=10")
     logger.info("[live-strategy] pilot scheduler started interval_seconds=10")
+    logger.info("[strategy-promotion] scheduler started")
     try:
         yield
     finally:
@@ -726,8 +738,8 @@ def get_runtime_status(request: Request) -> dict:
 
 @app.post("/api/runtime/start")
 def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request) -> dict:
-    if payload.confirmation != "AUTO STRATEGY ENABLE":
-        raise HTTPException(status_code=400, detail="AUTO STRATEGY ENABLE confirmation is required.")
+    if payload.confirmation != AUTO_STRATEGY_CONFIRMATION:
+        raise HTTPException(status_code=400, detail=f"{AUTO_STRATEGY_CONFIRMATION} confirmation is required.")
     acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("admin-ui", request)
     if not acquired:
         return {
@@ -1231,7 +1243,12 @@ def evaluate_auto_strategy_selector_endpoint(payload: AutoSelectorRequest) -> di
 
 @app.post("/api/auto-strategy-selector/apply-best")
 def apply_best_auto_strategy_endpoint(payload: AutoSelectorRequest) -> dict:
-    return evaluate_auto_strategy_selector(exchange=payload.exchange, apply=True)
+    return apply_selector_if_allowed(exchange=payload.exchange)
+
+
+@app.post("/api/strategy-promotion/run")
+def run_strategy_promotion_endpoint(payload: AutoSelectorRequest) -> dict:
+    return run_strategy_promotion_pipeline(exchange=payload.exchange)
 
 
 def _live_status(exchange: str | None = None) -> dict:

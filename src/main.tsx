@@ -54,6 +54,8 @@ type Strategy = "ma_cross" | "rsi" | "volatility_breakout";
 type Exchange = "upbit" | "bithumb";
 type Tone = "neutral" | "green" | "red" | "amber" | "cyan";
 
+const AUTO_TRADING_CONFIRMATION = "돈은 속도가 아니라 규율로 지킨다";
+
 type Candle = {
   time: string;
   open: number;
@@ -1497,7 +1499,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           candidate_strategy_id: liveStrategyCandidateId,
-          confirmation: "AUTO STRATEGY ENABLE",
+          confirmation: AUTO_TRADING_CONFIRMATION,
           order_confirmation: "PLACE AUTO LIVE ORDER"
         })
       });

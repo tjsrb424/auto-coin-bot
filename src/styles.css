@@ -7763,3 +7763,50 @@ input:disabled {
   grid-column: 1 / -1;
   width: fit-content;
 }
+
+.ref-switch-logs {
+  display: grid;
+  gap: 7px;
+  margin-top: 16px;
+  border-top: 1px solid rgba(49, 69, 93, 0.52);
+  padding-top: 10px;
+}
+
+.ref-switch-logs > strong {
+  color: #dce7f7;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.ref-switch-logs p {
+  display: grid;
+  grid-template-columns: 54px 1fr;
+  gap: 3px 8px;
+  min-width: 0;
+  margin: 0;
+  font-size: 11px;
+}
+
+.ref-switch-logs b,
+.ref-switch-logs span,
+.ref-switch-logs em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-switch-logs b {
+  color: #f7fbff;
+  font-weight: 900;
+}
+
+.ref-switch-logs span {
+  color: #cbd7e8;
+  font-weight: 800;
+}
+
+.ref-switch-logs em {
+  grid-column: 1 / -1;
+  color: var(--ref-muted);
+  font-style: normal;
+}

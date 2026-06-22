@@ -32,6 +32,7 @@ from app.database import (
     load_live_order_logs,
     load_open_live_position,
     load_open_live_position_for_strategy,
+    load_open_live_positions_for_exchange,
     load_live_position_by_entry_order_uuid,
     load_running_live_strategy_sessions,
     market_is_live_allowed,
@@ -80,6 +81,8 @@ from app.upbit import fetch_minute_candles
 
 logger = logging.getLogger("uvicorn.error")
 _strategy_tick_lock = Lock()
+AUTO_STRATEGY_CONFIRMATION = "돈은 속도가 아니라 규율로 지킨다"
+AUTO_STRATEGY_ORDER_CONFIRMATION = "PLACE AUTO LIVE ORDER"
 SMART_AUTONOMOUS_STRATEGY_NAME = "smart_autonomous"
 SMART_AUTONOMOUS_CANDIDATE_ID = 0
 
@@ -184,6 +187,46 @@ def _active_selector_candidate() -> dict | None:
     return load_candidate_strategy(int(active["candidate_strategy_id"]))
 
 
+def _sync_session_to_active_selector(session: dict, config: LiveStrategyConfig) -> dict:
+    candidate = _active_selector_candidate()
+    if not candidate:
+        return session
+    if int(candidate.get("id") or 0) == int(session.get("candidate_strategy_id") or 0):
+        return session
+    candidate_market = str(candidate.get("market") or "")
+    candidate_status = str(candidate.get("status") or "")
+    if candidate_status not in {"LIVE_ELIGIBLE", "LIVE_ACTIVE"}:
+        return session
+    if not market_is_live_allowed(config.allowed_exchange, candidate_market):
+        return session
+    if load_open_live_positions_for_exchange(config.allowed_exchange):
+        return session
+    update_live_strategy_session(
+        int(session["id"]),
+        {
+            "candidate_strategy_id": int(candidate["id"]),
+            "market": candidate_market,
+            "strategy_name": candidate["strategy"],
+            "strategy_parameters": candidate.get("parameters", {}),
+            "last_risk_result": "ACTIVE_SELECTOR_SYNCED",
+            "last_order_status": "WAITING_NEXT_ENTRY",
+            "last_signal": "NONE",
+            "last_processed_candle_time_utc": None,
+        },
+    )
+    return {
+        **session,
+        "candidate_strategy_id": int(candidate["id"]),
+        "market": candidate_market,
+        "strategy_name": candidate["strategy"],
+        "strategy_parameters": candidate.get("parameters", {}),
+        "last_risk_result": "ACTIVE_SELECTOR_SYNCED",
+        "last_order_status": "WAITING_NEXT_ENTRY",
+        "last_signal": "NONE",
+        "last_processed_candle_time_utc": None,
+    }
+
+
 def _neutral_legacy_signal() -> dict:
     return {
         "signal": "HOLD",
@@ -235,10 +278,10 @@ def live_strategy_status() -> dict:
 
 
 def start_live_strategy_pilot(*, candidate_strategy_id: int | None = None, confirmation: str, order_confirmation: str) -> dict:
-    if confirmation != "AUTO STRATEGY ENABLE":
-        return {"ok": False, "message": "AUTO STRATEGY ENABLE confirmation is required.", **live_strategy_status()}
-    if order_confirmation != "PLACE AUTO LIVE ORDER":
-        return {"ok": False, "message": "PLACE AUTO LIVE ORDER confirmation is required.", **live_strategy_status()}
+    if confirmation != AUTO_STRATEGY_CONFIRMATION:
+        return {"ok": False, "message": f"{AUTO_STRATEGY_CONFIRMATION} confirmation is required.", **live_strategy_status()}
+    if order_confirmation != AUTO_STRATEGY_ORDER_CONFIRMATION:
+        return {"ok": False, "message": f"{AUTO_STRATEGY_ORDER_CONFIRMATION} confirmation is required.", **live_strategy_status()}
     config = LiveStrategyConfig.from_env()
     active_candidate = _active_selector_candidate() if candidate_strategy_id is None else None
     smart_autonomous = candidate_strategy_id is None and active_candidate is None
@@ -354,6 +397,9 @@ async def _process_session(session: dict) -> None:
     if position:
         await _process_open_position(session, position, config, live_config)
         return
+
+    session = _sync_session_to_active_selector(session, config)
+    session_market = _session_market(session, config)
 
     if _is_smart_autonomous_session(session):
         smart_position = load_open_live_position(None, config.allowed_exchange, session_market)

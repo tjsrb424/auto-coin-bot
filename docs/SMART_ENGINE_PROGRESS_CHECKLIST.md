@@ -72,4 +72,4 @@
 
 현재는 "제한 실주문 코드 준비, 기본 OFF, 소액 리허설 게이트 구현, limited 전환 점검 화면/API, 외부요인 provider 2차 반영, SELL/REDUCE 제한 실주문 경로 준비" 단계까지 완료되었습니다.
 
-다음 운영 단계는 소액 수동 주문/취소 smoke test, 리허설 결과 UI 승인, `AUTO STRATEGY ENABLE` 수동 시작, live order log의 `order_uuid` 확인입니다.
+다음 운영 단계는 소액 수동 주문/취소 smoke test, 리허설 결과 UI 승인, `돈은 속도가 아니라 규율로 지킨다` 수동 시작, live order log의 `order_uuid` 확인입니다.

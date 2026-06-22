@@ -1422,6 +1422,31 @@ def load_candidate_strategies(limit: int = 50, *, statuses: list[str] | None = N
     return candidates
 
 
+def load_candidate_strategies_without_forward_session(limit: int = 50, *, status: str = "BACKTEST_PASSED") -> list[dict]:
+    normalized_status = normalize_candidate_status(status)
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT candidate_strategies.*
+            FROM candidate_strategies
+            LEFT JOIN paper_forward_sessions
+              ON paper_forward_sessions.candidate_strategy_id = candidate_strategies.id
+             AND paper_forward_sessions.status IN ('READY', 'RUNNING', 'COMPLETED', 'STOPPED')
+            WHERE candidate_strategies.status = ?
+              AND paper_forward_sessions.id IS NULL
+            ORDER BY candidate_strategies.score DESC, candidate_strategies.updated_at DESC, candidate_strategies.id DESC
+            LIMIT ?
+            """,
+            (normalized_status, limit),
+        ).fetchall()
+    candidates = []
+    for row in rows:
+        item = dict(row)
+        item["parameters"] = json.loads(item.pop("parameters_json"))
+        candidates.append(item)
+    return candidates
+
+
 def load_candidate_strategy(candidate_id: int) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
@@ -1746,6 +1771,33 @@ def load_strategy_switch_logs(limit: int = 20) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def load_strategy_switch_logs_with_candidates(limit: int = 20) -> list[dict]:
+    logs = load_strategy_switch_logs(limit)
+    candidate_ids = {
+        int(value)
+        for log in logs
+        for value in (log.get("from_candidate_strategy_id"), log.get("to_candidate_strategy_id"))
+        if value is not None
+    }
+    candidates: dict[int, dict] = {}
+    for candidate_id in candidate_ids:
+        candidate = load_candidate_strategy(candidate_id)
+        if candidate:
+            candidates[candidate_id] = candidate
+    enriched = []
+    for log in logs:
+        from_candidate_id = log.get("from_candidate_strategy_id")
+        to_candidate_id = log.get("to_candidate_strategy_id")
+        enriched.append(
+            {
+                **log,
+                "from_candidate": candidates.get(int(from_candidate_id)) if from_candidate_id is not None else None,
+                "to_candidate": candidates.get(int(to_candidate_id)) if to_candidate_id is not None else None,
+            }
+        )
+    return enriched
+
+
 def count_strategy_switches_today() -> int:
     with get_connection() as conn:
         row = conn.execute(
@@ -1871,6 +1923,22 @@ def load_latest_forward_session() -> dict | None:
             ORDER BY id DESC
             LIMIT 1
             """
+        ).fetchone()
+    if row is None:
+        return None
+    return load_forward_session(int(row["id"]))
+
+
+def load_latest_forward_session_for_candidate(candidate_strategy_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM paper_forward_sessions
+            WHERE candidate_strategy_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (candidate_strategy_id,),
         ).fetchone()
     if row is None:
         return None
@@ -2925,6 +2993,10 @@ def pause_running_live_strategy_sessions_on_startup() -> int:
 
 def update_live_strategy_session(session_id: int, updates: dict) -> None:
     allowed = {
+        "candidate_strategy_id",
+        "market",
+        "strategy_name",
+        "strategy_parameters",
         "status",
         "auto_enabled",
         "orders_created_today",
@@ -2941,6 +3013,8 @@ def update_live_strategy_session(session_id: int, updates: dict) -> None:
     values = {key: value for key, value in updates.items() if key in allowed}
     if not values:
         return
+    if "strategy_parameters" in values:
+        values["strategy_parameters"] = json.dumps(values["strategy_parameters"] or {}, ensure_ascii=False)
     values["updated_at"] = _utc_now()
     columns = ", ".join(f"{key} = ?" for key in values)
     params = list(values.values()) + [session_id]
@@ -3095,6 +3169,21 @@ def load_open_live_positions(exchange: str = "bithumb", market: str = "KRW-BTC")
             ORDER BY created_at DESC, id DESC
             """,
             (exchange, market),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_open_live_positions_for_exchange(exchange: str = "bithumb") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_positions
+            WHERE exchange = ?
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+            ORDER BY created_at DESC, id DESC
+            """,
+            (exchange,),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -3360,6 +3449,22 @@ def has_open_live_strategy_order(exchange: str, market: str) -> bool:
 
 def has_unresolved_live_order(exchange: str, market: str) -> bool:
     return bool(load_reconcilable_live_order_logs(exchange, market))
+
+
+def has_unresolved_live_order_for_exchange(exchange: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT 1
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
+            LIMIT 1
+            """,
+            (exchange,),
+        ).fetchone()
+    return row is not None
 
 
 def load_reconcilable_live_order_logs(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:
