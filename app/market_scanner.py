@@ -51,9 +51,9 @@ def _score_ticker(ticker: dict) -> tuple[float, float, float, float]:
     return liquidity_score + volatility_score + risk_score, liquidity_score, volatility_score, risk_score
 
 
-async def _candle_diagnostics(market: str) -> dict:
+async def _candle_diagnostics(market: str, *, base_url: str = UPBIT_BASE_URL) -> dict:
     try:
-        candles = await fetch_minute_candles(market=market, unit=1, count=200)
+        candles = await fetch_minute_candles(market=market, unit=1, count=200, base_url=base_url)
     except Exception as exc:
         return {
             "available": False,
@@ -94,7 +94,8 @@ async def scan_market_universe(
     top_n = max(1, min(int(top_n), 20))
     max_candidates = max(top_n, min(int(max_candidates), 40))
     markets = await fetch_krw_markets(exchange=exchange)
-    tickers = await fetch_tickers(markets, base_url=EXCHANGE_BASE_URLS.get(exchange, UPBIT_BASE_URL))
+    base_url = EXCHANGE_BASE_URLS.get(exchange, UPBIT_BASE_URL)
+    tickers = await fetch_tickers(markets, base_url=base_url)
     ranked_tickers = sorted(tickers, key=lambda item: _float(item.get("acc_trade_price_24h")), reverse=True)
 
     scanned_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -105,7 +106,7 @@ async def scan_market_universe(
             continue
         score, liquidity_score, volatility_score, risk_score = _score_ticker(ticker)
         trade_price_24h = _float(ticker.get("acc_trade_price_24h"))
-        candle = await _candle_diagnostics(market)
+        candle = await _candle_diagnostics(market, base_url=base_url)
         enabled = trade_price_24h >= min_24h_trade_price_krw and bool(candle["available"])
         reason = candle["reason"] if not candle["available"] else ("low 24h trade price" if not enabled else "scan passed")
         if candle["available"]:

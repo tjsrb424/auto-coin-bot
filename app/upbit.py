@@ -11,6 +11,7 @@ UPBIT_BASE_URL = "https://api.upbit.com"
 SUPPORTED_UNITS = {1, 3, 5, 10, 15, 30, 60, 240}
 UPBIT_PUBLIC_BATCH_DELAY_SECONDS = float(os.getenv("UPBIT_PUBLIC_BATCH_DELAY_SECONDS", "0.12"))
 UPBIT_PUBLIC_MAX_RETRIES = int(os.getenv("UPBIT_PUBLIC_MAX_RETRIES", "5"))
+UPBIT_PUBLIC_TICKER_BATCH_SIZE = int(os.getenv("UPBIT_PUBLIC_TICKER_BATCH_SIZE", "80"))
 
 
 class UpbitClientError(RuntimeError):
@@ -49,6 +50,7 @@ async def fetch_minute_candles(
     unit: int = 1,
     count: int = 200,
     to: str | None = None,
+    base_url: str = UPBIT_BASE_URL,
 ) -> list[dict[str, Any]]:
     if unit not in SUPPORTED_UNITS:
         raise UpbitClientError("Unsupported minute candle unit.")
@@ -67,9 +69,9 @@ async def fetch_minute_candles(
                 params["to"] = cursor
             batch = await _get_public_json(
                 client,
-                f"{UPBIT_BASE_URL}/v1/candles/minutes/{unit}",
+                f"{base_url.rstrip('/')}/v1/candles/minutes/{unit}",
                 params,
-                "Upbit minute candle fetch",
+                "Minute candle fetch",
             )
             if not batch:
                 break
@@ -128,13 +130,19 @@ async def fetch_tickers(markets: list[str], *, base_url: str = UPBIT_BASE_URL) -
     if not unique_markets:
         return []
 
+    batch_size = max(1, UPBIT_PUBLIC_TICKER_BATCH_SIZE)
+    batches = [unique_markets[index : index + batch_size] for index in range(0, len(unique_markets), batch_size)]
+    tickers: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=10.0) as client:
-        payload = await _get_public_json(
-            client,
-            f"{base_url.rstrip('/')}/v1/ticker",
-            {"markets": ",".join(unique_markets)},
-            "Upbit ticker fetch",
-        )
-        if not isinstance(payload, list):
-            raise UpbitClientError("Upbit ticker response format is invalid.")
-        return payload
+        for index, batch in enumerate(batches):
+            payload = await _get_public_json(
+                client,
+                f"{base_url.rstrip('/')}/v1/ticker",
+                {"markets": ",".join(batch)},
+                "Ticker fetch",
+            )
+            if not isinstance(payload, list):
+                raise UpbitClientError("Ticker response format is invalid.")
+            tickers.extend(payload)
+            await _pace_next_public_batch(len(batches) - index - 1)
+    return tickers

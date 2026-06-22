@@ -74,6 +74,26 @@ class UpbitClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake.calls), 2)
         sleep.assert_awaited_once_with(0.12)
 
+    async def test_fetch_tickers_batches_large_market_list(self) -> None:
+        first = [{"market": "KRW-A", "trade_price": 1}]
+        second = [{"market": "KRW-C", "trade_price": 3}]
+        fake = FakeAsyncClient([response(200, first), response(200, second)])
+
+        with (
+            patch.object(upbit.httpx, "AsyncClient", return_value=fake),
+            patch.object(upbit.asyncio, "sleep", new_callable=AsyncMock) as sleep,
+            patch.object(upbit, "UPBIT_PUBLIC_TICKER_BATCH_SIZE", 2),
+            patch.object(upbit, "UPBIT_PUBLIC_BATCH_DELAY_SECONDS", 0.12),
+        ):
+            tickers = await upbit.fetch_tickers(["KRW-A", "KRW-B", "KRW-C"], base_url="https://api.bithumb.com")
+
+        self.assertEqual(tickers, [*first, *second])
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(fake.calls[0]["url"], "https://api.bithumb.com/v1/ticker")
+        self.assertEqual(fake.calls[0]["params"]["markets"], "KRW-A,KRW-B")
+        self.assertEqual(fake.calls[1]["params"]["markets"], "KRW-C")
+        sleep.assert_awaited_once_with(0.12)
+
 
 if __name__ == "__main__":
     unittest.main()
