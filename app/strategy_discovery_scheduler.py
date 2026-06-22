@@ -166,6 +166,7 @@ def discovery_scheduler_config() -> dict:
         "promotion_enabled": _bool_env("AUTO_PROMOTION_PIPELINE_ENABLED", True),
         "promotion_interval_minutes": _minutes_env("AUTO_PROMOTION_INTERVAL_MINUTES", 5, minimum=1),
         "lock_ttl_seconds": _int_env("AUTO_DISCOVERY_LOCK_TTL_SECONDS", 7200, minimum=60),
+        "promotion_lock_ttl_seconds": _int_env("AUTO_PROMOTION_LOCK_TTL_SECONDS", 900, minimum=60, maximum=900),
     }
 
 
@@ -467,7 +468,7 @@ async def run_promotion_selector_scheduler_once() -> dict:
             result={"reason": "SCHEDULER_DISABLED"},
             next_run_at=_next_run_after_minutes(int(config["promotion_interval_minutes"])),
         )
-    acquired, current = acquire_scheduler_task_lock(PROMOTION_TASK, ttl_seconds=int(config["lock_ttl_seconds"]))
+    acquired, current = acquire_scheduler_task_lock(PROMOTION_TASK, ttl_seconds=int(config["promotion_lock_ttl_seconds"]))
     if not acquired:
         return {"task_name": PROMOTION_TASK, "status": "SKIPPED", "reason": "LOCKED", "current": current}
     try:

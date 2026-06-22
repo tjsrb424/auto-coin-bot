@@ -287,6 +287,22 @@ export function BacktestValidationView({ exchange }: Props) {
     void refresh().catch((err) => setError(err instanceof Error ? err.message : "새로고침에 실패했습니다."));
   }, [refresh]);
 
+  React.useEffect(() => {
+    const refreshQuietly = () => {
+      if (document.hidden) return;
+      void refresh().catch(() => undefined);
+    };
+    const intervalId = window.setInterval(refreshQuietly, 30_000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) refreshQuietly();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [refresh]);
+
   const runAction = async (label: string, successMessage: string, action: () => Promise<void>) => {
     if (busy) return;
     setBusy(label);

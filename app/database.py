@@ -1253,6 +1253,15 @@ def _normalize_scheduler_state(row: dict) -> dict:
     return item
 
 
+def _parse_scheduler_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 def acquire_scheduler_task_lock(task_name: str, *, owner: str = "scheduler", ttl_seconds: int = 1800) -> tuple[bool, dict | None]:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     now_utc = now.isoformat().replace("+00:00", "Z")
@@ -1260,7 +1269,9 @@ def acquire_scheduler_task_lock(task_name: str, *, owner: str = "scheduler", ttl
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM scheduler_task_state WHERE task_name = ?", (task_name,)).fetchone()
         current = _normalize_scheduler_state(dict(row)) if row else None
-        if current and current.get("status") == "RUNNING" and str(current.get("lock_until") or "") > now_utc:
+        started_at = _parse_scheduler_time(str(current.get("last_started_at") or "")) if current else None
+        ttl_expired = bool(started_at and started_at + timedelta(seconds=max(1, ttl_seconds)) <= now)
+        if current and current.get("status") == "RUNNING" and str(current.get("lock_until") or "") > now_utc and not ttl_expired:
             return False, current
         stale_lock_recovered = bool(current and current.get("status") == "RUNNING")
         stale_result = dict(current.get("last_result") or {}) if current else {}

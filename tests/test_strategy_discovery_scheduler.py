@@ -212,6 +212,24 @@ class StrategyDiscoverySchedulerTests(unittest.TestCase):
         assert state is not None
         self.assertTrue(state["last_result"]["stale_lock_recovered"])
 
+    def test_scheduler_lock_recovers_when_started_at_exceeds_current_ttl(self) -> None:
+        acquired, _ = database.acquire_scheduler_task_lock("promotion_selector", owner="test", ttl_seconds=7200)
+        self.assertTrue(acquired)
+        old_started_at = (datetime.now(timezone.utc) - timedelta(minutes=20)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        future_lock_until = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        with database.get_connection() as conn:
+            conn.execute(
+                "UPDATE scheduler_task_state SET last_started_at = ?, lock_until = ? WHERE task_name = 'promotion_selector'",
+                (old_started_at, future_lock_until),
+            )
+
+        reacquired, state = database.acquire_scheduler_task_lock("promotion_selector", owner="next", ttl_seconds=900)
+
+        self.assertTrue(reacquired)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertTrue(state["last_result"]["stale_lock_recovered"])
+
     def test_promotion_selector_retries_database_locked_then_succeeds(self) -> None:
         calls = []
 

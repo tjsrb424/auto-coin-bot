@@ -60,12 +60,15 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
+def _int_env(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
     try:
         value = int(os.getenv(name, str(default)))
     except ValueError:
         value = default
-    return max(minimum, value)
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
 
 
 def autonomous_orchestrator_config() -> dict:
@@ -74,7 +77,7 @@ def autonomous_orchestrator_config() -> dict:
         "bootstrap_enabled": _bool_env("AUTO_AUTONOMOUS_ORCHESTRATOR_BOOTSTRAP_ENABLED", True),
         "on_start_enabled": _bool_env("AUTO_AUTONOMOUS_ORCHESTRATOR_ON_START_ENABLED", True),
         "interval_minutes": _int_env("AUTO_AUTONOMOUS_ORCHESTRATOR_INTERVAL_MINUTES", 5, minimum=1),
-        "lock_ttl_seconds": _int_env("AUTO_AUTONOMOUS_ORCHESTRATOR_LOCK_TTL_SECONDS", 7200, minimum=60),
+        "lock_ttl_seconds": _int_env("AUTO_AUTONOMOUS_ORCHESTRATOR_LOCK_TTL_SECONDS", 1800, minimum=60, maximum=1800),
     }
 
 
