@@ -11,7 +11,7 @@ from app.backtest import candles_to_frame
 from app.database import (
     insert_decision_snapshot,
     insert_order_intent,
-    load_bot_operation_policy,
+    load_global_bot_operation_policy,
     load_open_live_positions,
     update_live_position,
 )
@@ -33,7 +33,7 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
     features = _build_features(frame)
     market_regime, regime_positives, regime_negatives = classify_market_regime(features)
     current_price = float(candle.get("trade_price") or legacy_signal.get("price") or features.get("last_price") or 0.0)
-    policy = load_bot_operation_policy(str(session.get("market") or DEFAULT_MARKET))
+    policy = load_global_bot_operation_policy()
     max_total_exposure = max(_float(policy.get("max_total_exposure_krw"), 500_000.0), 1.0)
     daily_loss_limit_pct = _float(policy.get("daily_loss_limit_pct"), 3.0)
     daily_loss_limit_krw = max_total_exposure * daily_loss_limit_pct / 100

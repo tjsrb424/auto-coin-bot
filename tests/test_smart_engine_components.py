@@ -4,7 +4,7 @@ import os
 import unittest
 import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from app import database
@@ -15,7 +15,7 @@ from app.smart_readiness import build_limited_readiness
 from app.smart_signal_engine import aggregate_signal_score, evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
 from app.smart_attack import apply_aggressive_target_layer, calculate_attack_score
-from app.smart_decision import _order_intent
+from app.smart_decision import _order_intent, record_shadow_decision
 
 
 class SmartEngineComponentTests(unittest.TestCase):
@@ -78,6 +78,48 @@ class SmartEngineComponentTests(unittest.TestCase):
         )
         self.assertLessEqual(result["target_exposure_pct"], 30)
         self.assertIn("SMART_POLICY_AUTO_TRADING_DISABLED", result["blockers"])
+
+    def test_non_btc_decision_uses_global_operation_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with patch.object(database, "DB_PATH", db_path), patch(
+                "app.smart_decision.load_external_factors",
+                return_value={"providers": {}, "hard_blockers": []},
+            ):
+                database.init_db()
+                database.update_bot_operation_policy(
+                    "KRW-BTC",
+                    {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3},
+                )
+                non_btc_policy = database.load_bot_operation_policy("KRW-XLM")
+                self.assertFalse(non_btc_policy["auto_trading_enabled"])
+                start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                candles = []
+                price = 100.0
+                for index in range(80):
+                    price += 0.2
+                    candles.append(
+                        {
+                            "candle_time_utc": (start + timedelta(minutes=5 * index)).isoformat().replace("+00:00", "Z"),
+                            "opening_price": price - 0.1,
+                            "high_price": price + 0.3,
+                            "low_price": price - 0.3,
+                            "trade_price": price,
+                            "candle_acc_trade_volume": 1000,
+                        }
+                    )
+
+                decision = record_shadow_decision(
+                    session={"exchange": "bithumb", "market": "KRW-XLM", "candidate_strategy_id": 28},
+                    candidate={"unit": 5, "strategy": "rsi", "name": "KRW-XLM rsi"},
+                    candles=candles,
+                    candle=candles[-1],
+                    legacy_signal={"signal": "HOLD"},
+                    available_krw_balance=100_000,
+                )
+
+        self.assertNotIn("SMART_POLICY_AUTO_TRADING_DISABLED", decision["blockers"])
+        self.assertFalse(any("Operation policy auto trading is OFF" in reason for reason in decision["negative_reasons"]))
 
     def test_promotion_defaults_to_shadow_and_limited_respects_twenty_percent_cap(self) -> None:
         intent = {"side": "BID", "delta_value_krw": 150_000}
