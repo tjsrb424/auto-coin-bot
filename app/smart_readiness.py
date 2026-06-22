@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.database import count_live_strategy_orders_today, get_connection, load_bot_operation_policy, load_latest_decision_snapshot, load_latest_smart_rehearsal_review
+from app.database import count_live_strategy_orders_today, get_connection, load_global_bot_operation_policy, load_latest_decision_snapshot, load_latest_smart_rehearsal_review
 from app.live_broker import is_emergency_stopped
 from app.risk_manager import compute_risk_state
 from app.shadow_report import build_shadow_report
@@ -29,7 +29,7 @@ def build_limited_readiness(
 ) -> dict:
     decision = decision if decision is not None else load_latest_decision_snapshot(market)
     report = report if report is not None else build_shadow_report(market=market, limit=100, horizon_candles=3)
-    policy = policy if policy is not None else load_bot_operation_policy(market)
+    policy = policy if policy is not None else load_global_bot_operation_policy()
     risk_state = risk_state if risk_state is not None else compute_risk_state(exchange, market)
     live_mode = live_mode or smart_engine_live_mode()
     emergency_stopped = is_emergency_stopped() if emergency_stopped is None else bool(emergency_stopped)

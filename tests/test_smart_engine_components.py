@@ -121,6 +121,40 @@ class SmartEngineComponentTests(unittest.TestCase):
         self.assertNotIn("SMART_POLICY_AUTO_TRADING_DISABLED", decision["blockers"])
         self.assertFalse(any("Operation policy auto trading is OFF" in reason for reason in decision["negative_reasons"]))
 
+    def test_non_btc_readiness_uses_global_operation_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with patch.object(database, "DB_PATH", db_path):
+                database.init_db()
+                database.update_bot_operation_policy(
+                    "KRW-BTC",
+                    {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3},
+                )
+                self.assertFalse(database.load_bot_operation_policy("KRW-XLM")["auto_trading_enabled"])
+                readiness = build_limited_readiness(
+                    market="KRW-XLM",
+                    decision={
+                        "risk_score": 35,
+                        "order_intents": [{
+                            "id": 8,
+                            "side": "BID",
+                            "status": "CREATED",
+                            "delta_value_krw": 20_000,
+                            "promotion_status": "READY_FOR_LIVE",
+                        }],
+                    },
+                    report={"summary": {"recommendation": "READY_FOR_LIMITED_PILOT_REVIEW"}},
+                    risk_state={"status": "OK"},
+                    daily_smart_order_count=0,
+                    emergency_stopped=False,
+                    live_mode="live",
+                    now_utc=datetime(2026, 6, 18, 3, tzinfo=timezone.utc),
+                )
+
+        policy_check = next(item for item in readiness["checks"] if item["id"] == "policy_auto_trading")
+        self.assertEqual(policy_check["status"], "pass")
+        self.assertNotIn("policy_auto_trading", {item["id"] for item in readiness["checks"] if item["status"] == "block"})
+
     def test_promotion_defaults_to_shadow_and_limited_respects_twenty_percent_cap(self) -> None:
         intent = {"side": "BID", "delta_value_krw": 150_000}
         snapshot = {"current_bot_position_value_krw": 0}
