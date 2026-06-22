@@ -88,7 +88,15 @@ from app.database import (
 from app.auto_strategy_selector import auto_strategy_selector_status, evaluate_auto_strategy_selector
 from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
-from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strategy_promotion_pipeline, run_strategy_promotion_scheduler_tick
+from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strategy_promotion_pipeline
+from app.strategy_discovery_scheduler import (
+    discovery_scheduler_config,
+    discovery_scheduler_status,
+    run_deep_validation_scheduler_tick,
+    run_fast_validation_scheduler_tick,
+    run_market_scan_scheduler_tick,
+    run_promotion_selector_scheduler_tick,
+)
 from app.live_broker import (
     LiveBroker,
     LiveBrokerError,
@@ -671,11 +679,40 @@ async def lifespan(_: FastAPI):
         coalesce=True,
         replace_existing=True,
     )
+    discovery_config = discovery_scheduler_config()
     scheduler.add_job(
-        run_strategy_promotion_scheduler_tick,
+        run_market_scan_scheduler_tick,
         "interval",
-        seconds=int(os.getenv("AUTO_PROMOTION_PIPELINE_INTERVAL_SECONDS", "60")),
-        id="strategy_promotion_pipeline_tick",
+        minutes=int(discovery_config["scan_interval_minutes"]),
+        id="market_scan_scheduler_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_fast_validation_scheduler_tick,
+        "interval",
+        minutes=int(discovery_config["fast_interval_minutes"]),
+        id="fast_validation_scheduler_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_deep_validation_scheduler_tick,
+        "cron",
+        hour=4,
+        minute=0,
+        id="deep_validation_scheduler_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_promotion_selector_scheduler_tick,
+        "interval",
+        minutes=int(discovery_config["promotion_interval_minutes"]),
+        id="promotion_selector_scheduler_tick",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
@@ -687,7 +724,10 @@ async def lifespan(_: FastAPI):
     logger.info("[paper-forward] scheduler started interval_seconds=60")
     logger.info("[auto-live] pilot scheduler started interval_seconds=10")
     logger.info("[live-strategy] pilot scheduler started interval_seconds=10")
-    logger.info("[strategy-promotion] scheduler started")
+    logger.info("[market-scan] scheduler started interval_minutes=%s", discovery_config["scan_interval_minutes"])
+    logger.info("[fast-validation] scheduler started interval_minutes=%s", discovery_config["fast_interval_minutes"])
+    logger.info("[deep-validation] scheduler started cron=04:00 Asia/Seoul")
+    logger.info("[promotion-selector] scheduler started interval_minutes=%s", discovery_config["promotion_interval_minutes"])
     try:
         yield
     finally:
@@ -1249,6 +1289,11 @@ def apply_best_auto_strategy_endpoint(payload: AutoSelectorRequest) -> dict:
 @app.post("/api/strategy-promotion/run")
 def run_strategy_promotion_endpoint(payload: AutoSelectorRequest) -> dict:
     return run_strategy_promotion_pipeline(exchange=payload.exchange)
+
+
+@app.get("/api/strategy-discovery-scheduler/status")
+def get_strategy_discovery_scheduler_status() -> dict:
+    return discovery_scheduler_status()
 
 
 def _live_status(exchange: str | None = None) -> dict:

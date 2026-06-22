@@ -350,6 +350,20 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS scheduler_task_state (
+                task_name TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'IDLE',
+                lock_owner TEXT NOT NULL DEFAULT '',
+                lock_until TEXT,
+                last_started_at TEXT,
+                last_finished_at TEXT,
+                next_run_at TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                last_result_json TEXT NOT NULL DEFAULT '{}',
+                run_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS paper_forward_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_strategy_id INTEGER NOT NULL,
@@ -920,6 +934,12 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_candidate_strategies_dedupe
+            ON candidate_strategies(market, strategy, unit, backtest_period, status)
+            """
+        )
+        conn.execute(
+            """
             INSERT INTO bot_operation_policy (
                 market, auto_trading_enabled, max_total_exposure_krw, daily_loss_limit_pct
             ) VALUES ('KRW-BTC', 0, 500000, 3)
@@ -1109,6 +1129,111 @@ def market_is_auto_selectable(exchange: str, market: str) -> bool:
     if item is None:
         return market == DEFAULT_MARKET
     return bool(item.get("is_enabled") and item.get("is_auto_selectable"))
+
+
+def _normalize_scheduler_state(row: dict) -> dict:
+    item = dict(row)
+    try:
+        item["last_result"] = json.loads(item.pop("last_result_json") or "{}")
+    except json.JSONDecodeError:
+        item["last_result"] = {}
+    return item
+
+
+def acquire_scheduler_task_lock(task_name: str, *, owner: str = "scheduler", ttl_seconds: int = 1800) -> tuple[bool, dict | None]:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now_utc = now.isoformat().replace("+00:00", "Z")
+    lock_until = (now + timedelta(seconds=max(1, ttl_seconds))).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM scheduler_task_state WHERE task_name = ?", (task_name,)).fetchone()
+        current = _normalize_scheduler_state(dict(row)) if row else None
+        if current and current.get("status") == "RUNNING" and str(current.get("lock_until") or "") > now_utc:
+            return False, current
+        conn.execute(
+            """
+            INSERT INTO scheduler_task_state (
+                task_name, status, lock_owner, lock_until, last_started_at,
+                last_error, updated_at
+            ) VALUES (?, 'RUNNING', ?, ?, ?, '', ?)
+            ON CONFLICT(task_name) DO UPDATE SET
+                status = 'RUNNING',
+                lock_owner = excluded.lock_owner,
+                lock_until = excluded.lock_until,
+                last_started_at = excluded.last_started_at,
+                last_error = '',
+                updated_at = excluded.updated_at
+            """,
+            (task_name, owner, lock_until, now_utc, now_utc),
+        )
+        row = conn.execute("SELECT * FROM scheduler_task_state WHERE task_name = ?", (task_name,)).fetchone()
+    return True, _normalize_scheduler_state(dict(row)) if row else None
+
+
+def finish_scheduler_task(
+    task_name: str,
+    *,
+    status: str,
+    result: dict | None = None,
+    error: str = "",
+    next_run_at: str | None = None,
+) -> dict:
+    now_utc = _utc_now()
+    normalized_status = str(status or "IDLE").upper()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduler_task_state (
+                task_name, status, lock_owner, lock_until, last_finished_at,
+                next_run_at, last_error, last_result_json, run_count, updated_at
+            ) VALUES (?, ?, '', NULL, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(task_name) DO UPDATE SET
+                status = excluded.status,
+                lock_owner = '',
+                lock_until = NULL,
+                last_finished_at = excluded.last_finished_at,
+                next_run_at = excluded.next_run_at,
+                last_error = excluded.last_error,
+                last_result_json = excluded.last_result_json,
+                run_count = scheduler_task_state.run_count + 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task_name,
+                normalized_status,
+                now_utc,
+                next_run_at,
+                error,
+                json.dumps(result or {}, ensure_ascii=False),
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM scheduler_task_state WHERE task_name = ?", (task_name,)).fetchone()
+    return _normalize_scheduler_state(dict(row))
+
+
+def load_scheduler_task_state(task_name: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM scheduler_task_state WHERE task_name = ?", (task_name,)).fetchone()
+    return _normalize_scheduler_state(dict(row)) if row else None
+
+
+def load_scheduler_task_states(task_names: list[str] | None = None) -> list[dict]:
+    filters = ""
+    params: list[object] = []
+    if task_names:
+        filters = f"WHERE task_name IN ({', '.join('?' for _ in task_names)})"
+        params.extend(task_names)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM scheduler_task_state
+            {filters}
+            ORDER BY task_name ASC
+            """,
+            params,
+        ).fetchall()
+    return [_normalize_scheduler_state(dict(row)) for row in rows]
 
 
 def insert_candles(candles: list[dict]) -> int:
@@ -1445,6 +1570,67 @@ def load_candidate_strategies_without_forward_session(limit: int = 50, *, status
         item["parameters"] = json.loads(item.pop("parameters_json"))
         candidates.append(item)
     return candidates
+
+
+def count_candidate_strategies_created_since(created_at: str, *, statuses: list[str] | None = None) -> int:
+    filters = ["datetime(created_at) >= datetime(?)"]
+    params: list[object] = [created_at]
+    if statuses:
+        normalized = [normalize_candidate_status(status) for status in statuses]
+        filters.append(f"status IN ({', '.join('?' for _ in normalized)})")
+        params.extend(normalized)
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM candidate_strategies
+            WHERE {' AND '.join(filters)}
+            """,
+            params,
+        ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def find_duplicate_candidate_strategy(candidate: dict, *, statuses: list[str] | None = None) -> dict | None:
+    normalized_statuses = [normalize_candidate_status(status) for status in statuses] if statuses else []
+    filters = [
+        "market = ?",
+        "strategy = ?",
+        "unit = ?",
+        "backtest_period = ?",
+    ]
+    params: list[object] = [
+        candidate.get("market"),
+        candidate.get("strategy"),
+        int(candidate.get("unit") or 0),
+        candidate.get("backtest_period"),
+    ]
+    if normalized_statuses:
+        filters.append(f"status IN ({', '.join('?' for _ in normalized_statuses)})")
+        params.extend(normalized_statuses)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM candidate_strategies
+            WHERE {' AND '.join(filters)}
+            ORDER BY score DESC, updated_at DESC, id DESC
+            LIMIT 100
+            """,
+            params,
+        ).fetchall()
+    target_parameters = candidate.get("parameters") or {}
+    for row in rows:
+        item = dict(row)
+        try:
+            parameters = json.loads(item.get("parameters_json") or "{}")
+        except json.JSONDecodeError:
+            parameters = {}
+        if parameters == target_parameters:
+            item["parameters"] = parameters
+            item.pop("parameters_json", None)
+            return item
+    return None
 
 
 def load_candidate_strategy(candidate_id: int) -> dict | None:

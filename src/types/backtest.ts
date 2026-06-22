@@ -109,3 +109,33 @@ export type AutoStrategySelectorStatus = {
   daily_switch_count: number;
   recent_switch_logs?: StrategySwitchLog[];
 };
+
+export type SchedulerTaskState = {
+  task_name: string;
+  enabled?: boolean;
+  interval_seconds?: number;
+  interval_minutes?: number;
+  max_markets?: number;
+  max_save_per_run?: number;
+  max_save_per_day?: number;
+  max_candidate_pool?: number;
+  status: string;
+  lock_owner?: string;
+  lock_until?: string | null;
+  last_started_at?: string | null;
+  last_finished_at?: string | null;
+  next_run_at?: string | null;
+  last_error?: string;
+  last_result?: Record<string, unknown>;
+  run_count?: number;
+  updated_at?: string;
+};
+
+export type StrategyDiscoverySchedulerStatus = {
+  enabled: boolean;
+  exchange: string;
+  scan: SchedulerTaskState;
+  fast_validation: SchedulerTaskState;
+  deep_validation: SchedulerTaskState;
+  promotion_selector: SchedulerTaskState;
+};

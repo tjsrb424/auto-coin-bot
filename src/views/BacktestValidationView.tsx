@@ -4,13 +4,16 @@ import {
   evaluateAutoStrategySelector,
   fetchAutoStrategySelectorStatus,
   fetchMarketUniverse,
+  fetchStrategyDiscoverySchedulerStatus,
   runMultiMarketValidation,
   scanMarketUniverse
 } from "../api/backtest";
 import type {
   AutoStrategySelectorStatus,
   MarketUniverseItem,
-  MultiMarketValidationResponse
+  MultiMarketValidationResponse,
+  StrategyDiscoverySchedulerStatus,
+  SchedulerTaskState
 } from "../types/backtest";
 
 type Props = {
@@ -86,6 +89,11 @@ function formatReasonLabel(reason?: string | null) {
     SCORE_DELTA_TOO_SMALL: "현재 전략 대비 점수 차이가 충분하지 않습니다.",
     DAILY_SWITCH_LIMIT: "하루 전략 전환 한도에 도달했습니다.",
     BEST_CANDIDATE_ALREADY_ACTIVE: "최고 후보가 이미 적용 중입니다.",
+    AUTO_TRADING_DISABLED_SELECTOR_NOT_APPLIED: "자동매매 OFF라 실거래 전략 교체는 보류했습니다.",
+    DAILY_CANDIDATE_SAVE_LIMIT: "하루 후보 자동 저장 한도에 도달했습니다.",
+    CANDIDATE_POOL_LIMIT: "후보 풀이 가득 차 저장을 보류했습니다.",
+    DUPLICATE_CANDIDATE: "중복 후보라 저장하지 않았습니다.",
+    NO_AUTO_SELECTABLE_MARKETS: "자동 검증 가능한 마켓이 없습니다.",
     "SCAN PASSED": "스캔 통과",
     "LOW 24H TRADE PRICE": "24시간 거래대금 부족",
     "NO VALID CANDLE PRICES": "유효한 캔들 가격 없음",
@@ -123,6 +131,88 @@ function formatDateTime(value?: string | null) {
   });
 }
 
+function formatCompactDateTime(value?: string | null) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ko-KR", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function schedulerTone(task?: SchedulerTaskState | null) {
+  const status = String(task?.status ?? "").toUpperCase();
+  if (!task?.enabled || status === "DISABLED") return "neutral";
+  if (status === "RUNNING") return "amber";
+  if (status === "FAILED") return "red";
+  if (status === "COMPLETED" || status === "COMPLETED_WITH_ERRORS") return "green";
+  return "neutral";
+}
+
+function schedulerLabel(task?: SchedulerTaskState | null) {
+  if (!task?.enabled) return "꺼짐";
+  const labels: Record<string, string> = {
+    IDLE: "대기",
+    RUNNING: "실행 중",
+    COMPLETED: "완료",
+    COMPLETED_WITH_ERRORS: "일부 오류",
+    FAILED: "실패",
+    SKIPPED: "건너뜀",
+    DISABLED: "꺼짐",
+    LOCKED: "실행 보류",
+  };
+  return labels[String(task.status ?? "IDLE").toUpperCase()] ?? task.status ?? "대기";
+}
+
+function schedulerSummary(task?: SchedulerTaskState | null) {
+  const result = task?.last_result ?? {};
+  const saved = result.saved_candidate_count;
+  const accepted = result.accepted_count;
+  const errors = result.error_count;
+  const skipReason = result.skip_reason;
+  const selectorDecision = result.selector_decision;
+  if (typeof saved === "number") return `저장 ${saved}개 · 오류 ${typeof errors === "number" ? errors : 0}개`;
+  if (typeof accepted === "number") return `발견 ${accepted}개`;
+  if (typeof skipReason === "string" && skipReason) return formatReasonLabel(skipReason);
+  if (typeof selectorDecision === "string" && selectorDecision) return `Selector ${formatStatusLabel(selectorDecision)}`;
+  return task?.last_error || "최근 결과 없음";
+}
+
+function coinLogoUrls(symbol?: string | null) {
+  const normalized = String(symbol ?? "").trim().toUpperCase();
+  if (!normalized) return [];
+  const encoded = encodeURIComponent(normalized);
+  return [
+    `https://static.upbit.com/logos/${encoded}.png`,
+    `https://img.logokit.com/token/${encoded}`,
+  ];
+}
+
+function CoinLogo({ symbol }: { symbol?: string | null }) {
+  const [sourceIndex, setSourceIndex] = React.useState(0);
+  const normalized = String(symbol ?? "").trim().toUpperCase();
+  const initial = normalized.slice(0, 1) || "?";
+  const urls = coinLogoUrls(normalized);
+  const url = urls[sourceIndex];
+
+  React.useEffect(() => {
+    setSourceIndex(0);
+  }, [normalized]);
+
+  return (
+    <span className="ref-coin-logo" aria-label={`${normalized || "coin"} logo`}>
+      {url ? (
+        <img src={url} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setSourceIndex((current) => current + 1)} />
+      ) : (
+        <span>{initial}</span>
+      )}
+    </span>
+  );
+}
+
 function Chip({ value, tone = "neutral" }: { value?: string; tone?: string }) {
   return <span className={`ref-status-chip ${tone}`}>{formatStatusLabel(value)}</span>;
 }
@@ -132,17 +222,20 @@ export function BacktestValidationView({ exchange }: Props) {
   const [selectedMarkets, setSelectedMarkets] = React.useState<string[]>([]);
   const [validation, setValidation] = React.useState<MultiMarketValidationResponse | null>(null);
   const [selector, setSelector] = React.useState<AutoStrategySelectorStatus | null>(null);
+  const [scheduler, setScheduler] = React.useState<StrategyDiscoverySchedulerStatus | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const [marketResult, selectorResult] = await Promise.all([
+    const [marketResult, selectorResult, schedulerResult] = await Promise.all([
       fetchMarketUniverse(exchange),
-      fetchAutoStrategySelectorStatus(exchange)
+      fetchAutoStrategySelectorStatus(exchange),
+      fetchStrategyDiscoverySchedulerStatus()
     ]);
     setMarkets(marketResult.markets);
     setSelector(selectorResult);
+    setScheduler(schedulerResult);
     setSelectedMarkets((current) => {
       if (current.length) return current.filter((market) => marketResult.markets.some((item) => item.market === market));
       return marketResult.markets.filter((item) => item.is_enabled && item.is_auto_selectable).slice(0, 5).map((item) => item.market);
@@ -179,21 +272,24 @@ export function BacktestValidationView({ exchange }: Props) {
   const switchLogs = selector?.recent_switch_logs?.slice(0, 4) ?? [];
 
   return (
-    <section className="ref-backtest-view">
+    <section className={`ref-backtest-view${busy ? " is-busy" : ""}`}>
       <div className="ref-panel ref-backtest-command">
         <div className="ref-backtest-head">
           <span><TestTube2 size={18} /> 전략 검증 센터</span>
-          <Chip value={busy ? "RUNNING" : "READY"} tone={busy ? "amber" : "green"} />
+          <div className="ref-backtest-status">
+            {busy ? <span className="ref-loading-state"><span className="ref-loading-spinner" />{busy} 진행 중</span> : null}
+            <Chip value={busy ? "RUNNING" : "READY"} tone={busy ? "amber" : "green"} />
+          </div>
         </div>
         <div className="ref-backtest-actions">
-          <button onClick={() => runAction("마켓 스캔", "마켓 스캔이 완료되었습니다.", async () => { await scanMarketUniverse(exchange); await refresh(); })} disabled={!!busy}>
-            <RefreshCw size={16} /> 마켓 스캔
+          <button className={busy === "마켓 스캔" ? "is-loading" : ""} onClick={() => runAction("마켓 스캔", "마켓 스캔이 완료되었습니다.", async () => { await scanMarketUniverse(exchange); await refresh(); })} disabled={!!busy}>
+            {busy === "마켓 스캔" ? <span className="ref-loading-spinner" /> : <RefreshCw size={16} />} 마켓 스캔
           </button>
-          <button onClick={() => runAction("다중 검증", "다중 마켓 검증이 완료되었습니다.", async () => { setValidation(await runMultiMarketValidation(exchange, selectedMarkets)); await refresh(); })} disabled={!!busy || selectedMarkets.length === 0}>
-            <BarChart3 size={16} /> 검증 실행
+          <button className={busy === "다중 검증" ? "is-loading" : ""} onClick={() => runAction("다중 검증", "다중 마켓 검증이 완료되었습니다.", async () => { setValidation(await runMultiMarketValidation(exchange, selectedMarkets)); await refresh(); })} disabled={!!busy || selectedMarkets.length === 0}>
+            {busy === "다중 검증" ? <span className="ref-loading-spinner" /> : <BarChart3 size={16} />} 검증 실행
           </button>
-          <button onClick={() => runAction("전략 선택 평가", "자동 전략 선택 평가가 완료되었습니다.", async () => { setSelector(await evaluateAutoStrategySelector(exchange)); })} disabled={!!busy}>
-            <Bot size={16} /> 선택 평가
+          <button className={busy === "전략 선택 평가" ? "is-loading" : ""} onClick={() => runAction("전략 선택 평가", "자동 전략 선택 평가가 완료되었습니다.", async () => { setSelector(await evaluateAutoStrategySelector(exchange)); })} disabled={!!busy}>
+            {busy === "전략 선택 평가" ? <span className="ref-loading-spinner" /> : <Bot size={16} />} 선택 평가
           </button>
         </div>
         {(message || error) && <p className={error ? "ref-backtest-error" : "ref-backtest-message"}>{error ?? message}</p>}
@@ -203,6 +299,22 @@ export function BacktestValidationView({ exchange }: Props) {
           <p><span>실거래 허용</span><b>{liveAllowedCount}</b></p>
           <p><span>선택됨</span><b>{selectedMarkets.length}</b></p>
         </div>
+        <div className="ref-scheduler-strip">
+          {[
+            { label: "마켓 스캔", task: scheduler?.scan },
+            { label: "빠른 검증", task: scheduler?.fast_validation },
+            { label: "정밀 검증", task: scheduler?.deep_validation },
+            { label: "Selector", task: scheduler?.promotion_selector },
+          ].map(({ label, task }) => (
+            <div key={label} className={`ref-scheduler-card ${schedulerTone(task)}`}>
+              <strong>{label}</strong>
+              <Chip value={schedulerLabel(task)} tone={schedulerTone(task)} />
+              <span>최근 {formatCompactDateTime(task?.last_finished_at)}</span>
+              <span>다음 {formatCompactDateTime(task?.next_run_at)}</span>
+              <em title={task?.last_error || schedulerSummary(task)}>{task?.last_error || schedulerSummary(task)}</em>
+            </div>
+          ))}
+        </div>
       </div>
 
       <div className="ref-panel ref-backtest-markets">
@@ -210,6 +322,7 @@ export function BacktestValidationView({ exchange }: Props) {
         <div className="ref-backtest-market-list">
           {markets.slice(0, 20).map((item) => (
             <button key={item.id} className={selectedMarkets.includes(item.market) ? "is-selected" : ""} onClick={() => toggleMarket(item.market)}>
+              <CoinLogo symbol={item.symbol} />
               <strong>{item.market}</strong>
               <span>{formatKrw(item.last_24h_trade_price_krw)}</span>
               <Chip value={item.is_live_allowed ? "LIVE" : item.status} tone={item.is_live_allowed ? "green" : statusTone(item.status)} />

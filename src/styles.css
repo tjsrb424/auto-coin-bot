@@ -7504,9 +7504,28 @@ input:disabled {
   left: 0;
   top: 0;
   width: 1430px;
-  height: 164px;
+  height: 232px;
   overflow: hidden;
   padding: 14px 18px;
+}
+
+.ref-backtest-view.is-busy .ref-backtest-command {
+  border-color: rgba(246, 195, 91, 0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    0 0 0 1px rgba(246, 195, 91, 0.09),
+    0 16px 42px rgba(0, 0, 0, 0.2);
+}
+
+.ref-backtest-view.is-busy .ref-backtest-command::after {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #f6c35b, #2b95ff, transparent);
+  content: "";
+  animation: ref-loading-sweep 1.2s linear infinite;
 }
 
 .ref-backtest-head,
@@ -7531,6 +7550,32 @@ input:disabled {
 
 .ref-backtest-head span {
   transform: translateY(-1px);
+}
+
+.ref-backtest-status,
+.ref-loading-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ref-loading-state {
+  color: #f6c35b;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.ref-loading-spinner {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(246, 195, 91, 0.28);
+  border-top-color: #f6c35b;
+  border-radius: 50%;
+  animation: ref-loading-spin 760ms linear infinite;
 }
 
 .ref-backtest-actions {
@@ -7567,6 +7612,17 @@ input:disabled {
 .ref-backtest-actions button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+.ref-backtest-view.is-busy .ref-backtest-actions button {
+  opacity: 0.42;
+}
+
+.ref-backtest-view.is-busy .ref-backtest-actions button.is-loading {
+  border-color: rgba(246, 195, 91, 0.76);
+  background: rgba(55, 40, 15, 0.74);
+  color: #fff4ce;
+  opacity: 1;
 }
 
 .ref-backtest-message,
@@ -7632,36 +7688,94 @@ input:disabled {
   white-space: nowrap;
 }
 
+.ref-scheduler-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.ref-scheduler-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 78px;
+  min-height: 66px;
+  align-items: center;
+  gap: 7px 8px;
+  overflow: hidden;
+  border: 1px solid rgba(49, 69, 93, 0.72);
+  border-radius: 5px;
+  background: rgba(5, 12, 21, 0.38);
+  padding: 7px 10px;
+}
+
+.ref-scheduler-card.green {
+  border-color: rgba(24, 217, 111, 0.28);
+}
+
+.ref-scheduler-card.amber {
+  border-color: rgba(246, 195, 91, 0.42);
+}
+
+.ref-scheduler-card.red {
+  border-color: rgba(255, 92, 92, 0.42);
+}
+
+.ref-scheduler-card strong,
+.ref-scheduler-card span,
+.ref-scheduler-card em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-scheduler-card strong {
+  color: #f7fbff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.ref-scheduler-card span,
+.ref-scheduler-card em {
+  color: var(--ref-muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.ref-scheduler-card em {
+  grid-column: 1 / -1;
+}
+
 .ref-backtest-markets {
   left: 0;
-  top: 184px;
+  top: 252px;
   width: 454px;
-  height: 640px;
+  height: 572px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-ranking {
   left: 474px;
-  top: 184px;
+  top: 252px;
   width: 626px;
-  height: 640px;
+  height: 572px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-selector {
   left: 1120px;
-  top: 184px;
+  top: 252px;
   width: 310px;
-  height: 640px;
+  height: 572px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-market-list {
   display: grid;
-  max-height: 578px;
+  max-height: 510px;
   gap: 8px;
   margin-top: 14px;
   overflow: auto;
@@ -7670,7 +7784,7 @@ input:disabled {
 
 .ref-backtest-market-list button {
   display: grid;
-  grid-template-columns: 86px 1fr 78px;
+  grid-template-columns: 28px 82px minmax(0, 1fr) 78px;
   min-height: 58px;
   padding: 9px 10px;
   text-align: left;
@@ -7682,15 +7796,45 @@ input:disabled {
 }
 
 .ref-backtest-market-list strong,
-.ref-backtest-market-list span,
+.ref-backtest-market-list button > span:not(.ref-coin-logo),
 .ref-backtest-market-list em {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.ref-coin-logo {
+  display: grid;
+  grid-row: 1 / 3;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  align-self: start;
+  overflow: hidden;
+  border: 1px solid rgba(102, 132, 170, 0.5);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 35% 25%, rgba(255, 255, 255, 0.2), transparent 42%),
+    rgba(10, 22, 36, 0.96);
+  color: #f7fbff;
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 1;
+}
+
+.ref-coin-logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ref-coin-logo span {
+  line-height: 1;
+}
+
 .ref-backtest-market-list em {
-  grid-column: 1 / -1;
+  grid-column: 2 / -1;
   color: var(--ref-muted);
   font-size: 11px;
   font-style: normal;
@@ -7809,4 +7953,19 @@ input:disabled {
   grid-column: 1 / -1;
   color: var(--ref-muted);
   font-style: normal;
+}
+
+@keyframes ref-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes ref-loading-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
 }

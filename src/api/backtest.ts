@@ -1,7 +1,8 @@
 import type {
   AutoStrategySelectorStatus,
   MarketUniverseItem,
-  MultiMarketValidationResponse
+  MultiMarketValidationResponse,
+  StrategyDiscoverySchedulerStatus
 } from "../types/backtest";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
@@ -54,6 +55,10 @@ export function runMultiMarketValidation(exchange: string, markets: string[]) {
 
 export function fetchAutoStrategySelectorStatus(exchange: string) {
   return requestJson<AutoStrategySelectorStatus>(`/api/auto-strategy-selector/status?exchange=${exchange}`);
+}
+
+export function fetchStrategyDiscoverySchedulerStatus() {
+  return requestJson<StrategyDiscoverySchedulerStatus>("/api/strategy-discovery-scheduler/status");
 }
 
 export function evaluateAutoStrategySelector(exchange: string) {
