@@ -149,6 +149,20 @@ class MultiMarketStrategyTests(unittest.TestCase):
         self.assertTrue(applied["can_apply"], applied)
         self.assertEqual(database.load_active_strategy_selection()["candidate_strategy_id"], candidate_id)
 
+    def test_selector_daily_switch_limit_zero_means_unlimited(self) -> None:
+        self.seed_market(live_allowed=True)
+        candidate_id = database.save_candidate_strategy(candidate_payload("KRW-ETH", "LIVE_ELIGIBLE", 95))
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5})
+
+        with patch("app.auto_strategy_selector.MAX_SWITCHES_PER_DAY", 0), \
+            patch("app.auto_strategy_selector.count_strategy_switches_today", return_value=99), \
+            patch("app.auto_strategy_selector.is_emergency_stopped", return_value=False):
+            result = evaluate_auto_strategy_selector(exchange="bithumb", apply=True)
+
+        self.assertTrue(result["can_apply"], result)
+        self.assertNotIn("DAILY_SWITCH_LIMIT", result["blockers"])
+        self.assertEqual(database.load_active_strategy_selection()["candidate_strategy_id"], candidate_id)
+
     def test_strategy_validation_accepts_non_btc_market(self) -> None:
         async def loader(market: str, unit: int, start: str, end: str):
             return candle_rows(market)

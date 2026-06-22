@@ -27,7 +27,7 @@ from app.risk_manager import compute_risk_state
 
 MIN_SCORE_DELTA = float(os.getenv("AUTO_SELECTOR_MIN_SCORE_DELTA", "10"))
 SWITCH_COOLDOWN_MINUTES = int(os.getenv("AUTO_SELECTOR_SWITCH_COOLDOWN_MINUTES", "60"))
-MAX_SWITCHES_PER_DAY = int(os.getenv("AUTO_SELECTOR_MAX_SWITCHES_PER_DAY", "3"))
+MAX_SWITCHES_PER_DAY = int(os.getenv("AUTO_SELECTOR_MAX_SWITCHES_PER_DAY", "0"))
 MAX_OPEN_POSITIONS = int(os.getenv("AUTO_SELECTOR_MAX_OPEN_POSITIONS", os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "5")))
 
 
@@ -108,7 +108,7 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
     elif active and best:
         warnings.append("BEST_CANDIDATE_ALREADY_ACTIVE")
 
-    if daily_switch_count >= MAX_SWITCHES_PER_DAY:
+    if MAX_SWITCHES_PER_DAY > 0 and daily_switch_count >= MAX_SWITCHES_PER_DAY:
         blockers.append("DAILY_SWITCH_LIMIT")
 
     can_apply = bool(best) and not blockers
