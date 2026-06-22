@@ -3,6 +3,7 @@ import type {
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
   BotPolicy,
+  CapitalAllocatorStatus,
   DbSchemaStatus,
   HealthStatus,
   MarketUniverseItem,
@@ -86,6 +87,24 @@ export function runAutonomousOrchestratorNow() {
   return requestJson<AutonomousOrchestratorRunResponse>("/api/autonomous-orchestrator/run-now", {
     method: "POST",
     body: JSON.stringify({ reason: "MANUAL_RUN_NOW" })
+  });
+}
+
+export function fetchCapitalAllocatorStatus(exchange: string) {
+  return requestJson<CapitalAllocatorStatus>(`/api/capital-allocator/status?exchange=${exchange}`);
+}
+
+export function runCapitalAllocatorNow(exchange: string) {
+  return requestJson<{
+    ok?: boolean;
+    run?: Record<string, unknown>;
+    accepted?: unknown[];
+    blocked?: unknown[];
+    status?: CapitalAllocatorStatus;
+    task_name?: string;
+  }>("/api/capital-allocator/run-now", {
+    method: "POST",
+    body: JSON.stringify({ exchange })
   });
 }
 

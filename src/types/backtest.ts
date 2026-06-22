@@ -195,6 +195,58 @@ export type AutonomousOrchestratorStatus = {
   } | null;
 };
 
+export type PositionSlot = {
+  id: number;
+  slot_number: number;
+  status: string;
+  exchange: string;
+  market?: string | null;
+  candidate_strategy_id?: number | null;
+  live_position_id?: number | null;
+  live_strategy_session_id?: number | null;
+  allocated_krw?: number;
+  reserved_krw?: number;
+  current_value_krw?: number;
+  unrealized_pnl?: number;
+  realized_pnl?: number;
+  entry_reason?: string | null;
+  exit_reason?: string | null;
+  opened_at?: string | null;
+  closed_at?: string | null;
+};
+
+export type NextEntryQueueItem = {
+  id: number;
+  candidate_strategy_id: number;
+  market: string;
+  strategy: string;
+  unit: number;
+  score: number;
+  allocation_score: number;
+  status: string;
+  blocked_reason?: string | null;
+  queued_at: string;
+  expires_at?: string | null;
+};
+
+export type CapitalAllocatorStatus = {
+  enabled: boolean;
+  exchange: string;
+  policy: BotPolicy;
+  max_slots: number;
+  open_slot_count: number;
+  empty_slot_count: number;
+  max_total_exposure_krw: number;
+  current_open_position_value_krw: number;
+  pending_buy_reserved_krw: number;
+  remaining_exposure_krw: number;
+  cash_reserve_krw: number;
+  slots: PositionSlot[];
+  reservations: Record<string, unknown>[];
+  next_entry_queue: NextEntryQueueItem[];
+  required_edge_pct: number;
+};
+
 export type AutonomousOrchestratorRunResponse =
   | SchedulerTaskState
   | {

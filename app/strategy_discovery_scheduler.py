@@ -497,6 +497,8 @@ async def run_promotion_selector_scheduler_once() -> dict:
                 next_run_at=_next_run_after_minutes(int(config["promotion_interval_minutes"])),
             )
         selector = result.get("selector", {})
+        allocator = result.get("allocator", {})
+        allocator_run = allocator.get("run", {}) if isinstance(allocator, dict) else {}
         policy = load_global_bot_operation_policy()
         summary = {
             "enrolled_count": len(result.get("enrolled", {}).get("enrolled", [])),
@@ -504,6 +506,9 @@ async def run_promotion_selector_scheduler_once() -> dict:
             "blocked_count": len(result.get("promoted", {}).get("blocked", [])),
             "selector_decision": selector.get("decision"),
             "selector_blockers": selector.get("blockers", [])[:6],
+            "allocator_status": allocator_run.get("status") or allocator.get("status"),
+            "allocator_accepted_count": len(allocator.get("accepted", [])) if isinstance(allocator, dict) else 0,
+            "allocator_blocked_count": len(allocator.get("blocked", [])) if isinstance(allocator, dict) else 0,
             "auto_trading_enabled": bool(policy.get("auto_trading_enabled")),
             "skip_reason": "AUTO_TRADING_DISABLED_SELECTOR_NOT_APPLIED" if not policy.get("auto_trading_enabled") else "",
         }

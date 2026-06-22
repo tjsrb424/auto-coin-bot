@@ -172,8 +172,12 @@ def apply_selector_if_allowed(*, exchange: str | None = None) -> dict:
             blockers.append("RISK_STATE_BLOCKED")
         if has_unresolved_live_order(exchange, best_market) or has_unresolved_live_order_for_exchange(exchange):
             blockers.append("UNRESOLVED_OPEN_ORDER")
-        if load_open_live_positions(exchange, best_market) or load_open_live_positions_for_exchange(exchange):
+        open_positions = load_open_live_positions_for_exchange(exchange)
+        max_open_positions = int(os.getenv("AUTO_SELECTOR_MAX_OPEN_POSITIONS", os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "5")))
+        if len(open_positions) >= max_open_positions:
             blockers.append("OPEN_POSITION_LIMIT")
+        elif load_open_live_positions(exchange, best_market):
+            blockers.append("DUPLICATE_MARKET_POSITION")
     else:
         risk_state = {}
     blockers.extend(status.get("blockers") or [])
@@ -195,6 +199,9 @@ def apply_selector_if_allowed(*, exchange: str | None = None) -> dict:
 async def run_strategy_promotion_pipeline_async(*, exchange: str | None = None) -> dict:
     enrolled = await enroll_backtest_passed_candidates()
     promoted = promote_shadow_candidates()
+    from app.capital_allocator import run_capital_allocator_once
+
+    allocator = run_capital_allocator_once("PROMOTION_SELECTOR", exchange=exchange or _config()["exchange"])
     selector = apply_selector_if_allowed(exchange=exchange)
     return {
         "ok": True,
@@ -202,6 +209,7 @@ async def run_strategy_promotion_pipeline_async(*, exchange: str | None = None) 
         "enrolled": enrolled,
         "promoted": promoted,
         "selector": selector,
+        "allocator": allocator,
         "switch_logs": load_strategy_switch_logs_with_candidates(10),
     }
 

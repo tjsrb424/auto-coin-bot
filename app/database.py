@@ -31,6 +31,11 @@ REQUIRED_SCHEMA_TABLES = [
     "paper_forward_orders",
     "live_order_logs",
     "live_positions",
+    "position_slots",
+    "capital_allocation_runs",
+    "capital_allocation_decisions",
+    "order_reservations",
+    "next_entry_queue",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -640,6 +645,105 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(session_id) REFERENCES live_strategy_sessions(id),
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS position_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slot_number INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'EMPTY',
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT,
+                candidate_strategy_id INTEGER,
+                live_position_id INTEGER,
+                live_strategy_session_id INTEGER,
+                entry_order_uuid TEXT,
+                exit_order_uuid TEXT,
+                allocated_krw REAL NOT NULL DEFAULT 0,
+                reserved_krw REAL NOT NULL DEFAULT 0,
+                current_value_krw REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                entry_reason TEXT,
+                exit_reason TEXT,
+                opened_at TEXT,
+                closed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id),
+                FOREIGN KEY(live_position_id) REFERENCES live_positions(id),
+                FOREIGN KEY(live_strategy_session_id) REFERENCES live_strategy_sessions(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS capital_allocation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                max_total_exposure_krw REAL NOT NULL DEFAULT 0,
+                current_exposure_krw REAL NOT NULL DEFAULT 0,
+                pending_reserved_krw REAL NOT NULL DEFAULT 0,
+                available_krw_balance REAL,
+                remaining_exposure_krw REAL NOT NULL DEFAULT 0,
+                empty_slot_count INTEGER NOT NULL DEFAULT 0,
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                accepted_count INTEGER NOT NULL DEFAULT 0,
+                blocked_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS capital_allocation_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                candidate_strategy_id INTEGER,
+                market TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                allocation_score REAL NOT NULL DEFAULT 0,
+                desired_order_krw REAL NOT NULL DEFAULT 0,
+                approved_order_krw REAL NOT NULL DEFAULT 0,
+                blocked_reason TEXT,
+                fee_rate REAL NOT NULL DEFAULT 0,
+                estimated_fee_krw REAL NOT NULL DEFAULT 0,
+                estimated_slippage_krw REAL NOT NULL DEFAULT 0,
+                expected_edge_pct REAL NOT NULL DEFAULT 0,
+                required_edge_pct REAL NOT NULL DEFAULT 0,
+                decision TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(run_id) REFERENCES capital_allocation_runs(id),
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS order_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                candidate_strategy_id INTEGER NOT NULL,
+                slot_id INTEGER,
+                amount_krw REAL NOT NULL,
+                status TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id),
+                FOREIGN KEY(slot_id) REFERENCES position_slots(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS next_entry_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_strategy_id INTEGER NOT NULL,
+                market TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                unit INTEGER NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 0,
+                allocation_score REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                blocked_reason TEXT,
+                queued_at TEXT NOT NULL,
+                expires_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(candidate_strategy_id, status),
                 FOREIGN KEY(candidate_strategy_id) REFERENCES candidate_strategies(id)
             );
 
@@ -3249,8 +3353,17 @@ def create_live_strategy_session(session: dict) -> int:
                 stopped_at = ?,
                 updated_at = ?
             WHERE status IN ('READY', 'RUNNING', 'PAUSED')
+              AND exchange = ?
+              AND market = ?
+              AND candidate_strategy_id = ?
             """,
-            (now_utc, now_utc),
+            (
+                now_utc,
+                now_utc,
+                session["exchange"],
+                session["market"],
+                int(session["candidate_strategy_id"]),
+            ),
         )
         cursor = conn.execute(
             """
@@ -3517,6 +3630,465 @@ def load_open_live_positions_for_exchange(exchange: str = "bithumb") -> list[dic
             (exchange,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def ensure_position_slots(max_slots: int = 5, exchange: str = "bithumb") -> list[dict]:
+    max_slots = max(1, int(max_slots))
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        for slot_number in range(1, max_slots + 1):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO position_slots (
+                    slot_number, status, exchange, created_at, updated_at
+                ) VALUES (?, 'EMPTY', ?, ?, ?)
+                """,
+                (slot_number, exchange, now_utc, now_utc),
+            )
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM position_slots
+            WHERE slot_number <= ?
+            ORDER BY slot_number ASC
+            """,
+            (max_slots,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def reconcile_position_slots(max_slots: int = 5, exchange: str = "bithumb") -> list[dict]:
+    ensure_position_slots(max_slots, exchange)
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE order_reservations
+            SET status = 'EXPIRED',
+                updated_at = ?
+            WHERE exchange = ?
+              AND status IN ('RESERVED', 'ORDER_SUBMITTED')
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            """,
+            (now_utc, exchange, now_utc),
+        )
+        conn.execute(
+            """
+            UPDATE position_slots
+            SET status = 'EMPTY',
+                market = NULL,
+                candidate_strategy_id = NULL,
+                live_position_id = NULL,
+                live_strategy_session_id = NULL,
+                entry_order_uuid = NULL,
+                exit_order_uuid = NULL,
+                allocated_krw = 0,
+                reserved_krw = 0,
+                current_value_krw = 0,
+                unrealized_pnl = 0,
+                realized_pnl = 0,
+                entry_reason = NULL,
+                exit_reason = NULL,
+                opened_at = NULL,
+                closed_at = ?,
+                updated_at = ?
+            WHERE exchange = ?
+              AND status = 'RESERVED'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM order_reservations r
+                  WHERE r.slot_id = position_slots.id
+                    AND r.status IN ('RESERVED', 'ORDER_SUBMITTED')
+                    AND (r.expires_at IS NULL OR r.expires_at > ?)
+              )
+            """,
+            (now_utc, now_utc, exchange, now_utc),
+        )
+        positions = conn.execute(
+            """
+            SELECT *
+            FROM live_positions
+            WHERE exchange = ?
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+            ORDER BY opened_at ASC, id ASC
+            """,
+            (exchange,),
+        ).fetchall()
+        active_position_ids = {int(row["id"]) for row in positions}
+        conn.execute(
+            """
+            UPDATE position_slots
+            SET status = 'EMPTY',
+                market = NULL,
+                candidate_strategy_id = NULL,
+                live_position_id = NULL,
+                live_strategy_session_id = NULL,
+                entry_order_uuid = NULL,
+                exit_order_uuid = NULL,
+                allocated_krw = 0,
+                reserved_krw = 0,
+                current_value_krw = 0,
+                unrealized_pnl = 0,
+                realized_pnl = 0,
+                entry_reason = NULL,
+                exit_reason = NULL,
+                opened_at = NULL,
+                closed_at = ?,
+                updated_at = ?
+            WHERE status NOT IN ('RESERVED', 'ENTERING')
+              AND (live_position_id IS NOT NULL OR status != 'EMPTY')
+              AND (live_position_id IS NULL OR live_position_id NOT IN (
+                  SELECT id FROM live_positions
+                  WHERE exchange = ?
+                    AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+              ))
+            """,
+            (now_utc, now_utc, exchange),
+        )
+        for position in positions:
+            position_id = int(position["id"])
+            current_value = float(position["current_price"] or 0.0) * float(position["entry_volume"] or 0.0)
+            existing = conn.execute(
+                "SELECT * FROM position_slots WHERE live_position_id = ? LIMIT 1",
+                (position_id,),
+            ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    """
+                    SELECT *
+                    FROM position_slots
+                    WHERE slot_number <= ?
+                      AND status = 'EMPTY'
+                    ORDER BY slot_number ASC
+                    LIMIT 1
+                    """,
+                    (max_slots,),
+                ).fetchone()
+            if existing is None:
+                continue
+            conn.execute(
+                """
+                UPDATE position_slots
+                SET status = ?,
+                    exchange = ?,
+                    market = ?,
+                    candidate_strategy_id = ?,
+                    live_position_id = ?,
+                    live_strategy_session_id = ?,
+                    entry_order_uuid = ?,
+                    exit_order_uuid = ?,
+                    allocated_krw = ?,
+                    reserved_krw = 0,
+                    current_value_krw = ?,
+                    unrealized_pnl = ?,
+                    realized_pnl = ?,
+                    opened_at = ?,
+                    closed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    position["status"],
+                    position["exchange"],
+                    position["market"],
+                    int(position["candidate_strategy_id"]),
+                    position_id,
+                    int(position["session_id"]),
+                    position.get("entry_order_uuid"),
+                    position.get("exit_order_uuid"),
+                    float(position["entry_amount_krw"] or current_value),
+                    current_value,
+                    float(position["unrealized_pnl"] or 0.0),
+                    float(position["realized_pnl"] or 0.0),
+                    position.get("opened_at"),
+                    now_utc,
+                    int(existing["id"]),
+                ),
+            )
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM position_slots
+            WHERE slot_number <= ?
+            ORDER BY slot_number ASC
+            """,
+            (max_slots,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_position_slots(max_slots: int = 5, exchange: str = "bithumb") -> list[dict]:
+    return reconcile_position_slots(max_slots=max_slots, exchange=exchange)
+
+
+def reserve_position_slot(
+    *,
+    slot_id: int,
+    exchange: str,
+    market: str,
+    candidate_strategy_id: int,
+    live_strategy_session_id: int | None,
+    amount_krw: float,
+    reason: str,
+) -> dict:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE position_slots
+            SET status = 'RESERVED',
+                exchange = ?,
+                market = ?,
+                candidate_strategy_id = ?,
+                live_strategy_session_id = ?,
+                allocated_krw = ?,
+                reserved_krw = ?,
+                entry_reason = ?,
+                opened_at = ?,
+                closed_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                exchange,
+                market,
+                candidate_strategy_id,
+                live_strategy_session_id,
+                amount_krw,
+                amount_krw,
+                reason,
+                now_utc,
+                now_utc,
+                slot_id,
+            ),
+        )
+        row = conn.execute("SELECT * FROM position_slots WHERE id = ?", (slot_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def create_order_reservation(reservation: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO order_reservations (
+                request_id, exchange, market, candidate_strategy_id, slot_id,
+                amount_krw, status, expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                reservation["request_id"],
+                reservation["exchange"],
+                reservation["market"],
+                int(reservation["candidate_strategy_id"]),
+                reservation.get("slot_id"),
+                float(reservation["amount_krw"]),
+                reservation.get("status", "RESERVED"),
+                reservation.get("expires_at"),
+                now_utc,
+                now_utc,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_active_order_reservations(exchange: str = "bithumb") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM order_reservations
+            WHERE exchange = ?
+              AND status IN ('RESERVED', 'ORDER_SUBMITTED')
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (exchange, _utc_now()),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_capital_allocation_run(payload: dict) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO capital_allocation_runs (
+                reason, status, max_total_exposure_krw, current_exposure_krw,
+                pending_reserved_krw, available_krw_balance, remaining_exposure_krw,
+                empty_slot_count, candidate_count, accepted_count, blocked_count,
+                started_at, finished_at, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.get("reason", "SCHEDULED"),
+                payload.get("status", "RUNNING"),
+                float(payload.get("max_total_exposure_krw") or 0.0),
+                float(payload.get("current_exposure_krw") or 0.0),
+                float(payload.get("pending_reserved_krw") or 0.0),
+                payload.get("available_krw_balance"),
+                float(payload.get("remaining_exposure_krw") or 0.0),
+                int(payload.get("empty_slot_count") or 0),
+                int(payload.get("candidate_count") or 0),
+                int(payload.get("accepted_count") or 0),
+                int(payload.get("blocked_count") or 0),
+                payload.get("started_at", now_utc),
+                payload.get("finished_at"),
+                payload.get("error"),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def finish_capital_allocation_run(run_id: int, updates: dict) -> dict | None:
+    allowed = {
+        "status",
+        "max_total_exposure_krw",
+        "current_exposure_krw",
+        "pending_reserved_krw",
+        "available_krw_balance",
+        "remaining_exposure_krw",
+        "empty_slot_count",
+        "candidate_count",
+        "accepted_count",
+        "blocked_count",
+        "finished_at",
+        "error",
+    }
+    values = {key: updates[key] for key in allowed if key in updates}
+    values.setdefault("finished_at", _utc_now())
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE capital_allocation_runs SET {assignments} WHERE id = ?",
+            [*values.values(), run_id],
+        )
+        row = conn.execute("SELECT * FROM capital_allocation_runs WHERE id = ?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def insert_capital_allocation_decision(decision: dict) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO capital_allocation_decisions (
+                run_id, candidate_strategy_id, market, strategy, allocation_score,
+                desired_order_krw, approved_order_krw, blocked_reason, fee_rate,
+                estimated_fee_krw, estimated_slippage_krw, expected_edge_pct,
+                required_edge_pct, decision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(decision["run_id"]),
+                decision.get("candidate_strategy_id"),
+                decision["market"],
+                decision["strategy"],
+                float(decision.get("allocation_score") or 0.0),
+                float(decision.get("desired_order_krw") or 0.0),
+                float(decision.get("approved_order_krw") or 0.0),
+                decision.get("blocked_reason"),
+                float(decision.get("fee_rate") or 0.0),
+                float(decision.get("estimated_fee_krw") or 0.0),
+                float(decision.get("estimated_slippage_krw") or 0.0),
+                float(decision.get("expected_edge_pct") or 0.0),
+                float(decision.get("required_edge_pct") or 0.0),
+                decision.get("decision", "BLOCKED"),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def enqueue_next_entry(candidate: dict, *, allocation_score: float, blocked_reason: str, ttl_minutes: int = 360) -> int | None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    expires_at = (now + timedelta(minutes=ttl_minutes)).isoformat().replace("+00:00", "Z")
+    now_utc = now.isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id FROM next_entry_queue
+            WHERE candidate_strategy_id = ?
+              AND status = 'QUEUED'
+            LIMIT 1
+            """,
+            (int(candidate["id"]),),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE next_entry_queue
+                SET allocation_score = ?,
+                    score = ?,
+                    blocked_reason = ?,
+                    expires_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    allocation_score,
+                    float(candidate.get("score") or 0.0),
+                    blocked_reason,
+                    expires_at,
+                    now_utc,
+                    int(existing["id"]),
+                ),
+            )
+            return int(existing["id"])
+        cursor = conn.execute(
+            """
+            INSERT INTO next_entry_queue (
+                candidate_strategy_id, market, strategy, unit, score,
+                allocation_score, status, blocked_reason, queued_at, expires_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)
+            """,
+            (
+                int(candidate["id"]),
+                candidate["market"],
+                candidate["strategy"],
+                int(candidate.get("unit") or 0),
+                float(candidate.get("score") or 0.0),
+                allocation_score,
+                blocked_reason,
+                now_utc,
+                expires_at,
+                now_utc,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_next_entry_queue(limit: int = 20, statuses: list[str] | None = None) -> list[dict]:
+    statuses = statuses or ["QUEUED", "BLOCKED"]
+    placeholders = ",".join("?" for _ in statuses)
+    params: list[object] = [*statuses, _utc_now(), limit]
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM next_entry_queue
+            WHERE status IN ({placeholders})
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY allocation_score DESC, queued_at ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_next_entry_status(candidate_strategy_id: int, status: str, blocked_reason: str | None = None) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE next_entry_queue
+            SET status = ?,
+                blocked_reason = COALESCE(?, blocked_reason),
+                updated_at = ?
+            WHERE candidate_strategy_id = ?
+              AND status = 'QUEUED'
+            """,
+            (status, blocked_reason, _utc_now(), candidate_strategy_id),
+        )
 
 
 def load_open_live_position_for_strategy(exchange: str, market: str, candidate_strategy_id: int) -> dict | None:

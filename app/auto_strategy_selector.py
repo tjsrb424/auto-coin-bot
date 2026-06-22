@@ -28,7 +28,7 @@ from app.risk_manager import compute_risk_state
 MIN_SCORE_DELTA = float(os.getenv("AUTO_SELECTOR_MIN_SCORE_DELTA", "10"))
 SWITCH_COOLDOWN_MINUTES = int(os.getenv("AUTO_SELECTOR_SWITCH_COOLDOWN_MINUTES", "60"))
 MAX_SWITCHES_PER_DAY = int(os.getenv("AUTO_SELECTOR_MAX_SWITCHES_PER_DAY", "3"))
-MAX_OPEN_POSITIONS = int(os.getenv("AUTO_SELECTOR_MAX_OPEN_POSITIONS", "1"))
+MAX_OPEN_POSITIONS = int(os.getenv("AUTO_SELECTOR_MAX_OPEN_POSITIONS", os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "5")))
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -89,8 +89,11 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
             blockers.append("RISK_STATE_BLOCKED")
         if risk_state.get("open_order_count", 0) > 0 or has_unresolved_live_order(exchange, market) or has_unresolved_live_order_for_exchange(exchange):
             blockers.append("UNRESOLVED_OPEN_ORDER")
-        if len(load_open_live_positions(exchange, market)) >= MAX_OPEN_POSITIONS or load_open_live_positions_for_exchange(exchange):
+        open_positions = load_open_live_positions_for_exchange(exchange)
+        if len(open_positions) >= MAX_OPEN_POSITIONS:
             blockers.append("OPEN_POSITION_LIMIT")
+        elif load_open_live_positions(exchange, market):
+            blockers.append("DUPLICATE_MARKET_POSITION")
     else:
         risk_state = {}
 

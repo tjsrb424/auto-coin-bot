@@ -5,10 +5,12 @@ import {
   fetchAutonomousOrchestratorStatus,
   fetchAutoStrategySelectorStatus,
   fetchBotPolicy,
+  fetchCapitalAllocatorStatus,
   fetchDbSchemaStatus,
   fetchHealthStatus,
   fetchMarketUniverse,
   runAutonomousOrchestratorNow,
+  runCapitalAllocatorNow,
   runMultiMarketValidation,
   scanMarketUniverse
 } from "../api/backtest";
@@ -16,6 +18,7 @@ import type {
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
   BotPolicy,
+  CapitalAllocatorStatus,
   CandidateStrategy,
   DbSchemaStatus,
   HealthStatus,
@@ -264,6 +267,7 @@ export function BacktestValidationView({ exchange }: Props) {
   const [validation, setValidation] = React.useState<MultiMarketValidationResponse | null>(null);
   const [selector, setSelector] = React.useState<AutoStrategySelectorStatus | null>(null);
   const [orchestrator, setOrchestrator] = React.useState<AutonomousOrchestratorStatus | null>(null);
+  const [allocator, setAllocator] = React.useState<CapitalAllocatorStatus | null>(null);
   const [dbSchema, setDbSchema] = React.useState<DbSchemaStatus | null>(null);
   const [health, setHealth] = React.useState<HealthStatus | null>(null);
   const [botPolicy, setBotPolicy] = React.useState<BotPolicy | null>(null);
@@ -272,10 +276,11 @@ export function BacktestValidationView({ exchange }: Props) {
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const [marketResult, selectorResult, orchestratorResult, schemaResult, healthResult, policyResult] = await Promise.all([
+    const [marketResult, selectorResult, orchestratorResult, allocatorResult, schemaResult, healthResult, policyResult] = await Promise.all([
       fetchMarketUniverse(exchange),
       fetchAutoStrategySelectorStatus(exchange),
       fetchAutonomousOrchestratorStatus(),
+      fetchCapitalAllocatorStatus(exchange),
       fetchDbSchemaStatus(),
       fetchHealthStatus(),
       fetchBotPolicy(exchange)
@@ -283,6 +288,7 @@ export function BacktestValidationView({ exchange }: Props) {
     setMarkets(marketResult.markets);
     setSelector(selectorResult);
     setOrchestrator(orchestratorResult);
+    setAllocator(allocatorResult);
     setDbSchema(schemaResult);
     setHealth(healthResult);
     setBotPolicy(policyResult.policy);
@@ -345,6 +351,9 @@ export function BacktestValidationView({ exchange }: Props) {
     taskResultText(orchestrator?.promotion_selector, "blocked_reason");
   const currentAutoTradingEnabled = botPolicy?.auto_trading_enabled;
   const currentRuntimeStatus = [health?.auto_runtime_status, health?.live_session_status].filter(Boolean).join(" / ");
+  const allocatorSlots = allocator?.slots ?? [];
+  const nextEntryCount = allocator?.next_entry_queue?.length ?? 0;
+  const occupiedSlotCount = allocatorSlots.filter((slot) => String(slot.status ?? "").toUpperCase() !== "EMPTY").length;
   const selectorBlockers = selector?.blockers?.length ? selector.blockers : ["차단 사유가 없습니다."];
   const selectorBlockerLabel = (item: string) => {
     if (item === "POLICY_AUTO_TRADING_DISABLED" && currentAutoTradingEnabled) {
@@ -386,6 +395,9 @@ export function BacktestValidationView({ exchange }: Props) {
           <button className={busy === "자동 점검" ? "is-loading" : ""} onClick={() => runAction("자동 점검", "자동 점검이 완료되었습니다.", async () => { await runAutonomousOrchestratorNow(); await refresh(); })} disabled={!!busy}>
             {busy === "자동 점검" ? <span className="ref-loading-spinner" /> : <Zap size={16} />} 즉시 자동 점검 실행
           </button>
+          <button className={busy === "자금 배분" ? "is-loading" : ""} onClick={() => runAction("자금 배분", "자금 배분 점검이 완료되었습니다.", async () => { await runCapitalAllocatorNow(exchange); await refresh(); })} disabled={!!busy}>
+            {busy === "자금 배분" ? <span className="ref-loading-spinner" /> : <Bot size={16} />} 자금 배분 실행
+          </button>
         </div>
         {(message || error) && <p className={error ? "ref-backtest-error" : "ref-backtest-message"}>{error ?? message}</p>}
         <div className="ref-backtest-kpis">
@@ -424,6 +436,22 @@ export function BacktestValidationView({ exchange }: Props) {
           <p><span>최근 보류</span><b>{orchestratorSkip ? formatReasonLabel(orchestratorSkip) : "보류 없음"}</b></p>
           <p><span>LIVE_ELIGIBLE</span><b>{candidateSummary(latestEligible)}</b></p>
           <p><span>LIVE_ACTIVE</span><b>{candidateSummary(latestActive)}</b></p>
+        </div>
+        <div className="ref-capital-allocator-card">
+          <strong><Bot size={15} /> 중앙 자금 배분</strong>
+          <p><span>슬롯</span><b>{occupiedSlotCount}/{allocator?.max_slots ?? 5}</b></p>
+          <p><span>남은 한도</span><b>{formatKrw(allocator?.remaining_exposure_krw)}</b></p>
+          <p><span>예약 매수</span><b>{formatKrw(allocator?.pending_buy_reserved_krw)}</b></p>
+          <p><span>필요 기대값</span><b>{allocator ? `${allocator.required_edge_pct.toFixed(2)}%` : "-"}</b></p>
+          <p><span>NEXT_ENTRY</span><b>{nextEntryCount}개</b></p>
+          <div className="ref-slot-row">
+            {allocatorSlots.slice(0, allocator?.max_slots ?? 5).map((slot) => (
+              <span key={slot.id} className={String(slot.status ?? "").toLowerCase()}>
+                #{slot.slot_number} {formatStatusLabel(slot.status)}{slot.market ? ` · ${slot.market}` : ""}
+              </span>
+            ))}
+            {!allocatorSlots.length ? <span>슬롯 정보를 불러오는 중입니다.</span> : null}
+          </div>
         </div>
       </div>
 

@@ -89,6 +89,7 @@ from app.database import (
     update_risk_log_resolution,
 )
 from app.auto_strategy_selector import auto_strategy_selector_status, evaluate_auto_strategy_selector
+from app.capital_allocator import capital_allocator_status, run_capital_allocator_once
 from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
 from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strategy_promotion_pipeline
@@ -1303,6 +1304,38 @@ def apply_best_auto_strategy_endpoint(payload: AutoSelectorRequest) -> dict:
 @app.post("/api/strategy-promotion/run")
 def run_strategy_promotion_endpoint(payload: AutoSelectorRequest) -> dict:
     return run_strategy_promotion_pipeline(exchange=payload.exchange)
+
+
+@app.get("/api/capital-allocator/status")
+def get_capital_allocator_status(exchange: str = Query("bithumb", pattern=r"^(upbit|bithumb)$")) -> dict:
+    return capital_allocator_status(exchange=exchange)
+
+
+@app.post("/api/capital-allocator/run-now")
+def run_capital_allocator_endpoint(payload: AutoSelectorRequest | None = None) -> dict:
+    exchange = payload.exchange if payload else "bithumb"
+    return run_capital_allocator_once("MANUAL_RUN_NOW", exchange=exchange)
+
+
+@app.get("/api/position-slots")
+def get_position_slots(exchange: str = Query("bithumb", pattern=r"^(upbit|bithumb)$")) -> dict:
+    status = capital_allocator_status(exchange=exchange)
+    return {
+        "exchange": status["exchange"],
+        "max_slots": status["max_slots"],
+        "open_slot_count": status["open_slot_count"],
+        "empty_slot_count": status["empty_slot_count"],
+        "slots": status["slots"],
+    }
+
+
+@app.get("/api/next-entry-queue")
+def get_next_entry_queue(exchange: str = Query("bithumb", pattern=r"^(upbit|bithumb)$")) -> dict:
+    status = capital_allocator_status(exchange=exchange)
+    return {
+        "exchange": status["exchange"],
+        "queue": status["next_entry_queue"],
+    }
 
 
 @app.get("/api/strategy-discovery-scheduler/status")

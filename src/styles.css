@@ -7504,7 +7504,7 @@ input:disabled {
   left: 0;
   top: 0;
   width: 1430px;
-  height: 416px;
+  height: 510px;
   overflow: hidden;
   padding: 14px 18px;
 }
@@ -7816,6 +7816,91 @@ input:disabled {
   font-weight: 950;
 }
 
+.ref-capital-allocator-card {
+  display: grid;
+  grid-template-columns: 180px repeat(5, minmax(0, 1fr));
+  align-items: center;
+  gap: 7px 10px;
+  min-height: 76px;
+  margin-top: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(43, 149, 255, 0.26);
+  border-radius: 5px;
+  background: linear-gradient(90deg, rgba(9, 27, 44, 0.88), rgba(5, 12, 21, 0.42));
+  padding: 8px 10px;
+}
+
+.ref-capital-allocator-card strong,
+.ref-capital-allocator-card p,
+.ref-capital-allocator-card span,
+.ref-capital-allocator-card b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-capital-allocator-card strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #f7fbff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.ref-capital-allocator-card p {
+  margin: 0;
+}
+
+.ref-capital-allocator-card p span {
+  display: block;
+  color: var(--ref-muted);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ref-capital-allocator-card p b {
+  display: block;
+  margin-top: 5px;
+  color: #f7fbff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.ref-slot-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.ref-slot-row span {
+  border: 1px solid rgba(49, 69, 93, 0.74);
+  border-radius: 4px;
+  background: rgba(5, 12, 21, 0.42);
+  padding: 5px 7px;
+  color: #c8d6e8;
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ref-slot-row span.empty {
+  color: var(--ref-muted);
+}
+
+.ref-slot-row span.reserved,
+.ref-slot-row span.entering {
+  border-color: rgba(246, 195, 91, 0.42);
+  color: #f6c35b;
+}
+
+.ref-slot-row span.open,
+.ref-slot-row span.live_active {
+  border-color: rgba(24, 217, 111, 0.35);
+  color: #42e88a;
+}
+
 .ref-schema-card {
   display: grid;
   grid-template-columns: 120px 130px minmax(0, 1fr) 420px;
@@ -7873,34 +7958,34 @@ input:disabled {
 
 .ref-backtest-markets {
   left: 0;
-  top: 432px;
+  top: 526px;
   width: 454px;
-  height: 392px;
+  height: 298px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-ranking {
   left: 474px;
-  top: 432px;
+  top: 526px;
   width: 626px;
-  height: 392px;
+  height: 298px;
   overflow: hidden;
   padding: 18px;
 }
 
 .ref-backtest-selector {
   left: 1120px;
-  top: 432px;
+  top: 526px;
   width: 310px;
-  height: 392px;
+  height: 298px;
   overflow: auto;
   padding: 18px;
 }
 
 .ref-backtest-market-list {
   display: grid;
-  max-height: 330px;
+  max-height: 236px;
   gap: 8px;
   margin-top: 14px;
   overflow: auto;

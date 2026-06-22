@@ -128,7 +128,7 @@ class LiveStrategyConfig:
             allowed_order_type=os.getenv("AUTO_ALLOWED_ORDER_TYPE", os.getenv("AUTO_ORDER_TYPE", "limit")).strip().lower(),
             max_order_krw=float(os.getenv("AUTO_MAX_ORDER_KRW", "30000")),
             max_orders_per_day=int(os.getenv("AUTO_MAX_ORDERS_PER_DAY", "3")),
-            max_open_position_count=int(os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "1")),
+            max_open_position_count=int(os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "5")),
             cooldown_seconds=int(os.getenv("AUTO_COOLDOWN_SECONDS", "1800")),
             core_order_cooldown_seconds=int(os.getenv("SMART_CORE_ORDER_COOLDOWN_SECONDS", os.getenv("AUTO_COOLDOWN_SECONDS", "1800"))),
             require_completed_candle=os.getenv("AUTO_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
@@ -199,7 +199,10 @@ def _sync_session_to_active_selector(session: dict, config: LiveStrategyConfig) 
         return session
     if not market_is_live_allowed(config.allowed_exchange, candidate_market):
         return session
-    if load_open_live_positions_for_exchange(config.allowed_exchange):
+    open_positions = load_open_live_positions_for_exchange(config.allowed_exchange)
+    if len(open_positions) >= config.max_open_position_count:
+        return session
+    if any(str(position.get("market") or "") == candidate_market for position in open_positions):
         return session
     update_live_strategy_session(
         int(session["id"]),
@@ -1306,7 +1309,8 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
     current_price = float(candle["trade_price"])
     range_rate = ((float(candle["high_price"]) - float(candle["low_price"])) / current_price) if current_price > 0 else 0.0
     price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))
-    amount = min(config.max_order_krw, live_config.max_live_order_krw)
+    session_max_order_krw = float(session.get("max_order_krw") or config.max_order_krw)
+    amount = min(session_max_order_krw, config.max_order_krw, live_config.max_live_order_krw)
     volume = amount / price if price > 0 else 0.0
     request_id = f"strategy-{uuid.uuid4().hex[:24]}"
     order = {
