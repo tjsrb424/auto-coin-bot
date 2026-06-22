@@ -1,5 +1,9 @@
 # Project Working Rules
 
+## Codex Handoff
+
+- Before continuing multi-market automation, live trading, scheduler/orchestrator, capital allocator, or production diagnosis work, read `docs/CODEX_HANDOFF.md` first.
+
 ## Commit And Push Routine
 
 - Before every commit and push, keep the left-bottom sidebar Build label enabled.
