@@ -412,6 +412,52 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         risk = compute_risk_state("bithumb", "KRW-BTC")
         self.assertEqual(risk["open_order_count"], 0)
 
+    async def test_sync_open_orders_dedupes_unchanged_open_order_events(self) -> None:
+        database.insert_live_order_log(order_log("open-sync-dedupe"))
+        broker = AsyncMock()
+        broker.list_open_orders.return_value = {
+            "orders": [
+                {
+                    "uuid": "order-1",
+                    "state": "wait",
+                    "price": "100000000",
+                    "volume": "0.0001",
+                    "executed_volume": "0",
+                    "remaining_volume": "0.0001",
+                }
+            ]
+        }
+
+        with patch("app.live_recovery.get_live_broker", return_value=broker):
+            first = await sync_open_orders("bithumb", "KRW-BTC")
+            second = await sync_open_orders("bithumb", "KRW-BTC")
+
+        self.assertEqual(first["reconciled_count"], 1)
+        self.assertEqual(second["reconciled_count"], 1)
+        events = database.load_live_recovery_events(10)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "OPEN_ORDER_SYNC")
+
+    async def test_sync_open_orders_uses_detail_reconciled_event_for_missing_open_order(self) -> None:
+        database.insert_live_order_log(order_log("detail-reconcile"))
+        broker = AsyncMock()
+        broker.list_open_orders.return_value = {"orders": []}
+        broker.get_order.return_value = {
+            "uuid": "order-1",
+            "state": "wait",
+            "price": "100000000",
+            "volume": "0.0001",
+            "executed_volume": "0",
+            "remaining_volume": "0.0001",
+        }
+
+        with patch("app.live_recovery.get_live_broker", return_value=broker):
+            result = await sync_open_orders("bithumb", "KRW-BTC")
+
+        self.assertEqual(result["reconciled_count"], 1)
+        events = database.load_live_recovery_events(1)
+        self.assertEqual(events[0]["event_type"], "OPEN_ORDER_DETAIL_RECONCILED")
+
     async def test_order_not_found_marks_pending_order_stale_without_deleting(self) -> None:
         database.insert_live_order_log(order_log("missing-order"))
         current = database.get_live_order_log("missing-order")

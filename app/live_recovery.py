@@ -36,6 +36,7 @@ OPEN_ORDER_STATES = {"SUBMITTED", "WAITING", "PARTIALLY_FILLED"}
 BALANCE_MISMATCH_VOLUME_TOLERANCE = 0.000001
 BALANCE_MISMATCH_RELATIVE_TOLERANCE = 0.01
 RECOVERY_EVENT_DEDUPE_SECONDS = 300
+ORDER_SYNC_DEDUPE_EVENT_TYPES = {"OPEN_ORDER_SYNC", "OPEN_ORDER_DETAIL_RECONCILED", "OPEN_ORDER_SYNC_MISSING"}
 
 
 def _market_symbol(market: str) -> str:
@@ -110,7 +111,7 @@ async def sync_open_orders(exchange: str = "bithumb", market: str = "KRW-BTC") -
             result["reconciled_count"] += 1
             continue
         if log.get("order_uuid"):
-            await reconcile_order_log(log, source="OPEN_ORDER_SYNC_MISSING")
+            await reconcile_order_log(log, source="OPEN_ORDER_DETAIL_RECONCILED")
             result["reconciled_count"] += 1
         else:
             update_live_order_log(
@@ -625,6 +626,19 @@ def _balance_mismatch_signature(payload: dict | None) -> tuple:
     )
 
 
+def _order_sync_signature(event: dict, payload: dict | None = None) -> tuple:
+    event_payload = payload if payload is not None else event.get("payload")
+    event_payload = event_payload or {}
+    return (
+        str(event.get("request_id") or ""),
+        str(event.get("order_uuid") or ""),
+        str(event_payload.get("status") or ""),
+        round(_float(event_payload.get("executed_volume")), 12),
+        round(_float(event_payload.get("remaining_volume")), 12),
+        round(_float(event_payload.get("filled_amount_krw")), 8),
+    )
+
+
 def _should_suppress_recovery_event(event_type: str, exchange: str, market: str, payload: dict | None) -> bool:
     if event_type != "BALANCE_MISMATCH":
         return False
@@ -648,6 +662,36 @@ def _should_suppress_recovery_event(event_type: str, exchange: str, market: str,
     return False
 
 
+def _should_suppress_order_sync_event(
+    event_type: str,
+    exchange: str,
+    market: str,
+    request_id: str | None,
+    order_uuid: str | None,
+    payload: dict | None,
+) -> bool:
+    if event_type not in ORDER_SYNC_DEDUPE_EVENT_TYPES:
+        return False
+    dedupe_seconds = _recovery_event_dedupe_seconds()
+    if dedupe_seconds <= 0:
+        return False
+    now = datetime.now(timezone.utc)
+    current_signature = _order_sync_signature({"request_id": request_id, "order_uuid": order_uuid}, payload)
+    for event in load_live_recovery_events(20):
+        if event.get("event_type") not in ORDER_SYNC_DEDUPE_EVENT_TYPES:
+            continue
+        if str(event.get("exchange") or "") != exchange or str(event.get("market") or "") != market:
+            continue
+        created_at = _parse_utc(event.get("created_at"))
+        if created_at is None:
+            continue
+        if (now - created_at).total_seconds() > dedupe_seconds:
+            continue
+        if _order_sync_signature(event) == current_signature:
+            return True
+    return False
+
+
 def log_recovery_event(
     event_type: str,
     severity: str,
@@ -661,6 +705,8 @@ def log_recovery_event(
     payload: dict | None = None,
 ) -> None:
     if _should_suppress_recovery_event(event_type, exchange, market, payload):
+        return
+    if _should_suppress_order_sync_event(event_type, exchange, market, request_id, order_uuid, payload):
         return
     insert_live_recovery_event(
         {
