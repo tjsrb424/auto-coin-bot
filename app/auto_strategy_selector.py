@@ -9,7 +9,7 @@ from app.database import (
     has_unresolved_live_order,
     has_unresolved_live_order_for_exchange,
     load_active_strategy_selection,
-    load_bot_operation_policy,
+    load_global_bot_operation_policy,
     load_live_eligible_candidate_strategies,
     load_market_universe_item,
     load_open_live_positions,
@@ -69,7 +69,7 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
     score_delta = _score(best) - _score(active_candidate)
     blockers: list[str] = []
     warnings: list[str] = []
-    policy = load_bot_operation_policy((best or active or {}).get("market", "KRW-BTC"))
+    policy = load_global_bot_operation_policy()
     daily_switch_count = count_strategy_switches_today()
 
     if not candidates:

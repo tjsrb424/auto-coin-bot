@@ -10,7 +10,7 @@ from app.database import (
     has_open_live_position_for_strategy,
     insert_risk_log,
     load_candidate_strategy,
-    load_bot_operation_policy,
+    load_global_bot_operation_policy,
     load_latest_risk_state,
     load_open_live_positions,
     load_reconcilable_live_order_logs,
@@ -387,7 +387,7 @@ def check_order_risk(
     else:
         ok("amount_check", amount)
 
-    policy = load_bot_operation_policy(market)
+    policy = load_global_bot_operation_policy()
     policy_limit = _float(policy.get("max_total_exposure_krw"))
     policy_daily_loss_limit_krw = policy_limit * _float(policy.get("daily_loss_limit_pct")) / 100
     current_bot_position_value = _current_bot_position_value_krw(exchange, market, market_snapshot)

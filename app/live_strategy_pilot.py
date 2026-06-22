@@ -26,8 +26,8 @@ from app.database import (
     insert_live_signal_log,
     load_active_strategy_selection,
     load_candidate_strategy,
-    load_bot_operation_policy,
     load_candles,
+    load_global_bot_operation_policy,
     load_latest_live_strategy_session,
     load_live_order_logs,
     load_open_live_position,
@@ -296,7 +296,7 @@ def start_live_strategy_pilot(*, candidate_strategy_id: int | None = None, confi
         return {"ok": False, "message": "Candidate market is not live-allowed.", **live_strategy_status()}
     if config.allowed_exchange != "bithumb":
         return {"ok": False, "message": "AUTO_ALLOWED_EXCHANGE=bithumb 설정이 필요합니다.", **live_strategy_status()}
-    policy = load_bot_operation_policy(candidate_market)
+    policy = load_global_bot_operation_policy()
     if not policy.get("auto_trading_enabled"):
         return {"ok": False, "message": "bot_operation_policy.auto_trading_enabled is OFF.", **live_strategy_status()}
     session_id = create_live_strategy_session(
@@ -636,7 +636,7 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_EXCHANGE_NOT_ALLOWED"
     if session_market != "KRW-BTC" and not market_is_live_allowed("bithumb", session_market):
         return "BLOCKED_MARKET_NOT_ALLOWED"
-    if not load_bot_operation_policy(session_market).get("auto_trading_enabled"):
+    if not load_global_bot_operation_policy().get("auto_trading_enabled"):
         return "SMART_POLICY_AUTO_TRADING_DISABLED"
     if config.allowed_order_type != "limit":
         return "BLOCKED_ORDER_TYPE_NOT_ALLOWED"
@@ -1130,7 +1130,7 @@ async def _submit_smart_intent_order(
     promotion = evaluate_promotion(
         intent={**intent, "delta_value_krw": amount},
         snapshot=smart_snapshot,
-        policy=load_bot_operation_policy(str(session.get("market") or "KRW-BTC")),
+        policy=load_global_bot_operation_policy(),
         risk_preview=risk_preview,
         shadow_recommendation=recommendation,
         available_krw=available_krw,
@@ -1256,7 +1256,7 @@ async def _submit_smart_intent_sell_order(
     promotion = evaluate_promotion(
         intent={**intent, "delta_value_krw": amount, "target_qty": volume},
         snapshot=smart_snapshot,
-        policy=load_bot_operation_policy(str(session.get("market") or "KRW-BTC")),
+        policy=load_global_bot_operation_policy(),
         risk_preview=risk_preview,
         shadow_recommendation=recommendation,
         available_krw=None,

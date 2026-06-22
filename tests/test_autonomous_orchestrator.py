@@ -120,16 +120,16 @@ class AutonomousOrchestratorTests(unittest.TestCase):
     def test_auto_trading_on_applies_live_eligible_candidate(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate("LIVE_ELIGIBLE"))
         database.update_bot_operation_policy(
-            "KRW-ETH",
+            "KRW-BTC",
             {"auto_trading_enabled": True, "max_total_exposure_krw": 700_000, "daily_loss_limit_pct": 7},
         )
-        before = database.load_bot_operation_policy("KRW-ETH")
+        before = database.load_bot_operation_policy("KRW-BTC")
 
         with patch("app.strategy_promotion_pipeline.is_emergency_stopped", return_value=False), \
             patch("app.auto_strategy_selector.is_emergency_stopped", return_value=False):
             result = run_autonomous_orchestrator_once("LIVE_ELIGIBLE_CREATED")
 
-        after = database.load_bot_operation_policy("KRW-ETH")
+        after = database.load_bot_operation_policy("KRW-BTC")
         active = database.load_active_strategy_selection()
         self.assertEqual(result["status"], "COMPLETED")
         self.assertIsNotNone(active)

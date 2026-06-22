@@ -4,6 +4,7 @@ import {
   evaluateAutoStrategySelector,
   fetchAutonomousOrchestratorStatus,
   fetchAutoStrategySelectorStatus,
+  fetchBotPolicy,
   fetchDbSchemaStatus,
   fetchHealthStatus,
   fetchMarketUniverse,
@@ -14,6 +15,7 @@ import {
 import type {
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
+  BotPolicy,
   CandidateStrategy,
   DbSchemaStatus,
   HealthStatus,
@@ -264,23 +266,26 @@ export function BacktestValidationView({ exchange }: Props) {
   const [orchestrator, setOrchestrator] = React.useState<AutonomousOrchestratorStatus | null>(null);
   const [dbSchema, setDbSchema] = React.useState<DbSchemaStatus | null>(null);
   const [health, setHealth] = React.useState<HealthStatus | null>(null);
+  const [botPolicy, setBotPolicy] = React.useState<BotPolicy | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const [marketResult, selectorResult, orchestratorResult, schemaResult, healthResult] = await Promise.all([
+    const [marketResult, selectorResult, orchestratorResult, schemaResult, healthResult, policyResult] = await Promise.all([
       fetchMarketUniverse(exchange),
       fetchAutoStrategySelectorStatus(exchange),
       fetchAutonomousOrchestratorStatus(),
       fetchDbSchemaStatus(),
-      fetchHealthStatus()
+      fetchHealthStatus(),
+      fetchBotPolicy(exchange)
     ]);
     setMarkets(marketResult.markets);
     setSelector(selectorResult);
     setOrchestrator(orchestratorResult);
     setDbSchema(schemaResult);
     setHealth(healthResult);
+    setBotPolicy(policyResult.policy);
     setSelectedMarkets((current) => {
       if (current.length) return current.filter((market) => marketResult.markets.some((item) => item.market === market));
       return marketResult.markets.filter((item) => item.is_enabled && item.is_auto_selectable).slice(0, 5).map((item) => item.market);
@@ -338,7 +343,7 @@ export function BacktestValidationView({ exchange }: Props) {
     taskResultText(orchestrator?.orchestrator, "skip_reason") ||
     taskResultText(orchestrator?.promotion_selector, "skip_reason") ||
     taskResultText(orchestrator?.promotion_selector, "blocked_reason");
-  const currentAutoTradingEnabled = health?.auto_trading_enabled;
+  const currentAutoTradingEnabled = botPolicy?.auto_trading_enabled;
   const currentRuntimeStatus = [health?.auto_runtime_status, health?.live_session_status].filter(Boolean).join(" / ");
   const selectorBlockers = selector?.blockers?.length ? selector.blockers : ["차단 사유가 없습니다."];
   const selectorBlockerLabel = (item: string) => {

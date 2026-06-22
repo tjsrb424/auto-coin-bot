@@ -4277,6 +4277,10 @@ def load_bot_operation_policy(market: str = "KRW-BTC") -> dict:
         return policy
 
 
+def load_global_bot_operation_policy() -> dict:
+    return load_bot_operation_policy("KRW-BTC")
+
+
 def update_bot_operation_policy(market: str = "KRW-BTC", updates: dict | None = None) -> dict:
     updates = updates or {}
     allowed = {"auto_trading_enabled", "max_total_exposure_krw", "daily_loss_limit_pct"}

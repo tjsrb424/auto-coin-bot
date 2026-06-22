@@ -102,7 +102,7 @@ class MultiMarketStrategyTests(unittest.TestCase):
 
     def test_non_btc_live_order_requires_live_candidate_and_live_allowed_market(self) -> None:
         self.seed_market(live_allowed=True)
-        database.update_bot_operation_policy("KRW-ETH", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5})
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5})
         candidate_id = database.save_candidate_strategy(candidate_payload("KRW-ETH", "BACKTEST_PASSED"))
         order = {"exchange": "bithumb", "market": "KRW-ETH", "side": "BUY", "order_type": "LIMIT", "amount_krw": 20_000, "price": 1_000, "volume": 20}
         blocked = check_order_risk(
@@ -137,7 +137,7 @@ class MultiMarketStrategyTests(unittest.TestCase):
         self.assertIn("POLICY_AUTO_TRADING_DISABLED", blocked["blockers"])
         self.assertIsNone(database.load_active_strategy_selection())
 
-        database.update_bot_operation_policy("KRW-ETH", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5})
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5})
         applied = evaluate_auto_strategy_selector(exchange="bithumb", apply=True)
         self.assertTrue(applied["can_apply"], applied)
         self.assertEqual(database.load_active_strategy_selection()["candidate_strategy_id"], candidate_id)

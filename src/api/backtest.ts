@@ -2,6 +2,7 @@ import type {
   AutonomousOrchestratorRunResponse,
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
+  BotPolicy,
   DbSchemaStatus,
   HealthStatus,
   MarketUniverseItem,
@@ -75,6 +76,10 @@ export function fetchDbSchemaStatus() {
 
 export function fetchHealthStatus() {
   return requestJson<HealthStatus>("/health");
+}
+
+export function fetchBotPolicy(exchange: string, market = "KRW-BTC") {
+  return requestJson<{ policy: BotPolicy }>(`/api/bot/policy?market=${market}&exchange=${exchange}`);
 }
 
 export function runAutonomousOrchestratorNow() {

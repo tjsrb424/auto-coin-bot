@@ -140,15 +140,15 @@ class StrategyPromotionPipelineTests(unittest.TestCase):
     def test_selector_apply_requires_auto_trading_on_and_does_not_mutate_policy(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate("LIVE_ELIGIBLE", score=95))
         database.update_bot_operation_policy(
-            "KRW-ETH",
+            "KRW-BTC",
             {"auto_trading_enabled": False, "max_total_exposure_krw": 700_000, "daily_loss_limit_pct": 7},
         )
-        before = database.load_bot_operation_policy("KRW-ETH")
+        before = database.load_bot_operation_policy("KRW-BTC")
         with patch.dict(os.environ, {"AUTO_SELECTOR_APPLY_BEST_ENABLED": "true"}, clear=False), \
             patch("app.strategy_promotion_pipeline.is_emergency_stopped", return_value=False), \
             patch("app.auto_strategy_selector.is_emergency_stopped", return_value=False):
             blocked = apply_selector_if_allowed(exchange="bithumb")
-        after_blocked = database.load_bot_operation_policy("KRW-ETH")
+        after_blocked = database.load_bot_operation_policy("KRW-BTC")
 
         self.assertEqual(blocked["decision"], "BLOCKED")
         self.assertIn("POLICY_AUTO_TRADING_DISABLED", blocked["blockers"])
@@ -157,13 +157,13 @@ class StrategyPromotionPipelineTests(unittest.TestCase):
         self.assertEqual(before["max_total_exposure_krw"], after_blocked["max_total_exposure_krw"])
         self.assertEqual(before["daily_loss_limit_pct"], after_blocked["daily_loss_limit_pct"])
 
-        database.update_bot_operation_policy("KRW-ETH", {"auto_trading_enabled": True})
-        before_apply = database.load_bot_operation_policy("KRW-ETH")
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True})
+        before_apply = database.load_bot_operation_policy("KRW-BTC")
         with patch.dict(os.environ, {"AUTO_SELECTOR_APPLY_BEST_ENABLED": "true"}, clear=False), \
             patch("app.strategy_promotion_pipeline.is_emergency_stopped", return_value=False), \
             patch("app.auto_strategy_selector.is_emergency_stopped", return_value=False):
             applied = apply_selector_if_allowed(exchange="bithumb")
-        after_apply = database.load_bot_operation_policy("KRW-ETH")
+        after_apply = database.load_bot_operation_policy("KRW-BTC")
 
         self.assertEqual(applied["decision"], "APPLY")
         self.assertEqual(database.load_active_strategy_selection()["candidate_strategy_id"], candidate_id)

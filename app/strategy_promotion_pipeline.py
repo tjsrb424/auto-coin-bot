@@ -10,9 +10,9 @@ from app.database import (
     has_unresolved_live_order,
     has_unresolved_live_order_for_exchange,
     load_active_strategy_selection,
-    load_bot_operation_policy,
     load_candidate_strategies,
     load_candidate_strategies_without_forward_session,
+    load_global_bot_operation_policy,
     load_latest_forward_session_for_candidate,
     load_open_live_positions,
     load_open_live_positions_for_exchange,
@@ -157,7 +157,7 @@ def apply_selector_if_allowed(*, exchange: str | None = None) -> dict:
     best = status.get("best_candidate")
     active = load_active_strategy_selection()
     market = str((best or active or {}).get("market") or "KRW-BTC")
-    policy = load_bot_operation_policy(market)
+    policy = load_global_bot_operation_policy()
     blockers: list[str] = []
     if not policy.get("auto_trading_enabled"):
         blockers.append("POLICY_AUTO_TRADING_DISABLED")

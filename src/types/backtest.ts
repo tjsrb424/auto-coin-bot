@@ -168,6 +168,13 @@ export type HealthStatus = {
   live_session_status?: string;
 };
 
+export type BotPolicy = {
+  market?: string;
+  auto_trading_enabled?: boolean;
+  max_total_exposure_krw?: number;
+  daily_loss_limit_pct?: number;
+};
+
 export type AutonomousOrchestratorStatus = {
   config: Record<string, unknown>;
   orchestrator: SchedulerTaskState;

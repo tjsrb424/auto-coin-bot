@@ -13,7 +13,7 @@ from app.database import (
     finish_scheduler_task,
     ensure_required_schema,
     insert_candles,
-    load_bot_operation_policy,
+    load_global_bot_operation_policy,
     load_candidate_strategies,
     load_candles_between,
     load_market_universe,
@@ -497,8 +497,7 @@ async def run_promotion_selector_scheduler_once() -> dict:
                 next_run_at=_next_run_after_minutes(int(config["promotion_interval_minutes"])),
             )
         selector = result.get("selector", {})
-        best = selector.get("best_candidate") or {}
-        policy = load_bot_operation_policy(best.get("market") or "KRW-BTC")
+        policy = load_global_bot_operation_policy()
         summary = {
             "enrolled_count": len(result.get("enrolled", {}).get("enrolled", [])),
             "promoted_count": len(result.get("promoted", {}).get("promoted", [])),
