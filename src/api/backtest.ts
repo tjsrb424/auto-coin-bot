@@ -3,6 +3,7 @@ import type {
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
   DbSchemaStatus,
+  HealthStatus,
   MarketUniverseItem,
   MultiMarketValidationResponse,
   StrategyDiscoverySchedulerStatus
@@ -70,6 +71,10 @@ export function fetchAutonomousOrchestratorStatus() {
 
 export function fetchDbSchemaStatus() {
   return requestJson<DbSchemaStatus>("/health/db-schema");
+}
+
+export function fetchHealthStatus() {
+  return requestJson<HealthStatus>("/health");
 }
 
 export function runAutonomousOrchestratorNow() {

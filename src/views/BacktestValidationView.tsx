@@ -5,6 +5,7 @@ import {
   fetchAutonomousOrchestratorStatus,
   fetchAutoStrategySelectorStatus,
   fetchDbSchemaStatus,
+  fetchHealthStatus,
   fetchMarketUniverse,
   runAutonomousOrchestratorNow,
   runMultiMarketValidation,
@@ -15,6 +16,7 @@ import type {
   AutoStrategySelectorStatus,
   CandidateStrategy,
   DbSchemaStatus,
+  HealthStatus,
   MarketUniverseItem,
   MultiMarketValidationResponse,
   SchedulerTaskState
@@ -261,21 +263,24 @@ export function BacktestValidationView({ exchange }: Props) {
   const [selector, setSelector] = React.useState<AutoStrategySelectorStatus | null>(null);
   const [orchestrator, setOrchestrator] = React.useState<AutonomousOrchestratorStatus | null>(null);
   const [dbSchema, setDbSchema] = React.useState<DbSchemaStatus | null>(null);
+  const [health, setHealth] = React.useState<HealthStatus | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const [marketResult, selectorResult, orchestratorResult, schemaResult] = await Promise.all([
+    const [marketResult, selectorResult, orchestratorResult, schemaResult, healthResult] = await Promise.all([
       fetchMarketUniverse(exchange),
       fetchAutoStrategySelectorStatus(exchange),
       fetchAutonomousOrchestratorStatus(),
-      fetchDbSchemaStatus()
+      fetchDbSchemaStatus(),
+      fetchHealthStatus()
     ]);
     setMarkets(marketResult.markets);
     setSelector(selectorResult);
     setOrchestrator(orchestratorResult);
     setDbSchema(schemaResult);
+    setHealth(healthResult);
     setSelectedMarkets((current) => {
       if (current.length) return current.filter((market) => marketResult.markets.some((item) => item.market === market));
       return marketResult.markets.filter((item) => item.is_enabled && item.is_auto_selectable).slice(0, 5).map((item) => item.market);
@@ -333,6 +338,15 @@ export function BacktestValidationView({ exchange }: Props) {
     taskResultText(orchestrator?.orchestrator, "skip_reason") ||
     taskResultText(orchestrator?.promotion_selector, "skip_reason") ||
     taskResultText(orchestrator?.promotion_selector, "blocked_reason");
+  const currentAutoTradingEnabled = health?.auto_trading_enabled;
+  const currentRuntimeStatus = [health?.auto_runtime_status, health?.live_session_status].filter(Boolean).join(" / ");
+  const selectorBlockers = selector?.blockers?.length ? selector.blockers : ["차단 사유가 없습니다."];
+  const selectorBlockerLabel = (item: string) => {
+    if (item === "POLICY_AUTO_TRADING_DISABLED" && currentAutoTradingEnabled) {
+      return "마지막 평가 당시 자동매매 OFF였습니다. 현재는 ON이라 다음 평가에서 재시도합니다.";
+    }
+    return formatReasonLabel(item);
+  };
 
   return (
     <section className={`ref-backtest-view${busy ? " is-busy" : ""}`}>
@@ -442,9 +456,11 @@ export function BacktestValidationView({ exchange }: Props) {
           <p><span>최고 후보</span><b>{selector?.best_candidate ? `${selector.best_candidate.market} · ${formatStrategyLabel(selector.best_candidate.strategy)}` : "-"}</b></p>
           <p><span>적용 중</span><b>{selector?.active_selection?.market ?? "-"}</b></p>
           <p><span>점수 차이</span><b>{selector?.score_delta?.toFixed(1) ?? "-"}</b></p>
+          <p><span>현재 자동매매</span><b>{currentAutoTradingEnabled == null ? "-" : currentAutoTradingEnabled ? "ON" : "OFF"}</b></p>
+          <p><span>런타임</span><b>{currentRuntimeStatus || "-"}</b></p>
         </div>
         <div className="ref-selector-blockers">
-          {(selector?.blockers?.length ? selector.blockers : ["차단 사유가 없습니다."]).slice(0, 6).map((item) => <span key={item}>{formatReasonLabel(item)}</span>)}
+          {selectorBlockers.slice(0, 6).map((item) => <span key={item}>{selectorBlockerLabel(item)}</span>)}
         </div>
         <div className="ref-switch-logs">
           <strong>최근 교체 로그</strong>

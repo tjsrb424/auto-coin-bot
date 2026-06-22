@@ -152,6 +152,22 @@ export type DbSchemaStatus = {
   error_type?: string;
 };
 
+export type HealthStatus = {
+  server_status?: string;
+  database_status?: string;
+  schema_status?: string;
+  broker_status?: string;
+  selected_exchange?: string;
+  scheduler_status?: string;
+  emergency_stop_status?: string;
+  live_trading_enabled?: boolean;
+  auto_trading_enabled?: boolean;
+  auto_strategy_enabled?: boolean;
+  auto_runtime_status?: string;
+  auto_strategy_status?: string;
+  live_session_status?: string;
+};
+
 export type AutonomousOrchestratorStatus = {
   config: Record<string, unknown>;
   orchestrator: SchedulerTaskState;
