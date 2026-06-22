@@ -117,3 +117,42 @@ class DatabaseLiveOrderTests(unittest.TestCase):
         self.assertEqual(logs[0]["status"], "BLOCKED")
         self.assertEqual(logs[0]["risk_result"], "SMART_SELL_POSITION_MISSING")
         self.assertEqual(logs[0]["side"], "BUY")
+
+    def test_trade_history_only_returns_filled_partial_and_canceled_orders(self) -> None:
+        database.insert_live_order_log(live_order_log("previewed-request", "PREVIEWED", order_uuid="previewed-uuid"))
+        database.insert_live_order_log(live_order_log("blocked-request", "BLOCKED", order_uuid="blocked-uuid"))
+        database.insert_live_order_log(live_order_log("submitted-request", "SUBMITTED", order_uuid="submitted-uuid"))
+        database.insert_live_order_log(live_order_log("waiting-request", "WAITING", order_uuid="waiting-uuid"))
+        database.insert_live_order_log(live_order_log("buy-filled-request", "FILLED", order_uuid="filled-uuid"))
+        database.insert_live_order_log(live_order_log("buy-partial-request", "PARTIALLY_FILLED", order_uuid="partial-uuid"))
+        canceled = live_order_log("sell-canceled-request", "CANCELED", order_uuid="canceled-uuid")
+        canceled["side"] = "SELL"
+        database.insert_live_order_log(canceled)
+
+        logs = database.load_trade_history_logs()
+
+        self.assertEqual(
+            {log["request_id"] for log in logs},
+            {"buy-filled-request", "buy-partial-request", "sell-canceled-request"},
+        )
+
+    def test_trade_history_keeps_canonical_canceled_order_when_only_wait_events_exist(self) -> None:
+        database.insert_live_order_log(live_order_log("strategy-request", "SUBMITTED"))
+        database.insert_live_order_log(live_order_log("strategy-request-submitted-event", "SUBMITTED"))
+        database.insert_live_order_log(live_order_log("strategy-request-waiting-event", "WAITING"))
+        database.update_live_order_log("strategy-request", {"status": "CANCELED"})
+
+        logs = database.load_trade_history_logs()
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["request_id"], "strategy-request")
+        self.assertEqual(logs[0]["status"], "CANCELED")
+
+    def test_trade_history_deduplicates_same_status_order_events(self) -> None:
+        database.insert_live_order_log(live_order_log("strategy-request", "CANCELED"))
+        database.insert_live_order_log(live_order_log("strategy-request-canceled-event", "CANCELED"))
+
+        logs = database.load_trade_history_logs()
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["request_id"], "strategy-request-canceled-event")

@@ -56,9 +56,9 @@ from app.database import (
     load_app_settings,
     load_forward_sessions,
     load_latest_forward_session,
-    load_live_order_logs,
     load_open_live_positions,
     load_runtime_lock,
+    load_trade_history_logs,
     load_latest_paper_session,
     pause_running_forward_sessions_on_startup,
     release_runtime_lock,
@@ -1365,7 +1365,7 @@ async def place_live_order(payload: LiveOrderPlaceRequest) -> dict:
 
 @app.get("/api/live-orders")
 def list_live_orders() -> dict:
-    return {"orders": load_live_order_logs(), "recovery_events": recent_recovery_events(), **_live_status()}
+    return {"orders": load_trade_history_logs(), "recovery_events": recent_recovery_events(), **_live_status()}
 
 
 @app.get("/api/live-recovery/status")

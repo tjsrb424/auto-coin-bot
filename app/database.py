@@ -17,6 +17,13 @@ LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-filled-%'
               AND request_id NOT LIKE '%-failed-%'
 """
+TRADE_HISTORY_STATUSES = (
+    "FILLED",
+    "PARTIALLY_FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "STALE_CANCELED",
+)
 
 DEFAULT_CANDIDATE_STRATEGIES = [
     {
@@ -1849,6 +1856,36 @@ def load_live_order_logs(limit: int = 100, include_canonical_with_events: bool =
             LIMIT ?
             """,
             (limit,),
+        ).fetchall()
+    return [_normalize_live_order_log(dict(row)) for row in rows]
+
+
+def load_trade_history_logs(limit: int = 100) -> list[dict]:
+    status_placeholders = ", ".join("?" for _ in TRADE_HISTORY_STATUSES)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM live_order_logs AS log
+            WHERE log.status IN ({status_placeholders})
+              AND UPPER(log.side) IN ('BUY', 'SELL', 'BID', 'ASK')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM live_order_logs AS newer_log
+                  WHERE newer_log.order_uuid IS NOT NULL
+                    AND log.order_uuid IS NOT NULL
+                    AND newer_log.order_uuid = log.order_uuid
+                    AND newer_log.status = log.status
+                    AND (
+                        newer_log.updated_at > log.updated_at
+                        OR (newer_log.updated_at = log.updated_at AND newer_log.created_at > log.created_at)
+                        OR (newer_log.updated_at = log.updated_at AND newer_log.created_at = log.created_at AND newer_log.id > log.id)
+                    )
+              )
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*TRADE_HISTORY_STATUSES, limit),
         ).fetchall()
     return [_normalize_live_order_log(dict(row)) for row in rows]
 
