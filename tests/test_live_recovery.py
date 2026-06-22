@@ -97,6 +97,24 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.filled_amount_krw, 10_000)
         self.assertEqual(status.paid_fee, 5)
 
+    def test_normalize_waiting_order_does_not_treat_locked_funds_as_filled(self) -> None:
+        status = normalize_exchange_order(
+            {
+                "uuid": "order-1",
+                "state": "wait",
+                "price": "323",
+                "volume": "309.59752321",
+                "executed_volume": "0",
+                "remaining_volume": "309.59752321",
+                "locked": "100250.99999683",
+            }
+        )
+
+        self.assertEqual(status.status, "WAITING")
+        self.assertEqual(status.executed_volume, 0.0)
+        self.assertEqual(status.remaining_volume, 309.59752321)
+        self.assertEqual(status.filled_amount_krw, 0.0)
+
     def test_apply_reconciled_status_updates_live_order_log(self) -> None:
         database.insert_live_order_log(order_log())
         current = database.get_live_order_log("strategy-test")

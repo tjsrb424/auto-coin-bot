@@ -768,7 +768,7 @@ def _safe_order_payload(order: dict) -> dict:
 
 
 def _filled_amount_krw(order: dict, executed_volume: float, price: float) -> float:
-    explicit = _float(order.get("paid_amount")) or _float(order.get("executed_funds")) or _float(order.get("locked"))
+    explicit = _float(order.get("paid_amount")) or _float(order.get("executed_funds"))
     if explicit > 0:
         return explicit
     trades = order.get("trades")
