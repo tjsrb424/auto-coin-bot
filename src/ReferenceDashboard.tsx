@@ -964,6 +964,30 @@ const policyBlockReasonLabels: Record<string, string> = {
   POLICY_BLOCKED: "정책차단"
 };
 
+const systemLogLabels: Record<string, string> = {
+  SERVER_START: "서버가 시작되어 실거래 모드를 안전 잠금으로 초기화했습니다.",
+  SERVER_RESTART_LIVE_PAUSED: "서버 재시작으로 실거래 세션을 일시정지했습니다.",
+  AUTO_TRADING_STOPPED_BY_USER: "사용자가 자동매매 Runtime을 중지했습니다.",
+  ARM: "실거래 모드 대기 상태로 전환했습니다.",
+  ARM_BLOCKED: "실거래 모드 전환이 차단되었습니다.",
+  LOCK: "실거래 모드를 잠금 처리했습니다.",
+  EMERGENCY_STOP: "긴급 정지가 활성화되어 모든 실거래 주문을 차단합니다.",
+  RESET_EMERGENCY: "긴급 정지를 해제했습니다.",
+  RESET_EMERGENCY_BLOCKED: "긴급 정지 해제가 차단되었습니다.",
+  BLOCKED_MIN_ORDER_AMOUNT: "최소 주문 금액보다 작아 주문을 차단했습니다.",
+  BLOCKED_OPEN_ORDER_EXISTS: "기존 주문이 체결 또는 취소될 때까지 신규 주문을 보류합니다.",
+  BLOCKED_OPEN_POSITION_EXISTS: "이미 열린 포지션이 있어 신규 진입을 보류합니다.",
+  BLOCKED_DUPLICATE_SIGNAL: "같은 신호가 반복되어 중복 주문을 막았습니다.",
+  BLOCKED_DUPLICATE_CANDLE: "이미 처리한 캔들이라 주문을 건너뜁니다.",
+  BLOCKED_INSUFFICIENT_BALANCE: "거래소 잔고가 부족해 주문을 차단했습니다.",
+  BLOCKED_ORDER_CHANCE_FAILED: "거래소 주문 가능 여부 확인에 실패했습니다.",
+  BLOCKED_API_RESPONSE_ERROR: "거래소 API 응답 오류로 주문을 차단했습니다.",
+  BLOCKED_RISK_LIMIT: "리스크 한도에 걸려 주문을 차단했습니다.",
+  ORDER_NOT_FOUND_STALE_CANCELED: "거래소에서 찾을 수 없는 오래된 주문을 취소 처리했습니다.",
+  BALANCE_MISMATCH: "봇 기록과 거래소 잔고가 달라 확인이 필요합니다.",
+  TEST_RECONCILE: "복구 점검 테스트 이벤트입니다."
+};
+
 function isOpenOrderWaitCode(value?: string | null) {
   return normalizeBlockCode(value) === "BLOCKED_OPEN_ORDER_EXISTS";
 }
@@ -1010,6 +1034,7 @@ function statusLabel(value?: string | null) {
     BLOCKED_OPEN_POSITION_EXISTS: "포지션 있음",
     BLOCKED_DUPLICATE_SIGNAL: "중복 신호",
     BLOCKED_DUPLICATE_CANDLE: "중복 캔들",
+    BLOCKED_MIN_ORDER_AMOUNT: "최소 주문 금액 미만",
     BLOCKED_INSUFFICIENT_BALANCE: "잔고 부족",
     BLOCKED_ORDER_CHANCE_FAILED: "주문 보류",
     BLOCKED_API_RESPONSE_ERROR: "API 오류",
@@ -1017,7 +1042,7 @@ function statusLabel(value?: string | null) {
     ALREADY_FILLED: "이미 체결",
     INSUFFICIENT_BALANCE: "잔고 부족"
   };
-  return labels[normalized] ?? reasonLabels[normalized] ?? value
+  return labels[normalized] ?? reasonLabels[normalized] ?? systemLogLabels[normalized] ?? value
     .replace(/^BLOCKED_/, "차단: ")
     .replace(/^WAITING_/, "대기: ")
     .replace(/^ORDER_/, "주문 ")
@@ -1061,6 +1086,19 @@ function policyBlockText(code?: string | null, fallback?: string | null) {
   return fallback ?? statusLabel(code);
 }
 
+function readableSystemLogText(code?: string | null, fallback?: string | null) {
+  const normalized = normalizeBlockCode(code);
+  if (normalized && systemLogLabels[normalized]) return systemLogLabels[normalized];
+  if (normalized && policyBlockReasonLabels[normalized]) return policyBlockReasonLabels[normalized];
+  if (fallback) {
+    const fallbackCode = normalizeBlockCode(fallback);
+    if (fallbackCode && systemLogLabels[fallbackCode]) return systemLogLabels[fallbackCode];
+    if (fallbackCode && policyBlockReasonLabels[fallbackCode]) return policyBlockReasonLabels[fallbackCode];
+    return fallback;
+  }
+  return statusLabel(code);
+}
+
 function riskSeverityLabel(value?: string | null) {
   const labels: Record<string, string> = {
     LOW: "낮음",
@@ -1088,7 +1126,7 @@ function riskLogTypeLabel(log: Pick<RiskLog, "allowed" | "block_code" | "block_r
 function riskLogMessage(log: Pick<RiskLog, "allowed" | "risk_level" | "block_code" | "block_reason" | "policy_block_detail">) {
   if (isOpenOrderWaitLog(log)) return "기존 매수 주문이 체결/취소될 때까지 신규 매수를 보류합니다.";
   if (riskLogIsPolicy(log)) return policyBlockText(log.block_code, log.block_reason);
-  if (!log.allowed) return log.block_reason ?? log.block_code ?? "리스크 조건에 의해 차단됐습니다.";
+  if (!log.allowed) return readableSystemLogText(log.block_code, log.block_reason) || "리스크 조건에 의해 차단됐습니다.";
   return `리스크 점검 통과 · ${riskSeverityLabel(log.risk_level)}`;
 }
 
@@ -2896,7 +2934,8 @@ function LogPanel({ data }: { data: DashboardData }) {
     createdAt: log.created_at,
     type: riskLogDotType(log),
     time: formatKstTime(log.created_at),
-    text: riskLogMessage(log)
+    text: riskLogMessage(log),
+    rawText: log.block_code ?? log.block_reason
   }));
   const orderLogs = data.liveOrders.slice(0, 7).map((order) => ({
     key: `order-${order.request_id ?? order.id ?? order.created_at ?? ""}`,
@@ -2905,14 +2944,16 @@ function LogPanel({ data }: { data: DashboardData }) {
     time: formatKstTime(order.created_at),
     text: isOpenOrderWaitOrder(order)
       ? `${marketDisplay(order.market)} 기존 매수 주문 체결 대기`
-      : `${marketDisplay(order.market)} ${statusLabel(order.side)} ${statusLabel(order.status)}`
+      : `${marketDisplay(order.market)} ${statusLabel(order.side)} ${statusLabel(order.status)}`,
+    rawText: order.risk_result ?? order.status
   }));
   const recoveryLogs = data.recoveryEvents.slice(0, 7).map((event, index) => ({
     key: `recovery-${event.created_at ?? index}-${event.event_type ?? ""}`,
     createdAt: event.created_at,
     type: event.severity === "ERROR" ? "danger" : "info",
     time: formatKstTime(event.created_at),
-    text: event.event_type ?? event.message ?? "복구 로그"
+    text: readableSystemLogText(event.event_type, event.message ?? "복구 로그"),
+    rawText: event.event_type
   }));
   const rows = [...riskLogs, ...orderLogs, ...recoveryLogs]
     .sort((a, b) => (parseDate(b.createdAt)?.getTime() ?? 0) - (parseDate(a.createdAt)?.getTime() ?? 0))
@@ -2927,7 +2968,7 @@ function LogPanel({ data }: { data: DashboardData }) {
       <div className="ref-log-list">
         {rows.length === 0 && <p><span>-</span><i className="info" />로그 데이터 없음</p>}
         {rows.map((row, index) => (
-          <p key={row.key} style={{ ["--log-index" as string]: index }}><span>{row.time}</span><i className={row.type} /><b title={row.text}>{row.text}</b></p>
+          <p key={row.key} style={{ ["--log-index" as string]: index }}><span>{row.time}</span><i className={row.type} /><b title={row.rawText ? `${row.text} (${row.rawText})` : row.text}>{row.text}</b></p>
         ))}
       </div>
     </RefPanel>

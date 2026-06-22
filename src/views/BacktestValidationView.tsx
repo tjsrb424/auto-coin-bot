@@ -377,7 +377,7 @@ export function BacktestValidationView({ exchange }: Props) {
       <div className="ref-panel ref-backtest-ranking">
         <div className="ref-backtest-title"><ShieldCheck size={17} /> 검증 순위</div>
         <table>
-          <thead><tr><th>마켓</th><th>전략</th><th>주기</th><th>점수</th><th>수익률</th><th>MDD</th><th>판정</th></tr></thead>
+          <thead><tr><th>마켓</th><th>전략</th><th>주기</th><th>점수</th><th>수익률</th><th title="MDD: Maximum Drawdown">최대 낙폭</th><th>판정</th></tr></thead>
           <tbody>
             {topRows.map((row, index) => (
               <tr key={`${row.market}-${row.strategy}-${row.unit}-${row.period_label}-${index}`}>
