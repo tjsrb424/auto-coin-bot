@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from math import ceil
 
@@ -10,7 +11,7 @@ from app.database import (
     count_candidate_strategies_created_since,
     find_duplicate_candidate_strategy,
     finish_scheduler_task,
-    init_db,
+    ensure_required_schema,
     insert_candles,
     load_bot_operation_policy,
     load_candidate_strategies,
@@ -83,6 +84,33 @@ def _int_csv_env(name: str, default: list[int]) -> list[int]:
 
 def _minutes_env(name: str, default: int, *, minimum: int = 1) -> int:
     return _int_env(name, default, minimum=minimum)
+
+
+def _is_database_locked_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
+
+
+def _missing_table_from_error(exc: Exception) -> str:
+    message = str(exc)
+    marker = "no such table:"
+    if marker in message.lower():
+        return message.lower().split(marker, 1)[1].strip().split()[0].strip("`'\"")
+    return ""
+
+
+async def _run_with_sqlite_retry(task_name: str, operation):
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not _is_database_locked_error(exc):
+                raise
+            last_error = exc
+            if attempt < 3:
+                await asyncio.sleep(0.25 * attempt)
+    assert last_error is not None
+    raise last_error
 
 
 def _next_run_after_minutes(minutes: int) -> str:
@@ -293,11 +321,14 @@ async def run_market_scan_scheduler_once() -> dict:
     if not acquired:
         return {"task_name": SCAN_TASK, "status": "SKIPPED", "reason": "LOCKED", "current": current}
     try:
-        result = await scan_market_universe(
-            exchange=str(config["exchange"]),
-            top_n=int(config["scan_top_n"]),
-            max_candidates=int(config["scan_max_candidates"]),
-            min_24h_trade_price_krw=float(config["scan_min_24h_trade_price_krw"]),
+        result = await _run_with_sqlite_retry(
+            SCAN_TASK,
+            lambda: scan_market_universe(
+                exchange=str(config["exchange"]),
+                top_n=int(config["scan_top_n"]),
+                max_candidates=int(config["scan_max_candidates"]),
+                min_24h_trade_price_krw=float(config["scan_min_24h_trade_price_krw"]),
+            ),
         )
         summary = {
             "accepted_count": len(result.get("accepted") or []),
@@ -345,16 +376,19 @@ async def _run_validation_scheduler_once(mode: str) -> dict:
         for market in markets:
             for strategy in config["strategies"]:
                 try:
-                    result = await run_strategy_validation(
-                        market=market,
-                        strategy=strategy,
-                        timeframes=list(config["timeframes"]),
-                        periods=list(config["periods"]),
-                        custom_start_time_utc=None,
-                        custom_end_time_utc=None,
-                        base_settings={},
-                        risk={"initial_cash": 1_000_000, "fee_rate": 0.0005, "slippage_rate": 0.0005},
-                        load_period_candles=_load_period_candles,
+                    result = await _run_with_sqlite_retry(
+                        task_name,
+                        lambda market=market, strategy=strategy: run_strategy_validation(
+                            market=market,
+                            strategy=strategy,
+                            timeframes=list(config["timeframes"]),
+                            periods=list(config["periods"]),
+                            custom_start_time_utc=None,
+                            custom_end_time_utc=None,
+                            base_settings={},
+                            risk={"initial_cash": 1_000_000, "fee_rate": 0.0005, "slippage_rate": 0.0005},
+                            load_period_candles=_load_period_candles,
+                        ),
                     )
                     all_rows.extend(_annotate_validation_decisions(result["rows"], min_score=float(config["validation_min_score"])))
                 except Exception as exc:
@@ -438,12 +472,29 @@ async def run_promotion_selector_scheduler_once() -> dict:
         return {"task_name": PROMOTION_TASK, "status": "SKIPPED", "reason": "LOCKED", "current": current}
     try:
         try:
-            result = await run_strategy_promotion_pipeline_async(exchange=str(config["exchange"]))
+            result = await _run_with_sqlite_retry(
+                PROMOTION_TASK,
+                lambda: run_strategy_promotion_pipeline_async(exchange=str(config["exchange"])),
+            )
         except Exception as exc:
-            if "no such table" not in str(exc).lower():
+            missing_table = _missing_table_from_error(exc)
+            if not missing_table:
                 raise
-            init_db()
-            result = await run_strategy_promotion_pipeline_async(exchange=str(config["exchange"]))
+            schema = ensure_required_schema(repair=True)
+            return finish_scheduler_task(
+                PROMOTION_TASK,
+                status="FAILED",
+                result={
+                    "error_type": exc.__class__.__name__,
+                    "skip_reason": f"DB_SCHEMA_MISSING: {missing_table}",
+                    "missing_table": missing_table,
+                    "schema_status": schema.get("schema_status"),
+                    "missing_tables": schema.get("missing_tables", []),
+                    "repair_status": schema.get("repair_status"),
+                },
+                error=f"DB_SCHEMA_MISSING: {missing_table}",
+                next_run_at=_next_run_after_minutes(int(config["promotion_interval_minutes"])),
+            )
         selector = result.get("selector", {})
         best = selector.get("best_candidate") or {}
         policy = load_bot_operation_policy(best.get("market") or "KRW-BTC")

@@ -31,9 +31,12 @@ from app.database import (
     load_active_strategy_selection,
     create_forward_session_from_candidate,
     create_live_paper_session,
+    database_path,
     delete_candidate_strategy,
+    ensure_required_schema,
     get_last_live_order_time,
     get_connection,
+    get_db_schema_status,
     get_live_order_log,
     ensure_default_candidate_strategies,
     has_unresolved_live_order,
@@ -201,6 +204,7 @@ def _health_payload(request: Request) -> dict:
         database_status = "OK"
     except Exception as exc:
         database_status = f"ERROR:{exc.__class__.__name__}"
+    db_schema = get_db_schema_status()
 
     risk_state = compute_risk_state(selected_exchange, os.getenv("AUTO_ALLOWED_MARKET", DEFAULT_MARKET))
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -209,6 +213,10 @@ def _health_payload(request: Request) -> dict:
     return {
         "server_status": "OK",
         "database_status": database_status,
+        "database_path": database_path(),
+        "schema_status": db_schema.get("schema_status"),
+        "missing_tables": db_schema.get("missing_tables", []),
+        "db_schema": db_schema,
         "broker_status": _live_status(selected_exchange)["broker_status"],
         "selected_exchange": selected_exchange,
         "scheduler_status": "RUNNING" if scheduler_running else "STOPPED",
@@ -637,6 +645,17 @@ async def lifespan(_: FastAPI):
     _.state.server_started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     _.state.instance_id = os.getenv("RUNTIME_INSTANCE_ID", f"{socket.gethostname()}-{uuid.uuid4().hex[:12]}")
     init_db()
+    schema_status = ensure_required_schema(repair=True)
+    _.state.db_schema_status = schema_status
+    logger.info(
+        "[db-schema] path=%s status=%s missing_tables=%s repair_status=%s",
+        schema_status.get("database_path"),
+        schema_status.get("schema_status"),
+        schema_status.get("missing_tables", []),
+        schema_status.get("repair_status"),
+    )
+    if schema_status.get("schema_status") != "OK":
+        raise RuntimeError(f"DB_SCHEMA_MISSING: {', '.join(schema_status.get('missing_tables', []))}")
     ensure_default_candidate_strategies()
     reset_live_runtime_state()
     insert_live_mode_event("SERVER_START", current_live_mode(), "서버 시작 시 실거래 모드는 자동 잠금 상태로 초기화되었습니다.")
@@ -800,6 +819,11 @@ def stop_runtime_endpoint(request: Request) -> dict:
 @app.get("/health")
 def health(request: Request) -> dict:
     return _health_payload(request)
+
+
+@app.get("/health/db-schema")
+def health_db_schema() -> dict:
+    return ensure_required_schema(repair=True)
 
 
 @app.get("/health/live")

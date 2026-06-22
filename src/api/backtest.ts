@@ -2,6 +2,7 @@ import type {
   AutonomousOrchestratorRunResponse,
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
+  DbSchemaStatus,
   MarketUniverseItem,
   MultiMarketValidationResponse,
   StrategyDiscoverySchedulerStatus
@@ -65,6 +66,10 @@ export function fetchStrategyDiscoverySchedulerStatus() {
 
 export function fetchAutonomousOrchestratorStatus() {
   return requestJson<AutonomousOrchestratorStatus>("/api/autonomous-orchestrator/status");
+}
+
+export function fetchDbSchemaStatus() {
+  return requestJson<DbSchemaStatus>("/health/db-schema");
 }
 
 export function runAutonomousOrchestratorNow() {

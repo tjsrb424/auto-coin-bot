@@ -36,7 +36,7 @@ def candidate(status: str = "BACKTEST_PASSED", market: str = "KRW-ETH", score: f
     }
 
 
-def allow_market(market: str = "KRW-ETH") -> None:
+def allow_market(market: str = "KRW-ETH", *, live_allowed: bool = True) -> None:
     database.upsert_market_universe(
         [
             {
@@ -46,7 +46,7 @@ def allow_market(market: str = "KRW-ETH") -> None:
                 "quote_currency": "KRW",
                 "status": "DISCOVERED",
                 "is_enabled": True,
-                "is_live_allowed": True,
+                "is_live_allowed": live_allowed,
                 "is_auto_selectable": True,
                 "scan_rank": 1,
                 "score": 90,
@@ -126,6 +126,16 @@ class StrategyPromotionPipelineTests(unittest.TestCase):
 
         self.assertEqual(database.load_candidate_strategy(candidate_id)["status"], "LIVE_ELIGIBLE")
         self.assertEqual([item["to_status"] for item in result["promoted"]], ["SHADOW_PASSED", "LIVE_ELIGIBLE"])
+
+    def test_live_eligible_promotion_marks_market_live_allowed(self) -> None:
+        allow_market("KRW-XRP", live_allowed=False)
+        candidate_id = database.save_candidate_strategy(candidate("SHADOW_PASSED", market="KRW-XRP"))
+        self.assertFalse(database.market_is_live_allowed("bithumb", "KRW-XRP"))
+
+        promoted = database.promote_candidate_strategy(candidate_id, "LIVE_ELIGIBLE", reason="test")
+
+        self.assertIsNotNone(promoted)
+        self.assertTrue(database.market_is_live_allowed("bithumb", "KRW-XRP"))
 
     def test_selector_apply_requires_auto_trading_on_and_does_not_mutate_policy(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate("LIVE_ELIGIBLE", score=95))

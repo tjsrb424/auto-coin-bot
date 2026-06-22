@@ -4,6 +4,7 @@ import {
   evaluateAutoStrategySelector,
   fetchAutonomousOrchestratorStatus,
   fetchAutoStrategySelectorStatus,
+  fetchDbSchemaStatus,
   fetchMarketUniverse,
   runAutonomousOrchestratorNow,
   runMultiMarketValidation,
@@ -13,6 +14,7 @@ import type {
   AutonomousOrchestratorStatus,
   AutoStrategySelectorStatus,
   CandidateStrategy,
+  DbSchemaStatus,
   MarketUniverseItem,
   MultiMarketValidationResponse,
   SchedulerTaskState
@@ -198,6 +200,19 @@ function taskResultText(task: SchedulerTaskState | null | undefined, key: string
   return typeof value === "string" && value ? value : "";
 }
 
+function schemaStatusLabel(status?: DbSchemaStatus | null) {
+  if (!status) return "확인 중";
+  if (status.schema_status === "OK") return status.repair_status === "REPAIRED" ? "자동 복구됨" : "정상";
+  if (status.schema_status === "MISSING_TABLES") return "DB 마이그레이션 필요";
+  return "복구 실패";
+}
+
+function schemaStatusTone(status?: DbSchemaStatus | null) {
+  if (!status) return "neutral";
+  if (status.schema_status === "OK") return status.repair_status === "REPAIRED" ? "amber" : "green";
+  return "red";
+}
+
 function candidateSummary(candidate?: CandidateStrategy | null) {
   if (!candidate) return "-";
   return `${candidate.market} · ${formatStrategyLabel(candidate.strategy)} · ${Number(candidate.score ?? 0).toFixed(1)}점`;
@@ -245,19 +260,22 @@ export function BacktestValidationView({ exchange }: Props) {
   const [validation, setValidation] = React.useState<MultiMarketValidationResponse | null>(null);
   const [selector, setSelector] = React.useState<AutoStrategySelectorStatus | null>(null);
   const [orchestrator, setOrchestrator] = React.useState<AutonomousOrchestratorStatus | null>(null);
+  const [dbSchema, setDbSchema] = React.useState<DbSchemaStatus | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
-    const [marketResult, selectorResult, orchestratorResult] = await Promise.all([
+    const [marketResult, selectorResult, orchestratorResult, schemaResult] = await Promise.all([
       fetchMarketUniverse(exchange),
       fetchAutoStrategySelectorStatus(exchange),
-      fetchAutonomousOrchestratorStatus()
+      fetchAutonomousOrchestratorStatus(),
+      fetchDbSchemaStatus()
     ]);
     setMarkets(marketResult.markets);
     setSelector(selectorResult);
     setOrchestrator(orchestratorResult);
+    setDbSchema(schemaResult);
     setSelectedMarkets((current) => {
       if (current.length) return current.filter((market) => marketResult.markets.some((item) => item.market === market));
       return marketResult.markets.filter((item) => item.is_enabled && item.is_auto_selectable).slice(0, 5).map((item) => item.market);
@@ -346,6 +364,12 @@ export function BacktestValidationView({ exchange }: Props) {
               <em title={task?.last_error || schedulerSummary(task)}>{task?.last_error || schedulerSummary(task)}</em>
             </div>
           ))}
+        </div>
+        <div className={`ref-schema-card ${schemaStatusTone(dbSchema)}`}>
+          <strong>DB 스키마</strong>
+          <span>{schemaStatusLabel(dbSchema)}</span>
+          <b>{dbSchema?.missing_tables?.length ? `누락: ${dbSchema.missing_tables.join(", ")}` : "필수 테이블 확인 완료"}</b>
+          <em>{dbSchema?.database_path ?? "-"}</em>
         </div>
         <div className={`ref-orchestrator-card ${schedulerTone(orchestrator?.orchestrator)}`}>
           <strong><Bot size={15} /> Autonomous Orchestrator</strong>

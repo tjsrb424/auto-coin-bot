@@ -9,6 +9,29 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH = Path(__file__).resolve().parent.parent / "coin_bot_lab.db"
+
+
+def _sqlite_busy_timeout_ms() -> int:
+    try:
+        return max(1000, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "10000")))
+    except ValueError:
+        return 10000
+
+
+SQLITE_BUSY_TIMEOUT_MS = _sqlite_busy_timeout_ms()
+REQUIRED_SCHEMA_TABLES = [
+    "market_universe",
+    "candidate_strategies",
+    "candidate_strategy_promotions",
+    "active_strategy_selection",
+    "strategy_switch_logs",
+    "scheduler_task_state",
+    "paper_forward_sessions",
+    "paper_forward_equity_points",
+    "paper_forward_orders",
+    "live_order_logs",
+    "live_positions",
+]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
               AND request_id NOT LIKE '%-waiting-%'
@@ -109,17 +132,75 @@ def _database_path() -> Path:
     return DB_PATH
 
 
+def database_path() -> str:
+    return str(_database_path())
+
+
+def _connect_database(path: Path | None = None) -> sqlite3.Connection:
+    resolved = path or _database_path()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(resolved, timeout=max(1.0, SQLITE_BUSY_TIMEOUT_MS / 1000))
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        # Startup/schema health will report persistent lock failures; individual
+        # short-lived connections should still be usable with busy_timeout.
+        pass
+    return conn
+
+
 @contextmanager
 def get_connection() -> Iterator[sqlite3.Connection]:
-    path = _database_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_database()
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def _missing_required_tables(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    existing = {str(row["name"]) for row in rows}
+    return [table for table in REQUIRED_SCHEMA_TABLES if table not in existing]
+
+
+def get_db_schema_status() -> dict:
+    try:
+        with get_connection() as conn:
+            missing = _missing_required_tables(conn)
+        return {
+            "schema_status": "OK" if not missing else "MISSING_TABLES",
+            "database_path": database_path(),
+            "required_tables": list(REQUIRED_SCHEMA_TABLES),
+            "missing_tables": missing,
+        }
+    except Exception as exc:
+        return {
+            "schema_status": "ERROR",
+            "database_path": database_path(),
+            "required_tables": list(REQUIRED_SCHEMA_TABLES),
+            "missing_tables": list(REQUIRED_SCHEMA_TABLES),
+            "error": str(exc),
+            "error_type": exc.__class__.__name__,
+        }
+
+
+def ensure_required_schema(*, repair: bool = True) -> dict:
+    status = get_db_schema_status()
+    if repair and status.get("schema_status") == "MISSING_TABLES":
+        init_db()
+        repaired = get_db_schema_status()
+        repaired["repair_attempted"] = True
+        repaired["repair_status"] = "REPAIRED" if repaired.get("schema_status") == "OK" else "FAILED"
+        repaired["initial_missing_tables"] = status.get("missing_tables", [])
+        return repaired
+    status["repair_attempted"] = False
+    status["repair_status"] = "NOT_NEEDED" if status.get("schema_status") == "OK" else "FAILED"
+    return status
 
 
 def init_db() -> None:
@@ -964,6 +1045,9 @@ def init_db() -> None:
             SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
             """
         )
+        missing = _missing_required_tables(conn)
+        if missing:
+            raise RuntimeError(f"DB_SCHEMA_MISSING: {', '.join(missing)}")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -1124,6 +1208,35 @@ def market_is_live_allowed(exchange: str, market: str) -> bool:
     return bool(item.get("is_enabled") and item.get("is_live_allowed"))
 
 
+def mark_market_live_allowed(exchange: str, market: str) -> int:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE market_universe
+            SET is_live_allowed = 1,
+                updated_at = ?
+            WHERE exchange = ?
+              AND market = ?
+              AND is_enabled = 1
+            """,
+            (now_utc, exchange, market),
+        )
+        if cursor.rowcount:
+            return int(cursor.rowcount)
+        cursor = conn.execute(
+            """
+            UPDATE market_universe
+            SET is_live_allowed = 1,
+                updated_at = ?
+            WHERE market = ?
+              AND is_enabled = 1
+            """,
+            (now_utc, market),
+        )
+        return int(cursor.rowcount)
+
+
 def market_is_auto_selectable(exchange: str, market: str) -> bool:
     item = load_market_universe_item(exchange, market)
     if item is None:
@@ -1149,21 +1262,35 @@ def acquire_scheduler_task_lock(task_name: str, *, owner: str = "scheduler", ttl
         current = _normalize_scheduler_state(dict(row)) if row else None
         if current and current.get("status") == "RUNNING" and str(current.get("lock_until") or "") > now_utc:
             return False, current
+        stale_lock_recovered = bool(current and current.get("status") == "RUNNING")
+        stale_result = dict(current.get("last_result") or {}) if current else {}
+        if stale_lock_recovered:
+            stale_result.update(
+                {
+                    "stale_lock_recovered": True,
+                    "previous_lock_until": current.get("lock_until"),
+                    "recovered_at": now_utc,
+                }
+            )
         conn.execute(
             """
             INSERT INTO scheduler_task_state (
                 task_name, status, lock_owner, lock_until, last_started_at,
-                last_error, updated_at
-            ) VALUES (?, 'RUNNING', ?, ?, ?, '', ?)
+                last_error, last_result_json, updated_at
+            ) VALUES (?, 'RUNNING', ?, ?, ?, '', ?, ?)
             ON CONFLICT(task_name) DO UPDATE SET
                 status = 'RUNNING',
                 lock_owner = excluded.lock_owner,
                 lock_until = excluded.lock_until,
                 last_started_at = excluded.last_started_at,
                 last_error = '',
+                last_result_json = CASE
+                    WHEN ? THEN excluded.last_result_json
+                    ELSE scheduler_task_state.last_result_json
+                END,
                 updated_at = excluded.updated_at
             """,
-            (task_name, owner, lock_until, now_utc, now_utc),
+            (task_name, owner, lock_until, now_utc, json.dumps(stale_result, ensure_ascii=False), now_utc, 1 if stale_lock_recovered else 0),
         )
         row = conn.execute("SELECT * FROM scheduler_task_state WHERE task_name = ?", (task_name,)).fetchone()
     return True, _normalize_scheduler_state(dict(row)) if row else None
@@ -1833,6 +1960,13 @@ def promote_candidate_strategy(candidate_id: int, to_status: str, *, reason: str
     updated = update_candidate_strategy(candidate_id, {"status": normalized})
     if updated is None:
         return None
+    live_allowed_updates = 0
+    if normalized in {"LIVE_ELIGIBLE", "LIVE_ACTIVE"}:
+        exchange = str((metadata or {}).get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb")).strip().lower() or "bithumb"
+        live_allowed_updates = mark_market_live_allowed(exchange, str(updated.get("market") or current.get("market") or DEFAULT_MARKET))
+        if metadata is None:
+            metadata = {}
+        metadata = {**metadata, "market_live_allowed_updates": live_allowed_updates}
     record_candidate_promotion(
         candidate_id,
         from_status=from_status,
@@ -3896,8 +4030,7 @@ def _normalize_auto_live_pilot_session(row: dict) -> dict:
 def load_forward_session(session_id: int, conn: sqlite3.Connection | None = None) -> dict | None:
     owns_connection = conn is None
     if conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = _connect_database()
     try:
         session = conn.execute(
             "SELECT * FROM paper_forward_sessions WHERE id = ?",
@@ -4792,8 +4925,7 @@ def load_latest_paper_session() -> dict | None:
 def load_paper_session(session_id: int, conn: sqlite3.Connection | None = None) -> dict | None:
     owns_connection = conn is None
     if conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = _connect_database()
     try:
         session = conn.execute(
             "SELECT * FROM paper_sessions WHERE id = ?",

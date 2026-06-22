@@ -140,6 +140,18 @@ export type StrategyDiscoverySchedulerStatus = {
   promotion_selector: SchedulerTaskState;
 };
 
+export type DbSchemaStatus = {
+  schema_status: "OK" | "MISSING_TABLES" | "ERROR" | string;
+  database_path?: string;
+  required_tables?: string[];
+  missing_tables?: string[];
+  repair_attempted?: boolean;
+  repair_status?: "NOT_NEEDED" | "REPAIRED" | "FAILED" | string;
+  initial_missing_tables?: string[];
+  error?: string;
+  error_type?: string;
+};
+
 export type AutonomousOrchestratorStatus = {
   config: Record<string, unknown>;
   orchestrator: SchedulerTaskState;

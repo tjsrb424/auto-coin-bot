@@ -4521,7 +4521,7 @@ function AnalysisView({ data }: { data: DashboardData }) {
   const shadowSummary = data.shadowReport?.summary;
   const shadowRows = data.shadowReport?.recent_rows ?? [];
   const rehearsal = intent?.policy_preview?.rehearsal as { allowed?: boolean; blockers?: string[]; daily_smart_order_count?: number; risk_score?: number } | undefined;
-  const noAveragingDownBlocked = Boolean(intent?.no_averaging_down_blocked ?? latest.aggressive_blockers?.includes("SMART_AGGRESSIVE_NO_AVERAGING_DOWN"));
+  const noAveragingDownBlocked = Boolean(intent?.no_averaging_down_blocked ?? latest?.aggressive_blockers?.includes("SMART_AGGRESSIVE_NO_AVERAGING_DOWN"));
   const aggressiveBuyBlockers = latest?.aggressive_buy_blockers?.length ? latest.aggressive_buy_blockers : latest?.aggressive_blockers ?? [];
   const aggressiveWarnings = latest?.aggressive_warnings?.length ? latest.aggressive_warnings : [];
 
