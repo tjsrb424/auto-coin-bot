@@ -450,6 +450,87 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated_intent["promotion_status"], "DUST_HOLD")
         self.assertEqual(updated_intent["promotion_blockers"], ["SMART_SELL_AMOUNT_BELOW_MIN"])
 
+    async def test_smart_sell_sweeps_full_position_when_remainder_would_be_dust(self) -> None:
+        database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
+        session = self.create_smart_session()
+        database.create_live_position(
+            {
+                "session_id": int(session["id"]),
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 0,
+                "strategy_name": "smart_autonomous",
+                "status": "OPEN",
+                "entry_order_uuid": "smart-entry",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 10_000,
+                "current_price": 100_000_000,
+                "stop_loss_price": 99_000_000,
+                "take_profit_price": 101_000_000,
+            }
+        )
+        snapshot_id, intent = self.create_intent(amount_requested=-6_000, current_value=10_000, side="ASK", action_hint="TAKE_PROFIT_PARTIAL")
+        broker = AsyncMock()
+        broker.get_balances.return_value = {
+            "by_currency": {
+                "KRW": {"balance": 0.0, "locked": 0.0},
+                "BTC": {"balance": 0.0001, "locked": 0.0},
+            }
+        }
+        broker.get_order_chance.return_value = {"market": "KRW-BTC"}
+        broker.place_order.return_value = {"uuid": "smart-sell-order-uuid"}
+        latest = candle()
+        env = {
+            "APP_ENV": "production",
+            "LIVE_TRADING_ENABLED": "true",
+            "LIVE_AUTO_TRADING_ENABLED": "true",
+            "SMART_AUTONOMOUS_TRADING_ENABLED": "true",
+            "SMART_ENGINE_LIVE_MODE": "live",
+            "MIN_LIVE_ORDER_KRW": "5000",
+            "MAX_LIVE_ORDER_KRW": "30000",
+            "RISK_MAX_ORDER_KRW": "30000",
+            "RISK_MAX_ORDERS_PER_DAY": "0",
+            "RISK_MAX_ENTRY_ORDERS_PER_DAY": "0",
+            "RISK_MAX_EXIT_ORDERS_PER_DAY": "0",
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+            "RISK_BLOCK_ON_OPEN_ORDER": "false",
+            "RISK_BLOCK_ON_PARTIAL_FILL": "false",
+            "RISK_MIN_VOLUME_KRW": "0",
+            "RISK_MIN_CURRENT_1M_VOLUME_KRW": "0",
+            "RISK_MIN_AVG_5M_VOLUME_KRW": "0",
+            "RISK_REQUIRE_ORDER_CHANCE_SUCCESS": "false",
+        }
+        with patch.dict("os.environ", env, clear=False), patch("app.live_strategy_pilot.get_live_broker", return_value=broker):
+            await _submit_smart_intent_order(
+                session,
+                latest,
+                {"signal": "HOLD", "reason": "smart test"},
+                LiveStrategyConfig.from_env(),
+                LiveTradingConfig.for_exchange("bithumb"),
+                {
+                    "id": snapshot_id,
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "current_bot_position_value_krw": 10_000,
+                    "current_bot_position_qty": 0.0001,
+                    "max_total_exposure_krw": 500_000,
+                    "risk_score": 35,
+                    "order_intents": [intent],
+                },
+            )
+
+        broker.place_order.assert_awaited_once()
+        order = broker.place_order.await_args.args[0]
+        self.assertEqual(order["side"], "SELL")
+        self.assertAlmostEqual(order["volume"], 0.0001)
+        self.assertEqual(order["amount_krw"], 10_000)
+        updated = database.load_decision_snapshot(snapshot_id)
+        assert updated is not None
+        updated_intent = updated["order_intents"][0]
+        self.assertTrue(updated_intent["policy_preview"]["dust_sweep_applied"])
+        self.assertEqual(updated_intent["policy_preview"]["remaining_position_value_krw"], 0.0)
+
     async def test_normal_bid_still_uses_live_order_flow(self) -> None:
         broker, snapshot = await self.submit_bid_intent(amount_requested=100_000, current_value=0, available_krw=200_000)
 

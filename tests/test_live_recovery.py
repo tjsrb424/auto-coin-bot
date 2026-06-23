@@ -296,6 +296,82 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(position["exit_order_uuid"])
         self.assertEqual(len(database.load_open_live_positions("bithumb", "KRW-BTC")), 1)
 
+    def test_filled_aggregate_exit_reconciliation_closes_multiple_positions(self) -> None:
+        session_id = create_strategy_session()
+        first_position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSING",
+                "entry_order_uuid": "entry-1",
+                "exit_order_uuid": "exit-aggregate",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 10_000,
+                "current_price": 100_000_000,
+            }
+        )
+        second_position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSING",
+                "entry_order_uuid": "entry-2",
+                "exit_order_uuid": "exit-aggregate",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.00002,
+                "entry_amount_krw": 2_000,
+                "current_price": 100_000_000,
+            }
+        )
+        database.insert_live_order_log(
+            {
+                **order_log("aggregate-exit-test"),
+                "session_id": session_id,
+                "side": "SELL",
+                "status": "SUBMITTED",
+                "order_uuid": "exit-aggregate",
+                "position_id": second_position_id,
+                "order_purpose": "EXIT",
+                "order_preview_payload": {
+                    "aggregate_exit": True,
+                    "aggregate_exit_position_ids": [first_position_id, second_position_id],
+                },
+            }
+        )
+        current = database.get_live_order_log("aggregate-exit-test")
+        assert current is not None
+
+        apply_reconciled_order_status(
+            current,
+            normalize_exchange_order(
+                {
+                    "uuid": "exit-aggregate",
+                    "state": "done",
+                    "price": "101000000",
+                    "volume": "0.00012",
+                    "executed_volume": "0.00012",
+                    "remaining_volume": "0",
+                    "paid_fee": "5",
+                }
+            ),
+            "TEST_AGGREGATE_EXIT_RECONCILE",
+        )
+
+        first = database.load_live_position(first_position_id)
+        second = database.load_live_position(second_position_id)
+        assert first is not None
+        assert second is not None
+        self.assertEqual(first["status"], "CLOSED")
+        self.assertEqual(second["status"], "CLOSED")
+        self.assertEqual(database.load_open_live_positions("bithumb", "KRW-BTC"), [])
+
     def test_partially_filled_exit_reconciliation_reduces_position_and_keeps_closing(self) -> None:
         session_id = create_strategy_session()
         position_id = database.create_live_position(

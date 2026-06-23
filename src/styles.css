@@ -2752,6 +2752,100 @@ body {
   font-weight: 700;
 }
 
+.ref-dashboard-portfolio-grid {
+  display: grid;
+  grid-template-columns: 255px minmax(0, 1fr);
+  gap: 14px;
+  align-items: stretch;
+  margin-top: 10px;
+}
+
+.ref-dashboard-portfolio-composition {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-donut {
+  width: 92px;
+  height: 92px;
+  margin-left: 0;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-donut::after {
+  inset: 23px;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-donut span,
+.ref-portfolio-panel .ref-dashboard-portfolio-donut em {
+  font-size: 10px;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-donut b {
+  max-width: 64px;
+  margin: 5px 0 3px;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-legend {
+  gap: 6px;
+  margin-top: 0;
+  min-width: 0;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-legend p {
+  grid-template-columns: 9px 34px 44px minmax(0, 1fr);
+  gap: 7px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-legend i {
+  width: 8px;
+  height: 8px;
+}
+
+.ref-portfolio-panel .ref-dashboard-portfolio-legend em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ref-dashboard-portfolio-trend {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0;
+}
+
+.ref-dashboard-portfolio-trend > span {
+  overflow: hidden;
+  color: #9eacbe;
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-dashboard-portfolio-trend .ref-portfolio-trend-chart {
+  position: relative;
+  left: auto;
+  right: auto;
+  top: auto;
+  height: 101px;
+}
+
+.ref-dashboard-portfolio-trend .ref-portfolio-trend-chart text {
+  font-size: 10px;
+}
+
+.ref-dashboard-portfolio-trend .ref-portfolio-trend-chart text:not(.axis) {
+  stroke-width: 5px;
+}
+
 .ref-portfolio-kpi-total { left: 208px; width: 297px; }
 .ref-portfolio-kpi-profit { left: 515px; width: 292px; }
 .ref-portfolio-kpi-return { left: 817px; width: 279px; }

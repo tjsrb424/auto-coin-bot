@@ -109,6 +109,56 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(risk["allowed"])
         self.assertEqual(risk["risk_result"], "BLOCKED_EXIT_DISABLED")
 
+    async def test_exit_preview_blocks_single_dust_position_below_min_order(self) -> None:
+        position = self.create_position(volume=0.00002)
+        candidate = create_exit_candidate_for_position(position, "STOP_LOSS", 100_000_000)
+        assert candidate is not None
+        approve_exit_candidate(int(candidate["id"]))
+        broker = AsyncMock()
+        broker.get_balances.return_value = {
+            "by_currency": {"BTC": {"balance": 0.00002, "locked": 0.0}},
+            "btc": {"balance": 0.00002, "locked": 0.0},
+            "krw": {"balance": 0.0, "locked": 0.0},
+        }
+        broker.get_order_chance.return_value = {"market": "KRW-BTC"}
+
+        with (
+            patch("app.live_exit.reconcile_balances", new=AsyncMock(return_value={"ok": True, "blocking": False})),
+            patch("app.live_exit.get_live_broker", return_value=broker),
+            patch("app.capital_snapshot.get_live_broker", return_value=broker),
+        ):
+            result = await create_exit_order_preview(int(candidate["id"]), manual_confirmed=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["preview"]["risk_result"], "BLOCKED_SELL_VOLUME_BELOW_MIN")
+
+    async def test_exit_preview_aggregates_same_market_dust_positions(self) -> None:
+        larger = self.create_position(volume=0.0001)
+        dust = self.create_position(volume=0.00002)
+        candidate = create_exit_candidate_for_position(dust, "STOP_LOSS", 100_000_000)
+        assert candidate is not None
+        approve_exit_candidate(int(candidate["id"]))
+        broker = AsyncMock()
+        broker.get_balances.return_value = {
+            "by_currency": {"BTC": {"balance": 0.00012, "locked": 0.0}},
+            "btc": {"balance": 0.00012, "locked": 0.0},
+            "krw": {"balance": 0.0, "locked": 0.0},
+        }
+        broker.get_order_chance.return_value = {"market": "KRW-BTC"}
+
+        with (
+            patch("app.live_exit.reconcile_balances", new=AsyncMock(return_value={"ok": True, "blocking": False})),
+            patch("app.live_exit.get_live_broker", return_value=broker),
+            patch("app.capital_snapshot.get_live_broker", return_value=broker),
+        ):
+            result = await create_exit_order_preview(int(candidate["id"]), manual_confirmed=True)
+
+        self.assertTrue(result["ok"])
+        self.assertAlmostEqual(result["preview"]["volume"], 0.00012)
+        self.assertEqual(result["preview"]["amount_krw"], 11_976)
+        self.assertTrue(result["preview"]["aggregate_exit"])
+        self.assertEqual(result["preview"]["aggregate_exit_position_ids"], [larger["id"], dust["id"]])
+
     async def test_manual_exit_preview_records_exit_order_log(self) -> None:
         position = self.create_position()
         candidate = create_exit_candidate_for_position(position, "STRATEGY_SELL", 100_000_000)

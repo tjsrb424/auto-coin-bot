@@ -962,6 +962,22 @@ def _block_smart_intent_order(
     update_live_strategy_session(int(session["id"]), {"last_risk_result": blocker, "last_order_status": "BLOCKED"})
 
 
+def _smart_sell_volume_avoiding_dust(requested_qty: float, current_qty: float, price: float, min_order_krw: float) -> tuple[float, dict]:
+    volume = max(min(requested_qty, current_qty), 0.0)
+    remaining_value = max(current_qty - volume, 0.0) * price
+    dust_sweep = current_qty > 0 and volume > 0 and 0 < remaining_value < min_order_krw
+    if dust_sweep:
+        volume = current_qty
+        remaining_value = 0.0
+    return volume, {
+        "dust_sweep_applied": dust_sweep,
+        "requested_sell_qty": requested_qty,
+        "final_sell_qty": volume,
+        "remaining_position_value_krw": remaining_value,
+        "min_order_krw": min_order_krw,
+    }
+
+
 async def _submit_smart_intent_order(
     session: dict,
     candle: dict,
@@ -1222,8 +1238,8 @@ async def _submit_smart_intent_sell_order(
     current_price = float(candle["trade_price"])
     current_qty = max(_float(position.get("entry_volume")), 0.0)
     requested_qty = abs(_float(intent.get("target_qty"))) or (abs(_float(intent.get("delta_value_krw"))) / current_price if current_price > 0 else 0.0)
-    volume = max(min(requested_qty, current_qty), 0.0)
     price = _round_krw_price(current_price)
+    volume, dust_preview = _smart_sell_volume_avoiding_dust(requested_qty, current_qty, price, live_config.min_order_krw)
     amount = volume * price
     request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
     order = {
@@ -1259,7 +1275,12 @@ async def _submit_smart_intent_sell_order(
     except Exception:
         recommendation = None
     promotion = evaluate_promotion(
-        intent={**intent, "delta_value_krw": amount, "target_qty": volume},
+        intent={
+            **intent,
+            "delta_value_krw": amount,
+            "target_qty": volume,
+            "policy_preview": {**(intent.get("policy_preview") or {}), **dust_preview},
+        },
         snapshot=smart_snapshot,
         policy=load_global_bot_operation_policy(),
         risk_preview=risk_preview,
@@ -1268,7 +1289,7 @@ async def _submit_smart_intent_sell_order(
         daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
         risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
     )
-    promotion["policy_preview"] = {**(intent.get("policy_preview") or {}), **promotion.get("policy_preview", {})}
+    promotion["policy_preview"] = {**(intent.get("policy_preview") or {}), **dust_preview, **promotion.get("policy_preview", {})}
     if intent_id:
         update_order_intent(int(intent_id), {**promotion, "status": "READY_FOR_LIVE" if promotion["promotion_status"] in {"READY_FOR_LIMITED", "READY_FOR_LIVE"} else "BLOCKED"})
     if promotion["promotion_status"] not in {"READY_FOR_LIMITED", "READY_FOR_LIVE"}:

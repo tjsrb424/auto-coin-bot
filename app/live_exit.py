@@ -18,6 +18,7 @@ from app.database import (
     load_latest_exit_candidate,
     load_live_position,
     load_open_live_position,
+    load_open_live_positions,
     update_exit_candidate,
     update_live_order_log,
     update_live_position,
@@ -179,11 +180,72 @@ def reject_exit_candidate(candidate_id: int) -> dict:
     return {"ok": True, "exit_candidate": load_exit_candidate(candidate_id)}
 
 
+def _balance_available_from_snapshot(snapshot: dict, symbol: str) -> float:
+    balances = snapshot.get("balances") or {}
+    by_currency = balances.get("by_currency") if isinstance(balances, dict) else {}
+    if not isinstance(by_currency, dict):
+        return 0.0
+    item = by_currency.get(symbol)
+    if not isinstance(item, dict):
+        return 0.0
+    return float(item.get("balance") or 0.0)
+
+
+def _aggregate_same_market_exit_candidate(
+    candidate: dict,
+    position: dict,
+    snapshot: dict,
+    live_config: LiveTradingConfig,
+) -> dict:
+    target_price = float(candidate.get("target_exit_price") or 0.0)
+    if target_price <= 0:
+        return candidate
+    exchange = str(candidate.get("exchange") or "bithumb")
+    market = str(candidate.get("market") or "")
+    positions = [
+        item
+        for item in (snapshot.get("positions") or load_open_live_positions(exchange, market))
+        if str(item.get("exchange") or exchange) == exchange
+        and str(item.get("market") or "") == market
+        and str(item.get("status") or "") in {"OPEN", "EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED"}
+    ]
+    if len(positions) <= 1:
+        return candidate
+    if any(has_open_exit_order(int(item["id"])) for item in positions if int(item["id"]) != int(position["id"])):
+        return candidate
+
+    current_amount = sellable_volume_for_position(snapshot, position) * target_price
+    position_amounts = [float(item.get("entry_volume") or 0.0) * target_price for item in positions]
+    has_dust_position = any(0 < amount < live_config.min_order_krw for amount in position_amounts)
+    if current_amount >= live_config.min_order_krw and not has_dust_position:
+        return candidate
+
+    symbol = market.split("-", 1)[-1]
+    total_db_volume = sum(float(item.get("entry_volume") or 0.0) for item in positions)
+    aggregate_volume = min(total_db_volume, _balance_available_from_snapshot(snapshot, symbol))
+    aggregate_amount = aggregate_volume * target_price
+    if aggregate_volume <= 0 or aggregate_amount < live_config.min_order_krw:
+        return candidate
+
+    ordered_positions = sorted(positions, key=lambda row: (str(row.get("opened_at") or ""), int(row["id"])))
+    return {
+        **candidate,
+        "volume": aggregate_volume,
+        "expected_amount_krw": aggregate_amount,
+        "expected_fee": aggregate_amount * LiveExitConfig.from_env().fee_rate,
+        "aggregate_exit": True,
+        "aggregate_exit_position_ids": [int(item["id"]) for item in ordered_positions],
+        "aggregate_exit_reason": "SAME_MARKET_DUST_SWEEP",
+    }
+
+
 async def create_exit_order_preview(candidate_id: int, *, manual_confirmed: bool, is_auto_exit: bool = False) -> dict:
     candidate = load_exit_candidate(candidate_id)
     if candidate is None:
         return {"ok": False, "status": "BLOCKED", "risk_result": "EXIT_CANDIDATE_NOT_FOUND"}
-    position = load_open_live_position(int(candidate["session_id"]), str(candidate["exchange"]), str(candidate["market"]))
+    position = load_live_position(int(candidate["position_id"]))
+    if position and str(position.get("status")) not in {"OPEN", "EXIT_CANDIDATE", "EXIT_PENDING"}:
+        position = None
     request_id = f"exit-{uuid.uuid4().hex[:24]}"
     order, risk = await _build_exit_order(candidate, position, request_id, manual_confirmed=manual_confirmed, is_auto_exit=is_auto_exit)
     log_payload = _exit_log_payload(candidate, position, order, risk, "PREVIEWED" if risk["allowed"] else "BLOCKED", manual_confirmed, is_auto_exit)
@@ -201,7 +263,9 @@ async def submit_exit_order(request_id: str, *, final_confirmation: str) -> dict
     if preview["status"] != "PREVIEWED" or preview["risk_result"] != "ALLOWED":
         return {"ok": False, "status": "BLOCKED", "risk_result": preview["risk_result"]}
     candidate = load_exit_candidate(int(preview["exit_candidate_id"]))
-    position = load_open_live_position(int(preview["session_id"]), str(preview["exchange"]), str(preview["market"]))
+    position = load_live_position(int(preview["position_id"])) if preview.get("position_id") else None
+    if position and str(position.get("status")) not in {"OPEN", "EXIT_CANDIDATE", "EXIT_PENDING"}:
+        position = None
     order = {
         "request_id": request_id,
         "client_order_id": request_id[:36],
@@ -241,6 +305,9 @@ async def submit_exit_order(request_id: str, *, final_confirmation: str) -> dict
             update_exit_candidate(int(candidate["id"]), {"status": "SUBMITTED", "risk_result": "ALLOWED"})
         if position:
             update_live_position(int(position["id"]), {"status": "CLOSING", "exit_order_uuid": order_uuid})
+            for aggregate_position_id in (preview.get("order_preview_payload") or {}).get("aggregate_exit_position_ids", []):
+                if int(aggregate_position_id) != int(position["id"]):
+                    update_live_position(int(aggregate_position_id), {"status": "CLOSING", "exit_order_uuid": order_uuid})
             update_live_strategy_session(int(position["session_id"]), {"last_order_status": "SUBMITTED", "last_risk_result": "EXIT_SUBMITTED"})
         if order_uuid:
             await reconcile_exit_order(request_id)
@@ -394,8 +461,11 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
                 if not snapshot_is_fresh(snapshot):
                     risk_result = "BLOCKED_SNAPSHOT_STALE"
                 else:
+                    candidate = _aggregate_same_market_exit_candidate(candidate, position, snapshot, live_config)
                     sellable_volume = sellable_volume_for_position(snapshot, position)
                     target_price = float(candidate.get("target_exit_price") or 0.0)
+                    if candidate.get("aggregate_exit"):
+                        sellable_volume = float(candidate.get("volume") or sellable_volume)
                     if sellable_volume <= 0:
                         risk_result = "BLOCKED_SELL_BALANCE_ZERO"
                     elif sellable_volume + 1e-12 < float(candidate["volume"]):
@@ -408,6 +478,8 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
                                 "volume": sellable_volume,
                                 "expected_amount_krw": adjusted_amount,
                             }
+                    elif float(candidate.get("expected_amount_krw") or 0.0) < live_config.min_order_krw:
+                        risk_result = "BLOCKED_SELL_VOLUME_BELOW_MIN"
             except Exception as exc:
                 risk_result = "BLOCKED_ORDER_CHANCE_FAILED"
                 reason = str(exc)
@@ -429,6 +501,9 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
         "expected_pnl": float(candidate.get("expected_pnl") or 0.0) if candidate else 0.0,
         "manual_confirmed": manual_confirmed,
         "is_auto_exit": is_auto_exit,
+        "aggregate_exit": bool(candidate.get("aggregate_exit")) if candidate else False,
+        "aggregate_exit_position_ids": candidate.get("aggregate_exit_position_ids", []) if candidate else [],
+        "aggregate_exit_reason": candidate.get("aggregate_exit_reason") if candidate else None,
     }
     if candidate:
         order = {

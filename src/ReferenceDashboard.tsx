@@ -1121,6 +1121,36 @@ const systemLogLabels: Record<string, string> = {
   TEST_RECONCILE: "복구 점검 테스트 이벤트입니다."
 };
 
+const systemMessageLabels: Record<string, string> = {
+  "startup open order sync failed.": "서버 시작 중 미체결 주문 동기화에 실패했습니다.",
+  "open order sync list_open_orders failed.": "거래소 미체결 주문 목록 조회에 실패했습니다.",
+  "balance reconciliation failed.": "잔고 대조에 실패했습니다.",
+  "server restart moved running live sessions to live_paused. manual resume is required.": "서버 재시작으로 실행 중이던 실거래 세션을 일시정지했습니다. 수동 재개가 필요합니다.",
+  "order status is unknown; blocked until exchange reconciliation succeeds.": "주문 상태를 알 수 없어 거래소 대조가 성공할 때까지 재주문을 차단합니다.",
+  "internal order has no exchange uuid and must not be retried.": "내부 주문에 거래소 주문 ID가 없어 재시도하면 안 됩니다.",
+  "cannot fetch order status without exchange uuid. new orders remain blocked.": "거래소 주문 ID가 없어 주문 상태를 조회할 수 없습니다. 신규 주문은 계속 차단됩니다.",
+  "exchange order was not found during reconciliation; marked stale without deleting db history.": "거래소 대조 중 주문을 찾지 못해 DB 기록은 보존하고 오래된 취소 상태로 표시했습니다.",
+  "pending order was not found on exchange and was marked stale canceled.": "대기 중인 주문을 거래소에서 찾지 못해 오래된 취소 상태로 표시했습니다.",
+  "order status fetch failed during reconciliation.": "거래소 주문 상태 대조 중 조회에 실패했습니다.",
+  "exchange request timed out; order status must be reconciled before any retry.": "거래소 요청 시간이 초과되어 재시도 전에 주문 상태 대조가 필요합니다.",
+  "live strategy order timed out. re-ordering is blocked until reconciliation.": "실거래 전략 주문 요청 시간이 초과되었습니다. 상태 대조가 끝날 때까지 재주문을 차단합니다.",
+  "auto live pilot order timed out. re-ordering is blocked until reconciliation.": "자동 실거래 파일럿 주문 요청 시간이 초과되었습니다. 상태 대조가 끝날 때까지 재주문을 차단합니다.",
+  "auto live pilot partial fill residual cancel failed.": "자동 실거래 파일럿 부분 체결 잔량 취소에 실패했습니다.",
+  "auto live pilot order status reconciliation failed.": "자동 실거래 파일럿 주문 상태 대조에 실패했습니다.",
+  "exit order request timed out; status reconciliation is required before retry.": "청산 주문 요청 시간이 초과되어 재시도 전에 상태 대조가 필요합니다.",
+  "exit order timed out. re-ordering is blocked until reconciliation.": "청산 주문 요청 시간이 초과되었습니다. 상태 대조가 끝날 때까지 재주문을 차단합니다.",
+  "exit order cancel failed.": "청산 주문 취소에 실패했습니다.",
+  "auto exit order submission failed.": "자동 청산 주문 제출에 실패했습니다.",
+  "filled entry order without position_id was recovered as a live position.": "체결된 진입 주문에 누락된 포지션 기록을 복구했습니다.",
+  "exchange btc balance was imported as an internal live position by explicit admin action.": "관리자 확인에 따라 거래소 BTC 잔고를 내부 실거래 포지션으로 편입했습니다.",
+  "candidate strategy not found.": "후보 전략을 찾지 못했습니다.",
+  "duplicate candle.": "이미 처리한 캔들이라 주문을 건너뜁니다.",
+  "order chance failed.": "거래소 주문 가능 여부 확인에 실패했습니다.",
+  "insufficient krw balance.": "KRW 잔고가 부족합니다.",
+  "no exit order to cancel.": "취소할 청산 주문이 없습니다.",
+  "exit candidate not found.": "청산 후보를 찾지 못했습니다."
+};
+
 const codeTokenLabels: Record<string, string> = {
   BLOCKED: "차단",
   BY: "",
@@ -1441,6 +1471,27 @@ function policyBlockText(code?: string | null, fallback?: string | null) {
   return fallback ?? statusLabel(code);
 }
 
+function translateEnglishSystemMessage(message?: string | null) {
+  const compact = String(message ?? "").trim().replace(/\s+/g, " ");
+  if (!compact) return "";
+  const lower = compact.toLowerCase();
+  if (systemMessageLabels[lower]) return systemMessageLabels[lower];
+
+  const reconciled = compact.match(/^order reconciled as ([A-Z_]+)\.$/i);
+  if (reconciled) return `주문 상태를 ${statusLabel(reconciled[1])}(으)로 대조했습니다.`;
+
+  const missingOpenOrder = compact.match(/^exchange open order .+ is missing from internal liveorderlog\.$/i);
+  if (missingOpenOrder) return "거래소에는 있지만 봇 기록에는 없는 미체결 주문이 있습니다.";
+
+  const exitCandidate = compact.match(/^exit candidate created: ([A-Z_]+)\.$/i);
+  if (exitCandidate) return `${statusLabel(exitCandidate[1])} 사유로 청산 후보가 생성되었습니다.`;
+
+  const confirmation = compact.match(/^(.+) confirmation is required\.$/i);
+  if (confirmation) return `확인 문구 ${confirmation[1]}가 필요합니다.`;
+
+  return "";
+}
+
 function readableSystemLogText(code?: string | null, fallback?: string | null) {
   const normalized = normalizeBlockCode(code);
   if (normalized && systemLogLabels[normalized]) return systemLogLabels[normalized];
@@ -1449,6 +1500,8 @@ function readableSystemLogText(code?: string | null, fallback?: string | null) {
     const fallbackCode = normalizeBlockCode(fallback);
     if (fallbackCode && systemLogLabels[fallbackCode]) return systemLogLabels[fallbackCode];
     if (fallbackCode && policyBlockReasonLabels[fallbackCode]) return policyBlockReasonLabels[fallbackCode];
+    const translatedFallback = translateEnglishSystemMessage(fallback);
+    if (translatedFallback) return translatedFallback;
     return fallback;
   }
   return readableCodeFallback(code);
@@ -2432,48 +2485,40 @@ function SignalPanel({ data }: { data: DashboardData }) {
   );
 }
 
-function PortfolioPanel({ data }: { data: DashboardData }) {
-  const balanceOk = data.liveBalances?.balance_fetch_status === "SUCCESS";
-  const btcPrice = latestCandle(data.candles)?.trade_price ?? 0;
-  const krwBalance = data.liveBalances?.balances?.krw ?? data.liveBalances?.balances?.by_currency?.KRW;
-  const btcBalance = data.liveBalances?.balances?.btc ?? data.liveBalances?.balances?.by_currency?.BTC;
-  const krw = balanceOk ? balanceAmount(krwBalance) : null;
-  const btc = balanceOk ? balanceAmount(btcBalance) : null;
-  const btcValue = btc == null ? null : btc * (data.liveBalances?.prices?.[MARKET]?.price ?? btcPrice);
-  const paperEquity = data.paper?.balance?.equity ?? data.forward?.balance?.equity ?? null;
-  const paperBtcValue = (data.paper?.position?.market_value ?? 0) || (data.paper?.position?.btc_quantity ?? 0) * (data.paper?.balance?.current_price ?? btcPrice);
-  const total = balanceOk ? data.liveBalances?.estimated_total_equity_krw ?? null : paperEquity;
-  const rows = balanceOk
-    ? [
-      ["KRW", krw ?? 0],
-      ["BTC", btcValue ?? 0]
-    ]
-    : [
-      ["현금", data.paper?.balance?.cash_krw ?? null],
-      ["BTC", paperBtcValue || null]
-    ];
-  const filteredRows = rows.filter(([, value]) => value != null && Number(value) > 0);
-  const displayRows = filteredRows.length ? filteredRows : [["데이터 없음", null]];
+function PortfolioPanel({ data, totalEquity }: { data: DashboardData; totalEquity?: number | null }) {
+  const fallbackTotal = totalEquity != null && totalEquity >= 10_000 ? totalEquity : portfolioBaseTotal;
+  const rows = buildPortfolioRows(data, fallbackTotal);
+  const computedTotal = rows.reduce((sum, row) => sum + row.value, 0);
+  const total = data.liveBalances?.estimated_total_equity_krw && data.liveBalances.estimated_total_equity_krw > 0
+    ? data.liveBalances.estimated_total_equity_krw
+    : computedTotal > 0 ? computedTotal : fallbackTotal;
+  const mainRows = rows.slice(0, 5);
+  const otherValue = rows.slice(5).reduce((sum, item) => sum + item.value, 0);
+  const otherAllocation = total > 0 ? otherValue / total : 0;
+  const legendRows = otherValue > 0
+    ? [...mainRows, { ...portfolioMeta("기타"), symbol: "기타", value: otherValue, allocation: otherAllocation } as PortfolioAssetRow]
+    : mainRows;
+  const trend = portfolioTrend(data, total);
 
   return (
     <RefPanel className="ref-portfolio-panel">
-      <h3>포트폴리오 비중</h3>
-      <div className="ref-portfolio-body">
-        <div className="ref-donut">
-          <div><span>총 자산</span><b>{formatKrw(total)}</b><em>KRW</em></div>
+      <div className="ref-portfolio-panel-head">
+        <h3>포트폴리오</h3>
+        <span>{data.liveBalances?.balance_fetch_status === "SUCCESS" ? "실잔고 기준" : "레퍼런스 표시"}</span>
+      </div>
+      <div className="ref-dashboard-portfolio-grid">
+        <div className="ref-dashboard-portfolio-composition">
+          <div className="ref-portfolio-page-donut ref-dashboard-portfolio-donut" style={{ background: buildConicGradient(legendRows) }}>
+            <div><span>총 자산</span><b>{formatKrw(total)}</b><em>KRW</em></div>
+          </div>
+          <div className="ref-portfolio-page-legend ref-dashboard-portfolio-legend">
+            {legendRows.map((asset) => (
+              <p key={asset.symbol}><i style={{ background: asset.color }} /><span>{asset.symbol}</span><b>{formatRatioPercent(asset.allocation)}</b><em>{formatKrw(asset.value)} KRW</em></p>
+            ))}
+          </div>
         </div>
-        <div className="ref-legend">
-          {displayRows.map(([name, value], index) => {
-            const percent = total && typeof value === "number" ? (value / total) * 100 : null;
-            return (
-              <p key={name}>
-                <i className={`c${index}`} />
-                <span>{name}</span>
-                <b>{percent == null ? "-" : `${percent.toFixed(1)}%`}</b>
-                <em>{typeof value === "number" ? `${formatKrw(value)} KRW` : "-"}</em>
-              </p>
-            );
-          })}
+        <div className="ref-dashboard-portfolio-trend">
+          <PortfolioTrendChart total={total} values={trend.values} labels={trend.labels} />
         </div>
       </div>
     </RefPanel>
@@ -4871,7 +4916,7 @@ function DashboardView({
       <BotStatusPanel data={data} onOpenAutoTrade={onOpenAutoTrade} />
       <PositionPanel data={data} />
       <SignalPanel data={data} />
-      <PortfolioPanel data={data} />
+      <PortfolioPanel data={data} totalEquity={totalEquity} />
       <RecentTradesPanel data={data} />
       <LogPanel data={data} />
     </>

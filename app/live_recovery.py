@@ -273,6 +273,14 @@ def sync_exit_order_position(log: dict, status: ReconciledOrderStatus) -> None:
     fill_volume = max(status.executed_volume - previous_executed, 0.0)
     filled_amount_delta = max(status.filled_amount_krw - previous_filled_amount, 0.0)
     paid_fee_delta = max(status.paid_fee - previous_paid_fee, 0.0)
+    aggregate_position_ids = _aggregate_exit_position_ids(log)
+    if aggregate_position_ids and status.status in {"FILLED", "PARTIALLY_FILLED"}:
+        _sync_aggregate_exit_order_positions(log, status, aggregate_position_ids, fill_volume, filled_amount_delta, paid_fee_delta)
+        return
+    if aggregate_position_ids and status.status == "CANCELED":
+        for position_id in aggregate_position_ids:
+            update_live_position(position_id, {"status": "OPEN", "exit_order_uuid": None})
+        return
     if fill_volume <= 0 and status.status in {"FILLED", "PARTIALLY_FILLED"}:
         return
     entry_basis = (entry_amount * min(fill_volume / entry_volume, 1.0)) if entry_volume > 0 else entry_price * fill_volume
@@ -300,7 +308,79 @@ def sync_exit_order_position(log: dict, status: ReconciledOrderStatus) -> None:
             },
         )
     elif status.status == "CANCELED":
-        update_live_position(position_id, {"status": "OPEN", "exit_order_uuid": None})
+        update_live_position(int(position["id"]), {"status": "OPEN", "exit_order_uuid": None})
+
+
+def _aggregate_exit_position_ids(log: dict) -> list[int]:
+    payload = log.get("order_preview_payload") or {}
+    if not isinstance(payload, dict):
+        return []
+    ids = payload.get("aggregate_exit_position_ids") or []
+    result: list[int] = []
+    for value in ids:
+        try:
+            position_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if position_id not in result:
+            result.append(position_id)
+    return result if len(result) > 1 else []
+
+
+def _sync_aggregate_exit_order_positions(
+    log: dict,
+    status: ReconciledOrderStatus,
+    position_ids: list[int],
+    fill_volume: float,
+    filled_amount_delta: float,
+    paid_fee_delta: float,
+) -> None:
+    if fill_volume <= 0:
+        return
+    remaining_fill = fill_volume
+    total_actual_pnl = 0.0
+    raw_state = str(status.raw.get("state") or status.raw.get("status") or "").lower()
+    still_waiting = status.status == "PARTIALLY_FILLED" and raw_state not in {"cancel", "canceled", "cancelled"}
+    for position_id in position_ids:
+        position = load_live_position(position_id)
+        if position is None:
+            continue
+        entry_volume = _float(position.get("entry_volume"))
+        if entry_volume <= 0:
+            continue
+        applied_volume = min(entry_volume, remaining_fill)
+        if applied_volume <= 0:
+            if still_waiting:
+                update_live_position(position_id, {"status": "CLOSING", "exit_order_uuid": log.get("order_uuid")})
+            continue
+        share = applied_volume / fill_volume
+        filled_amount_piece = filled_amount_delta * share
+        paid_fee_piece = paid_fee_delta * share
+        entry_amount = _float(position.get("entry_amount_krw"))
+        entry_price = _float(position.get("entry_price"))
+        entry_basis = (entry_amount * min(applied_volume / entry_volume, 1.0)) if entry_volume > 0 else entry_price * applied_volume
+        actual_pnl = filled_amount_piece - entry_basis - paid_fee_piece
+        total_actual_pnl += actual_pnl
+        realized_pnl = _float(position.get("realized_pnl")) + actual_pnl
+        remaining_volume = max(entry_volume - applied_volume, 0.0)
+        if remaining_volume <= BALANCE_MISMATCH_VOLUME_TOLERANCE:
+            update_live_position(position_id, {"status": "CLOSED", "realized_pnl": realized_pnl, "closed_at": _utc_now(), "exit_order_uuid": None})
+        else:
+            remaining_amount = max(entry_amount - entry_basis, 0.0)
+            current_price = filled_amount_piece / applied_volume if applied_volume > 0 else position.get("current_price")
+            update_live_position(
+                position_id,
+                {
+                    "status": "CLOSING" if still_waiting else "OPEN",
+                    "entry_volume": remaining_volume,
+                    "entry_amount_krw": remaining_amount,
+                    "current_price": current_price,
+                    "realized_pnl": realized_pnl,
+                    "exit_order_uuid": log.get("order_uuid") if still_waiting else None,
+                },
+            )
+        remaining_fill = max(remaining_fill - applied_volume, 0.0)
+    update_live_order_log(str(log["request_id"]), {"actual_pnl": total_actual_pnl})
 
 
 def _position_for_exit_order(log: dict) -> dict | None:
