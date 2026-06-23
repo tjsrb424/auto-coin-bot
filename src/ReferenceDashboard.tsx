@@ -1479,6 +1479,44 @@ function statusLabel(value?: string | null) {
   return labels[normalized] ?? reasonLabels[normalized] ?? systemLogLabels[normalized] ?? readableCodeFallback(value);
 }
 
+function marketRegimeLabel(value?: string | null) {
+  const key = String(value ?? "").toUpperCase();
+  const labels: Record<string, string> = {
+    PANIC: "급락/패닉",
+    TREND_DOWN: "하락 추세",
+    OVERHEATED: "과열",
+    UNKNOWN: "판단 불가",
+    RANGE: "박스권",
+    TREND_UP: "상승 추세",
+    BREAKOUT: "돌파"
+  };
+  return labels[key] ?? (value || "-");
+}
+
+function profitStrategyLabel(value?: string | null) {
+  const key = String(value ?? "").toLowerCase();
+  const labels: Record<string, string> = {
+    trend_pullback: "상승 눌림목",
+    volume_breakout: "거래량 돌파",
+    range_reversion: "박스권 되돌림",
+    panic_blocker: "패닉 차단"
+  };
+  return labels[key] ?? (value || "-");
+}
+
+function sizingReasonLabel(value?: string | null) {
+  const key = String(value ?? "").toUpperCase();
+  const labels: Record<string, string> = {
+    REQUEST_WITHIN_AVAILABLE_BALANCE: "요청 금액 그대로 가능",
+    REQUEST_EXCEEDS_AVAILABLE_BALANCE_CAPPED: "잔액 기준 자동 축소",
+    ORDER_BELOW_MINIMUM: "최소 주문액 미만",
+    INSUFFICIENT_BALANCE: "KRW 잔액 부족",
+    BALANCE_UNAVAILABLE: "잔액 조회 대기",
+    ORDER_AMOUNT_ZERO: "주문액 없음"
+  };
+  return labels[key] ?? (value || "-");
+}
+
 type PolicyBlockNotice = {
   code: string;
   text: string;
@@ -4121,6 +4159,17 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
   const projectedLossLimit = maxExposure * dailyLossPct / 100;
   const usage = policy?.exposure_usage_pct ?? 0;
   const usageWidth = Math.min(Math.max(usage, 0), 100);
+  const profitGateBlocked = profit?.entry_gate?.entry_allowed === false;
+  const profitGateLabel = profitGateBlocked
+    ? `차단됨 (${profit?.entry_gate?.block_code ?? "사유 확인 필요"})`
+    : profit?.entry_gate?.entry_allowed === true
+      ? "진입 가능"
+      : "판단 대기";
+  const profitKillSwitchLabel = profit?.kill_switch?.status === "PAUSED"
+    ? "전략 일시정지"
+    : profit?.kill_switch?.status === "OK"
+      ? "정상"
+      : profit?.kill_switch?.status ?? "-";
 
   return (
     <>
@@ -4208,20 +4257,6 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
           {readinessChecks.length === 0 && <div className="is-warn"><span>점검</span><b>대기</b><em>상태 데이터가 아직 없습니다.</em></div>}
         </section>
       </RefPanel>
-      <RefPanel className="ref-ops-profit-engine">
-        <h3>Profit Engine V1</h3>
-        <p><span>Mode</span><b>{profit?.config?.enabled ? "ON" : "OFF"} / {profit?.config?.mode ?? "-"}</b></p>
-        <p><span>Market regime</span><b>{profit?.entry_gate?.market_regime ?? "-"}</b></p>
-        <p><span>Entry gate</span><b>{profit?.entry_gate?.entry_allowed === false ? (profit.entry_gate.block_code ?? "BLOCKED") : "ALLOWED"}</b></p>
-        <p><span>Strategy</span><b>{profit?.entry_gate?.strategy_name ?? "-"}</b></p>
-        <p><span>Requested</span><b>{formatKrw(profit?.latest_order_sizing?.requested_order_krw)} KRW</b></p>
-        <p><span>Available</span><b>{formatKrw(profit?.latest_order_sizing?.available_krw)} KRW</b></p>
-        <p><span>Actual order</span><b>{formatKrw(profit?.latest_order_sizing?.actual_order_krw)} KRW</b></p>
-        <p><span>Sizing reason</span><b title={profit?.latest_order_sizing?.sizing_reason ?? "-"}>{profit?.latest_order_sizing?.sizing_reason ?? "-"}</b></p>
-        <p><span>Fill rate</span><b>{formatRatioPercent(profit?.execution_quality?.summary?.fill_rate, 1)}</b></p>
-        <p><span>Kill switch</span><b>{profit?.kill_switch?.status ?? "-"}</b></p>
-        {profit?.entry_gate?.entry_block_reason && <em>{profit.entry_gate.entry_block_reason}</em>}
-      </RefPanel>
       <RefPanel className="ref-ops-review">
         <h3>리허설 검토</h3>
         {latestRehearsal ? (
@@ -4254,11 +4289,21 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
           <p><span>최신 리허설</span><b>없음</b></p>
         )}
       </RefPanel>
-      <RefPanel className="ref-ops-modules">
-        <h3>내부 판단 모듈</h3>
-        {["RSI", "이동평균", "변동성 돌파", "시장상태", "리스크 필터", "외부요인"].map((item) => (
-          <p key={item}><span>{item}</span><b>읽기 전용</b></p>
-        ))}
+      <RefPanel className="ref-ops-profit-engine">
+        <h3>수익 엔진 상태</h3>
+        <div className="ref-profit-engine-head">
+          <strong className={profit?.config?.enabled ? "is-on" : ""}>{profit?.config?.enabled ? "작동 중" : "꺼짐"}</strong>
+          <span>{profit?.config?.mode === "aggressive" ? "공격형 수익 모드" : profit?.config?.mode ?? "-"}</span>
+        </div>
+        <p><span>시장 국면</span><b>{marketRegimeLabel(profit?.entry_gate?.market_regime)}</b></p>
+        <p><span>진입 판단</span><b className={profitGateBlocked ? "is-blocked" : "is-ok"} title={profit?.entry_gate?.block_code ?? "-"}>{profitGateLabel}</b></p>
+        <p><span>전략</span><b>{profitStrategyLabel(profit?.entry_gate?.strategy_name)}</b></p>
+        <p><span>요청 주문액</span><b>{formatKrw(profit?.latest_order_sizing?.requested_order_krw)} KRW</b></p>
+        <p><span>사용 가능 KRW</span><b>{formatKrw(profit?.latest_order_sizing?.available_krw)} KRW</b></p>
+        <p><span>실제 주문액</span><b>{formatKrw(profit?.latest_order_sizing?.actual_order_krw)} KRW</b></p>
+        <p><span>금액 산정</span><b title={profit?.latest_order_sizing?.sizing_reason ?? "-"}>{sizingReasonLabel(profit?.latest_order_sizing?.sizing_reason)}</b></p>
+        <p><span>킬 스위치</span><b>{profitKillSwitchLabel}</b></p>
+        {profit?.entry_gate?.entry_block_reason && <em>{profit.entry_gate.entry_block_reason}</em>}
       </RefPanel>
     </>
   );
