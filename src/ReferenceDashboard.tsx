@@ -2488,10 +2488,7 @@ function SignalPanel({ data }: { data: DashboardData }) {
 function PortfolioPanel({ data, totalEquity }: { data: DashboardData; totalEquity?: number | null }) {
   const fallbackTotal = totalEquity != null && totalEquity >= 10_000 ? totalEquity : portfolioBaseTotal;
   const rows = buildPortfolioRows(data, fallbackTotal);
-  const computedTotal = rows.reduce((sum, row) => sum + row.value, 0);
-  const total = data.liveBalances?.estimated_total_equity_krw && data.liveBalances.estimated_total_equity_krw > 0
-    ? data.liveBalances.estimated_total_equity_krw
-    : computedTotal > 0 ? computedTotal : fallbackTotal;
+  const total = portfolioDisplayTotal(data, rows, fallbackTotal);
   const mainRows = rows.slice(0, 5);
   const otherValue = rows.slice(5).reduce((sum, item) => sum + item.value, 0);
   const otherAllocation = total > 0 ? otherValue / total : 0;
@@ -2566,6 +2563,7 @@ const portfolioAssets: PortfolioAssetRow[] = [
 ];
 
 const portfolioBaseTotal = 28_450_000;
+const portfolioDustValueThresholdKrw = 100;
 
 const assetMeta: Record<string, { name: string; color: string; sector: string; targetAllocation: number }> = {
   KRW: { name: "원화", color: "#38bdf8", sector: "현금", targetAllocation: 0.12 },
@@ -2612,6 +2610,20 @@ function withAllocations(rows: PortfolioAssetRow[], totalOverride?: number | nul
   return rows.map((row) => ({ ...row, allocation: total > 0 ? row.value / total : 0 }));
 }
 
+function isPortfolioDustRow(row: PortfolioAssetRow) {
+  return row.symbol !== "KRW" && row.value > 0 && row.value < portfolioDustValueThresholdKrw;
+}
+
+function portfolioDisplayTotal(data: DashboardData, rows: PortfolioAssetRow[], fallbackTotal: number) {
+  const computedTotal = rows.reduce((sum, row) => sum + row.value, 0);
+  if (data.liveBalances?.balance_fetch_status === "SUCCESS") {
+    return computedTotal;
+  }
+  return data.liveBalances?.estimated_total_equity_krw && data.liveBalances.estimated_total_equity_krw > 0
+    ? data.liveBalances.estimated_total_equity_krw
+    : computedTotal > 0 ? computedTotal : fallbackTotal;
+}
+
 function fallbackPortfolioRows(total: number) {
   const scale = total / portfolioBaseTotal;
   return portfolioAssets.map((asset) => ({ ...asset, value: asset.value * scale, pnl: asset.pnl == null ? null : asset.pnl * scale }));
@@ -2624,7 +2636,7 @@ function buildPortfolioRows(data: DashboardData, fallbackTotal: number) {
     return withAllocations(fallbackPortfolioRows(fallbackTotal), fallbackTotal);
   }
 
-  const rows = Object.entries(byCurrency)
+  const rawRows = Object.entries(byCurrency)
     .map(([currency, entry], index): PortfolioAssetRow | null => {
       const symbol = currency.toUpperCase();
       const qty = balanceAmount(entry);
@@ -2656,10 +2668,11 @@ function buildPortfolioRows(data: DashboardData, fallbackTotal: number) {
     .filter((row): row is PortfolioAssetRow => row != null)
     .sort((a, b) => b.value - a.value);
 
-  if (rows.length === 0) {
+  if (rawRows.length === 0) {
     return withAllocations(fallbackPortfolioRows(fallbackTotal), fallbackTotal);
   }
-  return withAllocations(rows, data.liveBalances?.estimated_total_equity_krw);
+  const rows = rawRows.filter((row) => !isPortfolioDustRow(row));
+  return withAllocations(rows);
 }
 
 function buildConicGradient(rows: PortfolioAssetRow[]) {
@@ -2852,10 +2865,7 @@ function PortfolioView({
 }) {
   const fallbackTotal = totalEquity != null && totalEquity >= 10_000 ? totalEquity : portfolioBaseTotal;
   const rows = buildPortfolioRows(data, fallbackTotal);
-  const computedTotal = rows.reduce((sum, row) => sum + row.value, 0);
-  const total = data.liveBalances?.estimated_total_equity_krw && data.liveBalances.estimated_total_equity_krw > 0
-    ? data.liveBalances.estimated_total_equity_krw
-    : computedTotal > 0 ? computedTotal : fallbackTotal;
+  const total = portfolioDisplayTotal(data, rows, fallbackTotal);
   const cashValue = rows.find((row) => row.symbol === "KRW")?.value ?? 0;
   const livePnl = rows.reduce((sum, row) => sum + (row.pnl ?? 0), 0);
   const costBasis = rows.reduce((sum, row) => row.symbol === "KRW" ? sum : sum + ((row.average ?? 0) * row.qty), 0);

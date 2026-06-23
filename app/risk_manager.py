@@ -38,6 +38,7 @@ class RiskConfig:
     max_entry_orders_per_day: int
     max_exit_orders_per_day: int
     max_consecutive_losses: int
+    consecutive_loss_min_krw: float
     min_cooldown_seconds: int
     block_on_balance_mismatch: bool
     block_on_partial_fill: bool
@@ -62,7 +63,8 @@ class RiskConfig:
             max_orders_per_day=int(os.getenv("RISK_MAX_ORDERS_PER_DAY", "3")),
             max_entry_orders_per_day=int(os.getenv("RISK_MAX_ENTRY_ORDERS_PER_DAY", "2")),
             max_exit_orders_per_day=int(os.getenv("RISK_MAX_EXIT_ORDERS_PER_DAY", "3")),
-            max_consecutive_losses=int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "2")),
+            max_consecutive_losses=int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "4")),
+            consecutive_loss_min_krw=float(os.getenv("RISK_CONSECUTIVE_LOSS_MIN_KRW", "500")),
             min_cooldown_seconds=int(os.getenv("RISK_MIN_COOLDOWN_SECONDS", "1800")),
             block_on_balance_mismatch=os.getenv("RISK_BLOCK_ON_BALANCE_MISMATCH", "true").lower() == "true",
             block_on_partial_fill=os.getenv("RISK_BLOCK_ON_PARTIAL_FILL", "true").lower() == "true",
@@ -267,7 +269,7 @@ def compute_risk_state(
         "daily_order_count": daily_order_count,
         "daily_entry_count": daily_entry_count,
         "daily_exit_count": daily_exit_count,
-        "consecutive_loss_count": consecutive_loss_count(exchange, market),
+        "consecutive_loss_count": consecutive_loss_count(exchange, market, config.consecutive_loss_min_krw),
         "open_order_count": open_order_count,
         "open_position_count": open_position_count,
         "last_order_time_utc": order_row["last_order_time_utc"] if order_row else None,
@@ -562,7 +564,8 @@ def cooldown_remaining_seconds(last_order_time_utc: str | None, cooldown_seconds
     return max(int(cooldown_seconds - elapsed), 0)
 
 
-def consecutive_loss_count(exchange: str, market: str) -> int:
+def consecutive_loss_count(exchange: str, market: str, min_loss_krw: float | None = None) -> int:
+    threshold = abs(float(min_loss_krw if min_loss_krw is not None else RiskConfig.from_env().consecutive_loss_min_krw))
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -578,7 +581,8 @@ def consecutive_loss_count(exchange: str, market: str) -> int:
         ).fetchall()
     count = 0
     for row in rows:
-        if float(row["realized_pnl"] or 0.0) < 0:
+        realized_pnl = float(row["realized_pnl"] or 0.0)
+        if (realized_pnl < 0 and threshold <= 0) or (threshold > 0 and realized_pnl <= -threshold):
             count += 1
         else:
             break

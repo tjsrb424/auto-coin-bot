@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database
-from app.risk_manager import check_order_risk, compute_risk_state, get_risk_dashboard
+from app.risk_manager import check_order_risk, compute_risk_state, consecutive_loss_count, get_risk_dashboard
 
 
 def order() -> dict:
@@ -39,6 +39,43 @@ class RiskManagerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db_patch.stop()
         self.tmp.cleanup()
+
+    def create_closed_position(self, realized_pnl: float, closed_at: datetime | None = None) -> int:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "STOPPED",
+                "auto_enabled": False,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        closed = (closed_at or datetime.now(timezone.utc)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "CLOSED",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 99_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": realized_pnl,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-16T00:00:00Z",
+                "closed_at": closed,
+            }
+        )
 
     def test_daily_loss_limit_blocks_entry(self) -> None:
         session_id = database.create_live_strategy_session(
@@ -81,6 +118,37 @@ class RiskManagerTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["block_code"], "BLOCKED_DAILY_LOSS_LIMIT")
         self.assertEqual(compute_risk_state()["status"], "BLOCKED")
+
+    def test_four_meaningful_consecutive_losses_block_entry(self) -> None:
+        base = datetime.now(timezone.utc).replace(microsecond=0)
+        for index in range(4):
+            self.create_closed_position(-600, base + timedelta(minutes=index))
+
+        env = {
+            "RISK_MAX_DAILY_LOSS_KRW": "10000",
+            "RISK_MAX_DAILY_LOSS_PERCENT": "99",
+            "RISK_MAX_CONSECUTIVE_LOSSES": "4",
+            "RISK_CONSECUTIVE_LOSS_MIN_KRW": "500",
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            state = compute_risk_state()
+            result = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+
+        self.assertEqual(state["consecutive_loss_count"], 4)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["block_code"], "BLOCKED_CONSECUTIVE_LOSS_LIMIT")
+
+    def test_small_loss_resets_consecutive_loss_count(self) -> None:
+        base = datetime.now(timezone.utc).replace(microsecond=0)
+        for index in range(4):
+            self.create_closed_position(-600, base + timedelta(minutes=index))
+        self.create_closed_position(-100, base + timedelta(minutes=4))
+
+        with patch.dict(os.environ, {"RISK_CONSECUTIVE_LOSS_MIN_KRW": "500"}, clear=False):
+            count = consecutive_loss_count("bithumb", "KRW-BTC")
+
+        self.assertEqual(count, 0)
 
     def test_daily_loss_percent_uses_account_equity_basis(self) -> None:
         session_id = database.create_live_strategy_session(
