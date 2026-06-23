@@ -109,17 +109,41 @@ class StrategyPromotionPipelineTests(unittest.TestCase):
             conn.execute(
                 """
                 UPDATE paper_forward_sessions
-                SET trade_count = 3,
-                    win_count = 2,
-                    loss_count = 1,
+                SET trade_count = 30,
+                    win_count = 18,
+                    loss_count = 12,
                     win_rate = 0.6667,
                     profit_factor = 2.0,
                     total_return_percent = 1.25,
                     max_drawdown = 0.04,
-                    total_equity = 1012500
+                    total_equity = 1012500,
+                    realized_pnl = 30000,
+                    started_at = '2026-06-01T00:00:00Z',
+                    last_tick_time_utc = '2026-06-08T00:00:00Z',
+                    updated_at = '2026-06-08T00:00:00Z'
                 WHERE id = ?
                 """,
                 (session_id,),
+            )
+        for index in range(30):
+            database.insert_forward_order(
+                session_id,
+                {
+                    "candidate_strategy_id": candidate_id,
+                    "market": "KRW-ETH",
+                    "unit": 5,
+                    "strategy": "ma_cross",
+                    "side": "SELL",
+                    "price": 100_000,
+                    "volume": 0.01,
+                    "amount_krw": 1_000,
+                    "fee": 0,
+                    "slippage": 0,
+                    "realized_pnl": 1_000,
+                    "reason": "TAKE_PROFIT",
+                    "risk_result": "PASS",
+                    "candle_time_utc": f"2026-06-02T00:{index:02d}:00Z",
+                },
             )
 
         result = promote_shadow_candidates()

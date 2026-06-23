@@ -56,6 +56,7 @@ from app.database import (
     load_latest_live_paper_session,
     load_decision_snapshot,
     load_decision_snapshots,
+    load_execution_quality_logs,
     load_latest_decision_snapshot,
     load_risk_log,
     load_candles,
@@ -66,6 +67,7 @@ from app.database import (
     load_latest_forward_session,
     load_open_live_positions,
     load_runtime_lock,
+    load_strategy_kill_switch_events,
     load_trade_history_logs,
     load_latest_paper_session,
     pause_running_forward_sessions_on_startup,
@@ -138,6 +140,8 @@ from app.live_exit import (
 )
 from app.risk_manager import check_order_risk, compute_risk_state, enrich_policy_block_log, get_risk_dashboard
 from app.market_scanner import scan_market_universe
+from app.execution_quality import summarize_execution_quality
+from app.profit_engine import profit_engine_status_payload
 from app.shadow_report import build_shadow_report
 from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
@@ -1987,6 +1991,47 @@ def smart_engine_status(market: str = Query(DEFAULT_MARKET)) -> dict:
         "remaining_rehearsal_blockers": (limited_readiness or {}).get("rehearsal_blockers", []),
         "promotion_status": (latest_intent or {}).get("promotion_status"),
         "promotion_blockers": (latest_intent or {}).get("promotion_blockers", []),
+    }
+
+
+@app.get("/api/profit-engine/status")
+def profit_engine_status(
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    market: str = Query(DEFAULT_MARKET),
+) -> dict:
+    decision = load_latest_decision_snapshot(market)
+    latest_intent = (decision.get("order_intents") or [None])[0] if decision else None
+    policy_preview = (latest_intent or {}).get("policy_preview") or {}
+    quality_logs = load_execution_quality_logs(exchange=exchange, market=market, limit=50)
+    kill_switch_events = load_strategy_kill_switch_events(exchange=exchange, market=market, limit=10)
+    return {
+        "config": profit_engine_status_payload(),
+        "decision": decision,
+        "latest_intent": latest_intent,
+        "latest_order_sizing": {
+            "requested_order_krw": policy_preview.get("requested_order_krw") or policy_preview.get("amount_requested_krw"),
+            "available_krw": policy_preview.get("available_krw") or policy_preview.get("available_krw_balance"),
+            "actual_order_krw": policy_preview.get("actual_order_krw") or policy_preview.get("capped_order_amount_krw"),
+            "fee_buffer_rate": policy_preview.get("fee_buffer_rate"),
+            "sizing_mode": policy_preview.get("sizing_mode"),
+            "sizing_reason": policy_preview.get("sizing_reason"),
+            "block_code": policy_preview.get("block_code"),
+        },
+        "entry_gate": {
+            "market_regime": policy_preview.get("market_regime") or (decision or {}).get("market_regime"),
+            "strategy_name": policy_preview.get("strategy_name") or (decision or {}).get("selected_strategy_name"),
+            "entry_allowed": policy_preview.get("entry_allowed"),
+            "entry_block_reason": policy_preview.get("entry_block_reason"),
+            "block_code": policy_preview.get("block_code"),
+        },
+        "execution_quality": {
+            "summary": summarize_execution_quality(quality_logs),
+            "latest_logs": quality_logs[:10],
+        },
+        "kill_switch": {
+            "status": "PAUSED" if any(str(item.get("action")) == "PAUSED" for item in kill_switch_events) else "OK",
+            "latest_events": kill_switch_events,
+        },
     }
 
 

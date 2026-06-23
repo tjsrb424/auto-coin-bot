@@ -36,6 +36,8 @@ REQUIRED_SCHEMA_TABLES = [
     "capital_allocation_decisions",
     "order_reservations",
     "next_entry_queue",
+    "execution_quality_logs",
+    "strategy_kill_switch_events",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -1006,6 +1008,55 @@ def init_db() -> None:
                 expires_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS execution_quality_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                order_log_id INTEGER,
+                signal_time_utc TEXT,
+                candle_time_utc TEXT,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT NOT NULL,
+                strategy_name TEXT NOT NULL DEFAULT '',
+                market_regime TEXT NOT NULL DEFAULT '',
+                requested_order_krw REAL,
+                available_krw REAL,
+                actual_order_krw REAL,
+                order_price REAL,
+                current_price_at_signal REAL,
+                best_bid REAL,
+                best_ask REAL,
+                spread_pct REAL,
+                estimated_slippage_pct REAL,
+                submitted_at TEXT,
+                filled_at TEXT,
+                fill_time_seconds REAL,
+                filled_price REAL,
+                filled_volume REAL NOT NULL DEFAULT 0,
+                unfilled_volume REAL NOT NULL DEFAULT 0,
+                cancel_after_seconds INTEGER,
+                cancel_reason TEXT NOT NULL DEFAULT '',
+                post_fill_return_1m REAL,
+                post_fill_return_3m REAL,
+                post_fill_return_5m REAL,
+                adverse_selection_pct REAL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS strategy_kill_switch_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_strategy_id INTEGER,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT NOT NULL,
+                strategy_name TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                blockers_json TEXT NOT NULL DEFAULT '[]',
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                cooldown_until TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         _ensure_column(conn, "paper_sessions", "mode", "TEXT NOT NULL DEFAULT 'SIMULATION'")
@@ -1097,6 +1148,18 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_smart_rehearsal_reviews_latest
             ON smart_rehearsal_reviews(exchange, market, request_id, reviewed_at DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_execution_quality_market_strategy
+            ON execution_quality_logs(exchange, market, strategy_name, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_strategy_kill_switch_latest
+            ON strategy_kill_switch_events(exchange, market, strategy_name, created_at DESC)
             """
         )
         conn.execute(
@@ -5082,6 +5145,184 @@ def update_order_intent(intent_id: int, updates: dict) -> dict | None:
         conn.execute(f"UPDATE order_intents SET {assignments} WHERE id = ?", [*values.values(), intent_id])
         row = conn.execute("SELECT * FROM order_intents WHERE id = ?", (intent_id,)).fetchone()
     return _normalize_order_intent(dict(row)) if row else None
+
+
+def upsert_execution_quality_log(payload: dict) -> dict | None:
+    request_id = str(payload.get("request_id") or "")
+    if not request_id:
+        return None
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO execution_quality_logs (
+                request_id, order_log_id, signal_time_utc, candle_time_utc, exchange, market,
+                strategy_name, market_regime, requested_order_krw, available_krw,
+                actual_order_krw, order_price, current_price_at_signal, best_bid, best_ask,
+                spread_pct, estimated_slippage_pct, submitted_at, filled_at,
+                fill_time_seconds, filled_price, filled_volume, unfilled_volume,
+                cancel_after_seconds, cancel_reason, post_fill_return_1m,
+                post_fill_return_3m, post_fill_return_5m, adverse_selection_pct,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                order_log_id = excluded.order_log_id,
+                signal_time_utc = excluded.signal_time_utc,
+                candle_time_utc = excluded.candle_time_utc,
+                exchange = excluded.exchange,
+                market = excluded.market,
+                strategy_name = excluded.strategy_name,
+                market_regime = excluded.market_regime,
+                requested_order_krw = excluded.requested_order_krw,
+                available_krw = excluded.available_krw,
+                actual_order_krw = excluded.actual_order_krw,
+                order_price = excluded.order_price,
+                current_price_at_signal = excluded.current_price_at_signal,
+                best_bid = excluded.best_bid,
+                best_ask = excluded.best_ask,
+                spread_pct = excluded.spread_pct,
+                estimated_slippage_pct = excluded.estimated_slippage_pct,
+                submitted_at = excluded.submitted_at,
+                filled_at = excluded.filled_at,
+                fill_time_seconds = excluded.fill_time_seconds,
+                filled_price = excluded.filled_price,
+                filled_volume = excluded.filled_volume,
+                unfilled_volume = excluded.unfilled_volume,
+                cancel_after_seconds = excluded.cancel_after_seconds,
+                cancel_reason = excluded.cancel_reason,
+                post_fill_return_1m = excluded.post_fill_return_1m,
+                post_fill_return_3m = excluded.post_fill_return_3m,
+                post_fill_return_5m = excluded.post_fill_return_5m,
+                adverse_selection_pct = excluded.adverse_selection_pct,
+                updated_at = excluded.updated_at
+            """,
+            (
+                request_id,
+                payload.get("order_log_id"),
+                payload.get("signal_time_utc"),
+                payload.get("candle_time_utc"),
+                payload.get("exchange", "bithumb"),
+                payload.get("market", "KRW-BTC"),
+                payload.get("strategy_name", ""),
+                payload.get("market_regime", ""),
+                payload.get("requested_order_krw"),
+                payload.get("available_krw"),
+                payload.get("actual_order_krw"),
+                payload.get("order_price"),
+                payload.get("current_price_at_signal"),
+                payload.get("best_bid"),
+                payload.get("best_ask"),
+                payload.get("spread_pct"),
+                payload.get("estimated_slippage_pct"),
+                payload.get("submitted_at"),
+                payload.get("filled_at"),
+                payload.get("fill_time_seconds"),
+                payload.get("filled_price"),
+                payload.get("filled_volume", 0.0),
+                payload.get("unfilled_volume", 0.0),
+                payload.get("cancel_after_seconds"),
+                payload.get("cancel_reason", ""),
+                payload.get("post_fill_return_1m"),
+                payload.get("post_fill_return_3m"),
+                payload.get("post_fill_return_5m"),
+                payload.get("adverse_selection_pct"),
+                now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM execution_quality_logs WHERE request_id = ?", (request_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def load_execution_quality_logs(
+    *,
+    exchange: str = "bithumb",
+    market: str | None = None,
+    strategy_name: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    clauses = ["exchange = ?"]
+    params: list[object] = [exchange]
+    if market:
+        clauses.append("market = ?")
+        params.append(market)
+    if strategy_name:
+        clauses.append("strategy_name = ?")
+        params.append(strategy_name)
+    params.append(max(int(limit), 1))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM execution_quality_logs
+            WHERE {" AND ".join(clauses)}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def insert_strategy_kill_switch_event(event: dict) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO strategy_kill_switch_events (
+                candidate_strategy_id, exchange, market, strategy_name, action,
+                reason, blockers_json, metrics_json, cooldown_until, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.get("candidate_strategy_id"),
+                event.get("exchange", "bithumb"),
+                event.get("market", "KRW-BTC"),
+                event.get("strategy_name", ""),
+                event.get("action", "NONE"),
+                event.get("reason", ""),
+                json.dumps(event.get("blockers", []), ensure_ascii=False),
+                json.dumps(event.get("metrics", {}), ensure_ascii=False),
+                event.get("cooldown_until"),
+                event.get("created_at", _utc_now()),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def load_strategy_kill_switch_events(
+    *,
+    exchange: str = "bithumb",
+    market: str | None = None,
+    strategy_name: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    clauses = ["exchange = ?"]
+    params: list[object] = [exchange]
+    if market:
+        clauses.append("market = ?")
+        params.append(market)
+    if strategy_name:
+        clauses.append("strategy_name = ?")
+        params.append(strategy_name)
+    params.append(max(int(limit), 1))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM strategy_kill_switch_events
+            WHERE {" AND ".join(clauses)}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["blockers"] = _json_load(item.pop("blockers_json", "[]"), [])
+        item["metrics"] = _json_load(item.pop("metrics_json", "{}"), {})
+        result.append(item)
+    return result
 
 
 def load_latest_decision_snapshot(market: str | None = None) -> dict | None:

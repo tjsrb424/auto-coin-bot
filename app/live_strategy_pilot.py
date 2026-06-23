@@ -42,9 +42,11 @@ from app.database import (
     update_live_order_log,
     update_live_position,
     update_live_strategy_session,
+    upsert_execution_quality_log,
 )
 from app.auto_strategy_selector import evaluate_auto_strategy_selector
 from app.forward_paper import latest_completed_candle
+from app.execution_quality import build_execution_quality_payload
 from app.live_broker import (
     BithumbBroker,
     LiveTradingConfig,
@@ -74,6 +76,8 @@ from app.live_exit import (
     submit_exit_order,
 )
 from app.market_liquidity import one_minute_liquidity_snapshot
+from app.order_sizing import calculate_available_balance_capped_order
+from app.profit_engine import allowed_strategy_for_regime, evaluate_profit_entry_gate, profit_engine_enabled
 from app.risk_manager import check_order_risk
 from app.smart_decision import record_shadow_decision
 from app.shadow_report import build_shadow_report
@@ -140,9 +144,9 @@ class LiveStrategyConfig:
             core_marketable_limit_enabled=os.getenv("SMART_CORE_MARKETABLE_LIMIT_ENABLED", "false").lower() == "true",
             core_marketable_limit_max_slippage_pct=float(os.getenv("SMART_CORE_MARKETABLE_LIMIT_MAX_SLIPPAGE_PCT", "0.15")),
             core_marketable_limit_price_buffer_pct=float(os.getenv("SMART_CORE_MARKETABLE_LIMIT_PRICE_BUFFER_PCT", "0.02")),
-            stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.7")),
-            take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.0")),
-            max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "60")),
+            stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.8")),
+            take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.2")),
+            max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "90")),
             exit_enabled=os.getenv("AUTO_EXIT_ENABLED", "false").lower() == "true",
             market_order_enabled=os.getenv("AUTO_MARKET_ORDER_ENABLED", "false").lower() == "true",
         )
@@ -508,7 +512,7 @@ async def _process_session(session: dict) -> None:
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_DUPLICATE_CANDLE", "last_order_status": "BLOCKED"})
         return
 
-    await _submit_entry_order(session, candidate, latest, signal, config, live_config)
+    await _submit_entry_order(session, candidate, latest, signal, config, live_config, smart_snapshot)
 
 
 async def _process_open_position(session: dict, position: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> None:
@@ -933,6 +937,55 @@ def _smart_submitted_request_payload(order: dict, price_preview: dict, config: L
     }
 
 
+def _profit_engine_market_regime(snapshot: dict | None, signal: dict | None = None) -> str:
+    return str((snapshot or {}).get("market_regime") or (signal or {}).get("market_regime") or (signal or {}).get("regime") or "UNKNOWN").upper()
+
+
+def _profit_engine_strategy_name(session: dict, snapshot: dict | None, market_regime: str) -> str:
+    return (
+        str((snapshot or {}).get("selected_strategy_name") or "").strip()
+        or allowed_strategy_for_regime(market_regime)
+        or str(session.get("strategy_name") or "").strip()
+    )
+
+
+def _profit_engine_base_risk(risk: dict, enabled: bool) -> dict:
+    if not enabled:
+        return risk
+    risk_result = str(risk.get("risk_result") or "")
+    if risk_result not in {"BLOCKED_MAX_ORDER_AMOUNT", "BLOCKED_MAX_POSITION_RATIO"}:
+        return risk
+    return {
+        **risk,
+        "allowed": True,
+        "risk_result": "ALLOWED",
+        "blocked_reason": "",
+        "profit_engine_bypassed_base_risk": risk_result,
+    }
+
+
+def _record_execution_quality(
+    *,
+    request_id: str,
+    market_regime: str | None = None,
+    sizing: dict | None = None,
+    orderbook_top: dict | None = None,
+    current_price: float | None = None,
+) -> None:
+    order_log = get_live_order_log(request_id)
+    if not order_log:
+        return
+    upsert_execution_quality_log(
+        build_execution_quality_payload(
+            order_log=order_log,
+            market_regime=market_regime,
+            sizing=sizing,
+            orderbook_top=orderbook_top,
+            current_price_at_signal=current_price,
+        )
+    )
+
+
 def _block_smart_intent_order(
     session: dict,
     intent_id: Any,
@@ -1063,38 +1116,81 @@ async def _submit_smart_intent_order(
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
         return True
+    profit_enabled = profit_engine_enabled()
+    market_regime = _profit_engine_market_regime(smart_snapshot, signal)
+    profit_strategy = _profit_engine_strategy_name(session, smart_snapshot, market_regime)
     max_total = _float(smart_snapshot.get("max_total_exposure_krw"))
     current_value = _float(smart_snapshot.get("current_bot_position_value_krw"))
     available_krw = _available_balance(balances, "KRW")
-    mode = smart_engine_live_mode()
-    mode_cap = max_total * 0.2 if mode == "limited" else max_total
-    remaining_exposure = max(max_total - current_value, 0.0)
-    hard_cap = min(mode_cap, config.max_order_krw, live_config.max_live_order_krw, remaining_exposure, available_krw)
-    amount = min(amount_requested, hard_cap)
-    cap_preview = _smart_bid_cap_preview(
-        original_delta_value_krw=_float(intent.get("delta_value_krw")),
-        amount_requested_krw=amount_requested,
-        capped_order_amount_krw=amount,
-        hard_cap_krw=hard_cap,
-        mode_cap_krw=mode_cap,
-        max_order_krw=config.max_order_krw,
-        max_live_order_krw=live_config.max_live_order_krw,
-        remaining_exposure_krw=remaining_exposure,
-        available_krw_balance=available_krw,
+    profit_gate = evaluate_profit_entry_gate(
+        market_regime=market_regime,
+        strategy_name=profit_strategy,
+        side="BUY",
+        auto_exit_enabled=config.exit_enabled,
     )
-    if amount <= 0 or amount < live_config.min_order_krw:
-        blocker = _smart_bid_cap_blocker(
-            amount_requested=amount_requested,
-            available_krw=available_krw,
-            remaining_exposure=remaining_exposure,
-            hard_cap=hard_cap,
-            min_order_krw=live_config.min_order_krw,
-        )
-        if blocker in {"SMART_ORDER_AMOUNT_BELOW_MIN", "SMART_CAPPED_ORDER_BELOW_MIN"}:
-            _mark_smart_dust_intent(session, intent_id, blocker, cap_preview)
-            return True
-        _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
+    if profit_enabled and not profit_gate["entry_allowed"]:
+        cap_preview = {
+            **profit_gate,
+            "requested_order_krw": amount_requested,
+            "available_krw": available_krw,
+            "sizing_mode": "profit_engine_gate",
+        }
+        _block_smart_intent_order(session, intent_id, str(profit_gate["block_code"]), candle["candle_time_utc"], signal, cap_preview)
         return True
+    if profit_enabled:
+        sizing = calculate_available_balance_capped_order(
+            requested_order_krw=amount_requested,
+            available_krw=available_krw,
+            min_order_krw=live_config.min_order_krw,
+            fee_rate=live_config.fee_rate,
+        )
+        amount = float(sizing.get("actual_order_krw") or 0.0)
+        cap_preview = {
+            **sizing,
+            **profit_gate,
+            "original_delta_value_krw": _float(intent.get("delta_value_krw")),
+            "amount_requested_krw": amount_requested,
+            "capped_order_amount_krw": amount,
+            "available_krw_balance": available_krw,
+            "profit_engine_enabled": True,
+        }
+        if not sizing["allowed"]:
+            blocker = str(sizing["block_code"])
+            if blocker == "ORDER_BELOW_MINIMUM":
+                _mark_smart_dust_intent(session, intent_id, "SMART_CAPPED_ORDER_BELOW_MIN", cap_preview)
+                return True
+            _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
+            return True
+    else:
+        mode = smart_engine_live_mode()
+        mode_cap = max_total * 0.2 if mode == "limited" else max_total
+        remaining_exposure = max(max_total - current_value, 0.0)
+        hard_cap = min(mode_cap, config.max_order_krw, live_config.max_live_order_krw, remaining_exposure, available_krw)
+        amount = min(amount_requested, hard_cap)
+        cap_preview = _smart_bid_cap_preview(
+            original_delta_value_krw=_float(intent.get("delta_value_krw")),
+            amount_requested_krw=amount_requested,
+            capped_order_amount_krw=amount,
+            hard_cap_krw=hard_cap,
+            mode_cap_krw=mode_cap,
+            max_order_krw=config.max_order_krw,
+            max_live_order_krw=live_config.max_live_order_krw,
+            remaining_exposure_krw=remaining_exposure,
+            available_krw_balance=available_krw,
+        )
+        if amount <= 0 or amount < live_config.min_order_krw:
+            blocker = _smart_bid_cap_blocker(
+                amount_requested=amount_requested,
+                available_krw=available_krw,
+                remaining_exposure=remaining_exposure,
+                hard_cap=hard_cap,
+                min_order_krw=live_config.min_order_krw,
+            )
+            if blocker in {"SMART_ORDER_AMOUNT_BELOW_MIN", "SMART_CAPPED_ORDER_BELOW_MIN"}:
+                _mark_smart_dust_intent(session, intent_id, blocker, cap_preview)
+                return True
+            _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
+            return True
     core_accumulation = core_accumulation_bid
     try:
         orderbook_top = await _bithumb_orderbook_top(str(session.get("market") or "KRW-BTC"))
@@ -1130,6 +1226,7 @@ async def _submit_smart_intent_order(
         market_snapshot={"price": current_price},
         is_auto=True,
     )
+    risk_preview = _profit_engine_base_risk(risk_preview, profit_enabled)
     risk_preview = check_order_risk(
         order=order,
         purpose="ENTRY",
@@ -1142,6 +1239,7 @@ async def _submit_smart_intent_order(
         market_snapshot={"price": current_price, "complete": True},
         balances=balances,
         is_auto=True,
+        profit_engine_entry=profit_enabled,
     )
     risk_preview["policy_preview"] = {**(risk_preview.get("policy_preview") or {}), **cap_preview}
     try:
@@ -1169,6 +1267,13 @@ async def _submit_smart_intent_order(
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_PROMOTION_BLOCKED", "last_order_status": "BLOCKED"})
         return True
     insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview))
+    _record_execution_quality(
+        request_id=request_id,
+        market_regime=market_regime,
+        sizing=cap_preview,
+        orderbook_top=orderbook_top,
+        current_price=current_price,
+    )
     try:
         response = await broker.place_order(order)
         order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
@@ -1181,6 +1286,13 @@ async def _submit_smart_intent_order(
                 "exchange_request_payload_masked": _smart_submitted_request_payload(order, price_preview, config),
                 "exchange_response_payload": response,
             },
+        )
+        _record_execution_quality(
+            request_id=request_id,
+            market_regime=market_regime,
+            sizing=cap_preview,
+            orderbook_top=orderbook_top,
+            current_price=current_price,
         )
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "SUBMITTED", "status": "SUBMITTED", "submitted_at": _utc_now()})
@@ -1314,7 +1426,15 @@ async def _submit_smart_intent_sell_order(
         return True
 
 
-async def _submit_entry_order(session: dict, candidate: dict, candle: dict, signal: dict, config: LiveStrategyConfig, live_config: LiveTradingConfig) -> None:
+async def _submit_entry_order(
+    session: dict,
+    candidate: dict,
+    candle: dict,
+    signal: dict,
+    config: LiveStrategyConfig,
+    live_config: LiveTradingConfig,
+    smart_snapshot: dict | None = None,
+) -> None:
     broker = get_live_broker("bithumb")
     market = str(session.get("market") or "KRW-BTC")
     try:
@@ -1333,7 +1453,11 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
     range_rate = ((float(candle["high_price"]) - float(candle["low_price"])) / current_price) if current_price > 0 else 0.0
     price = _round_krw_price(current_price * (1 - config.entry_price_offset_percent / 100))
     session_max_order_krw = float(session.get("max_order_krw") or config.max_order_krw)
-    amount = min(session_max_order_krw, config.max_order_krw, live_config.max_live_order_krw)
+    profit_enabled = profit_engine_enabled()
+    market_regime = _profit_engine_market_regime(smart_snapshot, signal)
+    profit_strategy = _profit_engine_strategy_name(session, smart_snapshot, market_regime)
+    amount_requested = session_max_order_krw if profit_enabled else min(session_max_order_krw, config.max_order_krw, live_config.max_live_order_krw)
+    amount = amount_requested
     try:
         snapshot = await build_capital_snapshot_async("bithumb")
     except Exception as exc:
@@ -1351,16 +1475,51 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_OPEN_ORDER_MISMATCH", "last_order_status": "BLOCKED"})
         return
     snapshot_budget = float(snapshot.get("available_budget_krw") or 0.0)
-    if snapshot_budget <= 0:
-        reason = "BLOCKED_EXCHANGE_BALANCE_UNAVAILABLE" if snapshot.get("available_krw_balance") is None else "BLOCKED_INSUFFICIENT_KRW_BALANCE"
-        _insert_blocked_log(session, reason, reason, candle["candle_time_utc"], signal)
-        update_live_strategy_session(int(session["id"]), {"last_risk_result": reason, "last_order_status": "BLOCKED"})
-        return
-    amount = min(amount, snapshot_budget)
-    if amount < live_config.min_order_krw:
-        _insert_blocked_log(session, "BLOCKED_CAPITAL_TOO_SMALL", "Snapshot budget is below minimum order amount.", candle["candle_time_utc"], signal)
-        update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_CAPITAL_TOO_SMALL", "last_order_status": "BLOCKED"})
-        return
+    available_krw = snapshot.get("available_krw_balance")
+    if available_krw is None:
+        available_krw = snapshot_budget
+    profit_preview: dict = {
+        "profit_engine_enabled": profit_enabled,
+        "requested_order_krw": amount_requested,
+        "available_krw": available_krw,
+        "market_regime": market_regime,
+        "strategy_name": profit_strategy,
+    }
+    if profit_enabled:
+        profit_gate = evaluate_profit_entry_gate(
+            market_regime=market_regime,
+            strategy_name=profit_strategy,
+            side="BUY",
+            auto_exit_enabled=config.exit_enabled,
+        )
+        profit_preview.update(profit_gate)
+        if not profit_gate["entry_allowed"]:
+            _insert_blocked_log(session, str(profit_gate["block_code"]), profit_gate.get("entry_block_reason"), candle["candle_time_utc"], signal, preview=profit_preview)
+            update_live_strategy_session(int(session["id"]), {"last_risk_result": str(profit_gate["block_code"]), "last_order_status": "BLOCKED"})
+            return
+        sizing = calculate_available_balance_capped_order(
+            requested_order_krw=amount_requested,
+            available_krw=available_krw,
+            min_order_krw=live_config.min_order_krw,
+            fee_rate=live_config.fee_rate,
+        )
+        profit_preview.update(sizing)
+        amount = float(sizing.get("actual_order_krw") or 0.0)
+        if not sizing["allowed"]:
+            _insert_blocked_log(session, str(sizing["block_code"]), sizing.get("sizing_reason"), candle["candle_time_utc"], signal, preview=profit_preview)
+            update_live_strategy_session(int(session["id"]), {"last_risk_result": str(sizing["block_code"]), "last_order_status": "BLOCKED"})
+            return
+    else:
+        if snapshot_budget <= 0:
+            reason = "BLOCKED_EXCHANGE_BALANCE_UNAVAILABLE" if snapshot.get("available_krw_balance") is None else "BLOCKED_INSUFFICIENT_KRW_BALANCE"
+            _insert_blocked_log(session, reason, reason, candle["candle_time_utc"], signal)
+            update_live_strategy_session(int(session["id"]), {"last_risk_result": reason, "last_order_status": "BLOCKED"})
+            return
+        amount = min(amount, snapshot_budget)
+        if amount < live_config.min_order_krw:
+            _insert_blocked_log(session, "BLOCKED_CAPITAL_TOO_SMALL", "Snapshot budget is below minimum order amount.", candle["candle_time_utc"], signal)
+            update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_CAPITAL_TOO_SMALL", "last_order_status": "BLOCKED"})
+            return
     volume = amount / price if price > 0 else 0.0
     request_id = f"strategy-{uuid.uuid4().hex[:24]}"
     order = {
@@ -1385,10 +1544,11 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         market_snapshot={"price": current_price, "range_rate": range_rate, "volume": float(candle["candle_acc_trade_volume"])},
         is_auto=True,
     )
-    if amount > config.max_order_krw:
+    if amount > config.max_order_krw and not profit_enabled:
         risk["allowed"] = False
         risk["risk_result"] = "BLOCKED_MAX_ORDER_AMOUNT"
         risk["blocked_reason"] = "BLOCKED_MAX_ORDER_AMOUNT"
+    risk = _profit_engine_base_risk(risk, profit_enabled)
     liquidity_snapshot = await one_minute_liquidity_snapshot(market, require_completed=config.require_completed_candle)
     market_snapshot = {
         "price": current_price,
@@ -1410,7 +1570,9 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         market_snapshot=market_snapshot,
         balances=balances,
         is_auto=True,
+        profit_engine_entry=profit_enabled,
     )
+    risk["policy_preview"] = {**(risk.get("policy_preview") or {}), **profit_preview}
     if not risk["allowed"]:
         _insert_blocked_log(session, str(risk["risk_result"]), risk.get("blocked_reason"), candle["candle_time_utc"], signal, order, risk)
         update_live_strategy_session(int(session["id"]), {"last_risk_result": str(risk["risk_result"]), "last_order_status": "BLOCKED"})
@@ -1421,6 +1583,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
         return
 
     insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk))
+    _record_execution_quality(
+        request_id=request_id,
+        market_regime=market_regime,
+        sizing=profit_preview,
+        current_price=current_price,
+    )
     try:
         response = await broker.place_order(order)
         order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
@@ -1439,6 +1607,12 @@ async def _submit_entry_order(session: dict, candidate: dict, candle: dict, sign
                 "exchange_request_payload_masked": masked_exchange_request(order),
                 "exchange_response_payload": response,
             },
+        )
+        _record_execution_quality(
+            request_id=request_id,
+            market_regime=market_regime,
+            sizing=profit_preview,
+            current_price=current_price,
         )
         _insert_order_status_event(request_id, order_uuid, "SUBMITTED", response)
         update_live_strategy_session(
@@ -1724,6 +1898,8 @@ def _create_position_from_order(session: dict, order_status: dict, config: LiveS
     entry_amount = entry_price * entry_volume
     stop_loss_price = entry_price * (1 - config.stop_loss_percent / 100) if entry_price > 0 else 0.0
     take_profit_price = entry_price * (1 + config.take_profit_percent / 100) if entry_price > 0 else 0.0
+    trailing_stop_pct = float(os.getenv("AUTO_TRAILING_STOP_PERCENT", "0.7"))
+    trailing_stop_price = entry_price * (1 - trailing_stop_pct / 100) if entry_price > 0 and trailing_stop_pct > 0 else 0.0
     position_id = create_live_position(
         {
             "session_id": session["id"],
@@ -1741,6 +1917,10 @@ def _create_position_from_order(session: dict, order_status: dict, config: LiveS
             "realized_pnl": 0.0,
             "stop_loss_price": stop_loss_price,
             "take_profit_price": take_profit_price,
+            "highest_price_since_entry": entry_price,
+            "trailing_stop_price": trailing_stop_price,
+            "trailing_stop_pct": trailing_stop_pct,
+            "last_trailing_update_at": _utc_now(),
             "opened_at": _utc_now(),
         }
     )
@@ -1843,6 +2023,15 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
             "paid_fee": reconciled.paid_fee,
         },
     )
+    updated_log = get_live_order_log(str(request_id))
+    if updated_log:
+        preview = updated_log.get("order_preview_payload") or {}
+        _record_execution_quality(
+            request_id=str(request_id),
+            market_regime=preview.get("market_regime"),
+            sizing=preview,
+            current_price=preview.get("current_price") or preview.get("submitted_current_price"),
+        )
     if status in {"WAITING", "PARTIALLY_FILLED", "CANCELED", "FILLED", "FAILED"}:
         _insert_order_status_event(request_id, order_uuid, status, response)
 

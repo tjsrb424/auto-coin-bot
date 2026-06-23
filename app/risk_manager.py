@@ -305,6 +305,7 @@ def check_order_risk(
     balance_mismatch: bool | None = None,
     manual_confirmed: bool = False,
     is_auto: bool = False,
+    profit_engine_entry: bool = False,
 ) -> dict:
     exchange = str(order.get("exchange", "bithumb")).lower()
     market = str(order.get("market", "KRW-BTC"))
@@ -384,7 +385,7 @@ def check_order_risk(
         ok("order_type_check")
 
     amount = _float(order.get("amount_krw")) or (_float(order.get("price")) * _float(order.get("volume")))
-    if amount > config.max_order_krw:
+    if amount > config.max_order_krw and not (profit_engine_entry and purpose == "ENTRY" and side in {"BUY", "BID"}):
         block("BLOCKED_MAX_ORDER_AMOUNT", check_name="amount_check")
     else:
         ok("amount_check", amount)
@@ -415,9 +416,9 @@ def check_order_risk(
             block("BLOCKED_POLICY_AUTO_TRADING_DISABLED", check_name="operation_policy_check", detail=policy_check_detail)
         elif policy_limit <= 0:
             block("BLOCKED_POLICY_MAX_EXPOSURE_INVALID", check_name="operation_policy_check", detail=policy_check_detail)
-        elif current_bot_position_value >= policy_limit:
+        elif current_bot_position_value >= policy_limit and not profit_engine_entry:
             block("BLOCKED_POLICY_MAX_TOTAL_EXPOSURE", check_name="operation_policy_check", detail=policy_check_detail)
-        elif current_bot_position_value + amount > policy_limit:
+        elif current_bot_position_value + amount > policy_limit and not profit_engine_entry:
             block("BLOCKED_POLICY_MAX_TOTAL_EXPOSURE", check_name="operation_policy_check", detail=policy_check_detail)
         elif balances is not None and available_krw < amount:
             block("BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT", check_name="operation_policy_check", detail=policy_check_detail)
@@ -506,8 +507,11 @@ def check_order_risk(
     result["checks"] = checks
     result["risk_result"] = "ALLOWED" if result["allowed"] else result["block_code"]
     result["blocked_reason"] = "" if result["allowed"] else result["block_reason"]
-    result["max_allowed_order_krw"] = min(result.get("max_allowed_order_krw", config.max_order_krw), config.max_order_krw)
-    if purpose == "ENTRY" and side in {"BUY", "BID"}:
+    if profit_engine_entry and purpose == "ENTRY" and side in {"BUY", "BID"}:
+        result["max_allowed_order_krw"] = result.get("max_allowed_order_krw", amount) or amount
+    else:
+        result["max_allowed_order_krw"] = min(result.get("max_allowed_order_krw", config.max_order_krw), config.max_order_krw)
+    if purpose == "ENTRY" and side in {"BUY", "BID"} and not profit_engine_entry:
         result["max_allowed_order_krw"] = min(result["max_allowed_order_krw"], policy_check_detail["max_allowed_entry_krw"])
     result["operation_policy"] = policy_check_detail
     result["checked_at"] = _utc_now()

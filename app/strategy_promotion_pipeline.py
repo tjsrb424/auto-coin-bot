@@ -9,6 +9,7 @@ from app.database import (
     create_forward_session_from_candidate,
     has_unresolved_live_order,
     has_unresolved_live_order_for_exchange,
+    insert_strategy_kill_switch_event,
     load_active_strategy_selection,
     load_candidate_strategies,
     load_candidate_strategies_without_forward_session,
@@ -23,6 +24,7 @@ from app.database import (
 )
 from app.live_broker import is_emergency_stopped
 from app.risk_manager import compute_risk_state
+from app.strategy_kill_switch import evaluate_strategy_kill_switch
 from app.upbit import fetch_minute_candles
 
 
@@ -50,10 +52,14 @@ def _config() -> dict:
         "exchange": os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb").strip().lower() or "bithumb",
         "max_enroll_per_tick": _int_env("AUTO_PROMOTION_MAX_ENROLL_PER_TICK", 5),
         "initial_balance_krw": _float_env("AUTO_PROMOTION_FORWARD_BALANCE_KRW", 1_000_000.0),
-        "min_forward_trades": _int_env("AUTO_PROMOTION_MIN_FORWARD_TRADES", 1),
-        "min_forward_return_percent": _float_env("AUTO_PROMOTION_MIN_FORWARD_RETURN_PERCENT", 0.0),
-        "max_forward_mdd": _float_env("AUTO_PROMOTION_MAX_FORWARD_MDD", 0.15),
-        "min_forward_win_rate": _float_env("AUTO_PROMOTION_MIN_FORWARD_WIN_RATE", 0.0),
+        "min_forward_trades": _int_env("AUTO_PROMOTION_MIN_FORWARD_TRADES", 30),
+        "min_forward_runtime_hours": _float_env("AUTO_PROMOTION_MIN_FORWARD_RUNTIME_HOURS", 168.0),
+        "min_forward_return_percent": _float_env("AUTO_PROMOTION_MIN_FORWARD_RETURN_PERCENT", 1.0),
+        "max_forward_mdd": _float_env("AUTO_PROMOTION_MAX_FORWARD_MDD", 0.08),
+        "min_forward_win_rate": _float_env("AUTO_PROMOTION_MIN_FORWARD_WIN_RATE", 0.42),
+        "min_profit_factor": _float_env("AUTO_PROMOTION_MIN_PROFIT_FACTOR", 1.2),
+        "min_expectancy_after_fee": _float_env("AUTO_PROMOTION_MIN_EXPECTANCY_AFTER_FEE", 0.0),
+        "max_single_trade_profit_share": _float_env("AUTO_PROMOTION_MAX_SINGLE_TRADE_PROFIT_SHARE", 0.5),
         "selector_apply_enabled": os.getenv("AUTO_SELECTOR_APPLY_BEST_ENABLED", "true").lower() == "true",
     }
 
@@ -100,15 +106,68 @@ def _session_passes(session: dict, config: dict) -> tuple[bool, list[str]]:
     total_return_percent = float(session.get("balance", {}).get("total_return_percent") or session.get("total_return_percent") or 0.0)
     mdd = float(session.get("metrics", {}).get("mdd") or session.get("max_drawdown") or 0.0)
     win_rate = float(session.get("metrics", {}).get("win_rate") or session.get("win_rate") or 0.0)
+    profit_factor = float(session.get("metrics", {}).get("profit_factor") or session.get("profit_factor") or 0.0)
+    expectancy = _expectancy_after_fee(session)
+    single_trade_profit_share = _single_trade_profit_share(session)
+    runtime_hours = _forward_runtime_hours(session)
     if trade_count < int(config["min_forward_trades"]):
         blockers.append("FORWARD_TRADE_COUNT_TOO_LOW")
-    if total_return_percent <= float(config["min_forward_return_percent"]):
+    if runtime_hours < float(config["min_forward_runtime_hours"]):
+        blockers.append("FORWARD_RUNTIME_TOO_SHORT")
+    if total_return_percent < float(config["min_forward_return_percent"]):
         blockers.append("FORWARD_RETURN_TOO_LOW")
     if mdd > float(config["max_forward_mdd"]):
         blockers.append("FORWARD_MDD_TOO_HIGH")
     if win_rate < float(config["min_forward_win_rate"]):
         blockers.append("FORWARD_WIN_RATE_TOO_LOW")
+    if profit_factor < float(config["min_profit_factor"]):
+        blockers.append("FORWARD_PROFIT_FACTOR_TOO_LOW")
+    if expectancy <= float(config["min_expectancy_after_fee"]):
+        blockers.append("FORWARD_EXPECTANCY_TOO_LOW")
+    if single_trade_profit_share > float(config["max_single_trade_profit_share"]):
+        blockers.append("FORWARD_SINGLE_TRADE_PROFIT_SHARE_TOO_HIGH")
     return not blockers, blockers
+
+
+def _forward_runtime_hours(session: dict) -> float:
+    start = _parse_utc(session.get("started_at") or session.get("created_at"))
+    end = _parse_utc(session.get("last_tick_time_utc") or session.get("updated_at") or session.get("stopped_at")) or datetime.now(timezone.utc)
+    if start is None:
+        return 0.0
+    return max((end - start).total_seconds() / 3600, 0.0)
+
+
+def _expectancy_after_fee(session: dict) -> float:
+    pnl_values = [
+        float(order.get("realized_pnl") or 0.0)
+        for order in session.get("orders", [])
+        if str(order.get("side") or "").upper() == "SELL" and order.get("realized_pnl") is not None
+    ]
+    if pnl_values:
+        return sum(pnl_values) / len(pnl_values)
+    return float(session.get("metrics", {}).get("average_trade_pnl") or 0.0)
+
+
+def _single_trade_profit_share(session: dict) -> float:
+    profits = [
+        max(float(order.get("realized_pnl") or 0.0), 0.0)
+        for order in session.get("orders", [])
+        if str(order.get("side") or "").upper() == "SELL"
+    ]
+    total_profit = sum(profits)
+    if total_profit <= 0:
+        return 0.0
+    return max(profits) / total_profit
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def promote_shadow_candidates() -> dict:
@@ -122,6 +181,28 @@ def promote_shadow_candidates() -> dict:
         session = load_latest_forward_session_for_candidate(int(candidate["id"]))
         if not session:
             blocked.append({"candidate_id": candidate["id"], "reason": "NO_FORWARD_SESSION"})
+            continue
+        kill_switch = evaluate_strategy_kill_switch(orders=session.get("orders") or [])
+        if kill_switch["action"] == "PAUSE_STRATEGY":
+            insert_strategy_kill_switch_event(
+                {
+                    "candidate_strategy_id": candidate["id"],
+                    "exchange": config["exchange"],
+                    "market": candidate.get("market") or session.get("market"),
+                    "strategy_name": candidate.get("strategy") or session.get("strategy_name"),
+                    "action": "PAUSED",
+                    "reason": ",".join(kill_switch.get("blockers") or []),
+                    "blockers": kill_switch.get("blockers") or [],
+                    "metrics": kill_switch,
+                }
+            )
+            promote_candidate_strategy(
+                int(candidate["id"]),
+                "PAUSED",
+                reason="Strategy kill switch paused candidate",
+                metadata={"forward_session_id": session["id"], "kill_switch": kill_switch},
+            )
+            blocked.append({"candidate_id": candidate["id"], "forward_session_id": session["id"], "reasons": kill_switch["blockers"], "kill_switch": kill_switch})
             continue
         passes, blockers = _session_passes(session, config)
         if not passes:

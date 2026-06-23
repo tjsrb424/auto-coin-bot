@@ -41,6 +41,21 @@ def parameter_grid(strategy: str, base_settings: dict | None = None) -> list[dic
         ]
     elif strategy == "volatility_breakout":
         values = [{"k": k, "exit_rule": int(base.get("exit_rule", base.get("exit_window", 10)))} for k in [0.3, 0.5, 0.7]]
+    elif strategy == "trend_pullback":
+        values = [
+            {"rsi_low": low, "rsi_high": high}
+            for low, high in itertools.product([32, 35, 38], [43, 45, 48])
+            if low < high
+        ]
+    elif strategy == "volume_breakout":
+        values = [
+            {"volume_multiplier": multiplier, "max_recent_return_pct": max_return}
+            for multiplier, max_return in itertools.product([1.5, 1.8, 2.1], [4.0, 5.0])
+        ]
+    elif strategy == "range_reversion":
+        values = [{"rsi_threshold": threshold} for threshold in [28, 30, 32]]
+    elif strategy == "panic_blocker":
+        values = [{}]
     else:
         values = [base]
     return [{**base, **value} for value in values]

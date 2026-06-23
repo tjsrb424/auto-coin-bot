@@ -52,13 +52,13 @@ class LiveExitConfig:
             exit_enabled=os.getenv("AUTO_EXIT_ENABLED", "false").lower() == "true",
             exit_order_type=os.getenv("AUTO_EXIT_ORDER_TYPE", "limit").strip().lower(),
             market_order_enabled=os.getenv("AUTO_MARKET_ORDER_ENABLED", "false").lower() == "true",
-            stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.7")),
-            take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.0")),
-            max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "60")),
+            stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.8")),
+            take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.2")),
+            max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "90")),
             exit_price_offset_percent=float(os.getenv("AUTO_EXIT_PRICE_OFFSET_PERCENT", "0.2")),
-            cancel_exit_order_after_seconds=int(os.getenv("AUTO_CANCEL_EXIT_ORDER_AFTER_SECONDS", "60")),
-            max_exit_retry_count=int(os.getenv("AUTO_MAX_EXIT_RETRY_COUNT", "1")),
-            require_manual_confirm=os.getenv("AUTO_EXIT_REQUIRE_MANUAL_CONFIRM", "true").lower() == "true",
+            cancel_exit_order_after_seconds=int(os.getenv("AUTO_CANCEL_EXIT_ORDER_AFTER_SECONDS", "45")),
+            max_exit_retry_count=int(os.getenv("AUTO_MAX_EXIT_RETRY_COUNT", "2")),
+            require_manual_confirm=os.getenv("AUTO_EXIT_REQUIRE_MANUAL_CONFIRM", "false").lower() == "true",
             fee_rate=float(os.getenv("LIVE_FEE_RATE", "0.0005")),
         )
 
@@ -84,15 +84,20 @@ def live_exit_status(session_id: int | None = None, position_id: int | None = No
 
 
 def maybe_create_price_exit_candidate(position: dict, current_price: float, candle_time_utc: str | None = None) -> dict | None:
+    metrics = update_live_position_metrics(position, current_price)
+    trailing_stop_price = float(metrics.get("trailing_stop_price") or position.get("trailing_stop_price") or 0.0)
+    highest_price = float(metrics.get("highest_price_since_entry") or position.get("highest_price_since_entry") or 0.0)
+    entry_price = float(position.get("entry_price") or 0.0)
     reason = None
     if current_price <= float(position.get("stop_loss_price") or 0):
         reason = "STOP_LOSS"
     elif current_price >= float(position.get("take_profit_price") or 0):
         reason = "TAKE_PROFIT"
+    elif trailing_stop_price > 0 and highest_price > entry_price and current_price <= trailing_stop_price:
+        reason = "TRAILING_STOP"
     elif _holding_minutes(position.get("opened_at")) > LiveExitConfig.from_env().max_hold_minutes:
         reason = "MAX_HOLD_TIME"
     if reason is None:
-        update_live_position_metrics(position, current_price)
         return None
     return create_exit_candidate_for_position(position, reason, current_price, candle_time_utc)
 
@@ -151,14 +156,29 @@ def create_exit_candidate_for_position(position: dict, reason: str, current_pric
     return candidate
 
 
-def update_live_position_metrics(position: dict, current_price: float, status: str | None = None) -> None:
+def update_live_position_metrics(position: dict, current_price: float, status: str | None = None) -> dict:
     volume = float(position.get("entry_volume") or 0.0)
     entry_price = float(position.get("entry_price") or 0.0)
     unrealized = (current_price - entry_price) * volume
-    updates: dict[str, Any] = {"current_price": current_price, "unrealized_pnl": unrealized}
+    highest_price = max(
+        float(position.get("highest_price_since_entry") or 0.0),
+        entry_price,
+        current_price,
+    )
+    trailing_stop_pct = float(position.get("trailing_stop_pct") or os.getenv("AUTO_TRAILING_STOP_PERCENT", "0.7"))
+    trailing_stop_price = highest_price * (1 - trailing_stop_pct / 100) if highest_price > 0 and trailing_stop_pct > 0 else 0.0
+    updates: dict[str, Any] = {
+        "current_price": current_price,
+        "unrealized_pnl": unrealized,
+        "highest_price_since_entry": highest_price,
+        "trailing_stop_price": trailing_stop_price,
+        "trailing_stop_pct": trailing_stop_pct,
+        "last_trailing_update_at": _utc_now(),
+    }
     if status:
         updates["status"] = status
     update_live_position(int(position["id"]), updates)
+    return updates
 
 
 def approve_exit_candidate(candidate_id: int) -> dict:
@@ -379,9 +399,12 @@ async def cancel_exit_order(request_id: str) -> dict:
         response = await get_live_broker(str(log["exchange"])).cancel_order(str(log["order_uuid"]))
         update_live_order_log(request_id, {"status": "CANCELED", "exchange_response_payload": response})
         if log.get("exit_candidate_id"):
-            update_exit_candidate(int(log["exit_candidate_id"]), {"status": "CANCELED", "risk_result": "CANCELED"})
+            retry_count = count_exit_retries(int(log["exit_candidate_id"]))
+            candidate_status = "PENDING" if retry_count < LiveExitConfig.from_env().max_exit_retry_count else "CANCELED"
+            risk_result = "RETRY_PENDING" if candidate_status == "PENDING" else "CANCELED"
+            update_exit_candidate(int(log["exit_candidate_id"]), {"status": candidate_status, "risk_result": risk_result})
         if log.get("position_id"):
-            update_live_position(int(log["position_id"]), {"status": "MANUAL_REVIEW_REQUIRED"})
+            update_live_position(int(log["position_id"]), {"status": "EXIT_CANDIDATE", "exit_order_uuid": None})
         return {"ok": True, "status": "CANCELED"}
     except Exception as exc:
         log_recovery_event(

@@ -525,6 +525,46 @@ type SmartLimitedReadiness = {
   } | null;
 };
 
+type ProfitEngineStatus = {
+  config?: {
+    enabled?: boolean;
+    mode?: string;
+    order_sizing_mode?: string;
+    blocked_entry_regimes?: string[];
+    allowed_strategies_by_regime?: Record<string, string[]>;
+    extra_fee_buffer_rate?: number;
+  };
+  latest_order_sizing?: {
+    requested_order_krw?: number | null;
+    available_krw?: number | null;
+    actual_order_krw?: number | null;
+    fee_buffer_rate?: number | null;
+    sizing_mode?: string | null;
+    sizing_reason?: string | null;
+    block_code?: string | null;
+  };
+  entry_gate?: {
+    market_regime?: string | null;
+    strategy_name?: string | null;
+    entry_allowed?: boolean | null;
+    entry_block_reason?: string | null;
+    block_code?: string | null;
+  };
+  execution_quality?: {
+    summary?: {
+      order_count?: number;
+      fill_rate?: number;
+      cancel_rate?: number;
+      average_slippage_pct?: number;
+      average_fill_time_seconds?: number;
+    };
+  };
+  kill_switch?: {
+    status?: string;
+    latest_events?: Array<{ action?: string; reason?: string; created_at?: string; blockers?: string[] }>;
+  };
+};
+
 type HealthStatus = {
   server_status?: string;
   database_status?: string;
@@ -571,6 +611,7 @@ type DashboardData = {
     rehearsal_review_expires_at?: string | null;
     remaining_rehearsal_blockers?: string[];
   } | null;
+  profitEngineStatus: ProfitEngineStatus | null;
   botPolicy: BotPolicy | null;
   health: HealthStatus | null;
   recoveryEvents: RecoveryEvent[];
@@ -675,6 +716,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     analysisHistory: [],
     shadowReport: null,
     smartEngineStatus: null,
+    profitEngineStatus: null,
     botPolicy: null,
     health: null,
     recoveryEvents: [],
@@ -693,7 +735,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         }
       };
 
-      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, botPolicyResult, health] = await Promise.all([
+      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, profitEngineStatusResult, botPolicyResult, health] = await Promise.all([
         settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
         settle("실거래 상태", fetchJson<LiveStatus>(`/api/live/status?exchange=${selectedExchange}`)),
         settle("주문", fetchJson<{ orders?: LiveOrder[]; recovery_events?: RecoveryEvent[] }>("/api/live-orders")),
@@ -707,6 +749,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         settle("분석 히스토리", fetchJson<{ decisions?: AnalysisDecision[] }>(`/api/analysis/history?market=${MARKET}&limit=50`)),
         settle("Shadow 리포트", fetchJson<{ report?: ShadowReport }>(`/api/analysis/shadow-report?market=${MARKET}&limit=100&horizon_candles=3`)),
         settle("Smart Engine", fetchJson<DashboardData["smartEngineStatus"]>(`/api/smart-engine/status?market=${MARKET}`)),
+        settle("Profit Engine", fetchJson<ProfitEngineStatus>(`/api/profit-engine/status?market=${MARKET}&exchange=${selectedExchange}`)),
         settle("운용정책", fetchJson<{ policy?: BotPolicy }>(`/api/bot/policy?market=${MARKET}&exchange=${selectedExchange}`)),
         settle("Health", fetchJson<HealthStatus>("/health"))
       ]);
@@ -734,6 +777,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         analysisHistory: analysisHistoryResult?.decisions ?? [],
         shadowReport: shadowReportResult?.report ?? null,
         smartEngineStatus: smartEngineStatusResult,
+        profitEngineStatus: profitEngineStatusResult,
         botPolicy: botPolicyResult?.policy ?? null,
         health,
         recoveryEvents: ordersResult?.recovery_events ?? [],
@@ -4006,6 +4050,7 @@ function AutoTradeView({
 
 function OperationsView({ data, refresh }: { data: DashboardData; refresh: () => Promise<void> }) {
   const policy = data.botPolicy;
+  const profit = data.profitEngineStatus;
   const readiness = data.smartEngineStatus?.limited_readiness;
   const readinessChecks = readiness?.checks ?? [];
   const latestRehearsal = data.smartEngineStatus?.latest_rehearsal_order ?? readiness?.latest_rehearsal_order;
@@ -4162,6 +4207,20 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
           )}
           {readinessChecks.length === 0 && <div className="is-warn"><span>점검</span><b>대기</b><em>상태 데이터가 아직 없습니다.</em></div>}
         </section>
+      </RefPanel>
+      <RefPanel className="ref-ops-profit-engine">
+        <h3>Profit Engine V1</h3>
+        <p><span>Mode</span><b>{profit?.config?.enabled ? "ON" : "OFF"} / {profit?.config?.mode ?? "-"}</b></p>
+        <p><span>Market regime</span><b>{profit?.entry_gate?.market_regime ?? "-"}</b></p>
+        <p><span>Entry gate</span><b>{profit?.entry_gate?.entry_allowed === false ? (profit.entry_gate.block_code ?? "BLOCKED") : "ALLOWED"}</b></p>
+        <p><span>Strategy</span><b>{profit?.entry_gate?.strategy_name ?? "-"}</b></p>
+        <p><span>Requested</span><b>{formatKrw(profit?.latest_order_sizing?.requested_order_krw)} KRW</b></p>
+        <p><span>Available</span><b>{formatKrw(profit?.latest_order_sizing?.available_krw)} KRW</b></p>
+        <p><span>Actual order</span><b>{formatKrw(profit?.latest_order_sizing?.actual_order_krw)} KRW</b></p>
+        <p><span>Sizing reason</span><b title={profit?.latest_order_sizing?.sizing_reason ?? "-"}>{profit?.latest_order_sizing?.sizing_reason ?? "-"}</b></p>
+        <p><span>Fill rate</span><b>{formatRatioPercent(profit?.execution_quality?.summary?.fill_rate, 1)}</b></p>
+        <p><span>Kill switch</span><b>{profit?.kill_switch?.status ?? "-"}</b></p>
+        {profit?.entry_gate?.entry_block_reason && <em>{profit.entry_gate.entry_block_reason}</em>}
       </RefPanel>
       <RefPanel className="ref-ops-review">
         <h3>리허설 검토</h3>

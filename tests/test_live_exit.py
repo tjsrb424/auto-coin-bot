@@ -22,6 +22,18 @@ from app.live_strategy_pilot import LiveStrategyConfig, _process_open_position
 
 class LiveExitTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "MIN_LIVE_ORDER_KRW": "5000",
+                "AUTO_EXIT_ORDER_TYPE": "limit",
+                "AUTO_MARKET_ORDER_ENABLED": "false",
+                "AUTO_EXIT_REQUIRE_MANUAL_CONFIRM": "false",
+                "AUTO_MAX_EXIT_RETRY_COUNT": "2",
+            },
+            clear=False,
+        )
+        self.env_patch.start()
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
@@ -44,6 +56,7 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         self.db_patch.stop()
+        self.env_patch.stop()
         self.tmp.cleanup()
 
     def create_position(self, *, entry_price: float = 100_000_000, opened_minutes_ago: int = 10, volume: float = 0.0001) -> dict:
@@ -92,7 +105,7 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(database.has_open_exit_order(position["id"]))
 
     def test_max_hold_time_exit_candidate_created(self) -> None:
-        position = self.create_position(opened_minutes_ago=61)
+        position = self.create_position(opened_minutes_ago=91)
         candidate = maybe_create_price_exit_candidate(position, 100_100_000, "2026-06-16T00:00:00Z")
 
         self.assertIsNotNone(candidate)
