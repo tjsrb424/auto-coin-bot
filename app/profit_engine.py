@@ -102,8 +102,10 @@ def evaluate_profit_entry_gate(
 
 def normalize_profit_strategy_name(value: Any) -> str:
     strategy = str(value or "").strip().lower()
+    compact = strategy.replace("-", "_").replace(" ", "_")
     aliases = {
         "smart_autonomous": "",
+        "smart_autonomous_engine": "",
         "ma_cross": "",
         "rsi": "",
         "volatility_breakout": "volume_breakout",
@@ -111,7 +113,14 @@ def normalize_profit_strategy_name(value: Any) -> str:
         "pullback": "trend_pullback",
         "range": "range_reversion",
     }
-    return aliases.get(strategy, strategy)
+    if strategy in aliases:
+        return aliases[strategy]
+    if compact in aliases:
+        return aliases[compact]
+    for known_strategy in ("volume_breakout", "trend_pullback", "range_reversion"):
+        if known_strategy in compact:
+            return known_strategy
+    return strategy
 
 
 def _blocked(base: dict, code: str, reason: str) -> dict:

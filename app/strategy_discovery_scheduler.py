@@ -31,7 +31,17 @@ FAST_VALIDATION_TASK = "fast_validation"
 DEEP_VALIDATION_TASK = "deep_validation"
 PROMOTION_TASK = "promotion_selector"
 DISCOVERY_TASKS = [SCAN_TASK, FAST_VALIDATION_TASK, DEEP_VALIDATION_TASK, PROMOTION_TASK]
-ALLOWED_STRATEGIES = {"ma_cross", "rsi", "volatility_breakout"}
+DEFAULT_DISCOVERY_STRATEGIES = [
+    "ma_cross",
+    "rsi",
+    "volatility_breakout",
+    "trend_pullback",
+    "volume_breakout",
+    "range_reversion",
+]
+RISK_OFF_ONLY_STRATEGIES = {"panic_blocker"}
+BUY_CANDIDATE_STRATEGIES = set(DEFAULT_DISCOVERY_STRATEGIES)
+ALLOWED_STRATEGIES = {*DEFAULT_DISCOVERY_STRATEGIES, *RISK_OFF_ONLY_STRATEGIES}
 AUTO_CANDIDATE_STATUSES = ["BACKTEST_PASSED", "SHADOW_RUNNING", "SHADOW_PASSED", "LIVE_ELIGIBLE"]
 
 
@@ -138,7 +148,7 @@ def _is_weekly_deep_day(config: dict) -> bool:
 
 def discovery_scheduler_config() -> dict:
     exchange = os.getenv("AUTO_DISCOVERY_EXCHANGE", os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb")).strip().lower() or "bithumb"
-    strategies = [strategy for strategy in ["ma_cross", "rsi", "volatility_breakout"] if strategy in ALLOWED_STRATEGIES]
+    strategies = [strategy for strategy in DEFAULT_DISCOVERY_STRATEGIES if strategy in ALLOWED_STRATEGIES]
     return {
         "enabled": _bool_env("AUTO_DISCOVERY_SCHEDULER_ENABLED", True),
         "exchange": exchange if exchange in {"upbit", "bithumb"} else "bithumb",
@@ -151,6 +161,7 @@ def discovery_scheduler_config() -> dict:
         "fast_interval_minutes": _minutes_env("AUTO_FAST_VALIDATION_INTERVAL_MINUTES", 60, minimum=15),
         "fast_max_markets": _int_env("AUTO_FAST_VALIDATION_MAX_MARKETS", 8, minimum=5, maximum=8),
         "fast_strategies": strategies,
+        "risk_off_only_strategies": sorted(RISK_OFF_ONLY_STRATEGIES),
         "fast_timeframes": _int_csv_env("AUTO_FAST_VALIDATION_TIMEFRAMES", [5, 15]),
         "fast_periods": _csv_env("AUTO_FAST_VALIDATION_PERIODS", ["7d", "30d"]),
         "deep_enabled": _bool_env("AUTO_DEEP_VALIDATION_ENABLED", True),
@@ -291,7 +302,7 @@ def _validation_task_config(config: dict, mode: str) -> dict:
             "mode": "deep",
             "enabled": bool(config["enabled"] and config["deep_enabled"]),
             "max_markets": config["deep_max_markets"],
-            "strategies": ["ma_cross", "rsi", "volatility_breakout"],
+            "strategies": config["fast_strategies"],
             "timeframes": config["deep_timeframes"],
             "periods": periods,
             "next_run_at": _next_deep_run_at(),

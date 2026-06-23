@@ -97,6 +97,9 @@ from app.env import load_server_env
 from app.forward_paper import latest_completed_candle, process_running_forward_sessions, run_forward_scheduler_tick
 from app.strategy_promotion_pipeline import apply_selector_if_allowed, run_strategy_promotion_pipeline
 from app.strategy_discovery_scheduler import (
+    ALLOWED_STRATEGIES,
+    BUY_CANDIDATE_STRATEGIES,
+    DEFAULT_DISCOVERY_STRATEGIES,
     discovery_scheduler_config,
     discovery_scheduler_status,
 )
@@ -161,6 +164,7 @@ from app.upbit import UpbitClientError, fetch_day_candles, fetch_minute_candles,
 load_server_env()
 
 DEFAULT_MARKET = "KRW-BTC"
+DEFAULT_VALIDATION_STRATEGIES = list(DEFAULT_DISCOVERY_STRATEGIES)
 RUNTIME_LOCK_ID = "auto-trading"
 logger = logging.getLogger("uvicorn.error")
 _latest_balance_sync_time_utc: str | None = None
@@ -371,7 +375,7 @@ class BacktestCompareRequest(BaseModel):
     unit: int = 1
     start_time_utc: str
     end_time_utc: str
-    strategies: list[str] = Field(default_factory=lambda: ["ma_cross", "rsi", "volatility_breakout"])
+    strategies: list[str] = Field(default_factory=lambda: list(DEFAULT_VALIDATION_STRATEGIES))
     settings_by_strategy: dict[str, dict[str, Any]] = Field(default_factory=dict)
     risk: dict[str, Any] = Field(default_factory=dict)
 
@@ -399,7 +403,7 @@ class StrategyValidationRequest(BaseModel):
 class MultiMarketValidationRequest(BaseModel):
     exchange: str = Field("upbit", pattern=r"^(upbit|bithumb)$")
     markets: list[str] = Field(default_factory=list)
-    strategies: list[str] = Field(default_factory=lambda: ["ma_cross", "rsi", "volatility_breakout"])
+    strategies: list[str] = Field(default_factory=lambda: list(DEFAULT_VALIDATION_STRATEGIES))
     timeframes: list[int] = Field(default_factory=lambda: [1, 5, 15, 60])
     periods: list[str] = Field(default_factory=lambda: ["7d", "30d"])
     risk: dict[str, Any] = Field(default_factory=dict)
@@ -967,8 +971,7 @@ async def create_backtest(payload: BacktestRequest) -> dict:
 
 @app.post("/api/backtests/compare")
 async def compare_backtests(payload: BacktestCompareRequest) -> dict:
-    allowed = {"ma_cross", "rsi", "volatility_breakout"}
-    strategies = [strategy for strategy in payload.strategies if strategy in allowed]
+    strategies = [strategy for strategy in payload.strategies if strategy in ALLOWED_STRATEGIES]
     if not strategies:
         raise HTTPException(status_code=400, detail="비교할 전략이 없습니다.")
     try:
@@ -1051,7 +1054,7 @@ def latest_paper_trading() -> dict:
 
 @app.post("/api/strategy-validation/run")
 async def run_validation(payload: StrategyValidationRequest) -> dict:
-    if payload.strategy not in {"ma_cross", "rsi", "volatility_breakout"}:
+    if payload.strategy not in ALLOWED_STRATEGIES:
         raise HTTPException(status_code=400, detail="지원하지 않는 전략입니다.")
     try:
         result = await run_strategy_validation(
@@ -1080,8 +1083,7 @@ async def run_validation(payload: StrategyValidationRequest) -> dict:
 
 @app.post("/api/strategy-validation/multi-market")
 async def run_multi_market_validation(payload: MultiMarketValidationRequest) -> dict:
-    allowed = {"ma_cross", "rsi", "volatility_breakout"}
-    strategies = [strategy for strategy in payload.strategies if strategy in allowed]
+    strategies = [strategy for strategy in payload.strategies if strategy in BUY_CANDIDATE_STRATEGIES]
     if not strategies:
         raise HTTPException(status_code=400, detail="No supported strategies were requested.")
     markets = [market for market in dict.fromkeys(payload.markets) if market.startswith("KRW-")]

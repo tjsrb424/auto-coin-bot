@@ -95,6 +95,7 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
         "candle_time_kst": candle.get("candle_time_kst"),
         "selected_strategy_id": session.get("candidate_strategy_id"),
         "selected_strategy_name": candidate.get("name") or candidate.get("strategy"),
+        "selected_strategy_type": candidate.get("strategy"),
         "legacy_signal": str(legacy_signal.get("signal") or "HOLD"),
         "market_regime": market_regime,
         "current_bot_position_qty": position_qty,

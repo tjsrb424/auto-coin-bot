@@ -920,6 +920,7 @@ def init_db() -> None:
                 candle_time_kst TEXT,
                 selected_strategy_id INTEGER,
                 selected_strategy_name TEXT,
+                selected_strategy_type TEXT,
                 legacy_signal TEXT NOT NULL,
                 market_regime TEXT NOT NULL,
                 current_bot_position_qty REAL NOT NULL DEFAULT 0,
@@ -1108,6 +1109,7 @@ def init_db() -> None:
         _ensure_column(conn, "live_positions", "trailing_stop_price", "REAL")
         _ensure_column(conn, "live_positions", "trailing_stop_pct", "REAL")
         _ensure_column(conn, "live_positions", "last_trailing_update_at", "TEXT")
+        _ensure_column(conn, "decision_snapshots", "selected_strategy_type", "TEXT")
         _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "daily_loss_limit_pct", "REAL NOT NULL DEFAULT 0")
@@ -4999,7 +5001,7 @@ def insert_decision_snapshot(snapshot: dict) -> int:
             """
             INSERT INTO decision_snapshots (
                 decided_at, exchange, market, timeframe, candle_time_utc, candle_time_kst,
-                selected_strategy_id, selected_strategy_name, legacy_signal, market_regime,
+                selected_strategy_id, selected_strategy_name, selected_strategy_type, legacy_signal, market_regime,
                 current_bot_position_qty, current_bot_position_value_krw, current_exposure_pct,
                 target_exposure_pct, action_hint, confidence_score, risk_score,
                 one_line_summary, positive_reasons_json, negative_reasons_json,
@@ -5013,7 +5015,7 @@ def insert_decision_snapshot(snapshot: dict) -> int:
                 aggressive_buy_blockers_json, aggressive_warnings_json, core_exposure_pct,
                 core_exposure_applied, core_exposure_broken_by_panic,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.get("decided_at", now_utc),
@@ -5024,6 +5026,7 @@ def insert_decision_snapshot(snapshot: dict) -> int:
                 snapshot.get("candle_time_kst"),
                 snapshot.get("selected_strategy_id"),
                 snapshot.get("selected_strategy_name"),
+                snapshot.get("selected_strategy_type"),
                 snapshot.get("legacy_signal", "HOLD"),
                 snapshot.get("market_regime", "UNKNOWN"),
                 snapshot.get("current_bot_position_qty", 0.0),

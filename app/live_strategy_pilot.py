@@ -943,9 +943,11 @@ def _profit_engine_market_regime(snapshot: dict | None, signal: dict | None = No
 
 def _profit_engine_strategy_name(session: dict, snapshot: dict | None, market_regime: str) -> str:
     return (
-        str((snapshot or {}).get("selected_strategy_name") or "").strip()
-        or allowed_strategy_for_regime(market_regime)
+        str((snapshot or {}).get("selected_strategy_type") or "").strip()
         or str(session.get("strategy_name") or "").strip()
+        or str((snapshot or {}).get("selected_strategy_name") or "").strip()
+        or allowed_strategy_for_regime(market_regime)
+        or ""
     )
 
 
