@@ -515,6 +515,55 @@ class RiskManagerTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["block_code"], "BLOCKED_POLICY_KRW_BALANCE_INSUFFICIENT")
 
+    def test_duplicate_candle_check_ignores_current_preview_request(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        preview_order = {**order(), "request_id": "exit-preview-test", "side": "SELL"}
+        database.insert_live_order_log(
+            {
+                **preview_order,
+                "session_id": session_id,
+                "candidate_strategy_id": 1,
+                "fee_estimate": 5,
+                "risk_result": "ALLOWED",
+                "status": "PREVIEWED",
+                "error_message": None,
+                "order_preview_payload": {},
+                "exchange_request_payload_masked": {},
+                "exchange_response_payload": {},
+                "manual_confirmed": True,
+                "is_auto": False,
+                "is_auto_exit": False,
+                "order_purpose": "EXIT",
+                "candle_time_utc": "2026-06-16T00:00:00Z",
+            }
+        )
+
+        with patch.dict(os.environ, {"RISK_MIN_COOLDOWN_SECONDS": "0", "RISK_BLOCK_ON_OPEN_POSITION": "false"}, clear=False):
+            result = check_order_risk(
+                order=preview_order,
+                purpose="EXIT",
+                base_result={"allowed": True},
+                session_id=session_id,
+                candidate_strategy_id=1,
+                candle_time_utc="2026-06-16T00:00:00Z",
+                is_auto=False,
+            )
+
+        self.assertTrue(result["checks"]["duplicate_check"]["allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()

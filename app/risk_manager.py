@@ -609,13 +609,14 @@ def duplicate_order_exists(
                 WHERE exchange = ?
                   AND market = ?
                   AND side = ?
+                  AND request_id != ?
                   AND candle_time_utc = ?
                   AND (? IS NULL OR session_id = ?)
                   AND (? IS NULL OR candidate_strategy_id = ?)
                   AND status IN ('PREVIEWED', 'SUBMITTED', 'WAITING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'FAILED')
                 LIMIT 1
                 """,
-                (exchange, market, side, candle_time_utc, session_id, session_id, candidate_strategy_id, candidate_strategy_id),
+                (exchange, market, side, request_id, candle_time_utc, session_id, session_id, candidate_strategy_id, candidate_strategy_id),
             ).fetchone()
             if row:
                 return "BLOCKED_DUPLICATE_CANDLE"
