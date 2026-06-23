@@ -279,7 +279,7 @@ async def submit_exit_order(request_id: str, *, final_confirmation: str) -> dict
         "amount_krw": preview["amount_krw"],
         "order_purpose": "EXIT",
     }
-    risk = await evaluate_exit_order(candidate, position, manual_confirmed=True, is_auto_exit=bool(preview.get("is_auto_exit")))
+    risk = await evaluate_exit_order(candidate, position, manual_confirmed=True, is_auto_exit=bool(preview.get("is_auto_exit")), request_id=request_id)
     if not risk["allowed"]:
         update_live_order_log(request_id, {"status": "BLOCKED", "risk_result": risk["risk_result"], "error_message": risk["blocked_reason"]})
         if candidate:
@@ -416,7 +416,7 @@ async def manage_exit_order_timeout(position: dict, config: LiveExitConfig | Non
             return
 
 
-async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, manual_confirmed: bool, is_auto_exit: bool) -> dict:
+async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, manual_confirmed: bool, is_auto_exit: bool, request_id: str | None = None) -> dict:
     config = LiveExitConfig.from_env()
     live_config = LiveTradingConfig.for_exchange(str((candidate or {}).get("exchange") or "bithumb"))
     risk_result = "ALLOWED"
@@ -507,7 +507,7 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
     }
     if candidate:
         order = {
-            "request_id": f"exit-candidate-{candidate['id']}",
+            "request_id": request_id or f"exit-candidate-{candidate['id']}",
             "exchange": candidate["exchange"],
             "market": candidate["market"],
             "side": "SELL",
@@ -536,7 +536,7 @@ async def evaluate_exit_order(candidate: dict | None, position: dict | None, *, 
 
 
 async def _build_exit_order(candidate: dict, position: dict | None, request_id: str, *, manual_confirmed: bool, is_auto_exit: bool) -> tuple[dict, dict]:
-    risk = await evaluate_exit_order(candidate, position, manual_confirmed=manual_confirmed, is_auto_exit=is_auto_exit)
+    risk = await evaluate_exit_order(candidate, position, manual_confirmed=manual_confirmed, is_auto_exit=is_auto_exit, request_id=request_id)
     order = {
         "request_id": request_id,
         "client_order_id": request_id[:36],

@@ -15,6 +15,7 @@ from app.live_exit import (
     create_exit_order_preview,
     evaluate_exit_order,
     maybe_create_price_exit_candidate,
+    submit_exit_order,
 )
 from app.live_strategy_pilot import LiveStrategyConfig, _process_open_position
 
@@ -186,6 +187,31 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log["side"], "SELL")
         self.assertEqual(log["exit_reason"], "STRATEGY_SELL")
         self.assertTrue(log["manual_confirmed"])
+
+    async def test_manual_exit_submit_reuses_preview_request_for_duplicate_check(self) -> None:
+        position = self.create_position()
+        candidate = create_exit_candidate_for_position(position, "STRATEGY_SELL", 100_000_000, "2026-06-18T13:45:00Z")
+        assert candidate is not None
+        approve_exit_candidate(int(candidate["id"]))
+        broker = AsyncMock()
+        broker.get_balances.return_value = {
+            "by_currency": {"BTC": {"balance": 0.0001, "locked": 0.0}},
+            "btc": {"balance": 0.0001, "locked": 0.0},
+            "krw": {"balance": 0.0, "locked": 0.0},
+        }
+        broker.get_order_chance.return_value = {"market": "KRW-BTC"}
+        broker.place_order.return_value = {}
+
+        with (
+            patch("app.live_recovery.get_live_broker", return_value=broker),
+            patch("app.live_exit.get_live_broker", return_value=broker),
+            patch("app.capital_snapshot.get_live_broker", return_value=broker),
+        ):
+            preview = await create_exit_order_preview(int(candidate["id"]), manual_confirmed=True)
+            result = await submit_exit_order(preview["request_id"], final_confirmation="SUBMIT LIMIT EXIT ORDER")
+
+        self.assertTrue(result["ok"])
+        broker.place_order.assert_awaited_once()
 
     async def test_open_position_smart_limited_uses_live_trading_config(self) -> None:
         position = self.create_position()
