@@ -17,6 +17,7 @@ from app.database import (
     has_unresolved_live_order_for_exchange,
     insert_capital_allocation_decision,
     load_active_order_reservations,
+    load_candidate_strategy,
     load_global_bot_operation_policy,
     load_live_eligible_candidate_strategies,
     load_next_entry_queue,
@@ -30,6 +31,8 @@ from app.database import (
     reserve_position_slot,
     save_active_strategy_selection,
     update_next_entry_status,
+    update_order_reservation_status,
+    update_live_strategy_session,
 )
 from app.live_broker import is_emergency_stopped
 
@@ -83,6 +86,10 @@ def allocator_config() -> dict:
         "reservation_ttl_minutes": _int_env("AUTO_ORDER_RESERVATION_TTL_MINUTES", 30, minimum=1, maximum=1440),
         "queue_ttl_minutes": _int_env("AUTO_NEXT_ENTRY_TTL_MINUTES", 360, minimum=5, maximum=10080),
         "lock_ttl_seconds": _int_env("AUTO_CAPITAL_ALLOCATOR_LOCK_TTL_SECONDS", 300, minimum=30, maximum=1800),
+        "same_market_replace_min_score_delta": _float_env(
+            "AUTO_ALLOCATOR_REPLACE_MIN_SCORE_DELTA",
+            _float_env("AUTO_SELECTOR_MIN_SCORE_DELTA", 10.0),
+        ),
     }
 
 
@@ -172,6 +179,120 @@ def _candidate_block_reason(candidate: dict, exchange: str, open_markets: set[st
     return ""
 
 
+def _same_market_reserved_slot(candidate: dict, slots: list[dict], config: dict) -> tuple[dict | None, str]:
+    market = str(candidate.get("market") or "")
+    candidate_id = int(candidate.get("id") or 0)
+    candidate_score = float(candidate.get("score") or 0.0)
+    min_delta = float(config.get("same_market_replace_min_score_delta") or 0.0)
+    for slot in slots:
+        if str(slot.get("market") or "") != market:
+            continue
+        if str(slot.get("status") or "").upper() != "RESERVED" or slot.get("live_position_id"):
+            return None, "BLOCKED_DUPLICATE_MARKET_POSITION"
+        existing_candidate_id = int(slot.get("candidate_strategy_id") or 0)
+        if existing_candidate_id == candidate_id:
+            return None, "SAME_MARKET_CANDIDATE_ALREADY_RESERVED"
+        existing = load_candidate_strategy(existing_candidate_id) if existing_candidate_id else None
+        existing_score = float((existing or {}).get("score") or 0.0)
+        if existing and candidate_score - existing_score < min_delta:
+            return None, "SAME_MARKET_REPLACE_SCORE_DELTA_TOO_SMALL"
+        return slot, ""
+    return None, "NO_SAME_MARKET_RESERVED_SLOT"
+
+
+def _replace_reserved_slot_candidate(
+    *,
+    slot: dict,
+    candidate: dict,
+    approved_order: float,
+    reason: str,
+    config: dict,
+) -> dict:
+    now_utc = _utc_now()
+    old_candidate_id = int(slot.get("candidate_strategy_id") or 0)
+    old_candidate = load_candidate_strategy(old_candidate_id) if old_candidate_id else None
+    old_session_id = int(slot.get("live_strategy_session_id") or 0)
+    market = str(candidate["market"])
+    if old_candidate_id:
+        update_order_reservation_status(
+            candidate_strategy_id=old_candidate_id,
+            market=market,
+            status="REPLACED",
+            previous_statuses=["RESERVED"],
+        )
+        promote_candidate_strategy(
+            old_candidate_id,
+            "LIVE_ELIGIBLE",
+            reason="Replaced by stronger same-market candidate before entry",
+        )
+    if old_session_id:
+        update_live_strategy_session(
+            old_session_id,
+            {
+                "status": "STOPPED",
+                "auto_enabled": False,
+                "last_risk_result": "REPLACED_BEFORE_ENTRY",
+                "last_order_status": "REPLACED",
+                "stopped_at": now_utc,
+            },
+        )
+    session_id = create_live_strategy_session(
+        {
+            "exchange": str(config["exchange"]),
+            "market": market,
+            "candidate_strategy_id": int(candidate["id"]),
+            "strategy_name": candidate["strategy"],
+            "strategy_parameters": candidate.get("parameters", {}),
+            "status": "READY",
+            "auto_enabled": True,
+            "initial_balance_krw": 0.0,
+            "max_order_krw": approved_order,
+            "max_orders_per_day": _int_env("AUTO_MAX_ORDERS_PER_DAY", 3, minimum=1),
+        }
+    )
+    reservation_id = create_order_reservation(
+        {
+            "request_id": f"allocator-replace-{uuid.uuid4().hex[:16]}",
+            "exchange": str(config["exchange"]),
+            "market": market,
+            "candidate_strategy_id": int(candidate["id"]),
+            "slot_id": int(slot["id"]),
+            "amount_krw": approved_order,
+            "status": "RESERVED",
+            "expires_at": (
+                datetime.now(timezone.utc).replace(microsecond=0)
+                + timedelta(minutes=int(config["reservation_ttl_minutes"]))
+            ).isoformat().replace("+00:00", "Z"),
+        }
+    )
+    updated_slot = reserve_position_slot(
+        slot_id=int(slot["id"]),
+        exchange=str(config["exchange"]),
+        market=market,
+        candidate_strategy_id=int(candidate["id"]),
+        live_strategy_session_id=session_id,
+        amount_krw=approved_order,
+        reason=reason,
+    )
+    promote_candidate_strategy(int(candidate["id"]), "LIVE_ACTIVE", reason="Replaced same-market reserved slot")
+    save_active_strategy_selection(candidate, reason="Replaced same-market reserved slot", replaced_candidate_strategy_id=old_candidate_id or None)
+    record_strategy_switch(
+        from_candidate_strategy_id=old_candidate_id or None,
+        to_candidate_strategy_id=int(candidate["id"]),
+        from_market=market,
+        to_market=market,
+        decision="APPLIED",
+        reason="Replaced same-market reserved slot before entry",
+        score_delta=float(candidate.get("score") or 0.0) - float((old_candidate or {}).get("score") or 0.0),
+    )
+    return {
+        "slot": updated_slot,
+        "session_id": session_id,
+        "reservation_id": reservation_id,
+        "replaced_candidate_strategy_id": old_candidate_id or None,
+    }
+
+
 def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | None = None) -> dict:
     config = allocator_config()
     exchange = exchange or str(config["exchange"])
@@ -228,15 +349,6 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
         for candidate in candidates:
             if accepted_count >= int(config["max_new_entries_per_run"]):
                 break
-            if not empty_slots:
-                queue_id = enqueue_next_entry(
-                    candidate,
-                    allocation_score=allocation_score(candidate, config),
-                    blocked_reason="NO_EMPTY_SLOT",
-                    ttl_minutes=int(config["queue_ttl_minutes"]),
-                )
-                blocked.append({"candidate": candidate, "blocked_reason": "NO_EMPTY_SLOT", "queue_id": queue_id})
-                continue
             if not policy.get("auto_trading_enabled"):
                 queue_id = enqueue_next_entry(
                     candidate,
@@ -247,7 +359,14 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 blocked.append({"candidate": candidate, "blocked_reason": "POLICY_AUTO_TRADING_DISABLED", "queue_id": queue_id})
                 continue
 
-            block_reason = _candidate_block_reason(candidate, exchange, open_markets, config)
+            replacement_slot, same_market_block = _same_market_reserved_slot(candidate, slots, config)
+            is_replacement = replacement_slot is not None
+            if same_market_block != "NO_SAME_MARKET_RESERVED_SLOT" and not is_replacement:
+                block_reason = same_market_block
+            elif not is_replacement and not empty_slots:
+                block_reason = "NO_EMPTY_SLOT"
+            else:
+                block_reason = _candidate_block_reason(candidate, exchange, open_markets, config)
             if not block_reason and snapshot.get("snapshot_error"):
                 block_reason = "BLOCKED_SNAPSHOT_FAILED"
             if not block_reason and snapshot.get("balance_mismatch_detected"):
@@ -256,13 +375,19 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 block_reason = "BLOCKED_OPEN_ORDER_MISMATCH"
             score = allocation_score(candidate, config)
             desired_order = min(max_single, max(float(config["min_order_krw"]), max_single * min(score, 100.0) / 100))
-            approved_order = min(available_budget, desired_order, max_single, float(config["max_order_krw"]))
+            released_reserved = float((replacement_slot or {}).get("reserved_krw") or 0.0)
+            if is_replacement:
+                cash_after_reserve = max(float(snapshot.get("available_krw_balance") or 0.0) - float(snapshot.get("cash_reserve_krw") or 0.0), 0.0)
+                budget_for_candidate = min(max(remaining + released_reserved, 0.0), cash_after_reserve)
+            else:
+                budget_for_candidate = available_budget
+            approved_order = min(budget_for_candidate, desired_order, max_single, float(config["max_order_krw"]))
             if approved_order < float(config["min_order_krw"]) and not block_reason:
                 if snapshot.get("available_krw_balance") is None:
                     block_reason = "BLOCKED_EXCHANGE_BALANCE_UNAVAILABLE"
                 elif float(snapshot.get("available_krw_balance") or 0.0) < float(config["min_order_krw"]):
                     block_reason = "BLOCKED_INSUFFICIENT_KRW_BALANCE"
-                elif remaining < float(config["min_order_krw"]):
+                elif (remaining + released_reserved if is_replacement else remaining) < float(config["min_order_krw"]):
                     block_reason = "BLOCKED_REMAINING_EXPOSURE_TOO_SMALL"
                 else:
                     block_reason = "BLOCKED_CAPITAL_TOO_SMALL"
@@ -294,6 +419,32 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                     ttl_minutes=int(config["queue_ttl_minutes"]),
                 )
                 blocked.append({"candidate": candidate, "blocked_reason": block_reason, "queue_id": queue_id})
+                continue
+
+            if is_replacement:
+                replacement = _replace_reserved_slot_candidate(
+                    slot=replacement_slot,
+                    candidate=candidate,
+                    approved_order=approved_order,
+                    reason=reason,
+                    config={**config, "exchange": exchange},
+                )
+                accepted_count += 1
+                accepted.append(
+                    {
+                        "candidate": candidate,
+                        "slot_id": int(replacement["slot"]["id"]),
+                        "slot_number": int(replacement["slot"]["slot_number"]),
+                        "session_id": replacement["session_id"],
+                        "reservation_id": replacement["reservation_id"],
+                        "approved_order_krw": approved_order,
+                        "replaced_candidate_strategy_id": replacement.get("replaced_candidate_strategy_id"),
+                    }
+                )
+                update_next_entry_status(int(candidate["id"]), "PROMOTED_TO_SLOT")
+                open_markets.add(str(candidate["market"]))
+                available_budget = max(available_budget + released_reserved - approved_order, 0.0)
+                slots = [replacement["slot"] if int(slot.get("id") or 0) == int(replacement["slot"]["id"]) else slot for slot in slots]
                 continue
 
             slot = empty_slots.pop(0)

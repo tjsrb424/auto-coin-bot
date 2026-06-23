@@ -165,6 +165,90 @@ class CapitalAllocatorTests(unittest.TestCase):
         self.assertEqual(slots[0]["status"], "RESERVED")
         self.assertEqual(slots[0]["candidate_strategy_id"], candidate_id)
 
+    def test_same_market_stronger_candidate_replaces_reserved_slot_before_entry(self) -> None:
+        first_id = database.save_candidate_strategy(candidate_payload(score=80))
+        database.update_bot_operation_policy(
+            "KRW-BTC",
+            {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5},
+        )
+
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
+            first = run_capital_allocator_once("TEST", exchange="bithumb")
+
+        stronger = candidate_payload(score=95)
+        stronger["strategy"] = "volume_breakout"
+        stronger["name"] = "KRW-ETH volume_breakout 5m 95pt"
+        stronger_id = database.save_candidate_strategy(stronger)
+
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
+            second = run_capital_allocator_once("TEST_REPLACE", exchange="bithumb")
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(second["accepted"]), 1)
+        self.assertEqual(second["accepted"][0]["replaced_candidate_strategy_id"], first_id)
+        self.assertEqual(database.load_candidate_strategy(first_id)["status"], "LIVE_ELIGIBLE")
+        self.assertEqual(database.load_candidate_strategy(stronger_id)["status"], "LIVE_ACTIVE")
+        slots = database.load_position_slots(5, "bithumb")
+        self.assertEqual(slots[0]["status"], "RESERVED")
+        self.assertEqual(slots[0]["candidate_strategy_id"], stronger_id)
+        sessions = database.load_running_live_strategy_sessions()
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["candidate_strategy_id"], stronger_id)
+        self.assertEqual(sessions[0]["strategy_name"], "volume_breakout")
+
+    def test_same_market_candidate_is_not_replaced_when_position_is_open(self) -> None:
+        active_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE", score=80))
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": active_id,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {"short_window": 5, "long_window": 20},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 20_000,
+                "max_orders_per_day": 3,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": active_id,
+                "strategy_name": "ma_cross",
+                "status": "OPEN",
+                "entry_order_uuid": "open-position-test",
+                "entry_price": 1000,
+                "entry_volume": 10,
+                "entry_amount_krw": 10_000,
+                "current_price": 1010,
+                "stop_loss_price": 900,
+                "take_profit_price": 1100,
+            }
+        )
+        stronger = candidate_payload(score=99)
+        stronger["strategy"] = "volume_breakout"
+        stronger_id = database.save_candidate_strategy(stronger)
+        database.update_bot_operation_policy(
+            "KRW-BTC",
+            {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5},
+        )
+
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
+            result = run_capital_allocator_once("TEST_OPEN_POSITION", exchange="bithumb")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["accepted"]), 0)
+        self.assertEqual(result["blocked"][0]["blocked_reason"], "BLOCKED_DUPLICATE_MARKET_POSITION")
+        self.assertEqual(database.load_candidate_strategy(stronger_id)["status"], "LIVE_ELIGIBLE")
+
     def test_available_krw_shortage_blocks_candidate(self) -> None:
         database.save_candidate_strategy(candidate_payload())
         database.update_bot_operation_policy(
