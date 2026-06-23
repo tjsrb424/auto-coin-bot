@@ -921,6 +921,20 @@ function liveBtcStats(data: DashboardData) {
   };
 }
 
+function liveAccountPerformance(data: DashboardData) {
+  if (data.liveBalances?.balance_fetch_status !== "SUCCESS") return null;
+  const equity = data.liveBalances?.estimated_total_equity_krw;
+  const basis = data.botPolicy?.max_total_exposure_krw;
+  if (equity == null || !Number.isFinite(equity) || basis == null || !Number.isFinite(basis) || basis <= 0) return null;
+  const totalPnl = equity - basis;
+  return {
+    basis,
+    equity,
+    totalPnl,
+    totalReturn: totalPnl / basis
+  };
+}
+
 function parseDate(value?: string | null) {
   if (!value) return null;
   const normalized = value.includes("T") ? value : value.replace(" ", "T");
@@ -2951,8 +2965,8 @@ function PortfolioView({
   const cashValue = rows.find((row) => row.symbol === "KRW")?.value ?? 0;
   const livePnl = rows.reduce((sum, row) => sum + (row.pnl ?? 0), 0);
   const costBasis = rows.reduce((sum, row) => row.symbol === "KRW" ? sum : sum + ((row.average ?? 0) * row.qty), 0);
-  const pnl = data.liveBalances?.balance_fetch_status === "SUCCESS" ? livePnl : totalPnl ?? livePnl;
-  const returnRate = data.liveBalances?.balance_fetch_status === "SUCCESS" && costBasis > 0 ? pnl / costBasis : totalReturn ?? null;
+  const pnl = data.liveBalances?.balance_fetch_status === "SUCCESS" ? totalPnl ?? livePnl : totalPnl ?? livePnl;
+  const returnRate = data.liveBalances?.balance_fetch_status === "SUCCESS" ? totalReturn ?? (costBasis > 0 ? livePnl / costBasis : null) : totalReturn ?? null;
   const cashRatio = total > 0 ? cashValue / total : 0;
   const mainRows = rows.slice(0, 5);
   const otherValue = rows.slice(5).reduce((sum, item) => sum + item.value, 0);
@@ -2993,7 +3007,7 @@ function PortfolioView({
   return (
     <>
       <KpiCard className="ref-portfolio-kpi-total" icon={<Wallet size={28} />} label="총자산(KRW)" value={formatKrw(total)} sub={formatAssetSub(total)} />
-      <KpiCard className="ref-portfolio-kpi-profit" icon={<LineChart size={28} />} label="평가 손익 (KRW)" value={formatSignedKrw(pnl)} sub={formatPercent(returnRate)} tone="cyan" />
+      <KpiCard className="ref-portfolio-kpi-profit" icon={<LineChart size={28} />} label="총 손익 (KRW)" value={formatSignedKrw(pnl)} sub={formatPercent(returnRate)} tone="cyan" />
       <KpiCard className="ref-portfolio-kpi-return" icon={<PieChart size={28} />} label="수익률" value={formatPercent(returnRate)} sub={formatSignedKrw(pnl)} tone="green" />
       <KpiCard className="ref-portfolio-kpi-cash" icon={<ShieldCheck size={28} />} label="현금 비율" value={formatRatioPercent(cashRatio, 1)} sub={`${formatKrw(cashValue)} KRW`} tone="amber" />
       <KpiCard className="ref-portfolio-kpi-risk" icon={<Target size={28} />} label="리스크 상태" value={riskScore} sub={data.liveBalances?.balance_fetch_status ?? "-"} tone="cyan" />
@@ -5101,12 +5115,12 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
   const [importPositionError, setImportPositionError] = React.useState<string | null>(null);
   const scaledWidth = STAGE_WIDTH * scale;
   const scaledHeight = STAGE_HEIGHT * scale;
-  const liveBtc = liveBtcStats(data);
+  const liveAccount = liveAccountPerformance(data);
   const liveEquity = data.liveBalances?.balance_fetch_status === "SUCCESS" ? data.liveBalances?.estimated_total_equity_krw : null;
   const paperEquity = data.paper?.balance?.equity ?? data.forward?.balance?.equity ?? null;
   const totalEquity = liveEquity ?? paperEquity;
-  const totalPnl = liveBtc?.totalPnl ?? data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
-  const totalReturn = liveBtc?.totalReturn ?? data.paper?.balance?.total_return ?? data.forward?.balance?.total_return ?? null;
+  const totalPnl = liveAccount?.totalPnl ?? data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
+  const totalReturn = liveAccount?.totalReturn ?? data.paper?.balance?.total_return ?? data.forward?.balance?.total_return ?? null;
   const isAutoTradingOn = isRuntimeRunning(data);
 
   const toggleAutoTrading = React.useCallback(async () => {
