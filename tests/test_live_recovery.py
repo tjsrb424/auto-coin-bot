@@ -878,6 +878,11 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         assert accumulator is not None
         self.assertEqual(dict(accumulator)["status"], "STALE")
 
+        with patch("app.scale_in_repair.get_live_broker", return_value=broker):
+            second_preview = await repair_scale_in_duplicate(exchange="bithumb", market="KRW-BTC", dry_run=True)
+        self.assertEqual(second_preview["duplicate_groups"][0]["duplicate_positions_to_close_or_reconcile"], [])
+        self.assertEqual(second_preview["duplicate_groups"][0]["proposed_updates"], [])
+
     def test_timeout_exception_detection_blocks_retry_path(self) -> None:
         self.assertTrue(is_timeout_exception(httpx.ReadTimeout("timed out")))
         self.assertTrue(is_timeout_exception(RuntimeError("request timeout")))

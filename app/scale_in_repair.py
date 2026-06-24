@@ -148,28 +148,34 @@ def _proposed_duplicate_updates(group: dict, exchange_balance: dict) -> dict:
     if target_position_id:
         for log in logs:
             if str(log.get("side") or "").upper() == "BUY" and str(log.get("order_purpose") or "ENTRY").upper() == "ENTRY":
-                proposed_updates.append(
-                    {
-                        "table": "live_order_logs",
-                        "id": log["id"],
-                        "request_id": log["request_id"],
-                        "set": {"position_id": int(target_position_id)},
-                        "reason": "attach duplicate scale-in BUY log to target position",
-                    }
-                )
-        proposed_updates.append(
-            {
-                "table": "position_fill_events",
-                "order_uuid": order_uuid,
-                "set": {
-                    "position_id": int(target_position_id),
-                    "fill_type": "SCALE_IN",
-                    "applied_volume": 0.0,
-                    "applied_amount_krw": 0.0,
-                },
-                "reason": "idempotency guard; duplicate BUY was already netted by later SELL",
-            }
+                if int(log.get("position_id") or 0) != int(target_position_id):
+                    proposed_updates.append(
+                        {
+                            "table": "live_order_logs",
+                            "id": log["id"],
+                            "request_id": log["request_id"],
+                            "set": {"position_id": int(target_position_id)},
+                            "reason": "attach duplicate scale-in BUY log to target position",
+                        }
+                    )
+        existing_fill_event = _rows(
+            "SELECT id FROM position_fill_events WHERE order_uuid = ? AND fill_type = 'SCALE_IN' LIMIT 1",
+            (order_uuid,),
         )
+        if not existing_fill_event:
+            proposed_updates.append(
+                {
+                    "table": "position_fill_events",
+                    "order_uuid": order_uuid,
+                    "set": {
+                        "position_id": int(target_position_id),
+                        "fill_type": "SCALE_IN",
+                        "applied_volume": 0.0,
+                        "applied_amount_krw": 0.0,
+                    },
+                    "reason": "idempotency guard; duplicate BUY was already netted by later SELL",
+                }
+            )
     active_sessions = _rows(
         """
         SELECT *
