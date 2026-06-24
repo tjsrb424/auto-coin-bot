@@ -71,6 +71,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         target_source: str = "CONSERVATIVE",
         core_exposure_pct: float = 0.0,
         core_exposure_applied: bool = False,
+        blockers: list[str] | None = None,
     ) -> tuple[int, dict]:
         snapshot_id = database.insert_decision_snapshot(
             {
@@ -102,8 +103,9 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "order_type": "LIMIT",
             "limit_price": 100_000_000,
             "urgency": "NORMAL",
-            "status": "CREATED",
+            "status": "BLOCKED" if blockers else "CREATED",
             "promotion_status": "READY_FOR_LIVE",
+            "blockers": blockers or [],
             "target_source": target_source,
             "policy_preview": {
                 "target_source": target_source,
@@ -136,9 +138,15 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         core_order_cooldown_seconds: str | None = None,
         last_order_time_utc: str | None = None,
         seconds_since_last_order: float | None = None,
+        signal: str = "HOLD",
+        market_regime: str = "RANGE",
+        intent_blockers: list[str] | None = None,
+        open_position: dict | None = None,
+        extra_env: dict | None = None,
+        session: dict | None = None,
     ) -> tuple[AsyncMock, dict]:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
-        session = self.create_smart_session()
+        session = session or self.create_smart_session()
         if last_order_time_utc is not None:
             database.update_live_strategy_session(int(session["id"]), {"last_order_time_utc": last_order_time_utc})
             session = database.load_latest_live_strategy_session()
@@ -149,7 +157,30 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             target_source=target_source,
             core_exposure_pct=core_exposure_pct,
             core_exposure_applied=core_exposure_applied,
+            blockers=intent_blockers,
         )
+        if open_position is not None:
+            database.create_live_position(
+                {
+                    "session_id": int(session["id"]),
+                    "exchange": "bithumb",
+                    "market": "KRW-BTC",
+                    "candidate_strategy_id": 0,
+                    "strategy_name": "smart_autonomous",
+                    "status": "OPEN",
+                    "entry_order_uuid": "existing-entry",
+                    "entry_price": open_position.get("entry_price", 100_000_000),
+                    "entry_volume": open_position.get("entry_volume", 0.0001),
+                    "entry_amount_krw": open_position.get("entry_amount_krw", 10_000),
+                    "current_price": open_position.get("current_price", 100_000_000),
+                    "unrealized_pnl": open_position.get("unrealized_pnl", 0),
+                    "realized_pnl": 0,
+                    "stop_loss_price": 99_000_000,
+                    "take_profit_price": 101_000_000,
+                    "scale_in_count": open_position.get("scale_in_count", 0),
+                    "last_scale_in_at": open_position.get("last_scale_in_at"),
+                }
+            )
         broker = AsyncMock()
         broker.get_balances.return_value = {
             "by_currency": {
@@ -185,17 +216,28 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "SMART_CORE_MARKETABLE_LIMIT_PRICE_BUFFER_PCT": price_buffer_pct,
             "AUTO_COOLDOWN_SECONDS": auto_cooldown_seconds,
         }
+        if extra_env:
+            env.update(extra_env)
         if core_entry_offset is not None:
             env["SMART_CORE_ENTRY_PRICE_OFFSET_PERCENT"] = core_entry_offset
         if core_order_cooldown_seconds is not None:
             env["SMART_CORE_ORDER_COOLDOWN_SECONDS"] = core_order_cooldown_seconds
         orderbook_top = orderbook_top or {"best_bid": 99_900_000, "best_ask": 100_000_000, "spread_krw": 100_000, "spread_pct": 0.10005}
         orderbook_mock = AsyncMock(side_effect=RuntimeError("orderbook failed")) if orderbook_error else AsyncMock(return_value=orderbook_top)
+        capital_snapshot = {
+            "available_budget_krw": available_krw,
+            "available_krw_balance": available_krw,
+            "blockers": [],
+            "balance_mismatch_detected": False,
+            "open_order_mismatch_detected": False,
+        }
         seconds_context = patch("app.live_strategy_pilot._seconds_since", return_value=seconds_since_last_order) if seconds_since_last_order is not None else nullcontext()
         with (
             patch.dict("os.environ", env, clear=False),
             patch("app.live_strategy_pilot.get_live_broker", return_value=broker),
             patch("app.live_strategy_pilot._bithumb_orderbook_top", new=orderbook_mock),
+            patch("app.live_strategy_pilot.build_capital_snapshot_async", new=AsyncMock(return_value=capital_snapshot)),
+            patch("app.live_strategy_pilot.snapshot_is_fresh", return_value=True),
             seconds_context,
         ):
             if core_entry_offset is None:
@@ -207,7 +249,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await _submit_smart_intent_order(
                 session,
                 latest,
-                {"signal": "HOLD", "reason": "smart test"},
+                {"signal": signal, "reason": "smart test"},
                 config,
                 live_config,
                 {
@@ -217,6 +259,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "current_bot_position_value_krw": current_value,
                     "current_bot_position_qty": current_value / 100_000_000,
                     "current_exposure_pct": current_value / 500_000 * 100,
+                    "market_regime": market_regime,
                     "final_target_exposure_source": target_source,
                     "core_exposure_pct": core_exposure_pct,
                     "core_exposure_applied": core_exposure_applied,
@@ -405,8 +448,9 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         intent = snapshot["order_intents"][0]
         self.assertEqual(intent["status"], "BLOCKED")
         self.assertEqual(intent["promotion_status"], "DUST_HOLD")
-        self.assertEqual(intent["promotion_blockers"], ["SMART_ORDER_AMOUNT_BELOW_MIN"])
+        self.assertEqual(intent["promotion_blockers"], ["SMART_MIN_REBALANCE_DELTA"])
         self.assertEqual(intent["policy_preview"]["amount_requested_krw"], 0.08)
+        self.assertEqual(intent["policy_preview"]["accumulated_delta_krw"], 0.08)
 
     async def test_dust_ask_updates_intent_without_live_order_log(self) -> None:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
@@ -448,7 +492,9 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         updated_intent = updated["order_intents"][0]
         self.assertEqual(updated_intent["status"], "BLOCKED")
         self.assertEqual(updated_intent["promotion_status"], "DUST_HOLD")
-        self.assertEqual(updated_intent["promotion_blockers"], ["SMART_SELL_AMOUNT_BELOW_MIN"])
+        self.assertEqual(updated_intent["promotion_blockers"], ["SMART_MIN_REBALANCE_DELTA"])
+        self.assertEqual(updated_intent["policy_preview"]["dust_side"], "SELL")
+        self.assertEqual(updated_intent["policy_preview"]["accumulated_delta_krw"], 0.49)
 
     async def test_smart_sell_sweeps_full_position_when_remainder_would_be_dust(self) -> None:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
@@ -540,6 +586,92 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         intent = snapshot["order_intents"][0]
         self.assertEqual(intent["status"], "SUBMITTED")
         self.assertEqual(intent["promotion_status"], "SUBMITTED")
+
+    async def test_scale_in_blocks_losing_open_position(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=10_000,
+            current_value=10_000,
+            available_krw=200_000,
+            signal="BUY",
+            market_regime="RANGE",
+            open_position={
+                "entry_price": 101_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 10_100,
+                "current_price": 100_000_000,
+            },
+            extra_env={
+                "RISK_BLOCK_ON_OPEN_POSITION": "true",
+                "AUTO_SCALE_IN_ENABLED": "true",
+                "AUTO_SCALE_IN_NO_AVERAGING_DOWN": "true",
+            },
+        )
+
+        broker.place_order.assert_not_awaited()
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["status"], "BLOCKED")
+        self.assertEqual(intent["promotion_status"], "BLOCKED")
+        self.assertEqual(intent["promotion_blockers"], ["BLOCKED_SCALE_IN_POSITION_LOSING"])
+        self.assertTrue(intent["policy_preview"]["scale_in"]["scale_in"])
+
+    async def test_scale_in_allows_profitable_open_position(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=10_000,
+            current_value=10_000,
+            available_krw=200_000,
+            signal="BUY",
+            market_regime="RANGE",
+            open_position={
+                "entry_price": 99_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 9_900,
+                "current_price": 100_000_000,
+            },
+            extra_env={
+                "RISK_BLOCK_ON_OPEN_POSITION": "true",
+                "AUTO_SCALE_IN_ENABLED": "true",
+                "AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL": "true",
+            },
+        )
+
+        broker.place_order.assert_awaited_once()
+        order = broker.place_order.await_args.args[0]
+        self.assertTrue(order["scale_in"])
+        self.assertIsNotNone(order["position_id"])
+        intent = snapshot["order_intents"][0]
+        self.assertTrue(intent["policy_preview"]["scale_in"]["allowed"])
+
+    async def test_small_bid_delta_accumulates_until_minimum_order(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=2_000,
+            current_value=10_000,
+            available_krw=200_000,
+            signal="BUY",
+            intent_blockers=["SMART_MIN_REBALANCE_DELTA"],
+        )
+
+        broker.place_order.assert_not_awaited()
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["promotion_status"], "DUST_HOLD")
+        self.assertEqual(intent["promotion_blockers"], ["SMART_MIN_REBALANCE_DELTA"])
+        self.assertEqual(intent["policy_preview"]["accumulated_delta_krw"], 2_000)
+        session = database.load_latest_live_strategy_session()
+        assert session is not None
+
+        broker2, snapshot2 = await self.submit_bid_intent(
+            amount_requested=4_000,
+            current_value=10_000,
+            available_krw=200_000,
+            signal="BUY",
+            intent_blockers=["SMART_MIN_REBALANCE_DELTA"],
+            session=session,
+        )
+
+        broker2.place_order.assert_awaited_once()
+        order = broker2.place_order.await_args.args[0]
+        self.assertEqual(order["amount_krw"], 6_000)
+        intent2 = snapshot2["order_intents"][0]
+        self.assertEqual(intent2["policy_preview"]["rebalance_accumulator"]["promoted_order_krw"], 6_000)
 
     async def test_core_bid_uses_core_entry_offset(self) -> None:
         broker, snapshot = await self.submit_bid_intent(

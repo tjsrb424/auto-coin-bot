@@ -434,10 +434,11 @@ def check_order_risk(
         and candidate_strategy_id is not None
         and has_open_live_position_for_strategy(exchange, market, int(candidate_strategy_id))
     )
-    if purpose == "ENTRY" and config.block_on_open_position and same_strategy_position_open:
+    scale_in_order = bool(order.get("scale_in"))
+    if purpose == "ENTRY" and config.block_on_open_position and same_strategy_position_open and not scale_in_order:
         block("BLOCKED_OPEN_POSITION_EXISTS", check_name="position_check")
     elif purpose == "ENTRY":
-        ok("position_check")
+        ok("position_check", {"scale_in": scale_in_order, "same_strategy_position_open": same_strategy_position_open})
 
     if config.block_on_open_order and state["open_order_count"] > 0:
         block("BLOCKED_OPEN_ORDER_EXISTS", check_name="open_order_check")

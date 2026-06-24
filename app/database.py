@@ -1109,6 +1109,8 @@ def init_db() -> None:
         _ensure_column(conn, "live_positions", "trailing_stop_price", "REAL")
         _ensure_column(conn, "live_positions", "trailing_stop_pct", "REAL")
         _ensure_column(conn, "live_positions", "last_trailing_update_at", "TEXT")
+        _ensure_column(conn, "live_positions", "scale_in_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "live_positions", "last_scale_in_at", "TEXT")
         _ensure_column(conn, "decision_snapshots", "selected_strategy_type", "TEXT")
         _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
@@ -1186,6 +1188,31 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_candidate_strategies_dedupe
             ON candidate_strategies(market, strategy, unit, backtest_period, status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rebalance_delta_accumulators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                candidate_strategy_id INTEGER,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                accumulated_delta_krw REAL NOT NULL DEFAULT 0,
+                accumulated_qty REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'ACCUMULATING',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                flushed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rebalance_delta_accumulators_active
+            ON rebalance_delta_accumulators(session_id, market, candidate_strategy_id, side, status)
             """
         )
         conn.execute(
@@ -3587,8 +3614,8 @@ def create_live_position(position: dict) -> int:
                 entry_amount_krw, current_price, unrealized_pnl, realized_pnl,
                 stop_loss_price, take_profit_price, highest_price_since_entry,
                 trailing_stop_price, trailing_stop_pct, last_trailing_update_at,
-                opened_at, closed_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                scale_in_count, last_scale_in_at, opened_at, closed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position["session_id"],
@@ -3611,6 +3638,8 @@ def create_live_position(position: dict) -> int:
                 position.get("trailing_stop_price"),
                 position.get("trailing_stop_pct"),
                 position.get("last_trailing_update_at"),
+                position.get("scale_in_count", 0),
+                position.get("last_scale_in_at"),
                 position.get("opened_at", now_utc),
                 position.get("closed_at"),
                 now_utc,
@@ -4213,6 +4242,7 @@ def update_live_position(position_id: int, updates: dict) -> None:
     allowed = {
         "status",
         "exit_order_uuid",
+        "entry_price",
         "current_price",
         "entry_volume",
         "entry_amount_krw",
@@ -4222,6 +4252,8 @@ def update_live_position(position_id: int, updates: dict) -> None:
         "trailing_stop_price",
         "trailing_stop_pct",
         "last_trailing_update_at",
+        "scale_in_count",
+        "last_scale_in_at",
         "closed_at",
     }
     values = {key: value for key, value in updates.items() if key in allowed}
@@ -4232,6 +4264,76 @@ def update_live_position(position_id: int, updates: dict) -> None:
     params = list(values.values()) + [position_id]
     with get_connection() as conn:
         conn.execute(f"UPDATE live_positions SET {columns} WHERE id = ?", params)
+
+
+def upsert_rebalance_delta_accumulator(
+    *,
+    session_id: int,
+    candidate_strategy_id: int | None,
+    exchange: str,
+    market: str,
+    side: str,
+    delta_krw: float,
+    qty: float = 0.0,
+    metadata: dict | None = None,
+) -> dict:
+    now_utc = _utc_now()
+    normalized_side = side.upper()
+    metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM rebalance_delta_accumulators
+            WHERE session_id = ?
+              AND COALESCE(candidate_strategy_id, -1) = COALESCE(?, -1)
+              AND exchange = ?
+              AND market = ?
+              AND side = ?
+              AND status = 'ACCUMULATING'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (session_id, candidate_strategy_id, exchange, market, normalized_side),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE rebalance_delta_accumulators
+                SET accumulated_delta_krw = accumulated_delta_krw + ?,
+                    accumulated_qty = accumulated_qty + ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (abs(delta_krw), abs(qty), metadata_json, now_utc, row["id"]),
+            )
+            updated = conn.execute("SELECT * FROM rebalance_delta_accumulators WHERE id = ?", (row["id"],)).fetchone()
+            return dict(updated)
+        cursor = conn.execute(
+            """
+            INSERT INTO rebalance_delta_accumulators (
+                session_id, candidate_strategy_id, exchange, market, side,
+                accumulated_delta_krw, accumulated_qty, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, candidate_strategy_id, exchange, market, normalized_side, abs(delta_krw), abs(qty), metadata_json, now_utc, now_utc),
+        )
+        created = conn.execute("SELECT * FROM rebalance_delta_accumulators WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return dict(created)
+
+
+def mark_rebalance_delta_accumulator(accumulator_id: int, status: str, metadata: dict | None = None) -> None:
+    now_utc = _utc_now()
+    values: dict[str, object] = {"status": status, "updated_at": now_utc}
+    if status in {"PROMOTED", "DISCARDED"}:
+        values["flushed_at"] = now_utc
+    if metadata is not None:
+        values["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+    columns = ", ".join(f"{key} = ?" for key in values)
+    params = [*values.values(), accumulator_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE rebalance_delta_accumulators SET {columns} WHERE id = ?", params)
 
 
 def create_exit_candidate(candidate: dict) -> int:

@@ -495,6 +495,22 @@ def ensure_filled_entry_order_position(log: dict, *, source: str = "FILLED_ENTRY
         )
         return "ATTACHED"
 
+    scale_position_id = _merge_scale_in_entry_log(log)
+    if scale_position_id is not None:
+        _adopt_position_in_relevant_session(log, scale_position_id, "SCALE_IN_POSITION_SYNCED")
+        log_recovery_event(
+            source,
+            "INFO",
+            "Filled scale-in entry order was merged into the existing live position.",
+            exchange=exchange,
+            market=market,
+            session_id=log.get("session_id"),
+            request_id=log.get("request_id"),
+            order_uuid=order_uuid,
+            payload={"position_id": scale_position_id},
+        )
+        return "ATTACHED"
+
     entry_price = _entry_price_from_log(log)
     entry_volume = _float(log.get("executed_volume")) or _float(log.get("volume"))
     if entry_price <= 0 or entry_volume <= 0:
@@ -539,6 +555,44 @@ def ensure_filled_entry_order_position(log: dict, *, source: str = "FILLED_ENTRY
         },
     )
     return "CREATED"
+
+
+def _merge_scale_in_entry_log(log: dict) -> int | None:
+    preview = log.get("order_preview_payload") or {}
+    policy_preview = preview.get("policy_preview") if isinstance(preview, dict) else {}
+    scale_preview = (policy_preview or {}).get("scale_in") if isinstance(policy_preview, dict) else {}
+    if not isinstance(scale_preview, dict) or not scale_preview.get("allowed"):
+        return None
+    position_id = scale_preview.get("position_id")
+    if not position_id:
+        return None
+    position = load_live_position(int(position_id))
+    if not position or str(position.get("status") or "").upper() != "OPEN":
+        return None
+    entry_price = _entry_price_from_log(log)
+    entry_volume = _float(log.get("executed_volume")) or _float(log.get("volume"))
+    entry_amount = _filled_amount_from_log(log, entry_price, entry_volume)
+    if entry_price <= 0 or entry_volume <= 0 or entry_amount <= 0:
+        return None
+    previous_volume = _float(position.get("entry_volume"))
+    previous_amount = _float(position.get("entry_amount_krw"))
+    new_volume = previous_volume + entry_volume
+    new_amount = previous_amount + entry_amount
+    new_entry_price = new_amount / new_volume if new_volume > 0 else entry_price
+    update_live_position(
+        int(position_id),
+        {
+            "entry_price": new_entry_price,
+            "entry_volume": new_volume,
+            "entry_amount_krw": new_amount,
+            "current_price": entry_price,
+            "unrealized_pnl": (entry_price * new_volume) - new_amount,
+            "scale_in_count": int(position.get("scale_in_count") or 0) + 1,
+            "last_scale_in_at": _utc_now(),
+        },
+    )
+    update_live_order_log(str(log["request_id"]), {"position_id": int(position_id)})
+    return int(position_id)
 
 
 async def import_exchange_btc_position(exchange: str = "bithumb", market: str = "KRW-BTC", *, confirmation: str) -> dict:

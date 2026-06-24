@@ -36,8 +36,10 @@ from app.database import (
     load_open_live_positions_for_exchange,
     load_live_position_by_entry_order_uuid,
     load_running_live_strategy_sessions,
+    mark_rebalance_delta_accumulator,
     market_is_live_allowed,
     update_order_intent,
+    upsert_rebalance_delta_accumulator,
     update_order_reservation_status,
     update_live_order_log,
     update_live_position,
@@ -1033,6 +1035,167 @@ def _smart_sell_volume_avoiding_dust(requested_qty: float, current_qty: float, p
     }
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _position_pnl_percent(position: dict, current_price: float) -> float:
+    entry_amount = _float(position.get("entry_amount_krw"))
+    entry_volume = _float(position.get("entry_volume"))
+    if entry_amount <= 0 or entry_volume <= 0:
+        return 0.0
+    current_value = current_price * entry_volume
+    return (current_value - entry_amount) / entry_amount * 100
+
+
+def _scale_in_block(
+    session: dict,
+    intent_id: Any,
+    blocker: str,
+    candle_time_utc: str,
+    signal: dict,
+    preview: dict,
+) -> None:
+    if intent_id:
+        update_order_intent(
+            int(intent_id),
+            {
+                "status": "BLOCKED",
+                "promotion_status": "BLOCKED",
+                "promotion_blockers": [blocker],
+                "policy_preview": preview,
+            },
+        )
+    _insert_blocked_log(session, blocker, blocker, candle_time_utc, signal, preview={"risk_result": blocker, "fee_estimate": 0.0, "policy_preview": preview})
+    update_live_strategy_session(int(session["id"]), {"last_risk_result": blocker, "last_order_status": "BLOCKED"})
+
+
+async def _scale_in_preview(
+    *,
+    session: dict,
+    intent: dict,
+    signal: dict,
+    smart_snapshot: dict,
+    amount: float,
+    current_price: float,
+    market_regime: str,
+    available_krw: float,
+    min_order_krw: float,
+) -> tuple[dict | None, dict]:
+    exchange = str(session.get("exchange") or "bithumb")
+    market = str(session.get("market") or "KRW-BTC")
+    candidate_id = int(session.get("candidate_strategy_id") or 0)
+    position = load_open_live_position_for_strategy(exchange, market, candidate_id)
+    if position is None:
+        return None, {"scale_in": False, "allowed": True, "reason": "NO_OPEN_POSITION"}
+    preview = {
+        "scale_in": True,
+        "position_id": position.get("id"),
+        "scale_in_count": int(position.get("scale_in_count") or 0),
+        "max_count": _env_int("AUTO_SCALE_IN_MAX_COUNT_PER_POSITION", 3),
+        "market_regime": market_regime,
+        "current_position_pnl_pct": _position_pnl_percent(position, current_price),
+        "min_position_pnl_pct": _float(os.getenv("AUTO_SCALE_IN_MIN_POSITION_PNL_PERCENT"), 0.0),
+        "max_position_exposure_pct": _float(os.getenv("AUTO_SCALE_IN_MAX_POSITION_EXPOSURE_PCT"), 45.0),
+        "last_scale_in_at": position.get("last_scale_in_at"),
+        "min_interval_seconds": _env_int("AUTO_SCALE_IN_MIN_INTERVAL_SECONDS", 900),
+        "available_budget_krw": None,
+        "available_krw": available_krw,
+        "amount_krw": amount,
+    }
+    if not _env_bool("AUTO_SCALE_IN_ENABLED", True):
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_DISABLED"}
+    if str(position.get("status") or "").upper() != "OPEN":
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_EDGE_BROKEN", "status": position.get("status")}
+    if _env_bool("AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL", True) and str(signal.get("signal") or "").upper() != "BUY":
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_EDGE_BROKEN", "signal": signal.get("signal")}
+    if _env_bool("AUTO_SCALE_IN_BLOCK_TREND_DOWN", True) and str(market_regime).upper() == "TREND_DOWN":
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_TREND_DOWN"}
+    if _env_bool("AUTO_SCALE_IN_NO_AVERAGING_DOWN", True) and preview["current_position_pnl_pct"] < preview["min_position_pnl_pct"]:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_POSITION_LOSING"}
+    if preview["scale_in_count"] >= preview["max_count"]:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_MAX_COUNT"}
+    remaining_interval = 0
+    if position.get("last_scale_in_at"):
+        remaining_interval = max(preview["min_interval_seconds"] - int(_seconds_since(str(position["last_scale_in_at"]))), 0)
+    preview["remaining_interval_seconds"] = remaining_interval
+    if remaining_interval > 0:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_INTERVAL"}
+    if available_krw < min_order_krw:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED", "available_krw": available_krw}
+    try:
+        snapshot = await build_capital_snapshot_async(exchange)
+    except Exception as exc:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED", "snapshot_error": str(exc)}
+    preview["available_budget_krw"] = snapshot.get("available_budget_krw")
+    preview["snapshot_blockers"] = snapshot.get("blockers") or []
+    if not snapshot_is_fresh(snapshot) or snapshot.get("balance_mismatch_detected") or snapshot.get("open_order_mismatch_detected"):
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED"}
+    if _float(snapshot.get("available_budget_krw")) < min_order_krw:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED"}
+    max_total = _float(smart_snapshot.get("max_total_exposure_krw"))
+    current_position_value = _float(position.get("entry_volume")) * current_price
+    max_position_value = max_total * preview["max_position_exposure_pct"] / 100 if max_total > 0 else 0.0
+    preview["current_position_value_krw"] = current_position_value
+    preview["projected_position_value_krw"] = current_position_value + amount
+    preview["max_position_value_krw"] = max_position_value
+    if max_position_value > 0 and current_position_value + amount > max_position_value:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_MAX_EXPOSURE"}
+    blockers = list(intent.get("blockers") or []) + list(smart_snapshot.get("blockers") or [])
+    blockers += list(smart_snapshot.get("aggressive_buy_blockers") or [])
+    ignored = {"SMART_MIN_REBALANCE_DELTA"}
+    hard_blockers = [blocker for blocker in blockers if blocker not in ignored]
+    if hard_blockers:
+        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_EDGE_BROKEN", "edge_blockers": hard_blockers}
+    return position, {**preview, "allowed": True}
+
+
+def _accumulate_rebalance_delta(
+    *,
+    session: dict,
+    intent: dict,
+    amount_requested: float,
+    current_price: float,
+    min_order_krw: float,
+) -> tuple[float, dict | None]:
+    accumulator = upsert_rebalance_delta_accumulator(
+        session_id=int(session["id"]),
+        candidate_strategy_id=session.get("candidate_strategy_id"),
+        exchange=str(session.get("exchange") or "bithumb"),
+        market=str(session.get("market") or "KRW-BTC"),
+        side=str(intent.get("side") or "NONE"),
+        delta_krw=amount_requested,
+        qty=abs(amount_requested) / current_price if current_price > 0 else 0.0,
+        metadata={
+            "intent_id": intent.get("id"),
+            "target_source": intent.get("target_source"),
+            "blockers": intent.get("blockers") or [],
+            "policy_preview": intent.get("policy_preview") or {},
+        },
+    )
+    accumulated = _float(accumulator.get("accumulated_delta_krw"))
+    preview = {
+        "accumulator_id": accumulator.get("id"),
+        "amount_requested_krw": amount_requested,
+        "accumulated_delta_krw": accumulated,
+        "min_order_krw": min_order_krw,
+        "accumulator_status": accumulator.get("status"),
+    }
+    if accumulated < min_order_krw:
+        return amount_requested, preview
+    return accumulated, {**preview, "promoted_order_krw": accumulated}
+
+
 async def _submit_smart_intent_order(
     session: dict,
     candle: dict,
@@ -1051,6 +1214,26 @@ async def _submit_smart_intent_order(
     current_price = float(candle["trade_price"])
     market = str(session.get("market") or "KRW-BTC")
     amount_requested = abs(_float(intent.get("delta_value_krw")))
+    accumulator_preview = None
+    if side in {"BID", "BUY"} and (0 < amount_requested < live_config.min_order_krw or "SMART_MIN_REBALANCE_DELTA" in set(intent.get("blockers") or [])):
+        amount_requested, accumulator_preview = _accumulate_rebalance_delta(
+            session=session,
+            intent=intent,
+            amount_requested=amount_requested,
+            current_price=current_price,
+            min_order_krw=live_config.min_order_krw,
+        )
+        if amount_requested < live_config.min_order_krw:
+            _mark_smart_dust_intent(
+                session,
+                intent_id,
+                "SMART_MIN_REBALANCE_DELTA",
+                {
+                    **(accumulator_preview or {}),
+                    "dust_side": "BUY",
+                },
+            )
+            return True
     if side in {"BID", "BUY"} and 0 < amount_requested < live_config.min_order_krw:
         _mark_smart_dust_intent(
             session,
@@ -1067,6 +1250,34 @@ async def _submit_smart_intent_order(
         sell_requested = amount_requested
         if sell_requested <= 0 and current_price > 0:
             sell_requested = abs(_float(intent.get("target_qty"))) * current_price
+        if 0 < sell_requested < live_config.min_order_krw or "SMART_MIN_REBALANCE_DELTA" in set(intent.get("blockers") or []):
+            sell_requested, accumulator_preview = _accumulate_rebalance_delta(
+                session=session,
+                intent=intent,
+                amount_requested=sell_requested,
+                current_price=current_price,
+                min_order_krw=live_config.min_order_krw,
+            )
+            if sell_requested < live_config.min_order_krw:
+                _mark_smart_dust_intent(
+                    session,
+                    intent_id,
+                    "SMART_MIN_REBALANCE_DELTA",
+                    {
+                        **(accumulator_preview or {}),
+                        "dust_side": "SELL",
+                    },
+                )
+                return True
+            intent = {
+                **intent,
+                "delta_value_krw": -sell_requested,
+                "target_qty": sell_requested / current_price if current_price > 0 else intent.get("target_qty"),
+                "policy_preview": {
+                    **(intent.get("policy_preview") or {}),
+                    "rebalance_accumulator": accumulator_preview,
+                },
+            }
         if 0 < sell_requested < live_config.min_order_krw:
             _mark_smart_dust_intent(
                 session,
@@ -1193,6 +1404,24 @@ async def _submit_smart_intent_order(
                 return True
             _block_smart_intent_order(session, intent_id, blocker, candle["candle_time_utc"], signal, cap_preview)
             return True
+    if accumulator_preview:
+        cap_preview = {**cap_preview, "rebalance_accumulator": accumulator_preview}
+    scale_position, scale_preview = await _scale_in_preview(
+        session=session,
+        intent=intent,
+        signal=signal,
+        smart_snapshot=smart_snapshot,
+        amount=amount,
+        current_price=current_price,
+        market_regime=market_regime,
+        available_krw=available_krw,
+        min_order_krw=live_config.min_order_krw,
+    )
+    if scale_position is not None:
+        cap_preview = {**cap_preview, "scale_in": scale_preview}
+        if not scale_preview.get("allowed"):
+            _scale_in_block(session, intent_id, str(scale_preview.get("blocker") or "BLOCKED_SCALE_IN_EDGE_BROKEN"), candle["candle_time_utc"], signal, cap_preview)
+            return True
     core_accumulation = core_accumulation_bid
     try:
         orderbook_top = await _bithumb_orderbook_top(str(session.get("market") or "KRW-BTC"))
@@ -1217,6 +1446,8 @@ async def _submit_smart_intent_order(
         "price": price,
         "amount_krw": amount,
         "volume": amount / price if price > 0 else 0.0,
+        "scale_in": bool(scale_position is not None),
+        "position_id": scale_position.get("id") if scale_position else None,
     }
     risk_preview = evaluate_live_order_risk(
         order=order,
@@ -1298,6 +1529,8 @@ async def _submit_smart_intent_order(
         )
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "SUBMITTED", "status": "SUBMITTED", "submitted_at": _utc_now()})
+        if accumulator_preview and accumulator_preview.get("accumulator_id"):
+            mark_rebalance_delta_accumulator(int(accumulator_preview["accumulator_id"]), "PROMOTED", {**accumulator_preview, "submitted_request_id": request_id})
         update_live_strategy_session(
             int(session["id"]),
             {
@@ -1349,6 +1582,7 @@ async def _submit_smart_intent_sell_order(
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": ["SMART_ORDER_CHANCE_FAILED"]})
         return True
+    accumulator_preview = (intent.get("policy_preview") or {}).get("rebalance_accumulator")
     current_price = float(candle["trade_price"])
     current_qty = max(_float(position.get("entry_volume")), 0.0)
     requested_qty = abs(_float(intent.get("target_qty"))) or (abs(_float(intent.get("delta_value_krw"))) / current_price if current_price > 0 else 0.0)
@@ -1417,6 +1651,8 @@ async def _submit_smart_intent_sell_order(
         update_live_order_log(request_id, {"status": "SUBMITTED", "risk_result": "ALLOWED", "order_uuid": order_uuid, "exchange_request_payload_masked": masked_exchange_request(order), "exchange_response_payload": response})
         if intent_id:
             update_order_intent(int(intent_id), {"promotion_status": "SUBMITTED", "status": "SUBMITTED", "submitted_at": _utc_now()})
+        if accumulator_preview and accumulator_preview.get("accumulator_id"):
+            mark_rebalance_delta_accumulator(int(accumulator_preview["accumulator_id"]), "PROMOTED", {**accumulator_preview, "submitted_request_id": request_id})
         update_live_position(int(position["id"]), {"status": "CLOSING", "exit_order_uuid": order_uuid})
         update_live_strategy_session(int(session["id"]), {"last_order_status": "SUBMITTED", "last_risk_result": "SMART_SELL_SUBMITTED", "last_order_time_utc": _utc_now()})
         return True
@@ -1895,6 +2131,9 @@ def _create_position_from_order(session: dict, order_status: dict, config: LiveS
         if existing:
             _attach_position_to_order_log(entry_order_uuid, int(existing["id"]))
             return int(existing["id"])
+        scale_position_id = _merge_scale_in_order_if_needed(session, entry_order_uuid, order_status)
+        if scale_position_id:
+            return scale_position_id
     entry_price = _float(order_status.get("price"))
     entry_volume = _float(order_status.get("executed_volume")) or _float(order_status.get("volume"))
     entry_amount = entry_price * entry_volume
@@ -1929,6 +2168,48 @@ def _create_position_from_order(session: dict, order_status: dict, config: LiveS
     if entry_order_uuid:
         _attach_position_to_order_log(entry_order_uuid, position_id)
     return position_id
+
+
+def _merge_scale_in_order_if_needed(session: dict, entry_order_uuid: str, order_status: dict) -> int | None:
+    log = get_live_order_log_by_uuid(entry_order_uuid)
+    if not log:
+        return None
+    preview = log.get("order_preview_payload") or {}
+    policy_preview = preview.get("policy_preview") if isinstance(preview, dict) else {}
+    scale_preview = (policy_preview or {}).get("scale_in") if isinstance(policy_preview, dict) else {}
+    if not isinstance(scale_preview, dict) or not scale_preview.get("allowed"):
+        return None
+    position_id = scale_preview.get("position_id") or log.get("position_id")
+    if not position_id:
+        return None
+    position = load_open_live_position(int(session["id"]), session["exchange"], session["market"])
+    if not position or int(position["id"]) != int(position_id):
+        return None
+    fill_price = _float(order_status.get("price")) or _float(log.get("price"))
+    fill_volume = _float(order_status.get("executed_volume")) or _float(order_status.get("volume")) or _float(log.get("executed_volume")) or _float(log.get("volume"))
+    filled_amount = _float(order_status.get("executed_funds")) or _float(order_status.get("filled_amount_krw")) or _float(log.get("filled_amount_krw")) or fill_price * fill_volume
+    if fill_volume <= 0 or filled_amount <= 0:
+        return None
+    previous_volume = _float(position.get("entry_volume"))
+    previous_amount = _float(position.get("entry_amount_krw"))
+    new_volume = previous_volume + fill_volume
+    new_amount = previous_amount + filled_amount
+    new_entry_price = new_amount / new_volume if new_volume > 0 else fill_price
+    update_live_position(
+        int(position_id),
+        {
+            "status": "OPEN",
+            "entry_price": new_entry_price,
+            "entry_volume": new_volume,
+            "entry_amount_krw": new_amount,
+            "current_price": fill_price,
+            "unrealized_pnl": (fill_price * new_volume) - new_amount,
+            "scale_in_count": int(position.get("scale_in_count") or 0) + 1,
+            "last_scale_in_at": _utc_now(),
+        },
+    )
+    update_live_order_log(str(log["request_id"]), {"position_id": int(position_id)})
+    return int(position_id)
 
 
 def _attach_position_to_order_log(order_uuid: str, position_id: int) -> None:
