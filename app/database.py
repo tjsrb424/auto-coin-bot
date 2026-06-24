@@ -38,6 +38,7 @@ REQUIRED_SCHEMA_TABLES = [
     "next_entry_queue",
     "execution_quality_logs",
     "strategy_kill_switch_events",
+    "position_fill_events",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -836,6 +837,24 @@ def init_db() -> None:
                 message TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS position_fill_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_uuid TEXT NOT NULL,
+                position_id INTEGER NOT NULL,
+                fill_type TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                order_log_id INTEGER,
+                request_id TEXT,
+                applied_volume REAL NOT NULL DEFAULT 0,
+                applied_amount_krw REAL NOT NULL DEFAULT 0,
+                applied_fee REAL NOT NULL DEFAULT 0,
+                applied_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(order_uuid, fill_type),
+                FOREIGN KEY(position_id) REFERENCES live_positions(id),
+                FOREIGN KEY(order_log_id) REFERENCES live_order_logs(id)
             );
 
             CREATE TABLE IF NOT EXISTS runtime_locks (
@@ -4266,6 +4285,48 @@ def update_live_position(position_id: int, updates: dict) -> None:
         conn.execute(f"UPDATE live_positions SET {columns} WHERE id = ?", params)
 
 
+def load_position_fill_event(order_uuid: str, fill_type: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM position_fill_events
+            WHERE order_uuid = ?
+              AND fill_type = ?
+            LIMIT 1
+            """,
+            (order_uuid, fill_type),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def insert_position_fill_event(event: dict) -> bool:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO position_fill_events (
+                order_uuid, position_id, fill_type, source, order_log_id, request_id,
+                applied_volume, applied_amount_krw, applied_fee, applied_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["order_uuid"],
+                int(event["position_id"]),
+                event["fill_type"],
+                event.get("source", ""),
+                event.get("order_log_id"),
+                event.get("request_id"),
+                event.get("applied_volume", 0.0),
+                event.get("applied_amount_krw", 0.0),
+                event.get("applied_fee", 0.0),
+                event.get("applied_at", now_utc),
+                now_utc,
+            ),
+        )
+        return cursor.rowcount > 0
+
+
 def upsert_rebalance_delta_accumulator(
     *,
     session_id: int,
@@ -4685,6 +4746,32 @@ def get_live_order_log_by_uuid(order_uuid: str) -> dict | None:
             (order_uuid,),
         ).fetchone()
     return _normalize_live_order_log(dict(row)) if row else None
+
+
+def load_live_order_logs_by_uuid(order_uuid: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_order_logs
+            WHERE order_uuid = ?
+            ORDER BY
+                CASE
+                    WHEN request_id NOT LIKE '%-submitted%'
+                     AND request_id NOT LIKE '%-waiting-%'
+                     AND request_id NOT LIKE '%-partial%'
+                     AND request_id NOT LIKE '%-canceled-%'
+                     AND request_id NOT LIKE '%-filled-%'
+                     AND request_id NOT LIKE '%-failed-%'
+                    THEN 0 ELSE 1
+                END,
+                CASE WHEN position_id IS NOT NULL THEN 0 ELSE 1 END,
+                updated_at ASC,
+                id ASC
+            """,
+            (order_uuid,),
+        ).fetchall()
+    return [_normalize_live_order_log(dict(row)) for row in rows]
 
 
 def load_filled_entry_order_logs_without_position(exchange: str = "bithumb", market: str = "KRW-BTC") -> list[dict]:

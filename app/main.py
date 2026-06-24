@@ -148,6 +148,7 @@ from app.profit_engine import profit_engine_status_payload
 from app.shadow_report import build_shadow_report
 from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
+from app.scale_in_repair import repair_scale_in_duplicate
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
     AUTO_STRATEGY_CONFIRMATION,
@@ -1857,6 +1858,16 @@ async def sync_live_open_orders(exchange: str = Query("bithumb", pattern=r"^(bit
 @app.post("/api/live-recovery/import-exchange-position")
 async def import_exchange_position_endpoint(payload: ImportExchangePositionRequest, exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     result = await import_exchange_btc_position(exchange, DEFAULT_MARKET, confirmation=payload.confirmation)
+    return {**result, "recent_events": recent_recovery_events()}
+
+
+@app.post("/api/live-recovery/repair-scale-in-duplicate")
+async def repair_scale_in_duplicate_endpoint(
+    dry_run: bool = Query(True),
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    market: str = Query("KRW-XLM"),
+) -> dict:
+    result = await repair_scale_in_duplicate(exchange=exchange, market=market, dry_run=dry_run)
     return {**result, "recent_events": recent_recovery_events()}
 
 

@@ -15,7 +15,6 @@ from app.backtest import candles_to_frame
 from app.capital_snapshot import build_capital_snapshot_async, snapshot_is_fresh
 from app.database import (
     count_live_strategy_orders_today,
-    create_live_position,
     create_live_strategy_session,
     get_live_order_log,
     get_live_order_log_by_uuid,
@@ -35,7 +34,6 @@ from app.database import (
     load_open_live_position,
     load_open_live_position_for_strategy,
     load_open_live_positions_for_exchange,
-    load_live_position_by_entry_order_uuid,
     load_running_live_strategy_sessions,
     mark_rebalance_delta_accumulator,
     mark_rebalance_delta_accumulators,
@@ -48,6 +46,7 @@ from app.database import (
     update_live_strategy_session,
     upsert_execution_quality_log,
 )
+from app.live_position_sync import sync_filled_entry_order_to_position
 from app.auto_strategy_selector import evaluate_auto_strategy_selector
 from app.forward_paper import latest_completed_candle
 from app.execution_quality import build_execution_quality_payload
@@ -2025,7 +2024,7 @@ async def _submit_entry_order(
             if reconciled:
                 updates: dict[str, Any] = {"last_order_status": reconciled.status}
                 if reconciled.status == "FILLED":
-                    position_id = _create_position_from_order(session, reconciled.raw, config)
+                    position_id = _sync_filled_entry_position(session, reconciled.raw, config, source="POST_SUBMIT_STATUS_RECHECK")
                     update_order_reservation_status(
                         candidate_strategy_id=int(session["candidate_strategy_id"]),
                         market=market,
@@ -2125,8 +2124,7 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
 
     if state in {"done", "filled"} or (executed_volume > 0 and remaining_volume <= 0):
         _update_order_by_uuid(order_uuid, "FILLED", status)
-        open_position = load_open_live_position(session_id, session.get("exchange", config.allowed_exchange), session.get("market", config.allowed_market))
-        position_id = int(open_position["id"]) if open_position else _create_position_from_order(session, status, config)
+        position_id = _sync_filled_entry_position(session, status, config, source="ORDER_STATUS_SYNC")
         update_order_reservation_status(
             candidate_strategy_id=int(session["candidate_strategy_id"]),
             market=str(session.get("market") or config.allowed_market),
@@ -2203,7 +2201,7 @@ async def _manage_open_order(session: dict, config: LiveStrategyConfig) -> None:
             return
         if reconciled.status == "FILLED" or state in {"done", "filled"} or (executed_volume > 0 and remaining_volume <= 0):
             _update_order_by_uuid(order_uuid, "FILLED", status)
-            position_id = _create_position_from_order(session, status, config)
+            position_id = _sync_filled_entry_position(session, status, config, source="OPEN_ORDER_MANAGEMENT")
             update_live_strategy_session(
                 int(session["id"]),
                 {
@@ -2279,103 +2277,19 @@ async def _handle_emergency(session: dict) -> None:
     )
 
 
-def _create_position_from_order(session: dict, order_status: dict, config: LiveStrategyConfig) -> int:
+def _sync_filled_entry_position(session: dict, order_status: dict, config: LiveStrategyConfig, *, source: str) -> int:
     entry_order_uuid = str(order_status.get("uuid") or order_status.get("order_id") or order_status.get("id") or session.get("current_open_order_uuid") or "")
-    if entry_order_uuid:
-        existing = load_live_position_by_entry_order_uuid(session["exchange"], session["market"], entry_order_uuid)
-        if existing:
-            _attach_position_to_order_log(entry_order_uuid, int(existing["id"]))
-            return int(existing["id"])
-        scale_position_id = _merge_scale_in_order_if_needed(session, entry_order_uuid, order_status)
-        if scale_position_id:
-            return scale_position_id
-    entry_price = _float(order_status.get("price"))
-    entry_volume = _float(order_status.get("executed_volume")) or _float(order_status.get("volume"))
-    entry_amount = entry_price * entry_volume
-    stop_loss_price = entry_price * (1 - config.stop_loss_percent / 100) if entry_price > 0 else 0.0
-    take_profit_price = entry_price * (1 + config.take_profit_percent / 100) if entry_price > 0 else 0.0
-    trailing_stop_pct = float(os.getenv("AUTO_TRAILING_STOP_PERCENT", "0.7"))
-    trailing_stop_price = entry_price * (1 - trailing_stop_pct / 100) if entry_price > 0 and trailing_stop_pct > 0 else 0.0
-    position_id = create_live_position(
-        {
-            "session_id": session["id"],
-            "exchange": session["exchange"],
-            "market": session["market"],
-            "candidate_strategy_id": session["candidate_strategy_id"],
-            "strategy_name": session["strategy_name"],
-            "status": "OPEN",
-            "entry_order_uuid": entry_order_uuid,
-            "entry_price": entry_price,
-            "entry_volume": entry_volume,
-            "entry_amount_krw": entry_amount,
-            "current_price": entry_price,
-            "unrealized_pnl": 0.0,
-            "realized_pnl": 0.0,
-            "stop_loss_price": stop_loss_price,
-            "take_profit_price": take_profit_price,
-            "highest_price_since_entry": entry_price,
-            "trailing_stop_price": trailing_stop_price,
-            "trailing_stop_pct": trailing_stop_pct,
-            "last_trailing_update_at": _utc_now(),
-            "opened_at": _utc_now(),
-        }
+    log = get_live_order_log_by_uuid(entry_order_uuid) if entry_order_uuid else None
+    session_for_sync = {**session, "config": config}
+    result = sync_filled_entry_order_to_position(
+        log,
+        order_status,
+        source,
+        session=session_for_sync,
     )
-    if entry_order_uuid:
-        _attach_position_to_order_log(entry_order_uuid, position_id)
-    return position_id
-
-
-def _merge_scale_in_order_if_needed(session: dict, entry_order_uuid: str, order_status: dict) -> int | None:
-    log = get_live_order_log_by_uuid(entry_order_uuid)
-    if not log:
-        return None
-    preview = log.get("order_preview_payload") or {}
-    policy_preview = preview.get("policy_preview") if isinstance(preview, dict) else {}
-    scale_preview = (policy_preview or {}).get("scale_in") if isinstance(policy_preview, dict) else {}
-    if not isinstance(scale_preview, dict) or not scale_preview.get("allowed"):
-        return None
-    position_id = scale_preview.get("position_id") or log.get("position_id")
-    if not position_id:
-        return None
-    position = load_open_live_position(int(session["id"]), session["exchange"], session["market"])
-    if not position or int(position["id"]) != int(position_id):
-        return None
-    fill_price = _float(order_status.get("price")) or _float(log.get("price"))
-    fill_volume = _float(order_status.get("executed_volume")) or _float(order_status.get("volume")) or _float(log.get("executed_volume")) or _float(log.get("volume"))
-    filled_amount = _float(order_status.get("executed_funds")) or _float(order_status.get("filled_amount_krw")) or _float(log.get("filled_amount_krw")) or fill_price * fill_volume
-    if fill_volume <= 0 or filled_amount <= 0:
-        return None
-    previous_volume = _float(position.get("entry_volume"))
-    previous_amount = _float(position.get("entry_amount_krw"))
-    new_volume = previous_volume + fill_volume
-    new_amount = previous_amount + filled_amount
-    new_entry_price = new_amount / new_volume if new_volume > 0 else fill_price
-    update_live_position(
-        int(position_id),
-        {
-            "status": "OPEN",
-            "entry_price": new_entry_price,
-            "entry_volume": new_volume,
-            "entry_amount_krw": new_amount,
-            "current_price": fill_price,
-            "unrealized_pnl": (fill_price * new_volume) - new_amount,
-            "scale_in_count": int(position.get("scale_in_count") or 0) + 1,
-            "last_scale_in_at": _utc_now(),
-        },
-    )
-    update_live_order_log(str(log["request_id"]), {"position_id": int(position_id)})
-    return int(position_id)
-
-
-def _attach_position_to_order_log(order_uuid: str, position_id: int) -> None:
-    log = get_live_order_log_by_uuid(order_uuid)
-    if not log:
-        return
-    if str(log.get("order_purpose") or "ENTRY").upper() != "ENTRY":
-        return
-    if log.get("position_id"):
-        return
-    update_live_order_log(str(log["request_id"]), {"position_id": position_id})
+    if result.get("position_id"):
+        return int(result["position_id"])
+    raise RuntimeError(f"filled entry position sync failed: {result}")
 
 
 def _insert_blocked_log(session: dict, risk_result: str, message: str | None, candle_time_utc: str | None, signal: dict | None, order: dict | None = None, preview: dict | None = None) -> None:

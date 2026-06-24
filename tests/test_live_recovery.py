@@ -12,6 +12,7 @@ from app import database
 from app.live_recovery import (
     apply_reconciled_order_status,
     ensure_filled_entry_order_positions,
+    ensure_filled_entry_order_position,
     is_timeout_exception,
     normalize_exchange_order,
     reconcile_balances,
@@ -19,6 +20,7 @@ from app.live_recovery import (
     run_startup_live_recovery_async,
     sync_open_orders,
 )
+from app.scale_in_repair import repair_scale_in_duplicate
 from app.risk_manager import compute_risk_state
 
 
@@ -61,6 +63,29 @@ def create_strategy_session() -> int:
             "max_orders_per_day": 0,
         }
     )
+
+
+def live_position(session_id: int, **overrides: object) -> dict:
+    position = {
+        "session_id": session_id,
+        "exchange": "bithumb",
+        "market": "KRW-BTC",
+        "candidate_strategy_id": 1,
+        "strategy_name": "ma_cross",
+        "status": "OPEN",
+        "entry_order_uuid": "entry-1",
+        "entry_price": 100_000_000,
+        "entry_volume": 0.0001,
+        "entry_amount_krw": 10_000,
+        "current_price": 100_000_000,
+        "unrealized_pnl": 0.0,
+        "realized_pnl": 0.0,
+        "stop_loss_price": 99_000_000,
+        "take_profit_price": 101_000_000,
+        "opened_at": "2026-06-16T00:00:00Z",
+    }
+    position.update(overrides)
+    return position
 
 
 class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -668,6 +693,135 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         updated = database.get_live_order_log("filled-entry")
         assert updated is not None
         self.assertIsNotNone(updated["position_id"])
+
+    def test_scale_in_filled_entry_merges_existing_position(self) -> None:
+        old_session_id = create_strategy_session()
+        target_position_id = database.create_live_position(live_position(old_session_id))
+        scale_session_id = create_strategy_session()
+        preview = {
+            "policy_preview": {
+                "scale_in": {
+                    "scale_in": True,
+                    "allowed": True,
+                    "position_id": target_position_id,
+                    "blockers": [],
+                }
+            }
+        }
+        database.insert_live_order_log(
+            {
+                **order_log("scale-in-filled"),
+                "session_id": scale_session_id,
+                "status": "FILLED",
+                "order_uuid": "scale-in-order",
+                "price": 100_000_000,
+                "volume": 0.00005,
+                "executed_volume": 0.00005,
+                "remaining_volume": 0.0,
+                "filled_amount_krw": 5_000,
+                "order_preview_payload": preview,
+            }
+        )
+        log = database.get_live_order_log("scale-in-filled")
+        assert log is not None
+
+        result = ensure_filled_entry_order_position(log)
+
+        self.assertEqual(result, "ATTACHED")
+        positions = database.load_open_live_positions("bithumb", "KRW-BTC")
+        self.assertEqual(len(positions), 1)
+        updated = database.load_live_position(target_position_id)
+        assert updated is not None
+        self.assertAlmostEqual(updated["entry_volume"], 0.00015)
+        self.assertAlmostEqual(updated["entry_amount_krw"], 15_000)
+        self.assertEqual(updated["scale_in_count"], 1)
+        self.assertIsNotNone(updated["last_scale_in_at"])
+        order = database.get_live_order_log("scale-in-filled")
+        assert order is not None
+        self.assertEqual(order["position_id"], target_position_id)
+
+    def test_scale_in_duplicate_uuid_is_idempotent(self) -> None:
+        session_id = create_strategy_session()
+        target_position_id = database.create_live_position(live_position(session_id))
+        preview = {
+            "policy_preview": {
+                "scale_in": {
+                    "scale_in": True,
+                    "allowed": True,
+                    "position_id": target_position_id,
+                    "blockers": [],
+                }
+            }
+        }
+        base = {
+            **order_log("scale-in-canonical"),
+            "session_id": session_id,
+            "status": "FILLED",
+            "order_uuid": "scale-in-dup",
+            "price": 100_000_000,
+            "volume": 0.00005,
+            "executed_volume": 0.00005,
+            "remaining_volume": 0.0,
+            "filled_amount_krw": 5_000,
+            "order_preview_payload": preview,
+        }
+        database.insert_live_order_log(base)
+        database.insert_live_order_log({**base, "request_id": "scale-in-canonical-filled-1", "position_id": None})
+        database.insert_live_order_log({**base, "request_id": "scale-in-canonical-filled-2", "position_id": None})
+
+        for request_id in ["scale-in-canonical", "scale-in-canonical-filled-1", "scale-in-canonical-filled-2"]:
+            log = database.get_live_order_log(request_id)
+            assert log is not None
+            ensure_filled_entry_order_position(log)
+
+        updated = database.load_live_position(target_position_id)
+        assert updated is not None
+        self.assertAlmostEqual(updated["entry_volume"], 0.00015)
+        self.assertAlmostEqual(updated["entry_amount_krw"], 15_000)
+        self.assertEqual(updated["scale_in_count"], 1)
+        for request_id in ["scale-in-canonical", "scale-in-canonical-filled-1", "scale-in-canonical-filled-2"]:
+            log = database.get_live_order_log(request_id)
+            assert log is not None
+            self.assertEqual(log["position_id"], target_position_id)
+
+    async def test_duplicate_repair_preview_marks_inactive_ask_accumulator(self) -> None:
+        session_id = create_strategy_session()
+        target_position_id = database.create_live_position(live_position(session_id, entry_order_uuid="target-entry"))
+        duplicate_uuid = "duplicate-entry"
+        duplicate_a = database.create_live_position(live_position(session_id, entry_order_uuid=duplicate_uuid))
+        database.create_live_position(live_position(session_id, entry_order_uuid=duplicate_uuid, status="CLOSED", closed_at="2026-06-16T01:00:00Z"))
+        preview = {"policy_preview": {"scale_in": {"scale_in": True, "allowed": True, "position_id": target_position_id}}}
+        database.insert_live_order_log(
+            {
+                **order_log("duplicate-entry-log"),
+                "session_id": session_id,
+                "status": "FILLED",
+                "order_uuid": duplicate_uuid,
+                "executed_volume": 0.0001,
+                "filled_amount_krw": 10_000,
+                "order_preview_payload": preview,
+            }
+        )
+        database.update_live_strategy_session(session_id, {"status": "LIVE_PAUSED", "auto_enabled": False})
+        database.upsert_rebalance_delta_accumulator(
+            session_id=session_id,
+            candidate_strategy_id=1,
+            exchange="bithumb",
+            market="KRW-BTC",
+            side="ASK",
+            delta_krw=20_000,
+        )
+        broker = AsyncMock()
+        broker.get_balances.return_value = {"by_currency": {"BTC": {"balance": 0.0001, "locked": 0.0}}}
+
+        with patch("app.scale_in_repair.get_live_broker", return_value=broker):
+            result = await repair_scale_in_duplicate(exchange="bithumb", market="KRW-BTC", dry_run=True)
+
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["duplicate_groups"][0]["duplicate_entry_order_uuid"], duplicate_uuid)
+        self.assertEqual(result["duplicate_groups"][0]["target_scale_in_position_id"], target_position_id)
+        self.assertEqual(result["duplicate_groups"][0]["duplicate_positions_to_close_or_reconcile"][0]["id"], duplicate_a)
+        self.assertEqual(result["inactive_ask_accumulators_to_stale"][0]["side"], "ASK")
 
     def test_timeout_exception_detection_blocks_retry_path(self) -> None:
         self.assertTrue(is_timeout_exception(httpx.ReadTimeout("timed out")))
