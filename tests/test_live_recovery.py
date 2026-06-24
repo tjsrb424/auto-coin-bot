@@ -823,6 +823,61 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["duplicate_groups"][0]["duplicate_positions_to_close_or_reconcile"][0]["id"], duplicate_a)
         self.assertEqual(result["inactive_ask_accumulators_to_stale"][0]["side"], "ASK")
 
+    async def test_duplicate_repair_apply_attaches_logs_and_records_fill_event(self) -> None:
+        session_id = create_strategy_session()
+        target_position_id = database.create_live_position(live_position(session_id, entry_order_uuid="target-entry"))
+        duplicate_uuid = "duplicate-entry"
+        duplicate_position_id = database.create_live_position(live_position(session_id, entry_order_uuid=duplicate_uuid))
+        database.create_live_position(live_position(session_id, entry_order_uuid=duplicate_uuid, status="CLOSED", closed_at="2026-06-16T01:00:00Z"))
+        preview = {"policy_preview": {"scale_in": {"scale_in": True, "allowed": True, "position_id": target_position_id}}}
+        base = {
+            **order_log("duplicate-entry-log"),
+            "session_id": session_id,
+            "status": "FILLED",
+            "order_uuid": duplicate_uuid,
+            "executed_volume": 0.0001,
+            "filled_amount_krw": 10_000,
+            "order_preview_payload": preview,
+        }
+        database.insert_live_order_log(base)
+        database.insert_live_order_log({**base, "request_id": "duplicate-entry-log-filled", "position_id": None})
+        database.update_live_strategy_session(session_id, {"current_position_id": duplicate_position_id})
+        database.upsert_rebalance_delta_accumulator(
+            session_id=session_id,
+            candidate_strategy_id=1,
+            exchange="bithumb",
+            market="KRW-BTC",
+            side="ASK",
+            delta_krw=20_000,
+        )
+        database.update_live_strategy_session(session_id, {"status": "LIVE_PAUSED", "auto_enabled": False})
+        broker = AsyncMock()
+        broker.get_balances.return_value = {"by_currency": {"BTC": {"balance": 0.0001, "locked": 0.0}}}
+
+        with patch("app.scale_in_repair.get_live_broker", return_value=broker):
+            result = await repair_scale_in_duplicate(exchange="bithumb", market="KRW-BTC", dry_run=False)
+
+        self.assertTrue(result["applied"])
+        duplicate_position = database.load_live_position(duplicate_position_id)
+        assert duplicate_position is not None
+        self.assertEqual(duplicate_position["status"], "DUPLICATE_RECONCILED")
+        session = database.load_latest_live_strategy_session()
+        assert session is not None
+        self.assertEqual(session["current_position_id"], target_position_id)
+        self.assertEqual(database.get_live_order_log("duplicate-entry-log")["position_id"], target_position_id)
+        self.assertEqual(database.get_live_order_log("duplicate-entry-log-filled")["position_id"], target_position_id)
+        event = database.load_position_fill_event(duplicate_uuid, "SCALE_IN")
+        assert event is not None
+        self.assertEqual(event["position_id"], target_position_id)
+        self.assertEqual(event["applied_volume"], 0.0)
+        with database.get_connection() as conn:
+            accumulator = conn.execute(
+                "SELECT * FROM rebalance_delta_accumulators WHERE session_id = ? AND market = ?",
+                (session_id, "KRW-BTC"),
+            ).fetchone()
+        assert accumulator is not None
+        self.assertEqual(dict(accumulator)["status"], "STALE")
+
     def test_timeout_exception_detection_blocks_retry_path(self) -> None:
         self.assertTrue(is_timeout_exception(httpx.ReadTimeout("timed out")))
         self.assertTrue(is_timeout_exception(RuntimeError("request timeout")))

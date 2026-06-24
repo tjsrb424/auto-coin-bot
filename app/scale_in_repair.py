@@ -145,6 +145,31 @@ def _proposed_duplicate_updates(group: dict, exchange_balance: dict) -> dict:
                 "reason": "duplicate scale-in entry_order_uuid; not the target position",
             }
         )
+    if target_position_id:
+        for log in logs:
+            if str(log.get("side") or "").upper() == "BUY" and str(log.get("order_purpose") or "ENTRY").upper() == "ENTRY":
+                proposed_updates.append(
+                    {
+                        "table": "live_order_logs",
+                        "id": log["id"],
+                        "request_id": log["request_id"],
+                        "set": {"position_id": int(target_position_id)},
+                        "reason": "attach duplicate scale-in BUY log to target position",
+                    }
+                )
+        proposed_updates.append(
+            {
+                "table": "position_fill_events",
+                "order_uuid": order_uuid,
+                "set": {
+                    "position_id": int(target_position_id),
+                    "fill_type": "SCALE_IN",
+                    "applied_volume": 0.0,
+                    "applied_amount_krw": 0.0,
+                },
+                "reason": "idempotency guard; duplicate BUY was already netted by later SELL",
+            }
+        )
     active_sessions = _rows(
         """
         SELECT *
@@ -232,6 +257,41 @@ async def repair_scale_in_duplicate(
                 applied_updates.append({"live_positions": int(pos["id"]), "status": "DUPLICATE_RECONCILED"})
             target_position_id = preview.get("target_scale_in_position_id")
             if target_position_id:
+                for log in preview["affected_live_order_logs"]:
+                    if str(log.get("side") or "").upper() == "BUY" and str(log.get("order_purpose") or "ENTRY").upper() == "ENTRY":
+                        conn.execute(
+                            """
+                            UPDATE live_order_logs
+                            SET position_id = ?,
+                                updated_at = ?
+                            WHERE request_id = ?
+                            """,
+                            (int(target_position_id), now, str(log["request_id"])),
+                        )
+                        applied_updates.append({"live_order_logs": int(log["id"]), "position_id": int(target_position_id)})
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO position_fill_events (
+                        order_uuid, position_id, fill_type, source, order_log_id, request_id,
+                        applied_volume, applied_amount_krw, applied_fee, applied_at, created_at
+                    ) VALUES (?, ?, 'SCALE_IN', 'SCALE_IN_DUPLICATE_REPAIR_NETTED_BY_EXIT', ?, ?, 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        preview["duplicate_entry_order_uuid"],
+                        int(target_position_id),
+                        preview["affected_live_order_logs"][0]["id"] if preview["affected_live_order_logs"] else None,
+                        preview["affected_live_order_logs"][0]["request_id"] if preview["affected_live_order_logs"] else None,
+                        now,
+                        now,
+                    ),
+                )
+                applied_updates.append(
+                    {
+                        "position_fill_events": preview["duplicate_entry_order_uuid"],
+                        "fill_type": "SCALE_IN",
+                        "inserted": cursor.rowcount > 0,
+                    }
+                )
                 conn.execute(
                     """
                     UPDATE live_strategy_sessions
