@@ -140,6 +140,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         seconds_since_last_order: float | None = None,
         signal: str = "HOLD",
         market_regime: str = "RANGE",
+        action_hint: str = "BUY_MORE",
         intent_blockers: list[str] | None = None,
         open_position: dict | None = None,
         extra_env: dict | None = None,
@@ -157,6 +158,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
             target_source=target_source,
             core_exposure_pct=core_exposure_pct,
             core_exposure_applied=core_exposure_applied,
+            action_hint=action_hint,
             blockers=intent_blockers,
         )
         if open_position is not None:
@@ -492,9 +494,35 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         updated_intent = updated["order_intents"][0]
         self.assertEqual(updated_intent["status"], "BLOCKED")
         self.assertEqual(updated_intent["promotion_status"], "DUST_HOLD")
-        self.assertEqual(updated_intent["promotion_blockers"], ["SMART_MIN_REBALANCE_DELTA"])
+        self.assertEqual(updated_intent["promotion_blockers"], ["SMART_SELL_AMOUNT_BELOW_MIN"])
         self.assertEqual(updated_intent["policy_preview"]["dust_side"], "SELL")
-        self.assertEqual(updated_intent["policy_preview"]["accumulated_delta_krw"], 0.49)
+        self.assertEqual(updated_intent["policy_preview"]["accumulator_status"], "DISCARDED_DUST")
+
+    def test_rebalance_delta_accumulator_caps_to_sellable_value(self) -> None:
+        first = database.upsert_rebalance_delta_accumulator(
+            session_id=119,
+            candidate_strategy_id=54,
+            exchange="bithumb",
+            market="KRW-XLM",
+            side="ASK",
+            delta_krw=4_000,
+            qty=13.0,
+            max_accumulated_krw=6_000,
+        )
+        second = database.upsert_rebalance_delta_accumulator(
+            session_id=119,
+            candidate_strategy_id=54,
+            exchange="bithumb",
+            market="KRW-XLM",
+            side="ASK",
+            delta_krw=4_000,
+            qty=13.0,
+            max_accumulated_krw=6_000,
+        )
+
+        self.assertEqual(first["accumulated_delta_krw"], 4_000)
+        self.assertEqual(second["accumulated_delta_krw"], 6_000)
+        self.assertTrue(second["_capped"])
 
     async def test_smart_sell_sweeps_full_position_when_remainder_would_be_dust(self) -> None:
         database.update_bot_operation_policy("KRW-BTC", {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 3})
@@ -613,6 +641,59 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent["promotion_status"], "BLOCKED")
         self.assertEqual(intent["promotion_blockers"], ["BLOCKED_SCALE_IN_POSITION_LOSING"])
         self.assertTrue(intent["policy_preview"]["scale_in"]["scale_in"])
+        self.assertEqual(intent["policy_preview"]["scale_in"]["blockers"], ["BLOCKED_SCALE_IN_POSITION_LOSING"])
+
+    async def test_scale_in_uses_smart_buy_more_when_legacy_signal_holds(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=10_000,
+            current_value=10_000,
+            available_krw=200_000,
+            signal="HOLD",
+            market_regime="TREND_UP",
+            action_hint="BUY_MORE",
+            open_position={
+                "entry_price": 99_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 9_900,
+                "current_price": 100_000_000,
+            },
+            extra_env={
+                "RISK_BLOCK_ON_OPEN_POSITION": "true",
+                "AUTO_SCALE_IN_ENABLED": "true",
+                "AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL": "true",
+            },
+        )
+
+        broker.place_order.assert_awaited_once()
+        intent = snapshot["order_intents"][0]
+        self.assertTrue(intent["policy_preview"]["scale_in"]["allowed"])
+        self.assertIn("ACTION_BUY_MORE", intent["policy_preview"]["scale_in"]["buy_signal_sources"])
+
+    async def test_scale_in_requires_buy_context_when_configured(self) -> None:
+        broker, snapshot = await self.submit_bid_intent(
+            amount_requested=10_000,
+            current_value=10_000,
+            available_krw=200_000,
+            signal="HOLD",
+            market_regime="RANGE",
+            action_hint="HOLD_POSITION",
+            open_position={
+                "entry_price": 99_000_000,
+                "entry_volume": 0.0001,
+                "entry_amount_krw": 9_900,
+                "current_price": 100_000_000,
+            },
+            extra_env={
+                "RISK_BLOCK_ON_OPEN_POSITION": "true",
+                "AUTO_SCALE_IN_ENABLED": "true",
+                "AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL": "true",
+            },
+        )
+
+        broker.place_order.assert_not_awaited()
+        intent = snapshot["order_intents"][0]
+        self.assertEqual(intent["promotion_blockers"], ["BLOCKED_SCALE_IN_REQUIRE_BUY_SIGNAL"])
+        self.assertEqual(intent["policy_preview"]["scale_in"]["blockers"], ["BLOCKED_SCALE_IN_REQUIRE_BUY_SIGNAL"])
 
     async def test_scale_in_allows_profitable_open_position(self) -> None:
         broker, snapshot = await self.submit_bid_intent(

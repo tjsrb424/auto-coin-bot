@@ -4276,10 +4276,14 @@ def upsert_rebalance_delta_accumulator(
     delta_krw: float,
     qty: float = 0.0,
     metadata: dict | None = None,
+    max_accumulated_krw: float | None = None,
 ) -> dict:
     now_utc = _utc_now()
     normalized_side = side.upper()
     metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+    delta_abs = abs(delta_krw)
+    qty_abs = abs(qty)
+    max_accumulated = None if max_accumulated_krw is None else max(float(max_accumulated_krw), 0.0)
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -4297,19 +4301,36 @@ def upsert_rebalance_delta_accumulator(
             (session_id, candidate_strategy_id, exchange, market, normalized_side),
         ).fetchone()
         if row:
+            current_delta = float(row["accumulated_delta_krw"] or 0.0)
+            new_delta = current_delta + delta_abs
+            capped = False
+            if max_accumulated is not None and new_delta > max_accumulated:
+                new_delta = max_accumulated
+                capped = True
+            effective_delta = max(new_delta - current_delta, 0.0)
+            effective_qty = qty_abs * (effective_delta / delta_abs) if delta_abs > 0 else 0.0
             conn.execute(
                 """
                 UPDATE rebalance_delta_accumulators
-                SET accumulated_delta_krw = accumulated_delta_krw + ?,
+                SET accumulated_delta_krw = ?,
                     accumulated_qty = accumulated_qty + ?,
                     metadata_json = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (abs(delta_krw), abs(qty), metadata_json, now_utc, row["id"]),
+                (new_delta, effective_qty, metadata_json, now_utc, row["id"]),
             )
             updated = conn.execute("SELECT * FROM rebalance_delta_accumulators WHERE id = ?", (row["id"],)).fetchone()
-            return dict(updated)
+            result = dict(updated)
+            result["_capped"] = capped
+            result["_effective_delta_krw"] = effective_delta
+            return result
+        initial_delta = delta_abs
+        capped = False
+        if max_accumulated is not None and initial_delta > max_accumulated:
+            initial_delta = max_accumulated
+            capped = True
+        effective_qty = qty_abs * (initial_delta / delta_abs) if delta_abs > 0 else 0.0
         cursor = conn.execute(
             """
             INSERT INTO rebalance_delta_accumulators (
@@ -4317,16 +4338,19 @@ def upsert_rebalance_delta_accumulator(
                 accumulated_delta_krw, accumulated_qty, metadata_json, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, candidate_strategy_id, exchange, market, normalized_side, abs(delta_krw), abs(qty), metadata_json, now_utc, now_utc),
+            (session_id, candidate_strategy_id, exchange, market, normalized_side, initial_delta, effective_qty, metadata_json, now_utc, now_utc),
         )
         created = conn.execute("SELECT * FROM rebalance_delta_accumulators WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        return dict(created)
+        result = dict(created)
+        result["_capped"] = capped
+        result["_effective_delta_krw"] = initial_delta
+        return result
 
 
 def mark_rebalance_delta_accumulator(accumulator_id: int, status: str, metadata: dict | None = None) -> None:
     now_utc = _utc_now()
     values: dict[str, object] = {"status": status, "updated_at": now_utc}
-    if status in {"PROMOTED", "DISCARDED"}:
+    if status in {"PROMOTED", "DISCARDED", "STALE", "DISCARDED_DUST"}:
         values["flushed_at"] = now_utc
     if metadata is not None:
         values["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
@@ -4334,6 +4358,52 @@ def mark_rebalance_delta_accumulator(accumulator_id: int, status: str, metadata:
     params = [*values.values(), accumulator_id]
     with get_connection() as conn:
         conn.execute(f"UPDATE rebalance_delta_accumulators SET {columns} WHERE id = ?", params)
+
+
+def mark_rebalance_delta_accumulators(
+    *,
+    session_id: int,
+    candidate_strategy_id: int | None,
+    exchange: str,
+    market: str,
+    side: str,
+    status: str,
+    metadata: dict | None = None,
+    previous_status: str = "ACCUMULATING",
+) -> int:
+    now_utc = _utc_now()
+    normalized_side = side.upper()
+    values: dict[str, object] = {"status": status, "updated_at": now_utc}
+    if status in {"PROMOTED", "DISCARDED", "STALE", "DISCARDED_DUST"}:
+        values["flushed_at"] = now_utc
+    if metadata is not None:
+        values["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+    columns = ", ".join(f"{key} = ?" for key in values)
+    params = [
+        *values.values(),
+        session_id,
+        candidate_strategy_id,
+        exchange,
+        market,
+        normalized_side,
+        previous_status,
+    ]
+    with get_connection() as conn:
+        before = conn.total_changes
+        conn.execute(
+            f"""
+            UPDATE rebalance_delta_accumulators
+            SET {columns}
+            WHERE session_id = ?
+              AND COALESCE(candidate_strategy_id, -1) = COALESCE(?, -1)
+              AND exchange = ?
+              AND market = ?
+              AND side = ?
+              AND status = ?
+            """,
+            params,
+        )
+        return conn.total_changes - before
 
 
 def create_exit_candidate(candidate: dict) -> int:

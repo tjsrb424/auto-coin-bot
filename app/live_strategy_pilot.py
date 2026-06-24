@@ -30,6 +30,7 @@ from app.database import (
     load_candles,
     load_global_bot_operation_policy,
     load_latest_live_strategy_session,
+    load_live_position,
     load_live_order_logs,
     load_open_live_position,
     load_open_live_position_for_strategy,
@@ -37,6 +38,7 @@ from app.database import (
     load_live_position_by_entry_order_uuid,
     load_running_live_strategy_sessions,
     mark_rebalance_delta_accumulator,
+    mark_rebalance_delta_accumulators,
     market_is_live_allowed,
     update_order_intent,
     upsert_rebalance_delta_accumulator,
@@ -1058,6 +1060,33 @@ def _position_pnl_percent(position: dict, current_price: float) -> float:
     return (current_value - entry_amount) / entry_amount * 100
 
 
+def _scale_in_reject(preview: dict, blocker: str, **extra: Any) -> dict:
+    blockers = [*list(preview.get("blockers") or []), blocker]
+    return {**preview, **extra, "allowed": False, "blocker": blocker, "blockers": blockers}
+
+
+def _smart_buy_signal_ok(signal: dict, intent: dict, smart_snapshot: dict) -> tuple[bool, dict]:
+    legacy_signal = str(signal.get("signal") or smart_snapshot.get("legacy_signal") or "").upper()
+    action_hint = str(intent.get("action_hint") or smart_snapshot.get("action_hint") or "").upper()
+    intent_side = str(intent.get("side") or "").upper()
+    risk_preview = intent.get("risk_preview") or {}
+    risk_preview_valid = bool(risk_preview) and bool(risk_preview.get("allowed"))
+    sources: list[str] = []
+    if legacy_signal == "BUY":
+        sources.append("LEGACY_BUY")
+    if action_hint in {"BUY_MORE", "INCREASE_EXPOSURE"}:
+        sources.append(f"ACTION_{action_hint}")
+    if intent_side in {"BID", "BUY"} and risk_preview_valid:
+        sources.append("INTENT_BID")
+    return bool(sources), {
+        "legacy_signal": legacy_signal or None,
+        "action_hint": action_hint or None,
+        "intent_side": intent_side or None,
+        "risk_preview_valid": risk_preview_valid,
+        "buy_signal_sources": sources,
+    }
+
+
 def _scale_in_block(
     session: dict,
     intent_id: Any,
@@ -1112,37 +1141,40 @@ async def _scale_in_preview(
         "available_budget_krw": None,
         "available_krw": available_krw,
         "amount_krw": amount,
+        "blockers": [],
     }
     if not _env_bool("AUTO_SCALE_IN_ENABLED", True):
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_DISABLED"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_DISABLED")
     if str(position.get("status") or "").upper() != "OPEN":
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_EDGE_BROKEN", "status": position.get("status")}
-    if _env_bool("AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL", True) and str(signal.get("signal") or "").upper() != "BUY":
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_EDGE_BROKEN", "signal": signal.get("signal")}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_EDGE_BROKEN", status=position.get("status"))
+    buy_ok, buy_preview = _smart_buy_signal_ok(signal, intent, smart_snapshot)
+    preview = {**preview, **buy_preview}
+    if _env_bool("AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL", True) and not buy_ok:
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_REQUIRE_BUY_SIGNAL")
     if _env_bool("AUTO_SCALE_IN_BLOCK_TREND_DOWN", True) and str(market_regime).upper() == "TREND_DOWN":
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_TREND_DOWN"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_TREND_DOWN")
     if _env_bool("AUTO_SCALE_IN_NO_AVERAGING_DOWN", True) and preview["current_position_pnl_pct"] < preview["min_position_pnl_pct"]:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_POSITION_LOSING"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_POSITION_LOSING")
     if preview["scale_in_count"] >= preview["max_count"]:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_MAX_COUNT"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_MAX_COUNT")
     remaining_interval = 0
     if position.get("last_scale_in_at"):
         remaining_interval = max(preview["min_interval_seconds"] - int(_seconds_since(str(position["last_scale_in_at"]))), 0)
     preview["remaining_interval_seconds"] = remaining_interval
     if remaining_interval > 0:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_INTERVAL"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_INTERVAL")
     if available_krw < min_order_krw:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED", "available_krw": available_krw}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_RISK_PREVIEW_MISSING", available_krw=available_krw)
     try:
         snapshot = await build_capital_snapshot_async(exchange)
     except Exception as exc:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED", "snapshot_error": str(exc)}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_RISK_PREVIEW_MISSING", snapshot_error=str(exc))
     preview["available_budget_krw"] = snapshot.get("available_budget_krw")
     preview["snapshot_blockers"] = snapshot.get("blockers") or []
     if not snapshot_is_fresh(snapshot) or snapshot.get("balance_mismatch_detected") or snapshot.get("open_order_mismatch_detected"):
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_RISK_PREVIEW_MISSING")
     if _float(snapshot.get("available_budget_krw")) < min_order_krw:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_SNAPSHOT_FAILED"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_RISK_PREVIEW_MISSING")
     max_total = _float(smart_snapshot.get("max_total_exposure_krw"))
     current_position_value = _float(position.get("entry_volume")) * current_price
     max_position_value = max_total * preview["max_position_exposure_pct"] / 100 if max_total > 0 else 0.0
@@ -1150,13 +1182,14 @@ async def _scale_in_preview(
     preview["projected_position_value_krw"] = current_position_value + amount
     preview["max_position_value_krw"] = max_position_value
     if max_position_value > 0 and current_position_value + amount > max_position_value:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_MAX_EXPOSURE"}
+        return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_MAX_EXPOSURE")
     blockers = list(intent.get("blockers") or []) + list(smart_snapshot.get("blockers") or [])
     blockers += list(smart_snapshot.get("aggressive_buy_blockers") or [])
     ignored = {"SMART_MIN_REBALANCE_DELTA"}
     hard_blockers = [blocker for blocker in blockers if blocker not in ignored]
     if hard_blockers:
-        return position, {**preview, "allowed": False, "blocker": "BLOCKED_SCALE_IN_EDGE_BROKEN", "edge_blockers": hard_blockers}
+        blocker = "BLOCKED_SCALE_IN_RISK_PREVIEW_MISSING" if "SMART_RISK_PREVIEW_MISSING" in hard_blockers else "BLOCKED_SCALE_IN_EDGE_BROKEN"
+        return position, _scale_in_reject(preview, blocker, edge_blockers=hard_blockers)
     return position, {**preview, "allowed": True}
 
 
@@ -1167,6 +1200,7 @@ def _accumulate_rebalance_delta(
     amount_requested: float,
     current_price: float,
     min_order_krw: float,
+    max_accumulated_krw: float | None = None,
 ) -> tuple[float, dict | None]:
     accumulator = upsert_rebalance_delta_accumulator(
         session_id=int(session["id"]),
@@ -1181,7 +1215,9 @@ def _accumulate_rebalance_delta(
             "target_source": intent.get("target_source"),
             "blockers": intent.get("blockers") or [],
             "policy_preview": intent.get("policy_preview") or {},
+            "max_accumulated_krw": max_accumulated_krw,
         },
+        max_accumulated_krw=max_accumulated_krw,
     )
     accumulated = _float(accumulator.get("accumulated_delta_krw"))
     preview = {
@@ -1190,10 +1226,52 @@ def _accumulate_rebalance_delta(
         "accumulated_delta_krw": accumulated,
         "min_order_krw": min_order_krw,
         "accumulator_status": accumulator.get("status"),
+        "max_accumulated_krw": max_accumulated_krw,
+        "capped": bool(accumulator.get("_capped")),
+        "effective_delta_krw": accumulator.get("_effective_delta_krw"),
     }
     if accumulated < min_order_krw:
         return amount_requested, preview
     return accumulated, {**preview, "promoted_order_krw": accumulated}
+
+
+def _load_rebalance_position(session: dict, exchange: str, market: str) -> dict | None:
+    position_id = session.get("current_position_id")
+    if position_id:
+        position = load_live_position(int(position_id))
+        if position and str(position.get("status") or "").upper() in {"OPEN", "EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED"}:
+            return position
+    return load_open_live_position(int(session["id"]), exchange, market) or load_open_live_position(None, exchange, market)
+
+
+def _sellable_position_value_krw(position: dict | None, current_price: float) -> float:
+    if not position:
+        return 0.0
+    return max(_float(position.get("entry_volume")), 0.0) * max(current_price, 0.0)
+
+
+def _mark_sell_accumulator_stale_if_buy_context(session: dict, intent: dict, smart_snapshot: dict) -> None:
+    action_hint = str(intent.get("action_hint") or smart_snapshot.get("action_hint") or "").upper()
+    market_regime = str(smart_snapshot.get("market_regime") or "").upper()
+    side = str(intent.get("side") or "").upper()
+    if side not in {"BID", "BUY"}:
+        return
+    if action_hint not in {"BUY_MORE", "INCREASE_EXPOSURE"} and market_regime not in {"TREND_UP", "BREAKOUT"}:
+        return
+    mark_rebalance_delta_accumulators(
+        session_id=int(session["id"]),
+        candidate_strategy_id=session.get("candidate_strategy_id"),
+        exchange=str(session.get("exchange") or "bithumb"),
+        market=str(session.get("market") or "KRW-BTC"),
+        side="ASK",
+        status="STALE",
+        metadata={
+            "reason": "STALE_BY_BUY_CONTEXT",
+            "action_hint": action_hint,
+            "market_regime": market_regime,
+            "intent_id": intent.get("id"),
+        },
+    )
 
 
 async def _submit_smart_intent_order(
@@ -1215,6 +1293,7 @@ async def _submit_smart_intent_order(
     market = str(session.get("market") or "KRW-BTC")
     amount_requested = abs(_float(intent.get("delta_value_krw")))
     accumulator_preview = None
+    _mark_sell_accumulator_stale_if_buy_context(session, intent, smart_snapshot)
     if side in {"BID", "BUY"} and (0 < amount_requested < live_config.min_order_krw or "SMART_MIN_REBALANCE_DELTA" in set(intent.get("blockers") or [])):
         amount_requested, accumulator_preview = _accumulate_rebalance_delta(
             session=session,
@@ -1250,6 +1329,36 @@ async def _submit_smart_intent_order(
         sell_requested = amount_requested
         if sell_requested <= 0 and current_price > 0:
             sell_requested = abs(_float(intent.get("target_qty"))) * current_price
+        sell_position = _load_rebalance_position(session, str(session.get("exchange") or "bithumb"), market)
+        sellable_value_krw = _sellable_position_value_krw(sell_position, current_price)
+        if sellable_value_krw <= 0 or sellable_value_krw < live_config.min_order_krw:
+            mark_rebalance_delta_accumulators(
+                session_id=int(session["id"]),
+                candidate_strategy_id=session.get("candidate_strategy_id"),
+                exchange=str(session.get("exchange") or "bithumb"),
+                market=market,
+                side=side,
+                status="DISCARDED_DUST",
+                metadata={
+                    "reason": "SELLABLE_POSITION_BELOW_MIN",
+                    "sellable_position_value_krw": sellable_value_krw,
+                    "min_order_krw": live_config.min_order_krw,
+                    "intent_id": intent_id,
+                },
+            )
+            _mark_smart_dust_intent(
+                session,
+                intent_id,
+                "SMART_SELL_AMOUNT_BELOW_MIN",
+                {
+                    "amount_requested_krw": sell_requested,
+                    "sellable_position_value_krw": sellable_value_krw,
+                    "min_order_krw": live_config.min_order_krw,
+                    "dust_side": "SELL",
+                    "accumulator_status": "DISCARDED_DUST",
+                },
+            )
+            return True
         if 0 < sell_requested < live_config.min_order_krw or "SMART_MIN_REBALANCE_DELTA" in set(intent.get("blockers") or []):
             sell_requested, accumulator_preview = _accumulate_rebalance_delta(
                 session=session,
@@ -1257,6 +1366,7 @@ async def _submit_smart_intent_order(
                 amount_requested=sell_requested,
                 current_price=current_price,
                 min_order_krw=live_config.min_order_krw,
+                max_accumulated_krw=sellable_value_krw,
             )
             if sell_requested < live_config.min_order_krw:
                 _mark_smart_dust_intent(
@@ -1269,6 +1379,13 @@ async def _submit_smart_intent_order(
                     },
                 )
                 return True
+            if sellable_value_krw > 0 and sell_requested > sellable_value_krw:
+                sell_requested = sellable_value_krw
+                accumulator_preview = {
+                    **(accumulator_preview or {}),
+                    "capped_to_sellable_position": True,
+                    "sellable_position_value_krw": sellable_value_krw,
+                }
             intent = {
                 **intent,
                 "delta_value_krw": -sell_requested,
@@ -1587,7 +1704,45 @@ async def _submit_smart_intent_sell_order(
     current_qty = max(_float(position.get("entry_volume")), 0.0)
     requested_qty = abs(_float(intent.get("target_qty"))) or (abs(_float(intent.get("delta_value_krw"))) / current_price if current_price > 0 else 0.0)
     price = _round_krw_price(current_price)
-    volume, dust_preview = _smart_sell_volume_avoiding_dust(requested_qty, current_qty, price, live_config.min_order_krw)
+    asset = market.split("-")[-1] if "-" in market else market
+    exchange_sellable_qty = max(_available_balance(balances, asset), 0.0)
+    sellable_qty = min(current_qty, exchange_sellable_qty)
+    if sellable_qty * price < live_config.min_order_krw:
+        if accumulator_preview and accumulator_preview.get("accumulator_id"):
+            mark_rebalance_delta_accumulator(
+                int(accumulator_preview["accumulator_id"]),
+                "DISCARDED_DUST",
+                {
+                    **accumulator_preview,
+                    "reason": "SELLABLE_POSITION_BELOW_MIN",
+                    "db_position_qty": current_qty,
+                    "exchange_sellable_qty": exchange_sellable_qty,
+                    "sellable_position_value_krw": sellable_qty * price,
+                },
+            )
+        _mark_smart_dust_intent(
+            session,
+            intent_id,
+            "SMART_SELL_AMOUNT_BELOW_MIN",
+            {
+                **(accumulator_preview or {}),
+                "dust_side": "SELL",
+                "db_position_qty": current_qty,
+                "exchange_sellable_qty": exchange_sellable_qty,
+                "sellable_position_value_krw": sellable_qty * price,
+                "min_order_krw": live_config.min_order_krw,
+                "accumulator_status": "DISCARDED_DUST",
+            },
+        )
+        return True
+    volume, dust_preview = _smart_sell_volume_avoiding_dust(requested_qty, sellable_qty, price, live_config.min_order_krw)
+    dust_preview = {
+        **dust_preview,
+        "db_position_qty": current_qty,
+        "exchange_sellable_qty": exchange_sellable_qty,
+        "sellable_qty": sellable_qty,
+        "sellable_position_value_krw": sellable_qty * price,
+    }
     amount = volume * price
     request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
     order = {

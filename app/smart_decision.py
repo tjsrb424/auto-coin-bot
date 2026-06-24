@@ -156,6 +156,12 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
             snapshot=snapshot,
             policy=policy,
             shadow_recommendation=recommendation,
+            risk_preview={
+                "allowed": True,
+                "risk_result": "SMART_PREFLIGHT_RISK_DEFERRED",
+                "preflight": True,
+                "message": "Runtime live order risk is checked immediately before submission.",
+            },
             risk_score=risk_score,
             daily_smart_order_count=0,
         )
