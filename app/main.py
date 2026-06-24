@@ -44,6 +44,7 @@ from app.database import (
     init_db,
     insert_live_mode_event,
     insert_live_order_log,
+    load_aggression_preset_logs,
     insert_smart_rehearsal_review,
     insert_risk_log,
     insert_candles,
@@ -90,6 +91,7 @@ from app.database import (
     update_candidate_strategy,
     update_risk_log_resolution,
 )
+from app.aggression_presets import apply_aggression_preset, build_aggression_preset_preview, list_aggression_presets
 from app.auto_strategy_selector import auto_strategy_selector_status, evaluate_auto_strategy_selector
 from app.capital_allocator import capital_allocator_status, run_capital_allocator_once
 from app.capital_snapshot import build_capital_snapshot_async
@@ -501,6 +503,13 @@ class BotPolicyPatchRequest(BaseModel):
     auto_trading_enabled: bool | None = None
     max_total_exposure_krw: float | None = Field(None, gt=0)
     daily_loss_limit_pct: float | None = Field(None, gt=0, le=100)
+
+
+class AggressionPresetApplyRequest(BaseModel):
+    preset: str = Field(..., pattern=r"^(conservative|balanced|aggressive)$")
+    market: str = DEFAULT_MARKET
+    requested_by: str = "admin"
+    reason: str = ""
 
 
 class ForwardPaperStartRequest(BaseModel):
@@ -1939,6 +1948,37 @@ async def patch_bot_policy(payload: BotPolicyPatchRequest, market: str = Query(D
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"policy": await _bot_policy_payload(market, exchange)}
+
+
+@app.get("/api/aggression-presets")
+def get_aggression_presets(market: str = Query(DEFAULT_MARKET)) -> dict:
+    return list_aggression_presets(market=market)
+
+
+@app.get("/api/aggression-presets/preview/{preset}")
+def preview_aggression_preset_endpoint(preset: str, market: str = Query(DEFAULT_MARKET)) -> dict:
+    try:
+        return build_aggression_preset_preview(preset, market=market)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/aggression-presets/apply")
+def apply_aggression_preset_endpoint(payload: AggressionPresetApplyRequest) -> dict:
+    try:
+        return apply_aggression_preset(
+            payload.preset,
+            market=payload.market,
+            requested_by=payload.requested_by,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/aggression-presets/logs")
+def aggression_preset_logs(limit: int = Query(50, ge=1, le=200)) -> dict:
+    return {"logs": load_aggression_preset_logs(limit)}
 
 
 @app.get("/api/analysis/latest")

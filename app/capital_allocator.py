@@ -4,6 +4,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from app.aggression_presets import runtime_setting_float, runtime_setting_int
 from app.capital_snapshot import build_capital_snapshot
 from app.database import (
     acquire_scheduler_task_lock,
@@ -35,6 +36,7 @@ from app.database import (
     update_live_strategy_session,
 )
 from app.live_broker import is_emergency_stopped
+from app.market_opportunity import build_market_opportunity_rankings, rank_live_candidates
 
 ALLOCATOR_TASK = "capital_allocator"
 
@@ -74,14 +76,14 @@ def allocator_config() -> dict:
         "enabled": _bool_env("AUTO_CAPITAL_ALLOCATOR_ENABLED", True),
         "exchange": os.getenv("AUTO_ALLOWED_EXCHANGE", os.getenv("EXCHANGE", "bithumb")).strip().lower(),
         "max_slots": _int_env("AUTO_MAX_OPEN_POSITION_COUNT", 5, minimum=1, maximum=20),
-        "max_new_entries_per_run": _int_env("AUTO_MAX_NEW_ENTRIES_PER_TICK", 2, minimum=1, maximum=10),
-        "single_position_max_exposure_pct": _float_env("AUTO_SINGLE_POSITION_MAX_EXPOSURE_PCT", 45.0),
+        "max_new_entries_per_run": max(min(runtime_setting_int("AUTO_MAX_NEW_ENTRIES_PER_TICK", 2), 10), 1),
+        "single_position_max_exposure_pct": runtime_setting_float("AUTO_SINGLE_POSITION_MAX_EXPOSURE_PCT", 45.0),
         "cash_reserve_pct": _float_env("AUTO_CASH_RESERVE_PCT", 5.0),
         "min_expected_edge_pct": _float_env("AUTO_MIN_EXPECTED_EDGE_PCT", 0.45),
         "fee_rate": _float_env("AUTO_FEE_RATE", 0.0005),
         "slippage_rate": _float_env("AUTO_SLIPPAGE_RATE", 0.0005),
         "edge_safety_margin_pct": _float_env("AUTO_EDGE_SAFETY_MARGIN_PCT", 0.15),
-        "max_order_krw": _float_env("AUTO_MAX_ORDER_KRW", 30000.0),
+        "max_order_krw": runtime_setting_float("AUTO_MAX_ORDER_KRW", 30000.0),
         "min_order_krw": _float_env("AUTO_MIN_ORDER_KRW", 5000.0),
         "reservation_ttl_minutes": _int_env("AUTO_ORDER_RESERVATION_TTL_MINUTES", 30, minimum=1, maximum=1440),
         "queue_ttl_minutes": _int_env("AUTO_NEXT_ENTRY_TTL_MINUTES", 360, minimum=5, maximum=10080),
@@ -125,7 +127,11 @@ def allocation_score(candidate: dict, config: dict | None = None) -> float:
     edge_bonus = max(expected_edge - required_edge_pct(config), 0.0) * 1.5
     mdd_penalty = max(mdd - 10.0, 0.0) * 1.2
     trade_bonus = trade_count * 0.2
-    return max(0.0, score + edge_bonus + trade_bonus - mdd_penalty)
+    opportunity = candidate.get("market_opportunity_score")
+    opportunity_adjustment = 0.0
+    if opportunity is not None:
+        opportunity_adjustment = (float(opportunity or 0.0) - 50.0) * 0.5
+    return max(0.0, score + edge_bonus + trade_bonus + opportunity_adjustment - mdd_penalty)
 
 
 def capital_allocator_status(exchange: str | None = None) -> dict:
@@ -134,6 +140,8 @@ def capital_allocator_status(exchange: str | None = None) -> dict:
     snapshot = build_capital_snapshot(exchange)
     slots = snapshot.get("slots") or load_position_slots(int(config["max_slots"]), exchange)
     reservations = snapshot.get("reservations") or load_active_order_reservations(exchange)
+    candidates = load_live_eligible_candidate_strategies(100)
+    opportunity_rankings = build_market_opportunity_rankings(exchange=exchange, candidates=candidates, snapshot=snapshot, limit=10)
     return {
         "enabled": bool(config["enabled"]),
         "exchange": exchange,
@@ -161,6 +169,7 @@ def capital_allocator_status(exchange: str | None = None) -> dict:
         "reservations": reservations,
         "next_entry_queue": load_next_entry_queue(20, ["QUEUED", "BLOCKED"]),
         "required_edge_pct": required_edge_pct(config),
+        "market_opportunity_rankings": opportunity_rankings,
     }
 
 
@@ -336,6 +345,7 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
             for item in load_live_eligible_candidate_strategies(100)
             if str(item.get("status") or "").upper() == "LIVE_ELIGIBLE"
         ]
+        candidates = rank_live_candidates(exchange=exchange, candidates=candidates, snapshot=snapshot, limit=100)
         candidates = sorted(candidates, key=lambda item: allocation_score(item, config), reverse=True)
 
         max_total = float(snapshot.get("max_total_exposure_krw") or policy.get("max_total_exposure_krw") or 0.0)
@@ -374,6 +384,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
             if not block_reason and snapshot.get("open_order_mismatch_detected"):
                 block_reason = "BLOCKED_OPEN_ORDER_MISMATCH"
             score = allocation_score(candidate, config)
+            opportunity_breakdown = candidate.get("opportunity_score_breakdown") or {}
+            opportunity_blockers = candidate.get("opportunity_blockers") or []
             desired_order = min(max_single, max(float(config["min_order_krw"]), max_single * min(score, 100.0) / 100))
             released_reserved = float((replacement_slot or {}).get("reserved_krw") or 0.0)
             if is_replacement:
@@ -418,7 +430,16 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                     blocked_reason=block_reason,
                     ttl_minutes=int(config["queue_ttl_minutes"]),
                 )
-                blocked.append({"candidate": candidate, "blocked_reason": block_reason, "queue_id": queue_id})
+                blocked.append(
+                    {
+                        "candidate": candidate,
+                        "blocked_reason": block_reason,
+                        "queue_id": queue_id,
+                        "market_opportunity_score": candidate.get("market_opportunity_score", 0.0),
+                        "opportunity_score_breakdown": opportunity_breakdown,
+                        "opportunity_blockers": opportunity_blockers,
+                    }
+                )
                 continue
 
             if is_replacement:
@@ -439,6 +460,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                         "reservation_id": replacement["reservation_id"],
                         "approved_order_krw": approved_order,
                         "replaced_candidate_strategy_id": replacement.get("replaced_candidate_strategy_id"),
+                        "market_opportunity_score": candidate.get("market_opportunity_score", 0.0),
+                        "opportunity_score_breakdown": opportunity_breakdown,
                     }
                 )
                 update_next_entry_status(int(candidate["id"]), "PROMOTED_TO_SLOT")
@@ -507,6 +530,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                     "session_id": session_id,
                     "reservation_id": reservation_id,
                     "approved_order_krw": approved_order,
+                    "market_opportunity_score": candidate.get("market_opportunity_score", 0.0),
+                    "opportunity_score_breakdown": opportunity_breakdown,
                 }
             )
             open_markets.add(str(candidate["market"]))

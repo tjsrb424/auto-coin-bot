@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.aggression_presets import runtime_setting_bool, runtime_setting_float, runtime_setting_int
 from app.database import (
     get_connection,
     has_open_live_position_for_strategy,
@@ -60,25 +61,25 @@ class RiskConfig:
             max_daily_loss_percent=float(os.getenv("RISK_MAX_DAILY_LOSS_PERCENT", "20")),
             max_daily_loss_krw=float(os.getenv("RISK_MAX_DAILY_LOSS_KRW", "10000")),
             account_equity_krw=float(os.getenv("RISK_ACCOUNT_EQUITY_KRW", "300000")),
-            max_orders_per_day=int(os.getenv("RISK_MAX_ORDERS_PER_DAY", "3")),
-            max_entry_orders_per_day=int(os.getenv("RISK_MAX_ENTRY_ORDERS_PER_DAY", "2")),
-            max_exit_orders_per_day=int(os.getenv("RISK_MAX_EXIT_ORDERS_PER_DAY", "3")),
+            max_orders_per_day=runtime_setting_int("RISK_MAX_ORDERS_PER_DAY", 3),
+            max_entry_orders_per_day=runtime_setting_int("RISK_MAX_ENTRY_ORDERS_PER_DAY", 2),
+            max_exit_orders_per_day=runtime_setting_int("RISK_MAX_EXIT_ORDERS_PER_DAY", 3),
             max_consecutive_losses=int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "4")),
             consecutive_loss_min_krw=float(os.getenv("RISK_CONSECUTIVE_LOSS_MIN_KRW", "500")),
-            min_cooldown_seconds=int(os.getenv("RISK_MIN_COOLDOWN_SECONDS", "1800")),
-            block_on_balance_mismatch=os.getenv("RISK_BLOCK_ON_BALANCE_MISMATCH", "true").lower() == "true",
-            block_on_partial_fill=os.getenv("RISK_BLOCK_ON_PARTIAL_FILL", "true").lower() == "true",
-            block_on_open_order=os.getenv("RISK_BLOCK_ON_OPEN_ORDER", "true").lower() == "true",
+            min_cooldown_seconds=runtime_setting_int("RISK_MIN_COOLDOWN_SECONDS", 1800),
+            block_on_balance_mismatch=runtime_setting_bool("RISK_BLOCK_ON_BALANCE_MISMATCH", True),
+            block_on_partial_fill=runtime_setting_bool("RISK_BLOCK_ON_PARTIAL_FILL", True),
+            block_on_open_order=runtime_setting_bool("RISK_BLOCK_ON_OPEN_ORDER", True),
             block_on_open_position=os.getenv("RISK_BLOCK_ON_OPEN_POSITION", "true").lower() == "true",
-            max_position_ratio_percent=float(os.getenv("RISK_MAX_POSITION_RATIO_PERCENT", "20")),
-            max_order_krw=float(os.getenv("RISK_MAX_ORDER_KRW", "30000")),
+            max_position_ratio_percent=runtime_setting_float("RISK_MAX_POSITION_RATIO_PERCENT", 20.0),
+            max_order_krw=runtime_setting_float("RISK_MAX_ORDER_KRW", 30000.0),
             volatility_window=int(os.getenv("RISK_VOLATILITY_WINDOW", "5")),
             volatility_block_percent=float(os.getenv("RISK_VOLATILITY_BLOCK_PERCENT", "2")),
             min_volume_krw=float(os.getenv("RISK_MIN_VOLUME_KRW", "0")),
             min_current_1m_volume_krw=float(os.getenv("RISK_MIN_CURRENT_1M_VOLUME_KRW", "30000000")),
             min_avg_5m_volume_krw=float(os.getenv("RISK_MIN_AVG_5M_VOLUME_KRW", "50000000")),
             require_completed_candle=os.getenv("RISK_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
-            require_order_chance_success=os.getenv("RISK_REQUIRE_ORDER_CHANCE_SUCCESS", "true").lower() == "true",
+            require_order_chance_success=runtime_setting_bool("RISK_REQUIRE_ORDER_CHANCE_SUCCESS", True),
         )
 
 

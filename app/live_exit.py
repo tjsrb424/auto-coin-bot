@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from app.aggression_presets import runtime_setting_float, runtime_setting_int
 from app.database import (
     count_exit_retries,
     create_exit_candidate,
@@ -52,9 +53,9 @@ class LiveExitConfig:
             exit_enabled=os.getenv("AUTO_EXIT_ENABLED", "false").lower() == "true",
             exit_order_type=os.getenv("AUTO_EXIT_ORDER_TYPE", "limit").strip().lower(),
             market_order_enabled=os.getenv("AUTO_MARKET_ORDER_ENABLED", "false").lower() == "true",
-            stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.8")),
-            take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.2")),
-            max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "90")),
+            stop_loss_percent=runtime_setting_float("AUTO_STOP_LOSS_PERCENT", 0.8),
+            take_profit_percent=runtime_setting_float("AUTO_TAKE_PROFIT_PERCENT", 1.2),
+            max_hold_minutes=runtime_setting_int("AUTO_MAX_HOLD_MINUTES", 90),
             exit_price_offset_percent=float(os.getenv("AUTO_EXIT_PRICE_OFFSET_PERCENT", "0.2")),
             cancel_exit_order_after_seconds=int(os.getenv("AUTO_CANCEL_EXIT_ORDER_AFTER_SECONDS", "45")),
             max_exit_retry_count=int(os.getenv("AUTO_MAX_EXIT_RETRY_COUNT", "2")),

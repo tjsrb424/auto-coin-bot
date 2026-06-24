@@ -459,6 +459,68 @@ type BotPolicy = {
   updated_at?: string;
 };
 
+type AggressionPresetSummary = {
+  policy?: {
+    max_total_exposure_krw?: number;
+    daily_loss_limit_pct?: number;
+  };
+  limits?: {
+    auto_max_order_krw?: number;
+    entry_orders_per_day?: number;
+    exit_orders_per_day?: number;
+    cooldown_seconds?: number;
+  };
+  scale_in?: {
+    enabled?: boolean;
+    max_count?: number;
+    min_position_pnl_pct?: number;
+    no_averaging_down?: boolean;
+  };
+  exit?: {
+    stop_loss_percent?: number;
+    take_profit_percent?: number;
+    max_hold_minutes?: number;
+  };
+  dynamic_sizing?: {
+    enabled?: boolean;
+    mode?: string;
+    max_multiplier?: number;
+  };
+  expected_max_exposure?: {
+    max_aggressive_exposure_pct?: number;
+    expected_max_exposure_krw?: number;
+  };
+};
+
+type AggressionPresetPreview = {
+  preset?: string;
+  label?: string;
+  before?: AggressionPresetSummary;
+  after?: AggressionPresetSummary;
+  safety_guards?: Record<string, unknown>;
+  application?: {
+    runtime_restart_required?: boolean;
+    effective_on?: string;
+  };
+};
+
+type AggressionPresetOption = {
+  name: "conservative" | "balanced" | "aggressive" | string;
+  label?: string;
+  preview?: AggressionPresetPreview;
+};
+
+type AggressionPresetStatus = {
+  active_preset?: {
+    name?: string | null;
+    label?: string;
+    active?: boolean;
+    applied_at?: string;
+  };
+  presets?: AggressionPresetOption[];
+  safety_guards?: Record<string, unknown>;
+};
+
 type SmartReadinessCheck = {
   id?: string;
   label?: string;
@@ -613,6 +675,7 @@ type DashboardData = {
   } | null;
   profitEngineStatus: ProfitEngineStatus | null;
   botPolicy: BotPolicy | null;
+  aggressionPresets: AggressionPresetStatus | null;
   health: HealthStatus | null;
   recoveryEvents: RecoveryEvent[];
   errors: string[];
@@ -718,6 +781,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     smartEngineStatus: null,
     profitEngineStatus: null,
     botPolicy: null,
+    aggressionPresets: null,
     health: null,
     recoveryEvents: [],
     errors: [],
@@ -735,7 +799,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         }
       };
 
-      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, profitEngineStatusResult, botPolicyResult, health] = await Promise.all([
+      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, profitEngineStatusResult, botPolicyResult, aggressionPresetResult, health] = await Promise.all([
         settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
         settle("실거래 상태", fetchJson<LiveStatus>(`/api/live/status?exchange=${selectedExchange}`)),
         settle("주문", fetchJson<{ orders?: LiveOrder[]; recovery_events?: RecoveryEvent[] }>("/api/live-orders")),
@@ -751,6 +815,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         settle("Smart Engine", fetchJson<DashboardData["smartEngineStatus"]>(`/api/smart-engine/status?market=${MARKET}`)),
         settle("Profit Engine", fetchJson<ProfitEngineStatus>(`/api/profit-engine/status?market=${MARKET}&exchange=${selectedExchange}`)),
         settle("운용정책", fetchJson<{ policy?: BotPolicy }>(`/api/bot/policy?market=${MARKET}&exchange=${selectedExchange}`)),
+        settle("공격성 프리셋", fetchJson<AggressionPresetStatus>(`/api/aggression-presets?market=${MARKET}`)),
         settle("Health", fetchJson<HealthStatus>("/health"))
       ]);
 
@@ -779,6 +844,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         smartEngineStatus: smartEngineStatusResult,
         profitEngineStatus: profitEngineStatusResult,
         botPolicy: botPolicyResult?.policy ?? null,
+        aggressionPresets: aggressionPresetResult,
         health,
         recoveryEvents: ordersResult?.recovery_events ?? [],
         errors,
@@ -4102,6 +4168,7 @@ function AutoTradeView({
 
 function OperationsView({ data, refresh }: { data: DashboardData; refresh: () => Promise<void> }) {
   const policy = data.botPolicy;
+  const aggression = data.aggressionPresets;
   const profit = data.profitEngineStatus;
   const readiness = data.smartEngineStatus?.limited_readiness;
   const readinessChecks = readiness?.checks ?? [];
@@ -4115,6 +4182,7 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
   const [maxExposure, setMaxExposure] = React.useState(500000);
   const [dailyLossPct, setDailyLossPct] = React.useState(3);
   const [isSaving, setIsSaving] = React.useState(false);
+  const [isApplyingPreset, setIsApplyingPreset] = React.useState<string | null>(null);
   const [reviewNote, setReviewNote] = React.useState("");
   const [isReviewing, setIsReviewing] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
@@ -4170,9 +4238,31 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
     }
   };
 
+  const applyPreset = async (preset: string) => {
+    if (isApplyingPreset) return;
+    setIsApplyingPreset(preset);
+    setMessage(null);
+    setError(null);
+    try {
+      await postJson<unknown>("/api/aggression-presets/apply", {
+        preset,
+        market: MARKET,
+        requested_by: "dashboard",
+        reason: "operator-ui"
+      });
+      await refresh();
+      setMessage(`공격성 프리셋 적용 완료: ${preset}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "프리셋 적용 실패");
+    } finally {
+      setIsApplyingPreset(null);
+    }
+  };
+
   const projectedLossLimit = maxExposure * dailyLossPct / 100;
   const usage = policy?.exposure_usage_pct ?? 0;
   const usageWidth = Math.min(Math.max(usage, 0), 100);
+  const activePresetName = aggression?.active_preset?.name ?? null;
   const profitGateBlocked = profit?.entry_gate?.entry_allowed === false;
   const profitGateLabel = profitGateBlocked
     ? `차단됨 (${profit?.entry_gate?.block_code ?? "사유 확인 필요"})`
@@ -4227,6 +4317,35 @@ function OperationsView({ data, refresh }: { data: DashboardData; refresh: () =>
           <span><i style={{ width: `${usageWidth}%` }} /></span>
           <b>{formatRatioPercent(usage, 1)}</b>
         </section>
+      </RefPanel>
+      <RefPanel className="ref-ops-preset">
+        <h3>공격성 프리셋</h3>
+        <p><span>현재</span><b>{activePresetName ? statusLabel(activePresetName) : "미적용"}</b></p>
+        <p><span>적용 방식</span><b>다음 런타임 설정 로딩부터</b></p>
+        <section className="ref-ops-review-actions">
+          {(aggression?.presets ?? []).map((preset) => {
+            const after = preset.preview?.after;
+            const isActive = activePresetName === preset.name;
+            return (
+              <button key={preset.name} type="button" className={isActive ? "is-active" : ""} onClick={() => void applyPreset(preset.name)} disabled={Boolean(isApplyingPreset)}>
+                <SlidersHorizontal size={17} />
+                {preset.label ?? statusLabel(preset.name)}
+                <small>{formatKrw(after?.limits?.auto_max_order_krw)} · {formatNumber(after?.limits?.entry_orders_per_day, 0)}회</small>
+              </button>
+            );
+          })}
+        </section>
+        {aggression?.presets?.map((preset) => {
+          const after = preset.preview?.after;
+          return (
+            <p key={`${preset.name}-summary`}>
+              <span>{preset.label ?? statusLabel(preset.name)}</span>
+              <b>{formatKrw(after?.expected_max_exposure?.expected_max_exposure_krw)} KRW</b>
+              <em>max x{formatNumber(after?.dynamic_sizing?.max_multiplier, 1)} · 보유 {formatNumber(after?.exit?.max_hold_minutes, 0)}분</em>
+            </p>
+          );
+        })}
+        <p><span>보호</span><b>손실한도/긴급정지/불일치 차단 유지</b></p>
       </RefPanel>
       <RefPanel className="ref-ops-preview">
         <h3>저장 예정 값</h3>

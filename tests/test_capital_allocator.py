@@ -165,6 +165,61 @@ class CapitalAllocatorTests(unittest.TestCase):
         self.assertEqual(slots[0]["status"], "RESERVED")
         self.assertEqual(slots[0]["candidate_strategy_id"], candidate_id)
 
+    def test_allocator_uses_market_opportunity_score_for_candidate_ordering(self) -> None:
+        base_id = database.save_candidate_strategy(candidate_payload(market="KRW-ETH", score=95))
+        allow_market("KRW-XRP")
+        edge_payload = candidate_payload(market="KRW-XRP", score=90)
+        edge_payload["strategy"] = "rsi"
+        edge_id = database.save_candidate_strategy(edge_payload)
+        database.upsert_adaptive_edge_stat(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-XRP",
+                "strategy_name": "rsi",
+                "candidate_strategy_id": edge_id,
+                "unit": 5,
+                "market_regime": "TREND_UP",
+                "action_hint": "BUY_MORE",
+                "legacy_signal": "BUY",
+                "attack_mode": "BALANCED",
+                "target_source": "ADAPTIVE",
+                "order_purpose": "ENTRY",
+                "sample_count": 30,
+                "win_count": 22,
+                "loss_count": 8,
+                "win_rate": 0.73,
+                "avg_post_fill_return_1m": 1.0,
+                "avg_post_fill_return_5m": 2.0,
+                "avg_post_fill_return_15m": 2.5,
+                "avg_realized_return_pct": 2.0,
+                "avg_realized_pnl_krw": 2000,
+                "profit_factor": 2.0,
+                "avg_adverse_selection_pct": 0.1,
+                "avg_slippage_pct": 0.05,
+                "avg_fill_time_seconds": 4,
+                "max_drawdown_pct": -0.2,
+                "confidence_score": 85,
+                "edge_score": 3.0,
+                "last_updated_at": "2026-06-24T00:00:00Z",
+            }
+        )
+        database.update_bot_operation_policy(
+            "KRW-BTC",
+            {"auto_trading_enabled": True, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5},
+        )
+
+        with patch.dict(os.environ, {"AUTO_MAX_NEW_ENTRIES_PER_TICK": "1"}, clear=False), \
+            patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
+            result = run_capital_allocator_once("TEST_OPPORTUNITY", exchange="bithumb")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["accepted"]), 1)
+        self.assertEqual(result["accepted"][0]["candidate"]["id"], edge_id)
+        self.assertGreater(result["accepted"][0]["market_opportunity_score"], 0)
+        self.assertEqual(database.load_candidate_strategy(edge_id)["status"], "LIVE_ACTIVE")
+        self.assertEqual(database.load_candidate_strategy(base_id)["status"], "LIVE_ELIGIBLE")
+
     def test_same_market_stronger_candidate_replaces_reserved_slot_before_entry(self) -> None:
         first_id = database.save_candidate_strategy(candidate_payload(score=80))
         database.update_bot_operation_policy(

@@ -23,6 +23,7 @@ from app.smart_promotion import evaluate_promotion, smart_engine_live_mode
 from app.smart_signal_engine import evaluate_internal_signals
 from app.smart_target_exposure import calculate_target_exposure
 from app.smart_attack import apply_aggressive_target_layer, calculate_attack_score
+from app.adaptive_edge import attach_adaptive_edge_preview
 
 
 DEFAULT_MARKET = "KRW-BTC"
@@ -146,6 +147,7 @@ def record_shadow_decision(*, session: dict, candidate: dict, candles: list[dict
         blockers=blockers,
     )
     if intent:
+        attach_adaptive_edge_preview(intent=intent, snapshot=snapshot, candidate=candidate, order_purpose="ENTRY")
         recommendation = None
         try:
             recommendation = build_shadow_report(str(session.get("market") or DEFAULT_MARKET), limit=100).get("summary", {}).get("recommendation")

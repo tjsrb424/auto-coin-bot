@@ -52,6 +52,17 @@ def _scale_preview(log: dict | None) -> dict:
     return scale_preview if isinstance(scale_preview, dict) else {}
 
 
+def _record_trade_outcome(order_log: dict | None, position_id: int) -> None:
+    if not order_log:
+        return
+    try:
+        from app.trade_outcomes import record_filled_order_outcome
+
+        record_filled_order_outcome(order_log, position_id=position_id)
+    except Exception:
+        return
+
+
 def _canonical_log(order_log: dict | None, order_uuid: str) -> tuple[dict | None, list[dict]]:
     logs = load_live_order_logs_by_uuid(order_uuid) if order_uuid else []
     if not logs:
@@ -207,6 +218,7 @@ def sync_filled_entry_order_to_position(
     if existing_event:
         position_id = int(existing_event["position_id"])
         _attach_logs(logs, position_id)
+        _record_trade_outcome(canonical_log, position_id)
         update_live_strategy_session(
             int(session["id"]),
             {
@@ -256,6 +268,7 @@ def sync_filled_entry_order_to_position(
             },
         )
         _attach_logs(logs, scale_target_id)
+        _record_trade_outcome(canonical_log, scale_target_id)
         update_live_strategy_session(
             int(session["id"]),
             {
@@ -304,6 +317,7 @@ def sync_filled_entry_order_to_position(
                 "last_risk_result": "POSITION_OPEN_SYNCED",
             },
         )
+        _record_trade_outcome(canonical_log, position_id)
         return {"status": "ATTACHED", "position_id": position_id, "fill_type": "ENTRY", "idempotent": True}
 
     position_id = create_live_position(_new_position_payload(session, canonical_log, order_uuid, price, volume, amount))
@@ -322,6 +336,7 @@ def sync_filled_entry_order_to_position(
         }
     )
     _attach_logs(logs, position_id)
+    _record_trade_outcome(canonical_log, position_id)
     update_live_strategy_session(
         int(session["id"]),
         {

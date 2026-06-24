@@ -50,6 +50,9 @@ from app.live_position_sync import sync_filled_entry_order_to_position
 from app.auto_strategy_selector import evaluate_auto_strategy_selector
 from app.forward_paper import latest_completed_candle
 from app.execution_quality import build_execution_quality_payload
+from app.aggression_presets import runtime_setting_bool, runtime_setting_float, runtime_setting_int
+from app.dynamic_sizing import build_dynamic_sizing_preview
+from app.small_position_resolver import FULL_EXIT_CANDIDATE, evaluate_small_position_resolution
 from app.live_broker import (
     BithumbBroker,
     LiveTradingConfig,
@@ -135,11 +138,11 @@ class LiveStrategyConfig:
             allowed_exchange=os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb").strip().lower(),
             allowed_market=os.getenv("AUTO_ALLOWED_MARKET", "KRW-BTC"),
             allowed_order_type=os.getenv("AUTO_ALLOWED_ORDER_TYPE", os.getenv("AUTO_ORDER_TYPE", "limit")).strip().lower(),
-            max_order_krw=float(os.getenv("AUTO_MAX_ORDER_KRW", "30000")),
-            max_orders_per_day=int(os.getenv("AUTO_MAX_ORDERS_PER_DAY", "3")),
+            max_order_krw=runtime_setting_float("AUTO_MAX_ORDER_KRW", 30000.0),
+            max_orders_per_day=runtime_setting_int("AUTO_MAX_ORDERS_PER_DAY", 3),
             max_open_position_count=int(os.getenv("AUTO_MAX_OPEN_POSITION_COUNT", "5")),
-            cooldown_seconds=int(os.getenv("AUTO_COOLDOWN_SECONDS", "1800")),
-            core_order_cooldown_seconds=int(os.getenv("SMART_CORE_ORDER_COOLDOWN_SECONDS", os.getenv("AUTO_COOLDOWN_SECONDS", "1800"))),
+            cooldown_seconds=runtime_setting_int("AUTO_COOLDOWN_SECONDS", 1800),
+            core_order_cooldown_seconds=runtime_setting_int("SMART_CORE_ORDER_COOLDOWN_SECONDS", runtime_setting_int("AUTO_COOLDOWN_SECONDS", 1800)),
             require_completed_candle=os.getenv("AUTO_REQUIRE_COMPLETED_CANDLE", "true").lower() == "true",
             cancel_unfilled_after_seconds=int(os.getenv("AUTO_CANCEL_UNFILLED_AFTER_SECONDS", os.getenv("AUTO_CANCEL_AFTER_SECONDS", "60"))),
             entry_price_offset_percent=entry_price_offset_percent,
@@ -147,9 +150,9 @@ class LiveStrategyConfig:
             core_marketable_limit_enabled=os.getenv("SMART_CORE_MARKETABLE_LIMIT_ENABLED", "false").lower() == "true",
             core_marketable_limit_max_slippage_pct=float(os.getenv("SMART_CORE_MARKETABLE_LIMIT_MAX_SLIPPAGE_PCT", "0.15")),
             core_marketable_limit_price_buffer_pct=float(os.getenv("SMART_CORE_MARKETABLE_LIMIT_PRICE_BUFFER_PCT", "0.02")),
-            stop_loss_percent=float(os.getenv("AUTO_STOP_LOSS_PERCENT", "0.8")),
-            take_profit_percent=float(os.getenv("AUTO_TAKE_PROFIT_PERCENT", "1.2")),
-            max_hold_minutes=int(os.getenv("AUTO_MAX_HOLD_MINUTES", "90")),
+            stop_loss_percent=runtime_setting_float("AUTO_STOP_LOSS_PERCENT", 0.8),
+            take_profit_percent=runtime_setting_float("AUTO_TAKE_PROFIT_PERCENT", 1.2),
+            max_hold_minutes=runtime_setting_int("AUTO_MAX_HOLD_MINUTES", 90),
             exit_enabled=os.getenv("AUTO_EXIT_ENABLED", "false").lower() == "true",
             market_order_enabled=os.getenv("AUTO_MARKET_ORDER_ENABLED", "false").lower() == "true",
         )
@@ -722,6 +725,64 @@ def _smart_bid_cap_blocker(
     return "SMART_CAPPED_ORDER_BELOW_MIN"
 
 
+def _with_adaptive_edge_preview(base_preview: dict, intent: dict) -> dict:
+    policy_preview = intent.get("policy_preview") or {}
+    adaptive_preview = policy_preview.get("adaptive_edge")
+    if not isinstance(adaptive_preview, dict):
+        return base_preview
+    return {
+        **base_preview,
+        "adaptive_edge": adaptive_preview,
+        "adaptive_edge_score": adaptive_preview.get("adaptive_edge_score", policy_preview.get("adaptive_edge_score", 0.0)),
+        "edge_confidence": adaptive_preview.get("edge_confidence", policy_preview.get("edge_confidence", 0.0)),
+    }
+
+
+def _with_small_position_preview(base_preview: dict, preview: dict | None) -> dict:
+    if not isinstance(preview, dict):
+        return base_preview
+    return {
+        **base_preview,
+        "small_position_resolver": preview,
+        "small_position_classification": preview.get("classification"),
+        "small_position_recommended_action": preview.get("recommended_action"),
+    }
+
+
+def _apply_dynamic_sizing_preview(
+    *,
+    amount: float,
+    cap_preview: dict,
+    intent: dict,
+    live_config: LiveTradingConfig,
+) -> tuple[float, dict, dict]:
+    adaptive_edge = (intent.get("policy_preview") or {}).get("adaptive_edge")
+    fee_pct = _float(getattr(live_config, "fee_rate", 0.0)) * 100
+    max_allowed = _float(cap_preview.get("hard_cap_krw"), None)
+    if max_allowed is None or max_allowed <= 0:
+        max_allowed = _float(cap_preview.get("actual_order_krw"), None)
+    if max_allowed is None or max_allowed <= 0:
+        max_allowed = _float(cap_preview.get("capped_order_amount_krw"), amount)
+    preview = build_dynamic_sizing_preview(
+        original_amount_krw=amount,
+        adaptive_edge=adaptive_edge if isinstance(adaptive_edge, dict) else {},
+        fee_pct=fee_pct,
+        estimated_slippage_pct=cap_preview.get("estimated_slippage_pct"),
+        adverse_selection_pct=(adaptive_edge or {}).get("avg_adverse_selection_pct") if isinstance(adaptive_edge, dict) else None,
+        max_allowed_amount_krw=max_allowed,
+        min_order_krw=live_config.min_order_krw,
+    )
+    updated_preview = {
+        **cap_preview,
+        "dynamic_sizing": preview,
+        "dynamic_sizing_multiplier": preview["sizing_multiplier"],
+        "dynamic_sizing_net_edge_pct": preview["net_edge_pct"],
+        "dynamic_sizing_adjusted_amount_krw": preview["adjusted_amount_krw"],
+        "dynamic_sizing_applied_amount_krw": preview["applied_amount_krw"],
+    }
+    return float(preview["applied_amount_krw"]), updated_preview, preview
+
+
 def _mark_smart_dust_intent(
     session: dict,
     intent_id: Any,
@@ -1130,29 +1191,29 @@ async def _scale_in_preview(
         "scale_in": True,
         "position_id": position.get("id"),
         "scale_in_count": int(position.get("scale_in_count") or 0),
-        "max_count": _env_int("AUTO_SCALE_IN_MAX_COUNT_PER_POSITION", 3),
+        "max_count": runtime_setting_int("AUTO_SCALE_IN_MAX_COUNT_PER_POSITION", 3),
         "market_regime": market_regime,
         "current_position_pnl_pct": _position_pnl_percent(position, current_price),
-        "min_position_pnl_pct": _float(os.getenv("AUTO_SCALE_IN_MIN_POSITION_PNL_PERCENT"), 0.0),
-        "max_position_exposure_pct": _float(os.getenv("AUTO_SCALE_IN_MAX_POSITION_EXPOSURE_PCT"), 45.0),
+        "min_position_pnl_pct": runtime_setting_float("AUTO_SCALE_IN_MIN_POSITION_PNL_PERCENT", 0.0),
+        "max_position_exposure_pct": runtime_setting_float("AUTO_SCALE_IN_MAX_POSITION_EXPOSURE_PCT", 45.0),
         "last_scale_in_at": position.get("last_scale_in_at"),
-        "min_interval_seconds": _env_int("AUTO_SCALE_IN_MIN_INTERVAL_SECONDS", 900),
+        "min_interval_seconds": runtime_setting_int("AUTO_SCALE_IN_MIN_INTERVAL_SECONDS", 900),
         "available_budget_krw": None,
         "available_krw": available_krw,
         "amount_krw": amount,
         "blockers": [],
     }
-    if not _env_bool("AUTO_SCALE_IN_ENABLED", True):
+    if not runtime_setting_bool("AUTO_SCALE_IN_ENABLED", True):
         return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_DISABLED")
     if str(position.get("status") or "").upper() != "OPEN":
         return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_EDGE_BROKEN", status=position.get("status"))
     buy_ok, buy_preview = _smart_buy_signal_ok(signal, intent, smart_snapshot)
     preview = {**preview, **buy_preview}
-    if _env_bool("AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL", True) and not buy_ok:
+    if runtime_setting_bool("AUTO_SCALE_IN_REQUIRE_BUY_SIGNAL", True) and not buy_ok:
         return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_REQUIRE_BUY_SIGNAL")
-    if _env_bool("AUTO_SCALE_IN_BLOCK_TREND_DOWN", True) and str(market_regime).upper() == "TREND_DOWN":
+    if runtime_setting_bool("AUTO_SCALE_IN_BLOCK_TREND_DOWN", True) and str(market_regime).upper() == "TREND_DOWN":
         return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_TREND_DOWN")
-    if _env_bool("AUTO_SCALE_IN_NO_AVERAGING_DOWN", True) and preview["current_position_pnl_pct"] < preview["min_position_pnl_pct"]:
+    if runtime_setting_bool("AUTO_SCALE_IN_NO_AVERAGING_DOWN", True) and preview["current_position_pnl_pct"] < preview["min_position_pnl_pct"]:
         return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_POSITION_LOSING")
     if preview["scale_in_count"] >= preview["max_count"]:
         return position, _scale_in_reject(preview, "BLOCKED_SCALE_IN_MAX_COUNT")
@@ -1292,6 +1353,7 @@ async def _submit_smart_intent_order(
     market = str(session.get("market") or "KRW-BTC")
     amount_requested = abs(_float(intent.get("delta_value_krw")))
     accumulator_preview = None
+    small_position_preview = None
     _mark_sell_accumulator_stale_if_buy_context(session, intent, smart_snapshot)
     if side in {"BID", "BUY"} and (0 < amount_requested < live_config.min_order_krw or "SMART_MIN_REBALANCE_DELTA" in set(intent.get("blockers") or [])):
         amount_requested, accumulator_preview = _accumulate_rebalance_delta(
@@ -1330,6 +1392,29 @@ async def _submit_smart_intent_order(
             sell_requested = abs(_float(intent.get("target_qty"))) * current_price
         sell_position = _load_rebalance_position(session, str(session.get("exchange") or "bithumb"), market)
         sellable_value_krw = _sellable_position_value_krw(sell_position, current_price)
+        if sell_position:
+            small_position_preview = evaluate_small_position_resolution(
+                position=sell_position,
+                current_price=current_price,
+                min_order_krw=live_config.min_order_krw,
+                smart_snapshot=smart_snapshot,
+                intent=intent,
+                sellable_value_krw=sellable_value_krw,
+            )
+            if small_position_preview.get("recommended_action") == FULL_EXIT_CANDIDATE:
+                sell_requested = sellable_value_krw
+                intent = {
+                    **intent,
+                    "delta_value_krw": -sell_requested,
+                    "target_qty": _float(sell_position.get("entry_volume")),
+                    "policy_preview": _with_small_position_preview(
+                        {
+                            **(intent.get("policy_preview") or {}),
+                            "small_position_full_sweep_applied": True,
+                        },
+                        small_position_preview,
+                    ),
+                }
         if sellable_value_krw <= 0 or sellable_value_krw < live_config.min_order_krw:
             mark_rebalance_delta_accumulators(
                 session_id=int(session["id"]),
@@ -1349,13 +1434,16 @@ async def _submit_smart_intent_order(
                 session,
                 intent_id,
                 "SMART_SELL_AMOUNT_BELOW_MIN",
-                {
-                    "amount_requested_krw": sell_requested,
-                    "sellable_position_value_krw": sellable_value_krw,
-                    "min_order_krw": live_config.min_order_krw,
-                    "dust_side": "SELL",
-                    "accumulator_status": "DISCARDED_DUST",
-                },
+                _with_small_position_preview(
+                    {
+                        "amount_requested_krw": sell_requested,
+                        "sellable_position_value_krw": sellable_value_krw,
+                        "min_order_krw": live_config.min_order_krw,
+                        "dust_side": "SELL",
+                        "accumulator_status": "DISCARDED_DUST",
+                    },
+                    small_position_preview,
+                ),
             )
             return True
         if 0 < sell_requested < live_config.min_order_krw or "SMART_MIN_REBALANCE_DELTA" in set(intent.get("blockers") or []):
@@ -1372,10 +1460,13 @@ async def _submit_smart_intent_order(
                     session,
                     intent_id,
                     "SMART_MIN_REBALANCE_DELTA",
-                    {
-                        **(accumulator_preview or {}),
-                        "dust_side": "SELL",
-                    },
+                    _with_small_position_preview(
+                        {
+                            **(accumulator_preview or {}),
+                            "dust_side": "SELL",
+                        },
+                        small_position_preview,
+                    ),
                 )
                 return True
             if sellable_value_krw > 0 and sell_requested > sellable_value_krw:
@@ -1389,21 +1480,27 @@ async def _submit_smart_intent_order(
                 **intent,
                 "delta_value_krw": -sell_requested,
                 "target_qty": sell_requested / current_price if current_price > 0 else intent.get("target_qty"),
-                "policy_preview": {
-                    **(intent.get("policy_preview") or {}),
-                    "rebalance_accumulator": accumulator_preview,
-                },
+                "policy_preview": _with_small_position_preview(
+                    {
+                        **(intent.get("policy_preview") or {}),
+                        "rebalance_accumulator": accumulator_preview,
+                    },
+                    small_position_preview,
+                ),
             }
         if 0 < sell_requested < live_config.min_order_krw:
             _mark_smart_dust_intent(
                 session,
                 intent_id,
                 "SMART_SELL_AMOUNT_BELOW_MIN",
-                {
-                    "amount_requested_krw": sell_requested,
-                    "min_order_krw": live_config.min_order_krw,
-                    "dust_side": "SELL",
-                },
+                _with_small_position_preview(
+                    {
+                        "amount_requested_krw": sell_requested,
+                        "min_order_krw": live_config.min_order_krw,
+                        "dust_side": "SELL",
+                    },
+                    small_position_preview,
+                ),
             )
             return True
     core_accumulation_bid = side in {"BID", "BUY"} and _smart_core_accumulation_bid(intent, smart_snapshot)
@@ -1522,6 +1619,20 @@ async def _submit_smart_intent_order(
             return True
     if accumulator_preview:
         cap_preview = {**cap_preview, "rebalance_accumulator": accumulator_preview}
+    cap_preview = _with_adaptive_edge_preview(cap_preview, intent)
+    amount, cap_preview, dynamic_preview = _apply_dynamic_sizing_preview(
+        amount=amount,
+        cap_preview=cap_preview,
+        intent=intent,
+        live_config=live_config,
+    )
+    if not dynamic_preview["allowed"]:
+        _block_smart_intent_order(session, intent_id, str(dynamic_preview.get("blocker") or "SMART_DYNAMIC_SIZING_BLOCKED"), candle["candle_time_utc"], signal, cap_preview)
+        return True
+    if amount <= 0 or amount < live_config.min_order_krw:
+        blocker = "SMART_DYNAMIC_SIZING_ADJUSTED_BELOW_MIN" if dynamic_preview.get("enabled") else "SMART_CAPPED_ORDER_BELOW_MIN"
+        _mark_smart_dust_intent(session, intent_id, blocker, cap_preview)
+        return True
     scale_position, scale_preview = await _scale_in_preview(
         session=session,
         intent=intent,
@@ -1758,6 +1869,8 @@ async def _submit_smart_intent_sell_order(
         "order_purpose": "EXIT",
     }
     risk_preview = evaluate_live_order_risk(order=order, config=live_config, mode="AUTO_STRATEGY_RUNNING", balances=balances, request_exists=False, recent_duplicate=False, market_snapshot={"price": current_price}, is_auto=True)
+    dust_preview = _with_adaptive_edge_preview(dust_preview, intent)
+    dust_preview = _with_small_position_preview(dust_preview, (intent.get("policy_preview") or {}).get("small_position_resolver"))
     risk_preview = check_order_risk(
         order=order,
         purpose="EXIT",
@@ -1791,6 +1904,7 @@ async def _submit_smart_intent_sell_order(
         daily_smart_order_count=count_live_strategy_orders_today(str(session.get("exchange") or "bithumb"), str(session.get("market") or "KRW-BTC")),
         risk_score=_float(smart_snapshot.get("risk_score"), 0.0),
     )
+    risk_preview["policy_preview"] = {**(risk_preview.get("policy_preview") or {}), **dust_preview}
     promotion["policy_preview"] = {**(intent.get("policy_preview") or {}), **dust_preview, **promotion.get("policy_preview", {})}
     if intent_id:
         update_order_intent(int(intent_id), {**promotion, "status": "READY_FOR_LIVE" if promotion["promotion_status"] in {"READY_FOR_LIMITED", "READY_FOR_LIVE"} else "BLOCKED"})

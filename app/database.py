@@ -37,6 +37,9 @@ REQUIRED_SCHEMA_TABLES = [
     "order_reservations",
     "next_entry_queue",
     "execution_quality_logs",
+    "trade_outcome_logs",
+    "adaptive_edge_stats",
+    "aggression_preset_logs",
     "strategy_kill_switch_events",
     "position_fill_events",
 ]
@@ -919,6 +922,20 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS aggression_preset_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                preset_name TEXT NOT NULL,
+                previous_preset TEXT,
+                previous_settings_json TEXT NOT NULL DEFAULT '{}',
+                applied_settings_json TEXT NOT NULL DEFAULT '{}',
+                before_summary_json TEXT NOT NULL DEFAULT '{}',
+                after_summary_json TEXT NOT NULL DEFAULT '{}',
+                safety_guards_json TEXT NOT NULL DEFAULT '{}',
+                requested_by TEXT NOT NULL DEFAULT 'admin',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS bot_operation_policy (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market TEXT NOT NULL UNIQUE,
@@ -1064,6 +1081,89 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS trade_outcome_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_uuid TEXT NOT NULL UNIQUE,
+                request_id TEXT,
+                live_order_log_id INTEGER,
+                session_id INTEGER,
+                position_id INTEGER,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_purpose TEXT NOT NULL DEFAULT 'ENTRY',
+                strategy_name TEXT NOT NULL DEFAULT '',
+                candidate_strategy_id INTEGER,
+                market_regime TEXT NOT NULL DEFAULT '',
+                action_hint TEXT NOT NULL DEFAULT '',
+                legacy_signal TEXT NOT NULL DEFAULT '',
+                attack_mode TEXT NOT NULL DEFAULT '',
+                target_source TEXT NOT NULL DEFAULT '',
+                entry_or_exit_price REAL,
+                filled_price REAL,
+                filled_volume REAL NOT NULL DEFAULT 0,
+                filled_amount_krw REAL NOT NULL DEFAULT 0,
+                fee_krw REAL NOT NULL DEFAULT 0,
+                slippage_pct REAL,
+                spread_pct REAL,
+                fill_time_seconds REAL,
+                filled_at TEXT,
+                post_fill_return_1m REAL,
+                post_fill_return_3m REAL,
+                post_fill_return_5m REAL,
+                post_fill_return_15m REAL,
+                max_favorable_excursion_pct REAL,
+                max_adverse_excursion_pct REAL,
+                adverse_selection_pct REAL,
+                realized_pnl_krw REAL,
+                realized_return_pct REAL,
+                holding_minutes REAL,
+                outcome_status TEXT NOT NULL DEFAULT 'PENDING_OUTCOME',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(live_order_log_id) REFERENCES live_order_logs(id),
+                FOREIGN KEY(position_id) REFERENCES live_positions(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS adaptive_edge_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                market TEXT NOT NULL,
+                strategy_name TEXT NOT NULL DEFAULT '',
+                candidate_strategy_id INTEGER NOT NULL DEFAULT 0,
+                unit INTEGER NOT NULL DEFAULT 0,
+                market_regime TEXT NOT NULL DEFAULT '',
+                action_hint TEXT NOT NULL DEFAULT '',
+                legacy_signal TEXT NOT NULL DEFAULT '',
+                attack_mode TEXT NOT NULL DEFAULT '',
+                target_source TEXT NOT NULL DEFAULT '',
+                order_purpose TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                win_count INTEGER NOT NULL DEFAULT 0,
+                loss_count INTEGER NOT NULL DEFAULT 0,
+                win_rate REAL NOT NULL DEFAULT 0,
+                avg_post_fill_return_1m REAL NOT NULL DEFAULT 0,
+                avg_post_fill_return_5m REAL NOT NULL DEFAULT 0,
+                avg_post_fill_return_15m REAL NOT NULL DEFAULT 0,
+                avg_realized_return_pct REAL NOT NULL DEFAULT 0,
+                avg_realized_pnl_krw REAL NOT NULL DEFAULT 0,
+                profit_factor REAL NOT NULL DEFAULT 0,
+                avg_adverse_selection_pct REAL NOT NULL DEFAULT 0,
+                avg_slippage_pct REAL NOT NULL DEFAULT 0,
+                avg_fill_time_seconds REAL NOT NULL DEFAULT 0,
+                max_drawdown_pct REAL NOT NULL DEFAULT 0,
+                confidence_score REAL NOT NULL DEFAULT 0,
+                edge_score REAL NOT NULL DEFAULT 0,
+                last_updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(
+                    exchange, market, strategy_name, candidate_strategy_id, unit,
+                    market_regime, action_hint, legacy_signal, attack_mode,
+                    target_source, order_purpose
+                )
+            );
+
             CREATE TABLE IF NOT EXISTS strategy_kill_switch_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_strategy_id INTEGER,
@@ -1177,6 +1277,42 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_execution_quality_market_strategy
             ON execution_quality_logs(exchange, market, strategy_name, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_outcome_market_strategy
+            ON trade_outcome_logs(exchange, market, strategy_name, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_outcome_pending
+            ON trade_outcome_logs(outcome_status, filled_at, updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_outcome_position
+            ON trade_outcome_logs(position_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_adaptive_edge_lookup
+            ON adaptive_edge_stats(exchange, market, strategy_name, candidate_strategy_id, unit, edge_score DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_adaptive_edge_rank
+            ON adaptive_edge_stats(exchange, market, edge_score DESC, confidence_score DESC, last_updated_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_aggression_preset_logs_created
+            ON aggression_preset_logs(created_at DESC, id DESC)
             """
         )
         conn.execute(
@@ -3408,6 +3544,69 @@ def update_app_settings(settings: dict) -> dict:
     return load_app_settings()
 
 
+def insert_aggression_preset_log(payload: dict) -> dict:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO aggression_preset_logs (
+                preset_name, previous_preset, previous_settings_json,
+                applied_settings_json, before_summary_json, after_summary_json,
+                safety_guards_json, requested_by, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("preset_name") or ""),
+                payload.get("previous_preset"),
+                json.dumps(payload.get("previous_settings") or {}, ensure_ascii=False),
+                json.dumps(payload.get("applied_settings") or {}, ensure_ascii=False),
+                json.dumps(payload.get("before_summary") or {}, ensure_ascii=False),
+                json.dumps(payload.get("after_summary") or {}, ensure_ascii=False),
+                json.dumps(payload.get("safety_guards") or {}, ensure_ascii=False),
+                str(payload.get("requested_by") or "admin"),
+                str(payload.get("reason") or ""),
+                now_utc,
+            ),
+        )
+        row_id = int(cursor.lastrowid)
+    row = load_aggression_preset_log(row_id)
+    return row or {"id": row_id, "preset_name": payload.get("preset_name"), "created_at": now_utc}
+
+
+def load_aggression_preset_log(log_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM aggression_preset_logs WHERE id = ?", (log_id,)).fetchone()
+    return _normalize_aggression_preset_log(dict(row)) if row else None
+
+
+def load_aggression_preset_logs(limit: int = 50) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM aggression_preset_logs
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(min(int(limit), 200), 1),),
+        ).fetchall()
+    return [_normalize_aggression_preset_log(dict(row)) for row in rows]
+
+
+def _normalize_aggression_preset_log(row: dict) -> dict:
+    for source, target in (
+        ("previous_settings_json", "previous_settings"),
+        ("applied_settings_json", "applied_settings"),
+        ("before_summary_json", "before_summary"),
+        ("after_summary_json", "after_summary"),
+        ("safety_guards_json", "safety_guards"),
+    ):
+        try:
+            row[target] = json.loads(row.pop(source) or "{}")
+        except json.JSONDecodeError:
+            row[target] = {}
+    return row
+
+
 def _ensure_app_settings_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -5524,6 +5723,412 @@ def load_execution_quality_logs(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def upsert_trade_outcome_log(payload: dict) -> dict | None:
+    order_uuid = str(payload.get("order_uuid") or "")
+    if not order_uuid:
+        return None
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_outcome_logs (
+                order_uuid, request_id, live_order_log_id, session_id, position_id,
+                exchange, market, side, order_purpose, strategy_name,
+                candidate_strategy_id, market_regime, action_hint, legacy_signal,
+                attack_mode, target_source, entry_or_exit_price, filled_price,
+                filled_volume, filled_amount_krw, fee_krw, slippage_pct,
+                spread_pct, fill_time_seconds, filled_at, post_fill_return_1m,
+                post_fill_return_3m, post_fill_return_5m, post_fill_return_15m,
+                max_favorable_excursion_pct, max_adverse_excursion_pct,
+                adverse_selection_pct, realized_pnl_krw, realized_return_pct,
+                holding_minutes, outcome_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_uuid) DO UPDATE SET
+                request_id = COALESCE(excluded.request_id, trade_outcome_logs.request_id),
+                live_order_log_id = COALESCE(excluded.live_order_log_id, trade_outcome_logs.live_order_log_id),
+                session_id = COALESCE(excluded.session_id, trade_outcome_logs.session_id),
+                position_id = COALESCE(excluded.position_id, trade_outcome_logs.position_id),
+                exchange = excluded.exchange,
+                market = excluded.market,
+                side = excluded.side,
+                order_purpose = excluded.order_purpose,
+                strategy_name = excluded.strategy_name,
+                candidate_strategy_id = COALESCE(excluded.candidate_strategy_id, trade_outcome_logs.candidate_strategy_id),
+                market_regime = excluded.market_regime,
+                action_hint = excluded.action_hint,
+                legacy_signal = excluded.legacy_signal,
+                attack_mode = excluded.attack_mode,
+                target_source = excluded.target_source,
+                entry_or_exit_price = COALESCE(excluded.entry_or_exit_price, trade_outcome_logs.entry_or_exit_price),
+                filled_price = COALESCE(excluded.filled_price, trade_outcome_logs.filled_price),
+                filled_volume = CASE WHEN excluded.filled_volume > 0 THEN excluded.filled_volume ELSE trade_outcome_logs.filled_volume END,
+                filled_amount_krw = CASE WHEN excluded.filled_amount_krw > 0 THEN excluded.filled_amount_krw ELSE trade_outcome_logs.filled_amount_krw END,
+                fee_krw = CASE WHEN excluded.fee_krw > 0 THEN excluded.fee_krw ELSE trade_outcome_logs.fee_krw END,
+                slippage_pct = COALESCE(excluded.slippage_pct, trade_outcome_logs.slippage_pct),
+                spread_pct = COALESCE(excluded.spread_pct, trade_outcome_logs.spread_pct),
+                fill_time_seconds = COALESCE(excluded.fill_time_seconds, trade_outcome_logs.fill_time_seconds),
+                filled_at = COALESCE(excluded.filled_at, trade_outcome_logs.filled_at),
+                outcome_status = CASE
+                    WHEN trade_outcome_logs.outcome_status IN ('REALIZED', 'POST_FILL_COMPLETE')
+                    THEN trade_outcome_logs.outcome_status
+                    ELSE excluded.outcome_status
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                order_uuid,
+                payload.get("request_id"),
+                payload.get("live_order_log_id"),
+                payload.get("session_id"),
+                payload.get("position_id"),
+                payload.get("exchange", "bithumb"),
+                payload.get("market", "KRW-BTC"),
+                str(payload.get("side") or "").upper(),
+                payload.get("order_purpose", "ENTRY"),
+                payload.get("strategy_name", ""),
+                payload.get("candidate_strategy_id"),
+                payload.get("market_regime", ""),
+                payload.get("action_hint", ""),
+                payload.get("legacy_signal", ""),
+                payload.get("attack_mode", ""),
+                payload.get("target_source", ""),
+                payload.get("entry_or_exit_price"),
+                payload.get("filled_price"),
+                payload.get("filled_volume", 0.0),
+                payload.get("filled_amount_krw", 0.0),
+                payload.get("fee_krw", 0.0),
+                payload.get("slippage_pct"),
+                payload.get("spread_pct"),
+                payload.get("fill_time_seconds"),
+                payload.get("filled_at"),
+                payload.get("post_fill_return_1m"),
+                payload.get("post_fill_return_3m"),
+                payload.get("post_fill_return_5m"),
+                payload.get("post_fill_return_15m"),
+                payload.get("max_favorable_excursion_pct"),
+                payload.get("max_adverse_excursion_pct"),
+                payload.get("adverse_selection_pct"),
+                payload.get("realized_pnl_krw"),
+                payload.get("realized_return_pct"),
+                payload.get("holding_minutes"),
+                payload.get("outcome_status", "PENDING_OUTCOME"),
+                now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM trade_outcome_logs WHERE order_uuid = ?", (order_uuid,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_trade_outcome_log(order_uuid: str, updates: dict) -> dict | None:
+    allowed = {
+        "request_id",
+        "live_order_log_id",
+        "session_id",
+        "position_id",
+        "exchange",
+        "market",
+        "side",
+        "order_purpose",
+        "strategy_name",
+        "candidate_strategy_id",
+        "market_regime",
+        "action_hint",
+        "legacy_signal",
+        "attack_mode",
+        "target_source",
+        "entry_or_exit_price",
+        "filled_price",
+        "filled_volume",
+        "filled_amount_krw",
+        "fee_krw",
+        "slippage_pct",
+        "spread_pct",
+        "fill_time_seconds",
+        "filled_at",
+        "post_fill_return_1m",
+        "post_fill_return_3m",
+        "post_fill_return_5m",
+        "post_fill_return_15m",
+        "max_favorable_excursion_pct",
+        "max_adverse_excursion_pct",
+        "adverse_selection_pct",
+        "realized_pnl_krw",
+        "realized_return_pct",
+        "holding_minutes",
+        "outcome_status",
+    }
+    values = {key: value for key, value in updates.items() if key in allowed}
+    if not values:
+        return load_trade_outcome_log_by_order_uuid(order_uuid)
+    values["updated_at"] = _utc_now()
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with get_connection() as conn:
+        conn.execute(f"UPDATE trade_outcome_logs SET {assignments} WHERE order_uuid = ?", [*values.values(), order_uuid])
+        row = conn.execute("SELECT * FROM trade_outcome_logs WHERE order_uuid = ?", (order_uuid,)).fetchone()
+    return dict(row) if row else None
+
+
+def load_trade_outcome_log_by_order_uuid(order_uuid: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM trade_outcome_logs WHERE order_uuid = ?", (order_uuid,)).fetchone()
+    return dict(row) if row else None
+
+
+def load_trade_outcome_logs(
+    *,
+    exchange: str | None = None,
+    market: str | None = None,
+    position_id: int | None = None,
+    outcome_status: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if exchange:
+        clauses.append("exchange = ?")
+        params.append(exchange)
+    if market:
+        clauses.append("market = ?")
+        params.append(market)
+    if position_id is not None:
+        clauses.append("position_id = ?")
+        params.append(position_id)
+    if outcome_status:
+        clauses.append("outcome_status = ?")
+        params.append(outcome_status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(max(int(limit), 1))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM trade_outcome_logs
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_trade_outcomes_needing_post_fill_updates(limit: int = 200) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM trade_outcome_logs
+            WHERE filled_price IS NOT NULL
+              AND filled_price > 0
+              AND (
+                    post_fill_return_1m IS NULL
+                 OR post_fill_return_3m IS NULL
+                 OR post_fill_return_5m IS NULL
+                 OR post_fill_return_15m IS NULL
+              )
+              AND outcome_status IN ('PENDING_OUTCOME', 'PENDING_MARKET_DATA', 'PENDING_REALIZED')
+            ORDER BY filled_at ASC, id ASC
+            LIMIT ?
+            """,
+            (max(int(limit), 1),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_adaptive_edge_stat(payload: dict) -> dict | None:
+    now_utc = _utc_now()
+    key = {
+        "exchange": payload.get("exchange", "bithumb"),
+        "market": payload.get("market", "KRW-BTC"),
+        "strategy_name": payload.get("strategy_name", ""),
+        "candidate_strategy_id": int(payload.get("candidate_strategy_id") or 0),
+        "unit": int(payload.get("unit") or 0),
+        "market_regime": payload.get("market_regime", ""),
+        "action_hint": payload.get("action_hint", ""),
+        "legacy_signal": payload.get("legacy_signal", ""),
+        "attack_mode": payload.get("attack_mode", ""),
+        "target_source": payload.get("target_source", ""),
+        "order_purpose": payload.get("order_purpose", ""),
+    }
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO adaptive_edge_stats (
+                exchange, market, strategy_name, candidate_strategy_id, unit,
+                market_regime, action_hint, legacy_signal, attack_mode,
+                target_source, order_purpose, sample_count, win_count, loss_count,
+                win_rate, avg_post_fill_return_1m, avg_post_fill_return_5m,
+                avg_post_fill_return_15m, avg_realized_return_pct,
+                avg_realized_pnl_krw, profit_factor, avg_adverse_selection_pct,
+                avg_slippage_pct, avg_fill_time_seconds, max_drawdown_pct,
+                confidence_score, edge_score, last_updated_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                exchange, market, strategy_name, candidate_strategy_id, unit,
+                market_regime, action_hint, legacy_signal, attack_mode,
+                target_source, order_purpose
+            ) DO UPDATE SET
+                sample_count = excluded.sample_count,
+                win_count = excluded.win_count,
+                loss_count = excluded.loss_count,
+                win_rate = excluded.win_rate,
+                avg_post_fill_return_1m = excluded.avg_post_fill_return_1m,
+                avg_post_fill_return_5m = excluded.avg_post_fill_return_5m,
+                avg_post_fill_return_15m = excluded.avg_post_fill_return_15m,
+                avg_realized_return_pct = excluded.avg_realized_return_pct,
+                avg_realized_pnl_krw = excluded.avg_realized_pnl_krw,
+                profit_factor = excluded.profit_factor,
+                avg_adverse_selection_pct = excluded.avg_adverse_selection_pct,
+                avg_slippage_pct = excluded.avg_slippage_pct,
+                avg_fill_time_seconds = excluded.avg_fill_time_seconds,
+                max_drawdown_pct = excluded.max_drawdown_pct,
+                confidence_score = excluded.confidence_score,
+                edge_score = excluded.edge_score,
+                last_updated_at = excluded.last_updated_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                key["exchange"],
+                key["market"],
+                key["strategy_name"],
+                key["candidate_strategy_id"],
+                key["unit"],
+                key["market_regime"],
+                key["action_hint"],
+                key["legacy_signal"],
+                key["attack_mode"],
+                key["target_source"],
+                key["order_purpose"],
+                int(payload.get("sample_count") or 0),
+                int(payload.get("win_count") or 0),
+                int(payload.get("loss_count") or 0),
+                payload.get("win_rate", 0.0),
+                payload.get("avg_post_fill_return_1m", 0.0),
+                payload.get("avg_post_fill_return_5m", 0.0),
+                payload.get("avg_post_fill_return_15m", 0.0),
+                payload.get("avg_realized_return_pct", 0.0),
+                payload.get("avg_realized_pnl_krw", 0.0),
+                payload.get("profit_factor", 0.0),
+                payload.get("avg_adverse_selection_pct", 0.0),
+                payload.get("avg_slippage_pct", 0.0),
+                payload.get("avg_fill_time_seconds", 0.0),
+                payload.get("max_drawdown_pct", 0.0),
+                payload.get("confidence_score", 0.0),
+                payload.get("edge_score", 0.0),
+                payload.get("last_updated_at", now_utc),
+                now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT *
+            FROM adaptive_edge_stats
+            WHERE exchange = ?
+              AND market = ?
+              AND strategy_name = ?
+              AND candidate_strategy_id = ?
+              AND unit = ?
+              AND market_regime = ?
+              AND action_hint = ?
+              AND legacy_signal = ?
+              AND attack_mode = ?
+              AND target_source = ?
+              AND order_purpose = ?
+            """,
+            (
+                key["exchange"],
+                key["market"],
+                key["strategy_name"],
+                key["candidate_strategy_id"],
+                key["unit"],
+                key["market_regime"],
+                key["action_hint"],
+                key["legacy_signal"],
+                key["attack_mode"],
+                key["target_source"],
+                key["order_purpose"],
+            ),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def load_adaptive_edge_stats(
+    *,
+    exchange: str = "bithumb",
+    market: str | None = None,
+    strategy_name: str | None = None,
+    candidate_strategy_id: int | None = None,
+    unit: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    clauses = ["exchange = ?"]
+    params: list[object] = [exchange]
+    if market:
+        clauses.append("market = ?")
+        params.append(market)
+    if strategy_name:
+        clauses.append("strategy_name = ?")
+        params.append(strategy_name)
+    if candidate_strategy_id is not None:
+        clauses.append("candidate_strategy_id = ?")
+        params.append(int(candidate_strategy_id))
+    if unit is not None:
+        clauses.append("unit = ?")
+        params.append(int(unit))
+    params.append(max(int(limit), 1))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM adaptive_edge_stats
+            WHERE {" AND ".join(clauses)}
+            ORDER BY edge_score DESC, confidence_score DESC, sample_count DESC, last_updated_at DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_adaptive_edge_stat(context: dict) -> dict | None:
+    params = (
+        context.get("exchange", "bithumb"),
+        context.get("market", "KRW-BTC"),
+        context.get("strategy_name", ""),
+        int(context.get("candidate_strategy_id") or 0),
+        int(context.get("unit") or 0),
+        context.get("market_regime", ""),
+        context.get("action_hint", ""),
+        context.get("legacy_signal", ""),
+        context.get("attack_mode", ""),
+        context.get("target_source", ""),
+        context.get("order_purpose", ""),
+    )
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM adaptive_edge_stats
+            WHERE exchange = ?
+              AND market = ?
+              AND strategy_name = ?
+              AND candidate_strategy_id = ?
+              AND unit = ?
+              AND market_regime = ?
+              AND action_hint = ?
+              AND legacy_signal = ?
+              AND attack_mode = ?
+              AND target_source = ?
+              AND order_purpose = ?
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def insert_strategy_kill_switch_event(event: dict) -> int:

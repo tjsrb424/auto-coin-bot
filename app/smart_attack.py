@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from app.aggression_presets import runtime_setting_float
+
 
 ATTACK_ENTRY_DEFAULT = 65.0
 ATTACK_MAX_DEFAULT = 80.0
@@ -284,11 +286,11 @@ def apply_aggressive_target_layer(
 
 def _aggressive_target(regime: str, mode: str) -> float:
     if regime == "BREAKOUT":
-        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_BREAKOUT"), 85.0) if mode == "MAX_AGGRESSIVE" else 70.0 if mode == "AGGRESSIVE" else 0.0
+        return runtime_setting_float("SMART_AGGRESSIVE_MAX_EXPOSURE_BREAKOUT", 85.0) if mode == "MAX_AGGRESSIVE" else 70.0 if mode == "AGGRESSIVE" else 0.0
     if regime == "TREND_UP":
-        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_TREND_UP"), 75.0) if mode == "MAX_AGGRESSIVE" else 60.0 if mode == "AGGRESSIVE" else 0.0
+        return runtime_setting_float("SMART_AGGRESSIVE_MAX_EXPOSURE_TREND_UP", 75.0) if mode == "MAX_AGGRESSIVE" else 60.0 if mode == "AGGRESSIVE" else 0.0
     if regime == "RANGE":
-        return _float(os.getenv("SMART_AGGRESSIVE_MAX_EXPOSURE_RANGE"), 45.0) if mode in {"AGGRESSIVE", "MAX_AGGRESSIVE"} else 0.0
+        return runtime_setting_float("SMART_AGGRESSIVE_MAX_EXPOSURE_RANGE", 45.0) if mode in {"AGGRESSIVE", "MAX_AGGRESSIVE"} else 0.0
     if regime == "TREND_DOWN":
         return 10.0
     if regime == "PANIC":

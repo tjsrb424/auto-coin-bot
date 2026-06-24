@@ -22,6 +22,7 @@ from app.database import (
     save_active_strategy_selection,
 )
 from app.live_broker import is_emergency_stopped
+from app.market_opportunity import rank_live_candidates
 from app.risk_manager import compute_risk_state
 
 
@@ -63,9 +64,10 @@ def _active_candidate_summary(active: dict | None, candidates: list[dict]) -> di
 
 def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = False) -> dict:
     candidates = load_live_eligible_candidate_strategies(100)
+    ranked_candidates = rank_live_candidates(exchange=exchange, candidates=candidates, limit=100)
     active = load_active_strategy_selection()
-    active_candidate = next((item for item in candidates if active and int(item["id"]) == int(active["candidate_strategy_id"])), None)
-    best = candidates[0] if candidates else None
+    active_candidate = next((item for item in ranked_candidates if active and int(item["id"]) == int(active["candidate_strategy_id"])), None)
+    best = ranked_candidates[0] if ranked_candidates else None
     score_delta = _score(best) - _score(active_candidate)
     blockers: list[str] = []
     warnings: list[str] = []
@@ -122,6 +124,7 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
         "warnings": warnings,
         "best_candidate": best,
         "active_selection": _active_candidate_summary(active, candidates),
+        "top_opportunity_candidates": ranked_candidates[:10],
         "score_delta": score_delta,
         "daily_switch_count": daily_switch_count,
         "limits": {

@@ -39,6 +39,28 @@ RECOVERY_EVENT_DEDUPE_SECONDS = 300
 ORDER_SYNC_DEDUPE_EVENT_TYPES = {"OPEN_ORDER_SYNC", "OPEN_ORDER_DETAIL_RECONCILED", "OPEN_ORDER_SYNC_MISSING"}
 
 
+def _record_trade_outcome(order_log: dict | None, position_id: int | None) -> None:
+    if not order_log or not position_id:
+        return
+    try:
+        from app.trade_outcomes import record_filled_order_outcome
+
+        record_filled_order_outcome(order_log, position_id=int(position_id))
+    except Exception:
+        return
+
+
+def _refresh_realized_trade_outcomes(position_id: int | None) -> None:
+    if not position_id:
+        return
+    try:
+        from app.trade_outcomes import refresh_realized_outcomes_for_position
+
+        refresh_realized_outcomes_for_position(int(position_id))
+    except Exception:
+        return
+
+
 def _market_symbol(market: str) -> str:
     return str(market or "").split("-")[-1].upper()
 
@@ -287,10 +309,12 @@ def sync_exit_order_position(log: dict, status: ReconciledOrderStatus) -> None:
     actual_pnl = filled_amount_delta - entry_basis - paid_fee_delta
     if status.status in {"FILLED", "PARTIALLY_FILLED"}:
         update_live_order_log(str(log["request_id"]), {"actual_pnl": actual_pnl})
+        _record_trade_outcome({**log, "actual_pnl": actual_pnl, "position_id": position_id}, position_id)
         realized_pnl = _float(position.get("realized_pnl")) + actual_pnl
         remaining_volume = max(entry_volume - fill_volume, 0.0)
         if remaining_volume <= BALANCE_MISMATCH_VOLUME_TOLERANCE:
             update_live_position(position_id, {"status": "CLOSED", "realized_pnl": realized_pnl, "closed_at": _utc_now(), "exit_order_uuid": None})
+            _refresh_realized_trade_outcomes(position_id)
             _repair_closed_position_session_pointer(position)
             return
         remaining_amount = max(entry_amount - entry_basis, 0.0)
@@ -366,6 +390,7 @@ def _sync_aggregate_exit_order_positions(
         remaining_volume = max(entry_volume - applied_volume, 0.0)
         if remaining_volume <= BALANCE_MISMATCH_VOLUME_TOLERANCE:
             update_live_position(position_id, {"status": "CLOSED", "realized_pnl": realized_pnl, "closed_at": _utc_now(), "exit_order_uuid": None})
+            _refresh_realized_trade_outcomes(position_id)
             _repair_closed_position_session_pointer(position)
         else:
             remaining_amount = max(entry_amount - entry_basis, 0.0)
@@ -383,6 +408,8 @@ def _sync_aggregate_exit_order_positions(
             )
         remaining_fill = max(remaining_fill - applied_volume, 0.0)
     update_live_order_log(str(log["request_id"]), {"actual_pnl": total_actual_pnl})
+    if position_ids:
+        _record_trade_outcome({**log, "actual_pnl": total_actual_pnl, "position_id": position_ids[0]}, position_ids[0])
 
 
 def _repair_closed_position_session_pointer(position: dict) -> None:
