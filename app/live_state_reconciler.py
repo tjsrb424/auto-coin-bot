@@ -18,6 +18,7 @@ STALE_POINTER_SESSION_STATUSES = {"READY", "RUNNING", "LIVE_PAUSED"}
 TERMINAL_POSITION_STATUSES = {"CLOSED", "DUPLICATE_RECONCILED", "REJECTED"}
 ORPHAN_REASON = "ORPHAN_LIVE_ACTIVE_RECONCILED"
 STALE_POINTER_REASON = "STALE_SESSION_POSITION_POINTER_RECONCILED"
+MISMATCHED_SLOT_REASON = "MISMATCHED_SLOT_SESSION_RECONCILED"
 
 
 def _utc_now() -> str:
@@ -295,28 +296,147 @@ def reconcile_stale_live_strategy_sessions(*, dry_run: bool = True) -> dict:
     }
 
 
+def find_mismatched_position_slot_sessions() -> dict:
+    rows = _rows(
+        f"""
+        SELECT
+            ps.id AS slot_id,
+            ps.slot_number,
+            ps.status AS slot_status,
+            ps.market AS slot_market,
+            ps.candidate_strategy_id AS slot_candidate_strategy_id,
+            ps.live_position_id,
+            ps.live_strategy_session_id,
+            ps.entry_order_uuid,
+            s.market AS session_market,
+            s.candidate_strategy_id AS session_candidate_strategy_id,
+            s.status AS session_status
+        FROM position_slots ps
+        LEFT JOIN live_strategy_sessions s ON s.id = ps.live_strategy_session_id
+        WHERE ps.live_strategy_session_id IS NOT NULL
+          AND ps.status IN ({_status_set(ACTIVE_SLOT_STATUSES)})
+          AND (
+              s.id IS NULL
+              OR COALESCE(ps.market, '') != COALESCE(s.market, '')
+              OR COALESCE(ps.candidate_strategy_id, 0) != COALESCE(s.candidate_strategy_id, 0)
+          )
+        ORDER BY ps.slot_number ASC, ps.id ASC
+        """,
+        tuple(ACTIVE_SLOT_STATUSES),
+    )
+    items: list[dict] = []
+    for row in rows:
+        safe_to_release = (
+            str(row.get("slot_status") or "").upper() == "RESERVED"
+            and not row.get("live_position_id")
+            and not row.get("entry_order_uuid")
+        )
+        item = dict(row)
+        item["safe_to_release"] = safe_to_release
+        item["reason"] = MISMATCHED_SLOT_REASON
+        items.append(item)
+    return {"checked_count": len(items), "items": items}
+
+
+def reconcile_mismatched_position_slot_sessions(*, dry_run: bool = True, enqueue: bool = True) -> dict:
+    probe = find_mismatched_position_slot_sessions()
+    released_count = 0
+    manual_review_count = 0
+    now_utc = _utc_now()
+    for item in probe["items"]:
+        if not item["safe_to_release"]:
+            manual_review_count += 1
+            continue
+        candidate_id = int(item.get("slot_candidate_strategy_id") or 0)
+        market = str(item.get("slot_market") or "")
+        session_id = int(item.get("live_strategy_session_id") or 0)
+        if not dry_run:
+            with get_connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE order_reservations
+                    SET status = 'EXPIRED',
+                        updated_at = ?
+                    WHERE slot_id = ?
+                      AND status IN ('RESERVED', 'ORDER_SUBMITTED')
+                    """,
+                    (now_utc, int(item["slot_id"])),
+                )
+                conn.execute(
+                    """
+                    UPDATE position_slots
+                    SET status = 'EMPTY',
+                        market = NULL,
+                        candidate_strategy_id = NULL,
+                        live_strategy_session_id = NULL,
+                        allocated_krw = 0,
+                        reserved_krw = 0,
+                        entry_reason = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (MISMATCHED_SLOT_REASON, now_utc, int(item["slot_id"])),
+                )
+            if session_id:
+                update_live_strategy_session(
+                    session_id,
+                    {
+                        "status": "STOPPED",
+                        "auto_enabled": False,
+                        "last_risk_result": MISMATCHED_SLOT_REASON,
+                        "last_order_status": "REPLACED",
+                        "stopped_at": now_utc,
+                    },
+                )
+            if candidate_id:
+                promote_candidate_strategy(candidate_id, "LIVE_ELIGIBLE", reason=MISMATCHED_SLOT_REASON)
+                if enqueue:
+                    candidate = _row("SELECT * FROM candidate_strategies WHERE id = ?", (candidate_id,))
+                    if candidate:
+                        enqueue_next_entry(
+                            {**candidate, "market": market, "status": "LIVE_ELIGIBLE"},
+                            allocation_score=float(candidate.get("score") or 0.0),
+                            blocked_reason=MISMATCHED_SLOT_REASON,
+                        )
+        released_count += 1
+    return {
+        "checked_count": probe["checked_count"],
+        "released_count": 0 if dry_run else released_count,
+        "manual_review_count": manual_review_count,
+        "dry_run": dry_run,
+        "items": probe["items"],
+    }
+
+
 def live_state_warnings() -> dict:
     orphan = find_orphan_live_active_candidates()
     stale = find_stale_live_strategy_sessions()
+    mismatched = find_mismatched_position_slot_sessions()
     warnings: list[str] = []
     if orphan["orphan_count"]:
         warnings.append("ORPHAN_LIVE_ACTIVE_CANDIDATES_DETECTED")
     if stale["stale_count"]:
         warnings.append("STALE_SESSION_POSITION_POINTER_DETECTED")
+    if mismatched["checked_count"]:
+        warnings.append("MISMATCHED_POSITION_SLOT_SESSION_DETECTED")
     return {
         "warnings": warnings,
         "orphan_live_active_candidates_count": orphan["orphan_count"],
         "stale_session_position_pointer_count": stale["stale_count"],
+        "mismatched_position_slot_session_count": mismatched["checked_count"],
         "orphan_live_active_candidates": orphan["items"],
         "stale_session_position_pointers": stale["items"],
+        "mismatched_position_slot_sessions": mismatched["items"],
     }
 
 
 def reconcile_live_state(*, dry_run: bool = True) -> dict:
+    mismatched = reconcile_mismatched_position_slot_sessions(dry_run=dry_run)
     stale = reconcile_stale_live_strategy_sessions(dry_run=dry_run)
     orphan = reconcile_orphan_live_active_candidates(dry_run=dry_run)
     return {
         "dry_run": dry_run,
+        "mismatched_position_slot_sessions": mismatched,
         "stale_session_pointers": stale,
         "orphan_live_active_candidates": orphan,
         "warnings_after": live_state_warnings() if not dry_run else None,

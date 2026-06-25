@@ -228,8 +228,10 @@ def _health_payload(request: Request) -> dict:
             "warnings": [f"LIVE_STATE_WARNING_CHECK_FAILED:{exc.__class__.__name__}"],
             "orphan_live_active_candidates_count": 0,
             "stale_session_position_pointer_count": 0,
+            "mismatched_position_slot_session_count": 0,
             "orphan_live_active_candidates": [],
             "stale_session_position_pointers": [],
+            "mismatched_position_slot_sessions": [],
         }
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_running = bool(scheduler and getattr(scheduler, "running", False))
@@ -258,8 +260,10 @@ def _health_payload(request: Request) -> dict:
         "warnings": state_warnings["warnings"],
         "orphan_live_active_candidates_count": state_warnings["orphan_live_active_candidates_count"],
         "stale_session_position_pointer_count": state_warnings["stale_session_position_pointer_count"],
+        "mismatched_position_slot_session_count": state_warnings["mismatched_position_slot_session_count"],
         "orphan_live_active_candidates": state_warnings["orphan_live_active_candidates"],
         "stale_session_position_pointers": state_warnings["stale_session_position_pointers"],
+        "mismatched_position_slot_sessions": state_warnings["mismatched_position_slot_sessions"],
     }
 
 

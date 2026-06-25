@@ -7,6 +7,7 @@ from unittest.mock import patch
 from app import database
 from app.capital_allocator import run_capital_allocator_once
 from app.live_state_reconciler import (
+    MISMATCHED_SLOT_REASON,
     ORPHAN_REASON,
     STALE_POINTER_REASON,
     live_state_warnings,
@@ -264,3 +265,46 @@ class LiveStateReconcilerTests(unittest.TestCase):
         reconcile_live_state(dry_run=False)
         warnings_after = live_state_warnings()
         self.assertNotIn("STALE_SESSION_POSITION_POINTER_DETECTED", warnings_after["warnings"])
+
+    def test_reconcile_releases_mismatched_reserved_slot_session(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(market="KRW-ETH"))
+        wrong_candidate_id = database.save_candidate_strategy(candidate_payload(market="KRW-XRP"))
+        allow_market("KRW-XRP")
+        wrong_session_id = self._session(wrong_candidate_id, market="KRW-XRP")
+        slot = database.load_position_slots(5, "bithumb")[0]
+        database.reserve_position_slot(
+            slot_id=int(slot["id"]),
+            exchange="bithumb",
+            market="KRW-ETH",
+            candidate_strategy_id=candidate_id,
+            live_strategy_session_id=wrong_session_id,
+            amount_krw=20_000,
+            reason="TEST",
+        )
+        database.create_order_reservation(
+            {
+                "request_id": "mismatch-test",
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "slot_id": int(slot["id"]),
+                "amount_krw": 20_000,
+                "status": "RESERVED",
+                "expires_at": "2099-01-01T00:00:00Z",
+            }
+        )
+
+        warnings = live_state_warnings()
+        self.assertIn("MISMATCHED_POSITION_SLOT_SESSION_DETECTED", warnings["warnings"])
+
+        result = reconcile_live_state(dry_run=False)
+
+        self.assertEqual(result["mismatched_position_slot_sessions"]["released_count"], 1)
+        released_slot = database.load_position_slots(5, "bithumb")[0]
+        self.assertEqual(released_slot["status"], "EMPTY")
+        self.assertIsNone(released_slot["candidate_strategy_id"])
+        self.assertEqual(database.load_candidate_strategy(candidate_id)["status"], "LIVE_ELIGIBLE")
+        self.assertEqual(load_session(wrong_session_id)["status"], "STOPPED")
+        self.assertEqual(load_session(wrong_session_id)["last_risk_result"], MISMATCHED_SLOT_REASON)
+        queue = database.load_next_entry_queue(statuses=["QUEUED"])
+        self.assertTrue(any(row["candidate_strategy_id"] == candidate_id for row in queue))
