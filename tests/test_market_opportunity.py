@@ -182,6 +182,53 @@ class MarketOpportunityTests(unittest.TestCase):
         self.assertIn("BLOCKED_DUPLICATE_MARKET_POSITION", blockers)
         self.assertIn("BLOCKED_OPEN_ORDER_MISMATCH", blockers)
 
+    def test_exit_open_order_only_blocks_same_market_but_entry_order_blocks_exchange(self) -> None:
+        allow_market("KRW-AAA")
+        allow_market("KRW-BBB")
+        candidate_id = database.save_candidate_strategy(candidate_payload("KRW-AAA"))
+        candidate = database.load_candidate_strategy(candidate_id)
+        database.insert_live_order_log(
+            {
+                "request_id": "other-exit",
+                "exchange": "bithumb",
+                "market": "KRW-BBB",
+                "side": "SELL",
+                "order_type": "LIMIT",
+                "price": 1000,
+                "volume": 10,
+                "amount_krw": 10_000,
+                "fee_estimate": 5,
+                "risk_result": "ALLOWED",
+                "status": "WAITING",
+                "order_uuid": "other-exit-uuid",
+                "order_purpose": "EXIT",
+            }
+        )
+
+        blockers = explain_candidate_blockers(candidate or {}, exchange="bithumb")
+        self.assertNotIn("UNRESOLVED_OPEN_ORDER", blockers)
+
+        database.insert_live_order_log(
+            {
+                "request_id": "entry-waiting",
+                "exchange": "bithumb",
+                "market": "KRW-BBB",
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "price": 1000,
+                "volume": 10,
+                "amount_krw": 10_000,
+                "fee_estimate": 5,
+                "risk_result": "ALLOWED",
+                "status": "WAITING",
+                "order_uuid": "entry-waiting-uuid",
+                "order_purpose": "ENTRY",
+            }
+        )
+
+        blockers = explain_candidate_blockers(candidate or {}, exchange="bithumb")
+        self.assertIn("UNRESOLVED_OPEN_ORDER", blockers)
+
 
 if __name__ == "__main__":
     unittest.main()

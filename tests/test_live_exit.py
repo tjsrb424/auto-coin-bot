@@ -14,6 +14,7 @@ from app.live_exit import (
     create_exit_candidate_for_position,
     create_exit_order_preview,
     evaluate_exit_order,
+    manage_exit_order_timeout,
     maybe_create_price_exit_candidate,
     submit_exit_order,
 )
@@ -226,6 +227,62 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         broker.place_order.assert_awaited_once()
 
+    async def test_candidate_less_smart_exit_waiting_order_is_canceled_after_timeout(self) -> None:
+        position = self.create_position()
+        database.update_live_position(int(position["id"]), {"status": "CLOSING", "exit_order_uuid": "exit-waiting"})
+        database.insert_live_order_log(
+            {
+                "request_id": "smart-exit-waiting",
+                "session_id": self.session_id,
+                "candidate_strategy_id": 1,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "side": "SELL",
+                "order_type": "LIMIT",
+                "price": 99_000_000,
+                "volume": 0.0001,
+                "amount_krw": 9_900,
+                "fee_estimate": 4.95,
+                "risk_result": "ALLOWED",
+                "status": "WAITING",
+                "order_uuid": "exit-waiting",
+                "position_id": position["id"],
+                "order_purpose": "EXIT",
+                "is_auto_exit": True,
+            }
+        )
+        broker = AsyncMock()
+        broker.get_order.return_value = {
+            "uuid": "exit-waiting",
+            "state": "wait",
+            "created_at": "2020-01-01T00:00:00+00:00",
+            "volume": "0.0001",
+            "remaining_volume": "0.0001",
+            "executed_volume": "0",
+            "executed_funds": "0",
+            "paid_fee": "0",
+        }
+        broker.cancel_order.return_value = {
+            "uuid": "exit-waiting",
+            "state": "cancel",
+            "volume": "0.0001",
+            "remaining_volume": "0.0001",
+            "executed_volume": "0",
+        }
+
+        with patch("app.live_exit.get_live_broker", return_value=broker):
+            await manage_exit_order_timeout(database.load_live_position(int(position["id"])), LiveExitConfigForTest())
+
+        broker.cancel_order.assert_awaited_once_with("exit-waiting")
+        updated_log = database.get_live_order_log("smart-exit-waiting")
+        updated_position = database.load_live_position(int(position["id"]))
+        updated_session = database.load_latest_live_strategy_session()
+        assert updated_log is not None and updated_position is not None and updated_session is not None
+        self.assertEqual(updated_log["status"], "CANCELED")
+        self.assertEqual(updated_position["status"], "OPEN")
+        self.assertIsNone(updated_position["exit_order_uuid"])
+        self.assertEqual(updated_session["last_risk_result"], "AUTO_CANCELED_STALE_EXIT_ORDER")
+
     async def test_open_position_smart_limited_uses_live_trading_config(self) -> None:
         position = self.create_position()
         session = database.load_latest_live_strategy_session()
@@ -286,6 +343,11 @@ class LiveExitTests(unittest.IsolatedAsyncioTestCase):
         passed_live_config = submit_mock.await_args.args[4]
         self.assertTrue(hasattr(passed_live_config, "fee_rate"))
         self.assertIs(passed_live_config, live_config)
+
+
+class LiveExitConfigForTest:
+    cancel_exit_order_after_seconds = 45
+    max_exit_retry_count = 2
 
 
 if __name__ == "__main__":

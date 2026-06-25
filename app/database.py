@@ -4898,6 +4898,23 @@ def has_unresolved_live_order_for_exchange(exchange: str) -> bool:
     return row is not None
 
 
+def has_unresolved_entry_live_order_for_exchange(exchange: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT 1
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND order_purpose = 'ENTRY'
+              AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
+            LIMIT 1
+            """,
+            (exchange,),
+        ).fetchone()
+    return row is not None
+
+
 def load_unresolved_live_order_logs_for_exchange(exchange: str = "bithumb") -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(

@@ -5,7 +5,7 @@ from typing import Any
 from app.database import (
     get_connection,
     has_unresolved_live_order,
-    has_unresolved_live_order_for_exchange,
+    has_unresolved_entry_live_order_for_exchange,
     load_adaptive_edge_stats,
     load_live_eligible_candidate_strategies,
     load_market_universe_item,
@@ -139,7 +139,7 @@ def explain_candidate_blockers(
         blockers.append("BLOCKED_OPEN_ORDER_MISMATCH")
     if snapshot and snapshot.get("balance_mismatch_detected"):
         blockers.append("BLOCKED_BALANCE_MISMATCH")
-    if has_unresolved_live_order(exchange, market) or has_unresolved_live_order_for_exchange(exchange):
+    if has_unresolved_live_order(exchange, market) or has_unresolved_entry_live_order_for_exchange(exchange):
         blockers.append("UNRESOLVED_OPEN_ORDER")
     if not market_is_live_allowed(exchange, market):
         blockers.append("MARKET_NOT_LIVE_ALLOWED")

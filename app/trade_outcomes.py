@@ -120,6 +120,59 @@ def refresh_realized_outcomes_for_position(position_id: int) -> dict:
     return {"updated": updated, "status": "REALIZED" if updated else "NO_OUTCOMES"}
 
 
+def backfill_trade_outcomes_from_filled_orders(*, limit: int = 1000, now_utc: str | None = None) -> dict:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT live.*
+            FROM live_order_logs AS live
+            WHERE live.status IN ('FILLED', 'PARTIALLY_FILLED')
+              AND live.order_uuid IS NOT NULL
+              AND live.order_uuid != ''
+              AND live.executed_volume > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM trade_outcome_logs AS outcome
+                  WHERE outcome.order_uuid = live.order_uuid
+              )
+            ORDER BY live.updated_at ASC, live.id ASC
+            LIMIT ?
+            """,
+            (max(int(limit), 1),),
+        ).fetchall()
+    created = 0
+    touched_positions: set[int] = set()
+    touched_markets: set[tuple[str, str]] = set()
+    seen_order_uuids: set[str] = set()
+    for row in rows:
+        order_log = dict(row)
+        order_uuid = str(order_log.get("order_uuid") or "")
+        if not order_uuid or order_uuid in seen_order_uuids:
+            continue
+        seen_order_uuids.add(order_uuid)
+        outcome = record_filled_order_outcome(order_log, position_id=order_log.get("position_id"))
+        if not outcome:
+            continue
+        created += 1
+        if outcome.get("position_id"):
+            touched_positions.add(int(outcome["position_id"]))
+        touched_markets.add((str(outcome.get("exchange") or "bithumb"), str(outcome.get("market") or "KRW-BTC")))
+
+    post_fill = refresh_trade_outcome_post_fill_returns(now_utc=now_utc, limit=max(limit, 1))
+    realized = 0
+    for position_id in sorted(touched_positions):
+        result = refresh_realized_outcomes_for_position(position_id)
+        realized += int(result.get("updated") or 0)
+    for exchange, market in touched_markets:
+        _refresh_adaptive_edge_stats([{"exchange": exchange, "market": market}])
+    return {
+        "scanned": len(rows),
+        "created": created,
+        "post_fill": post_fill,
+        "realized_updates": realized,
+    }
+
+
 def _refresh_adaptive_edge_stats(outcomes: list[dict]) -> None:
     markets = {(str(outcome.get("exchange") or "bithumb"), str(outcome.get("market") or "KRW-BTC")) for outcome in outcomes if outcome}
     if not markets:

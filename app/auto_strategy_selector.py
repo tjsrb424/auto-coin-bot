@@ -6,8 +6,8 @@ from typing import Any
 
 from app.database import (
     count_strategy_switches_today,
+    has_unresolved_entry_live_order_for_exchange,
     has_unresolved_live_order,
-    has_unresolved_live_order_for_exchange,
     load_active_strategy_selection,
     load_global_bot_operation_policy,
     load_live_eligible_candidate_strategies,
@@ -89,7 +89,7 @@ def evaluate_auto_strategy_selector(*, exchange: str = "bithumb", apply: bool = 
         risk_state = compute_risk_state(exchange, market)
         if risk_state.get("status") in {"BLOCKED", "EMERGENCY_STOPPED"}:
             blockers.append("RISK_STATE_BLOCKED")
-        if risk_state.get("open_order_count", 0) > 0 or has_unresolved_live_order(exchange, market) or has_unresolved_live_order_for_exchange(exchange):
+        if risk_state.get("open_order_count", 0) > 0 or has_unresolved_live_order(exchange, market) or has_unresolved_entry_live_order_for_exchange(exchange):
             blockers.append("UNRESOLVED_OPEN_ORDER")
         open_positions = load_open_live_positions_for_exchange(exchange)
         if len(open_positions) >= MAX_OPEN_POSITIONS:

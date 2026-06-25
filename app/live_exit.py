@@ -405,7 +405,17 @@ async def cancel_exit_order(request_id: str) -> dict:
             risk_result = "RETRY_PENDING" if candidate_status == "PENDING" else "CANCELED"
             update_exit_candidate(int(log["exit_candidate_id"]), {"status": candidate_status, "risk_result": risk_result})
         if log.get("position_id"):
-            update_live_position(int(log["position_id"]), {"status": "EXIT_CANDIDATE", "exit_order_uuid": None})
+            next_position_status = "EXIT_CANDIDATE" if log.get("exit_candidate_id") else "OPEN"
+            update_live_position(int(log["position_id"]), {"status": next_position_status, "exit_order_uuid": None})
+        if log.get("session_id"):
+            update_live_strategy_session(
+                int(log["session_id"]),
+                {
+                    "current_open_order_uuid": None,
+                    "last_order_status": "CANCELED",
+                    "last_risk_result": "AUTO_CANCELED_STALE_EXIT_ORDER",
+                },
+            )
         return {"ok": True, "status": "CANCELED"}
     except Exception as exc:
         log_recovery_event(
@@ -424,9 +434,6 @@ async def cancel_exit_order(request_id: str) -> dict:
 
 async def manage_exit_order_timeout(position: dict, config: LiveExitConfig | None = None) -> None:
     config = config or LiveExitConfig.from_env()
-    candidate = load_active_exit_candidate(int(position["id"]))
-    if not candidate:
-        return
     # The active order is found through LiveOrderLog; keeping this conservative
     # avoids canceling unrelated entry orders.
     from app.database import load_live_order_logs
@@ -435,7 +442,7 @@ async def manage_exit_order_timeout(position: dict, config: LiveExitConfig | Non
         if log.get("order_purpose") == "EXIT" and log.get("position_id") == position["id"] and log.get("status") in {"SUBMITTED", "WAITING"}:
             await reconcile_exit_order(str(log["request_id"]))
             refreshed = get_live_order_log(str(log["request_id"]))
-            if refreshed and refreshed.get("status") == "WAITING" and _seconds_since(str(refreshed.get("updated_at") or _utc_now())) >= config.cancel_exit_order_after_seconds:
+            if refreshed and refreshed.get("status") == "WAITING" and _seconds_since(_exit_order_timeout_basis(refreshed)) >= config.cancel_exit_order_after_seconds:
                 await cancel_exit_order(str(refreshed["request_id"]))
             return
 
@@ -624,6 +631,13 @@ def _holding_minutes(opened_at: str | None) -> float:
     if not opened_at:
         return 0.0
     return _seconds_since(opened_at) / 60
+
+
+def _exit_order_timeout_basis(order_log: dict) -> str:
+    response = order_log.get("exchange_response_payload")
+    if isinstance(response, dict) and response.get("created_at"):
+        return str(response["created_at"])
+    return str(order_log.get("created_at") or order_log.get("updated_at") or _utc_now())
 
 
 def _seconds_since(timestamp_utc: str) -> float:

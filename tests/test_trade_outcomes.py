@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app import database
 from app.trade_outcomes import (
+    backfill_trade_outcomes_from_filled_orders,
     record_filled_order_outcome,
     refresh_realized_outcomes_for_position,
     refresh_trade_outcome_post_fill_returns,
@@ -186,6 +187,36 @@ class TradeOutcomeTests(unittest.TestCase):
         self.assertTrue(all(row["realized_pnl_krw"] == 150.0 for row in rows))
         self.assertTrue(all(row["realized_return_pct"] == 7.5 for row in rows))
         self.assertTrue(all(row["holding_minutes"] == 30.0 for row in rows))
+
+    def test_backfill_filled_orders_creates_outcomes_and_adaptive_stats(self) -> None:
+        database.insert_live_order_log(live_order("backfill-1", order_uuid="backfill-order-1"))
+        database.insert_live_order_log(live_order("backfill-2", order_uuid="backfill-order-2", filled_price=101.0))
+        with database.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE live_order_logs
+                SET created_at = '2026-06-24T00:00:00Z',
+                    updated_at = '2026-06-24T00:00:30Z'
+                WHERE request_id IN ('backfill-1', 'backfill-2')
+                """
+            )
+        database.insert_candles(
+            [
+                candle("2026-06-24T00:01:30Z", 101.0),
+                candle("2026-06-24T00:03:30Z", 102.0),
+                candle("2026-06-24T00:05:30Z", 103.0),
+                candle("2026-06-24T00:15:30Z", 104.0),
+            ]
+        )
+
+        result = backfill_trade_outcomes_from_filled_orders(limit=10, now_utc="2026-06-24T00:16:00Z")
+
+        outcomes = database.load_trade_outcome_logs(exchange="bithumb", market="KRW-BTC", limit=10)
+        stats = database.load_adaptive_edge_stats(exchange="bithumb", market="KRW-BTC")
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(len(outcomes), 2)
+        self.assertGreaterEqual(len(stats), 1)
+        self.assertGreaterEqual(stats[0]["sample_count"], 1)
 
 
 if __name__ == "__main__":
