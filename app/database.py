@@ -3702,6 +3702,12 @@ def create_live_strategy_session(session: dict) -> int:
         return int(cursor.lastrowid)
 
 
+def load_live_strategy_session(session_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM live_strategy_sessions WHERE id = ?", (session_id,)).fetchone()
+    return _normalize_live_strategy_session(dict(row)) if row else None
+
+
 def load_latest_live_strategy_session() -> dict | None:
     with get_connection() as conn:
         row = conn.execute(

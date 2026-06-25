@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database
-from app.capital_allocator import capital_allocator_status, run_capital_allocator_once
+from app.capital_allocator import _create_allocator_session, capital_allocator_status, run_capital_allocator_once
 
 
 def candidate_payload(market: str = "KRW-ETH", status: str = "LIVE_ELIGIBLE", score: float = 95.0) -> dict:
@@ -164,6 +164,31 @@ class CapitalAllocatorTests(unittest.TestCase):
         slots = database.load_position_slots(5, "bithumb")
         self.assertEqual(slots[0]["status"], "RESERVED")
         self.assertEqual(slots[0]["candidate_strategy_id"], candidate_id)
+
+    def test_allocator_session_creation_rejects_candidate_mismatch(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(market="KRW-ETH"))
+        wrong_session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-WLD",
+                "candidate_strategy_id": 999,
+                "strategy_name": "rsi",
+                "strategy_parameters": {},
+                "status": "READY",
+                "auto_enabled": True,
+                "initial_balance_krw": 0.0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 3,
+            }
+        )
+
+        with patch("app.capital_allocator.create_live_strategy_session", return_value=wrong_session_id):
+            with self.assertRaisesRegex(RuntimeError, "ALLOCATOR_SESSION_CANDIDATE_MISMATCH"):
+                _create_allocator_session(
+                    candidate=database.load_candidate_strategy(candidate_id),
+                    approved_order=10_000,
+                    exchange="bithumb",
+                )
 
     def test_allocator_uses_market_opportunity_score_for_candidate_ordering(self) -> None:
         base_id = database.save_candidate_strategy(candidate_payload(market="KRW-ETH", score=95))

@@ -21,6 +21,7 @@ from app.database import (
     load_candidate_strategy,
     load_global_bot_operation_policy,
     load_live_eligible_candidate_strategies,
+    load_live_strategy_session,
     load_next_entry_queue,
     load_open_live_positions,
     load_open_live_positions_for_exchange,
@@ -246,20 +247,7 @@ def _replace_reserved_slot_candidate(
                 "stopped_at": now_utc,
             },
         )
-    session_id = create_live_strategy_session(
-        {
-            "exchange": str(config["exchange"]),
-            "market": market,
-            "candidate_strategy_id": int(candidate["id"]),
-            "strategy_name": candidate["strategy"],
-            "strategy_parameters": candidate.get("parameters", {}),
-            "status": "READY",
-            "auto_enabled": True,
-            "initial_balance_krw": 0.0,
-            "max_order_krw": approved_order,
-            "max_orders_per_day": _int_env("AUTO_MAX_ORDERS_PER_DAY", 3, minimum=1),
-        }
-    )
+    session_id = _create_allocator_session(candidate=candidate, approved_order=approved_order, exchange=str(config["exchange"]))
     reservation_id = create_order_reservation(
         {
             "request_id": f"allocator-replace-{uuid.uuid4().hex[:16]}",
@@ -301,6 +289,36 @@ def _replace_reserved_slot_candidate(
         "reservation_id": reservation_id,
         "replaced_candidate_strategy_id": old_candidate_id or None,
     }
+
+
+def _create_allocator_session(*, candidate: dict, approved_order: float, exchange: str) -> int:
+    session_id = create_live_strategy_session(
+        {
+            "exchange": exchange,
+            "market": candidate["market"],
+            "candidate_strategy_id": int(candidate["id"]),
+            "strategy_name": candidate["strategy"],
+            "strategy_parameters": candidate.get("parameters", {}),
+            "status": "READY",
+            "auto_enabled": True,
+            "initial_balance_krw": 0.0,
+            "max_order_krw": approved_order,
+            "max_orders_per_day": _int_env("AUTO_MAX_ORDERS_PER_DAY", 3, minimum=1),
+        }
+    )
+    session = load_live_strategy_session(session_id)
+    if not session:
+        raise RuntimeError(f"ALLOCATOR_SESSION_CREATE_MISSING:{session_id}")
+    if str(session.get("market") or "") != str(candidate["market"]) or int(session.get("candidate_strategy_id") or 0) != int(
+        candidate["id"]
+    ):
+        raise RuntimeError(
+            "ALLOCATOR_SESSION_CANDIDATE_MISMATCH:"
+            f"session_id={session_id}:session_market={session.get('market')}:"
+            f"session_candidate={session.get('candidate_strategy_id')}:"
+            f"candidate_market={candidate['market']}:candidate_id={candidate['id']}"
+        )
+    return session_id
 
 
 def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | None = None) -> dict:
@@ -474,20 +492,7 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 continue
 
             slot = empty_slots.pop(0)
-            session_id = create_live_strategy_session(
-                {
-                    "exchange": exchange,
-                    "market": candidate["market"],
-                    "candidate_strategy_id": int(candidate["id"]),
-                    "strategy_name": candidate["strategy"],
-                    "strategy_parameters": candidate.get("parameters", {}),
-                    "status": "READY",
-                    "auto_enabled": True,
-                    "initial_balance_krw": 0.0,
-                    "max_order_krw": approved_order,
-                    "max_orders_per_day": _int_env("AUTO_MAX_ORDERS_PER_DAY", 3, minimum=1),
-                }
-            )
+            session_id = _create_allocator_session(candidate=candidate, approved_order=approved_order, exchange=exchange)
             reservation_id = create_order_reservation(
                 {
                     "request_id": f"allocator-{uuid.uuid4().hex[:24]}",
