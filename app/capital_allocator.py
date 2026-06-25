@@ -37,6 +37,7 @@ from app.database import (
 )
 from app.live_broker import is_emergency_stopped
 from app.market_opportunity import build_market_opportunity_rankings, rank_live_candidates
+from app.live_state_reconciler import reconcile_orphan_live_active_candidates, reconcile_stale_live_strategy_sessions
 
 ALLOCATOR_TASK = "capital_allocator"
 
@@ -335,6 +336,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
             return {"ok": True, "run": run, "accepted": accepted, "blocked": blocked}
 
         policy = load_global_bot_operation_policy()
+        stale_reconcile = reconcile_stale_live_strategy_sessions(dry_run=False)
+        orphan_reconcile = reconcile_orphan_live_active_candidates(dry_run=False)
         snapshot = build_capital_snapshot(exchange)
         slots = snapshot.get("slots") or reconcile_position_slots(int(config["max_slots"]), exchange)
         open_positions = snapshot.get("positions") or load_open_live_positions_for_exchange(exchange)
@@ -564,6 +567,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 "blocked_count": len(blocked),
                 "empty_slot_count": len(empty_slots),
                 "snapshot_error": snapshot.get("snapshot_error", ""),
+                "stale_session_reconcile": stale_reconcile,
+                "orphan_live_active_reconcile": orphan_reconcile,
             },
         )
         return {"ok": True, "run": run, "accepted": accepted, "blocked": blocked, "status": capital_allocator_status(exchange)}

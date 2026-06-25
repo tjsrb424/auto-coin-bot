@@ -136,6 +136,7 @@ from app.live_recovery import (
     run_startup_live_recovery_async,
     sync_open_orders,
 )
+from app.live_state_reconciler import live_state_warnings, reconcile_live_state
 from app.live_exit import (
     approve_exit_candidate,
     cancel_exit_order,
@@ -220,6 +221,16 @@ def _health_payload(request: Request) -> dict:
     db_schema = get_db_schema_status()
 
     risk_state = compute_risk_state(selected_exchange, os.getenv("AUTO_ALLOWED_MARKET", DEFAULT_MARKET))
+    try:
+        state_warnings = live_state_warnings()
+    except Exception as exc:
+        state_warnings = {
+            "warnings": [f"LIVE_STATE_WARNING_CHECK_FAILED:{exc.__class__.__name__}"],
+            "orphan_live_active_candidates_count": 0,
+            "stale_session_position_pointer_count": 0,
+            "orphan_live_active_candidates": [],
+            "stale_session_position_pointers": [],
+        }
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_running = bool(scheduler and getattr(scheduler, "running", False))
     scheduler_jobs = [job.id for job in scheduler.get_jobs()] if scheduler else []
@@ -244,6 +255,11 @@ def _health_payload(request: Request) -> dict:
         "live_session_status": runtime["strategy_status"] if runtime["strategy_status"] != "STOPPED" else "PAUSED",
         "latest_order_sync_time": runtime["last_order_time_utc"],
         "latest_balance_sync_time": _latest_balance_sync_time_utc,
+        "warnings": state_warnings["warnings"],
+        "orphan_live_active_candidates_count": state_warnings["orphan_live_active_candidates_count"],
+        "stale_session_position_pointer_count": state_warnings["stale_session_position_pointer_count"],
+        "orphan_live_active_candidates": state_warnings["orphan_live_active_candidates"],
+        "stale_session_position_pointers": state_warnings["stale_session_position_pointers"],
     }
 
 
@@ -1862,6 +1878,11 @@ async def live_recovery_status(exchange: str = Query("bithumb", pattern=r"^(bith
 @app.post("/api/live-recovery/sync-open-orders")
 async def sync_live_open_orders(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     return {"sync": await sync_open_orders(exchange, DEFAULT_MARKET), "recent_events": recent_recovery_events()}
+
+
+@app.post("/api/live-recovery/reconcile-state")
+def reconcile_live_state_endpoint(dry_run: bool = Query(True)) -> dict:
+    return reconcile_live_state(dry_run=dry_run)
 
 
 @app.post("/api/live-recovery/import-exchange-position")
