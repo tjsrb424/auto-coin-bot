@@ -223,6 +223,41 @@ class CapitalAllocatorTests(unittest.TestCase):
         self.assertEqual(len([row for row in queue if row["candidate_strategy_id"] == candidate_id]), 1)
         self.assertEqual(queue[0]["blocked_reason"], "POLICY_AUTO_TRADING_DISABLED")
 
+    def test_next_entry_status_update_merges_existing_target_status_row(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload())
+        candidate = database.load_candidate_strategy(candidate_id)
+
+        first_id = database.enqueue_next_entry(candidate, allocation_score=10, blocked_reason="FIRST")
+        database.update_next_entry_status(candidate_id, "PROMOTED_TO_SLOT", "FIRST_PROMOTED")
+        second_id = database.enqueue_next_entry(candidate, allocation_score=20, blocked_reason="SECOND")
+
+        self.assertIsNotNone(first_id)
+        self.assertIsNotNone(second_id)
+        database.update_next_entry_status(candidate_id, "PROMOTED_TO_SLOT", "SECOND_PROMOTED")
+
+        with database.get_connection() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM next_entry_queue WHERE candidate_strategy_id = ? ORDER BY id",
+                    (candidate_id,),
+                ).fetchall()
+            ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "PROMOTED_TO_SLOT")
+        self.assertEqual(rows[0]["allocation_score"], 20)
+        self.assertEqual(rows[0]["blocked_reason"], "SECOND_PROMOTED")
+
+    def test_next_entry_queue_insert_is_centralized_in_database_helper(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        insert_sites = []
+        for path in (repo_root / "app").glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if "INSERT INTO next_entry_queue" in text:
+                insert_sites.append(path.name)
+
+        self.assertEqual(insert_sites, ["database.py"])
+
     def test_allocator_uses_market_opportunity_score_for_candidate_ordering(self) -> None:
         base_id = database.save_candidate_strategy(candidate_payload(market="KRW-ETH", score=95))
         allow_market("KRW-XRP")

@@ -8,6 +8,8 @@ from unittest.mock import patch
 from app import database
 from app.capital_allocator import run_capital_allocator_once
 from app.live_state_reconciler import (
+    DUPLICATE_POSITION_SESSION_REASON,
+    ENTRY_FILL_LIFECYCLE_REASON,
     EXPIRED_RESERVATION_REASON,
     MISMATCHED_SLOT_REASON,
     ORPHAN_REASON,
@@ -16,6 +18,8 @@ from app.live_state_reconciler import (
     STALE_POINTER_REASON,
     live_state_warnings,
     reconcile_expired_order_reservations,
+    reconcile_duplicate_position_sessions,
+    reconcile_entry_fill_lifecycles,
     reconcile_live_state,
     reconcile_orphan_live_active_candidates,
     reconcile_reserved_entry_blocked_slots,
@@ -406,6 +410,64 @@ class LiveStateReconcilerTests(unittest.TestCase):
         self.assertEqual(load_reservations(candidate_id)[0]["status"], "RESERVED")
         self.assertEqual(load_slot(int(slot["id"]))["status"], "RESERVED")
         self.assertEqual(load_session(session_id)["status"], "READY")
+
+    def test_entry_filled_consumes_reservation_and_opens_reserved_slot(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        session_id = self._session(candidate_id, status="RUNNING")
+        slot = database.load_position_slots(5, "bithumb")[0]
+        database.reserve_position_slot(
+            slot_id=int(slot["id"]),
+            exchange="bithumb",
+            market="KRW-ETH",
+            candidate_strategy_id=candidate_id,
+            live_strategy_session_id=session_id,
+            amount_krw=20_000,
+            reason="TEST_ENTRY_FILL",
+        )
+        database.create_order_reservation(
+            {
+                "request_id": "entry-filled-reservation-test",
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "slot_id": int(slot["id"]),
+                "amount_krw": 20_000,
+                "status": "RESERVED",
+                "expires_at": utc_offset(30),
+            }
+        )
+        position_id = database.create_live_position(live_position(session_id, candidate_id))
+        database.update_live_strategy_session(session_id, {"current_position_id": position_id})
+
+        result = reconcile_entry_fill_lifecycles(dry_run=False)
+
+        self.assertEqual(result["finalized_count"], 1)
+        opened_slot = load_slot(int(slot["id"]))
+        self.assertEqual(opened_slot["status"], "OPEN")
+        self.assertEqual(opened_slot["live_position_id"], position_id)
+        self.assertEqual(opened_slot["live_strategy_session_id"], session_id)
+        self.assertEqual(opened_slot["reserved_krw"], 0)
+        self.assertEqual(opened_slot["entry_order_uuid"], "entry-open")
+        self.assertEqual(load_reservations(candidate_id)[0]["status"], "CONSUMED")
+
+    def test_duplicate_running_session_for_same_position_is_stopped(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        authoritative_session_id = self._session(candidate_id, status="RUNNING")
+        duplicate_session_id = self._session(candidate_id, status="RUNNING")
+        position_id = database.create_live_position(live_position(authoritative_session_id, candidate_id))
+        database.update_live_strategy_session(authoritative_session_id, {"status": "RUNNING", "auto_enabled": True})
+        database.update_live_strategy_session(authoritative_session_id, {"current_position_id": position_id})
+        database.update_live_strategy_session(duplicate_session_id, {"current_position_id": position_id})
+
+        result = reconcile_duplicate_position_sessions(dry_run=False)
+
+        self.assertEqual(result["stopped_count"], 1)
+        self.assertEqual(load_session(authoritative_session_id)["status"], "RUNNING")
+        duplicate = load_session(duplicate_session_id)
+        self.assertEqual(duplicate["status"], "STOPPED")
+        self.assertIsNone(duplicate["current_position_id"])
+        self.assertFalse(duplicate["auto_enabled"])
+        self.assertEqual(duplicate["last_risk_result"], DUPLICATE_POSITION_SESSION_REASON)
 
     def test_reserved_slot_session_pointer_updates_to_active_runtime_session(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))

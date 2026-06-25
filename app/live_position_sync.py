@@ -6,6 +6,7 @@ from typing import Any
 
 from app.database import (
     create_live_position,
+    finalize_entry_lifecycle_for_position,
     insert_live_recovery_event,
     insert_position_fill_event,
     load_order_application_ledger,
@@ -241,6 +242,8 @@ def _apply_order_uuid_delta(
                 "last_risk_result": "DUPLICATE_ORDER_UUID_ALREADY_APPLIED",
             },
         )
+        if str(ledger.get("fill_type") or "ENTRY").upper() == "ENTRY":
+            finalize_entry_lifecycle_for_position(position_id)
         return {
             "status": "ATTACHED",
             "position_id": position_id,
@@ -295,6 +298,8 @@ def _apply_order_uuid_delta(
             "last_risk_result": "ORDER_UUID_DELTA_APPLIED",
         },
     )
+    if str(ledger.get("fill_type") or "ENTRY").upper() == "ENTRY":
+        finalize_entry_lifecycle_for_position(position_id)
     _log_event(
         "ORDER_UUID_DELTA_APPLIED",
         "INFO",
@@ -428,6 +433,8 @@ def sync_filled_entry_order_to_position(
                 "last_risk_result": "POSITION_FILL_ALREADY_SYNCED",
             },
         )
+        if fill_type == "ENTRY":
+            finalize_entry_lifecycle_for_position(position_id)
         return {"status": "ATTACHED", "position_id": position_id, "fill_type": fill_type, "idempotent": True}
 
     if scale_target_id:
@@ -538,6 +545,7 @@ def sync_filled_entry_order_to_position(
             },
         )
         _record_trade_outcome(canonical_log, position_id)
+        finalize_entry_lifecycle_for_position(position_id)
         return {"status": "ATTACHED", "position_id": position_id, "fill_type": "ENTRY", "idempotent": True}
 
     position_id = create_live_position(_new_position_payload(session, canonical_log, order_uuid, price, volume, amount))
@@ -576,6 +584,7 @@ def sync_filled_entry_order_to_position(
             "last_risk_result": "POSITION_OPEN_SYNCED",
         },
     )
+    finalize_entry_lifecycle_for_position(position_id)
     _log_event(
         "POSITION_OPEN_SYNCED",
         "INFO",

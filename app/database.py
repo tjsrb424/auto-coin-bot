@@ -4286,6 +4286,169 @@ def update_order_reservation_status(
         return conn.total_changes - before
 
 
+def finalize_entry_lifecycle_for_position(
+    position_id: int,
+    *,
+    reservation_status: str = "CONSUMED",
+    reason: str = "ENTRY_FILL_LIFECYCLE_FINALIZED",
+) -> dict:
+    position = load_live_position(position_id)
+    if not position:
+        return {"ok": False, "reason": "POSITION_NOT_FOUND", "position_id": position_id}
+    if str(position.get("status") or "").upper() not in {
+        "OPEN",
+        "EXIT_CANDIDATE",
+        "EXIT_PENDING",
+        "CLOSING",
+        "MANUAL_REVIEW_REQUIRED",
+    }:
+        return {"ok": False, "reason": "POSITION_NOT_ACTIVE", "position_id": position_id}
+
+    now_utc = _utc_now()
+    session_id = int(position.get("session_id") or 0)
+    candidate_id = int(position.get("candidate_strategy_id") or 0)
+    exchange = str(position.get("exchange") or "bithumb")
+    market = str(position.get("market") or "")
+    current_price = float(position.get("current_price") or position.get("entry_price") or 0.0)
+    entry_volume = float(position.get("entry_volume") or 0.0)
+    entry_amount = float(position.get("entry_amount_krw") or (current_price * entry_volume))
+    current_value = current_price * entry_volume
+
+    with get_connection() as conn:
+        slot = None
+        if session_id:
+            slot = conn.execute(
+                """
+                SELECT *
+                FROM position_slots
+                WHERE exchange = ?
+                  AND market = ?
+                  AND candidate_strategy_id = ?
+                  AND live_strategy_session_id = ?
+                  AND status IN ('RESERVED', 'ENTERING', 'OPEN')
+                ORDER BY CASE status WHEN 'RESERVED' THEN 0 WHEN 'ENTERING' THEN 1 ELSE 2 END,
+                         updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (exchange, market, candidate_id, session_id),
+            ).fetchone()
+        if slot is None:
+            slot = conn.execute(
+                """
+                SELECT *
+                FROM position_slots
+                WHERE exchange = ?
+                  AND market = ?
+                  AND candidate_strategy_id = ?
+                  AND status IN ('RESERVED', 'ENTERING', 'OPEN')
+                  AND (live_position_id IS NULL OR live_position_id = ?)
+                ORDER BY CASE status WHEN 'RESERVED' THEN 0 WHEN 'ENTERING' THEN 1 ELSE 2 END,
+                         updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (exchange, market, candidate_id, position_id),
+            ).fetchone()
+        if slot is None:
+            slot = conn.execute(
+                """
+                SELECT *
+                FROM position_slots
+                WHERE live_position_id = ?
+                LIMIT 1
+                """,
+                (position_id,),
+            ).fetchone()
+
+        slot_id = int(slot["id"]) if slot else None
+        if slot_id is not None:
+            conn.execute(
+                """
+                UPDATE position_slots
+                SET status = ?,
+                    exchange = ?,
+                    market = ?,
+                    candidate_strategy_id = ?,
+                    live_position_id = ?,
+                    live_strategy_session_id = ?,
+                    entry_order_uuid = ?,
+                    exit_order_uuid = ?,
+                    allocated_krw = ?,
+                    reserved_krw = 0,
+                    current_value_krw = ?,
+                    unrealized_pnl = ?,
+                    realized_pnl = ?,
+                    entry_reason = COALESCE(entry_reason, ?),
+                    opened_at = COALESCE(opened_at, ?),
+                    closed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(position.get("status") or "OPEN"),
+                    exchange,
+                    market,
+                    candidate_id,
+                    position_id,
+                    session_id or None,
+                    position.get("entry_order_uuid"),
+                    position.get("exit_order_uuid"),
+                    entry_amount,
+                    current_value,
+                    float(position.get("unrealized_pnl") or 0.0),
+                    float(position.get("realized_pnl") or 0.0),
+                    reason,
+                    position.get("opened_at") or now_utc,
+                    now_utc,
+                    slot_id,
+                ),
+            )
+
+        reservation_filters = [
+            "exchange = ?",
+            "market = ?",
+            "candidate_strategy_id = ?",
+            "status IN ('RESERVED', 'ORDER_SUBMITTED')",
+        ]
+        reservation_params: list[object] = [exchange, market, candidate_id]
+        if slot_id is not None:
+            reservation_filters.append("(slot_id = ? OR slot_id IS NULL)")
+            reservation_params.append(slot_id)
+        conn.execute(
+            f"""
+            UPDATE order_reservations
+            SET status = ?,
+                updated_at = ?
+            WHERE {' AND '.join(reservation_filters)}
+            """,
+            [reservation_status, now_utc, *reservation_params],
+        )
+        updated_slot = conn.execute("SELECT * FROM position_slots WHERE id = ?", (slot_id,)).fetchone() if slot_id else None
+        reservations = conn.execute(
+            """
+            SELECT *
+            FROM order_reservations
+            WHERE exchange = ?
+              AND market = ?
+              AND candidate_strategy_id = ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (exchange, market, candidate_id),
+        ).fetchall()
+
+    update_next_entry_status(candidate_id, "PROMOTED_TO_SLOT", reason)
+    return {
+        "ok": True,
+        "reason": reason,
+        "position_id": position_id,
+        "session_id": session_id or None,
+        "slot_id": slot_id,
+        "reservation_status": reservation_status,
+        "slot": dict(updated_slot) if updated_slot else None,
+        "reservations": [dict(row) for row in reservations],
+    }
+
+
 def create_capital_allocation_run(payload: dict) -> int:
     now_utc = _utc_now()
     with get_connection() as conn:
@@ -4443,6 +4606,60 @@ def load_next_entry_queue(limit: int = 20, statuses: list[str] | None = None) ->
 
 def update_next_entry_status(candidate_strategy_id: int, status: str, blocked_reason: str | None = None) -> None:
     with get_connection() as conn:
+        queued = conn.execute(
+            """
+            SELECT *
+            FROM next_entry_queue
+            WHERE candidate_strategy_id = ?
+              AND status = 'QUEUED'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (candidate_strategy_id,),
+        ).fetchone()
+        if not queued:
+            return
+        existing_target = conn.execute(
+            """
+            SELECT *
+            FROM next_entry_queue
+            WHERE candidate_strategy_id = ?
+              AND status = ?
+              AND id != ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (candidate_strategy_id, status, int(queued["id"])),
+        ).fetchone()
+        if existing_target:
+            conn.execute(
+                """
+                UPDATE next_entry_queue
+                SET market = ?,
+                    strategy = ?,
+                    unit = ?,
+                    score = ?,
+                    allocation_score = ?,
+                    blocked_reason = COALESCE(?, ?),
+                    expires_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    queued["market"],
+                    queued["strategy"],
+                    int(queued["unit"] or 0),
+                    float(queued["score"] or 0.0),
+                    float(queued["allocation_score"] or 0.0),
+                    blocked_reason,
+                    queued["blocked_reason"],
+                    queued["expires_at"],
+                    _utc_now(),
+                    int(existing_target["id"]),
+                ),
+            )
+            conn.execute("DELETE FROM next_entry_queue WHERE id = ?", (int(queued["id"]),))
+            return
         conn.execute(
             """
             UPDATE next_entry_queue

@@ -6,6 +6,7 @@ from typing import Any
 
 from app.database import (
     enqueue_next_entry,
+    finalize_entry_lifecycle_for_position,
     get_connection,
     load_scheduler_task_state,
     promote_candidate_strategy,
@@ -24,6 +25,8 @@ MISMATCHED_SLOT_REASON = "MISMATCHED_SLOT_SESSION_RECONCILED"
 EXPIRED_RESERVATION_REASON = "EXPIRED_ORDER_RESERVATION_RECONCILED"
 RESERVED_SLOT_SESSION_POINTER_REASON = "RESERVED_SLOT_SESSION_POINTER_RECONCILED"
 RESERVED_ENTRY_BLOCK_REASON = "RESERVED_ENTRY_BLOCK_RECONCILED"
+ENTRY_FILL_LIFECYCLE_REASON = "ENTRY_FILL_LIFECYCLE_FINALIZED"
+DUPLICATE_POSITION_SESSION_REASON = "DUPLICATE_POSITION_SESSION_RECONCILED"
 RESERVED_ENTRY_RELEASE_BLOCKERS = {
     "PROFIT_ENGINE_BLOCKED_TREND_DOWN",
     "SMART_AGGRESSIVE_TREND_DOWN_BLOCKED",
@@ -707,6 +710,130 @@ def reconcile_reserved_slot_session_pointer(*, dry_run: bool = True) -> dict:
     }
 
 
+def find_entry_fill_lifecycle_gaps() -> dict:
+    items = _rows(
+        f"""
+        SELECT
+            ps.*,
+            p.id AS position_id,
+            p.market AS position_market,
+            p.status AS position_status,
+            p.session_id AS position_session_id,
+            p.entry_order_uuid AS position_entry_order_uuid,
+            p.entry_amount_krw AS position_entry_amount_krw,
+            r.id AS reservation_id,
+            r.status AS reservation_status
+        FROM position_slots ps
+        JOIN live_positions p
+          ON p.exchange = ps.exchange
+         AND p.market = ps.market
+         AND p.candidate_strategy_id = ps.candidate_strategy_id
+         AND p.session_id = ps.live_strategy_session_id
+         AND p.status IN ({_status_set(ACTIVE_POSITION_STATUSES)})
+        LEFT JOIN order_reservations r
+          ON r.slot_id = ps.id
+         AND r.status IN ({_status_set(ACTIVE_RESERVATION_STATUSES)})
+        WHERE ps.status IN ('RESERVED', 'ENTERING')
+          AND ps.candidate_strategy_id IS NOT NULL
+        ORDER BY ps.slot_number ASC, ps.id ASC
+        """,
+        (*ACTIVE_POSITION_STATUSES, *ACTIVE_RESERVATION_STATUSES),
+    )
+    for item in items:
+        item["safe_to_finalize"] = (
+            int(item.get("position_id") or 0) > 0
+            and int(item.get("position_session_id") or 0) == int(item.get("live_strategy_session_id") or 0)
+            and str(item.get("position_market") or "") == str(item.get("market") or "")
+        )
+        item["reason"] = ENTRY_FILL_LIFECYCLE_REASON
+    return {"checked_count": len(items), "gap_count": len(items), "items": items}
+
+
+def reconcile_entry_fill_lifecycles(*, dry_run: bool = True) -> dict:
+    probe = find_entry_fill_lifecycle_gaps()
+    finalized_count = 0
+    manual_review_count = 0
+    results: list[dict] = []
+    for item in probe["items"]:
+        if not item["safe_to_finalize"]:
+            manual_review_count += 1
+            continue
+        if not dry_run:
+            result = finalize_entry_lifecycle_for_position(
+                int(item["position_id"]),
+                reservation_status="CONSUMED",
+                reason=ENTRY_FILL_LIFECYCLE_REASON,
+            )
+            results.append(result)
+        finalized_count += 1
+    return {
+        "checked_count": probe["checked_count"],
+        "gap_count": probe["gap_count"],
+        "finalized_count": 0 if dry_run else finalized_count,
+        "manual_review_count": manual_review_count,
+        "dry_run": dry_run,
+        "items": probe["items"],
+        "results": [] if dry_run else results,
+    }
+
+
+def find_duplicate_position_sessions() -> dict:
+    items = _rows(
+        f"""
+        SELECT
+            s.*,
+            p.session_id AS authoritative_session_id,
+            p.id AS position_id,
+            p.market AS position_market,
+            p.candidate_strategy_id AS position_candidate_strategy_id
+        FROM live_strategy_sessions s
+        JOIN live_positions p ON p.id = s.current_position_id
+        WHERE s.status IN ({_status_set(ACTIVE_SESSION_STATUSES)})
+          AND p.status IN ({_status_set(ACTIVE_POSITION_STATUSES)})
+          AND s.id != p.session_id
+        ORDER BY p.id ASC, s.updated_at ASC, s.id ASC
+        """,
+        (*ACTIVE_SESSION_STATUSES, *ACTIVE_POSITION_STATUSES),
+    )
+    for item in items:
+        item["safe_to_stop"] = not item.get("current_open_order_uuid")
+        item["reason"] = DUPLICATE_POSITION_SESSION_REASON
+    return {"checked_count": len(items), "duplicate_count": len(items), "items": items}
+
+
+def reconcile_duplicate_position_sessions(*, dry_run: bool = True) -> dict:
+    probe = find_duplicate_position_sessions()
+    stopped_count = 0
+    manual_review_count = 0
+    now_utc = _utc_now()
+    for item in probe["items"]:
+        if not item["safe_to_stop"]:
+            manual_review_count += 1
+            continue
+        if not dry_run:
+            update_live_strategy_session(
+                int(item["id"]),
+                {
+                    "status": "STOPPED",
+                    "auto_enabled": False,
+                    "current_position_id": None,
+                    "current_open_order_uuid": None,
+                    "last_risk_result": DUPLICATE_POSITION_SESSION_REASON,
+                    "last_order_status": "REPLACED",
+                    "stopped_at": now_utc,
+                },
+            )
+        stopped_count += 1
+    return {
+        "checked_count": probe["checked_count"],
+        "duplicate_count": probe["duplicate_count"],
+        "stopped_count": 0 if dry_run else stopped_count,
+        "manual_review_count": manual_review_count,
+        "dry_run": dry_run,
+        "items": probe["items"],
+    }
+
+
 def find_reserved_entry_blocked_slots() -> dict:
     threshold = _int_env("AUTO_RESERVED_ENTRY_MAX_BLOCKED_TICKS", 2, minimum=1, maximum=20)
     slots = _rows(
@@ -813,6 +940,8 @@ def live_state_warnings() -> dict:
     mismatched = find_mismatched_position_slot_sessions()
     expired = find_expired_order_reservations()
     reserved_pointer = find_reserved_slot_session_pointer_mismatches()
+    entry_lifecycle = find_entry_fill_lifecycle_gaps()
+    duplicate_sessions = find_duplicate_position_sessions()
     reserved_blocked = find_reserved_entry_blocked_slots()
     allocator_state = load_scheduler_task_state("capital_allocator")
     allocator_last_status = str((allocator_state or {}).get("status") or "")
@@ -829,6 +958,10 @@ def live_state_warnings() -> dict:
         warnings.append("EXPIRED_ORDER_RESERVATION_DETECTED")
     if reserved_pointer["mismatch_count"]:
         warnings.append("RESERVED_SLOT_SESSION_POINTER_MISMATCH")
+    if entry_lifecycle["gap_count"]:
+        warnings.append("ENTRY_FILL_LIFECYCLE_GAP_DETECTED")
+    if duplicate_sessions["duplicate_count"]:
+        warnings.append("DUPLICATE_POSITION_SESSION_DETECTED")
     if reserved_blocked["blocked_slot_count"]:
         warnings.append("RESERVED_ENTRY_BLOCKED_SLOT_DETECTED")
     if allocator_last_status == "FAILED" or allocator_last_error:
@@ -840,6 +973,8 @@ def live_state_warnings() -> dict:
         "mismatched_position_slot_session_count": mismatched["checked_count"],
         "expired_order_reservation_count": expired["expired_count"],
         "reserved_slot_session_pointer_mismatch_count": reserved_pointer["mismatch_count"],
+        "entry_fill_lifecycle_gap_count": entry_lifecycle["gap_count"],
+        "duplicate_position_session_count": duplicate_sessions["duplicate_count"],
         "reserved_entry_blocked_slot_count": reserved_blocked["blocked_slot_count"],
         "allocator_last_run_status": allocator_last_status,
         "allocator_last_error": allocator_last_error,
@@ -849,6 +984,8 @@ def live_state_warnings() -> dict:
         "mismatched_position_slot_sessions": mismatched["items"],
         "expired_order_reservations": expired["items"],
         "reserved_slot_session_pointer_mismatches": reserved_pointer["items"],
+        "entry_fill_lifecycle_gaps": entry_lifecycle["items"],
+        "duplicate_position_sessions": duplicate_sessions["items"],
         "reserved_entry_blocked_slots": reserved_blocked["items"],
     }
 
@@ -859,6 +996,8 @@ def reconcile_live_state(*, dry_run: bool = True) -> dict:
     mismatched = reconcile_mismatched_position_slot_sessions(dry_run=dry_run)
     expired = reconcile_expired_order_reservations(dry_run=dry_run)
     reserved_pointer = reconcile_reserved_slot_session_pointer(dry_run=dry_run)
+    entry_lifecycle = reconcile_entry_fill_lifecycles(dry_run=dry_run)
+    duplicate_sessions = reconcile_duplicate_position_sessions(dry_run=dry_run)
     reserved_blocked = reconcile_reserved_entry_blocked_slots(dry_run=dry_run)
     return {
         "dry_run": dry_run,
@@ -867,6 +1006,8 @@ def reconcile_live_state(*, dry_run: bool = True) -> dict:
         "mismatched_position_slot_sessions": mismatched,
         "expired_order_reservations": expired,
         "reserved_slot_session_pointer_mismatches": reserved_pointer,
+        "entry_fill_lifecycles": entry_lifecycle,
+        "duplicate_position_sessions": duplicate_sessions,
         "reserved_entry_blocked_slots": reserved_blocked,
         "warnings_after": live_state_warnings() if not dry_run else None,
     }

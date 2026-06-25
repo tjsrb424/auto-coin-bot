@@ -39,6 +39,8 @@ from app.database import (
 from app.live_broker import is_emergency_stopped
 from app.market_opportunity import build_market_opportunity_rankings, rank_live_candidates
 from app.live_state_reconciler import (
+    reconcile_duplicate_position_sessions,
+    reconcile_entry_fill_lifecycles,
     reconcile_expired_order_reservations,
     reconcile_mismatched_position_slot_sessions,
     reconcile_orphan_live_active_candidates,
@@ -366,6 +368,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
         mismatched_reconcile = reconcile_mismatched_position_slot_sessions(dry_run=False)
         expired_reconcile = reconcile_expired_order_reservations(dry_run=False)
         reserved_pointer_reconcile = reconcile_reserved_slot_session_pointer(dry_run=False)
+        entry_lifecycle_reconcile = reconcile_entry_fill_lifecycles(dry_run=False)
+        duplicate_session_reconcile = reconcile_duplicate_position_sessions(dry_run=False)
         reserved_blocked_reconcile = reconcile_reserved_entry_blocked_slots(dry_run=False)
         reconcile_position_slots(int(config["max_slots"]), exchange)
         snapshot = build_capital_snapshot(exchange)
@@ -589,6 +593,8 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 "mismatched_position_slot_reconcile": mismatched_reconcile,
                 "expired_order_reservation_reconcile": expired_reconcile,
                 "reserved_slot_session_pointer_reconcile": reserved_pointer_reconcile,
+                "entry_fill_lifecycle_reconcile": entry_lifecycle_reconcile,
+                "duplicate_position_session_reconcile": duplicate_session_reconcile,
                 "reserved_entry_blocked_slot_reconcile": reserved_blocked_reconcile,
             },
         )
