@@ -18,6 +18,7 @@ ACTIVE_RESERVATION_STATUSES = {"RESERVED", "ORDER_SUBMITTED"}
 ACTIVE_POSITION_STATUSES = {"OPEN", "CLOSING", "EXIT_PENDING", "EXIT_CANDIDATE", "MANUAL_REVIEW_REQUIRED"}
 ACTIVE_SESSION_STATUSES = {"READY", "RUNNING"}
 STALE_POINTER_SESSION_STATUSES = {"READY", "RUNNING", "LIVE_PAUSED"}
+DUPLICATE_POSITION_SESSION_STATUSES = {"READY", "RUNNING", "LIVE_PAUSED"}
 TERMINAL_POSITION_STATUSES = {"CLOSED", "DUPLICATE_RECONCILED", "REJECTED"}
 ORPHAN_REASON = "ORPHAN_LIVE_ACTIVE_RECONCILED"
 STALE_POINTER_REASON = "STALE_SESSION_POSITION_POINTER_RECONCILED"
@@ -788,12 +789,12 @@ def find_duplicate_position_sessions() -> dict:
             p.candidate_strategy_id AS position_candidate_strategy_id
         FROM live_strategy_sessions s
         JOIN live_positions p ON p.id = s.current_position_id
-        WHERE s.status IN ({_status_set(ACTIVE_SESSION_STATUSES)})
+        WHERE s.status IN ({_status_set(DUPLICATE_POSITION_SESSION_STATUSES)})
           AND p.status IN ({_status_set(ACTIVE_POSITION_STATUSES)})
           AND s.id != p.session_id
         ORDER BY p.id ASC, s.updated_at ASC, s.id ASC
         """,
-        (*ACTIVE_SESSION_STATUSES, *ACTIVE_POSITION_STATUSES),
+        (*DUPLICATE_POSITION_SESSION_STATUSES, *ACTIVE_POSITION_STATUSES),
     )
     for item in items:
         item["safe_to_stop"] = not item.get("current_open_order_uuid")

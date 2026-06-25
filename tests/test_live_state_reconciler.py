@@ -469,6 +469,23 @@ class LiveStateReconcilerTests(unittest.TestCase):
         self.assertFalse(duplicate["auto_enabled"])
         self.assertEqual(duplicate["last_risk_result"], DUPLICATE_POSITION_SESSION_REASON)
 
+    def test_duplicate_live_paused_session_for_same_position_is_stopped(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        authoritative_session_id = self._session(candidate_id, status="LIVE_PAUSED")
+        duplicate_session_id = self._session(candidate_id, status="LIVE_PAUSED")
+        position_id = database.create_live_position(live_position(authoritative_session_id, candidate_id))
+        database.update_live_strategy_session(authoritative_session_id, {"current_position_id": position_id})
+        database.update_live_strategy_session(duplicate_session_id, {"current_position_id": position_id})
+
+        result = reconcile_duplicate_position_sessions(dry_run=False)
+
+        self.assertEqual(result["stopped_count"], 1)
+        self.assertEqual(load_session(authoritative_session_id)["status"], "LIVE_PAUSED")
+        duplicate = load_session(duplicate_session_id)
+        self.assertEqual(duplicate["status"], "STOPPED")
+        self.assertIsNone(duplicate["current_position_id"])
+        self.assertEqual(duplicate["last_risk_result"], DUPLICATE_POSITION_SESSION_REASON)
+
     def test_reserved_slot_session_pointer_updates_to_active_runtime_session(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
         old_session_id = self._session(candidate_id, status="LIVE_PAUSED")
