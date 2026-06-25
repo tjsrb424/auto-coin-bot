@@ -38,7 +38,14 @@ from app.database import (
 )
 from app.live_broker import is_emergency_stopped
 from app.market_opportunity import build_market_opportunity_rankings, rank_live_candidates
-from app.live_state_reconciler import reconcile_orphan_live_active_candidates, reconcile_stale_live_strategy_sessions
+from app.live_state_reconciler import (
+    reconcile_expired_order_reservations,
+    reconcile_mismatched_position_slot_sessions,
+    reconcile_orphan_live_active_candidates,
+    reconcile_reserved_entry_blocked_slots,
+    reconcile_reserved_slot_session_pointer,
+    reconcile_stale_live_strategy_sessions,
+)
 
 ALLOCATOR_TASK = "capital_allocator"
 
@@ -356,6 +363,11 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
         policy = load_global_bot_operation_policy()
         stale_reconcile = reconcile_stale_live_strategy_sessions(dry_run=False)
         orphan_reconcile = reconcile_orphan_live_active_candidates(dry_run=False)
+        mismatched_reconcile = reconcile_mismatched_position_slot_sessions(dry_run=False)
+        expired_reconcile = reconcile_expired_order_reservations(dry_run=False)
+        reserved_pointer_reconcile = reconcile_reserved_slot_session_pointer(dry_run=False)
+        reserved_blocked_reconcile = reconcile_reserved_entry_blocked_slots(dry_run=False)
+        reconcile_position_slots(int(config["max_slots"]), exchange)
         snapshot = build_capital_snapshot(exchange)
         slots = snapshot.get("slots") or reconcile_position_slots(int(config["max_slots"]), exchange)
         open_positions = snapshot.get("positions") or load_open_live_positions_for_exchange(exchange)
@@ -574,6 +586,10 @@ def run_capital_allocator_once(reason: str = "SCHEDULED", *, exchange: str | Non
                 "snapshot_error": snapshot.get("snapshot_error", ""),
                 "stale_session_reconcile": stale_reconcile,
                 "orphan_live_active_reconcile": orphan_reconcile,
+                "mismatched_position_slot_reconcile": mismatched_reconcile,
+                "expired_order_reservation_reconcile": expired_reconcile,
+                "reserved_slot_session_pointer_reconcile": reserved_pointer_reconcile,
+                "reserved_entry_blocked_slot_reconcile": reserved_blocked_reconcile,
             },
         )
         return {"ok": True, "run": run, "accepted": accepted, "blocked": blocked, "status": capital_allocator_status(exchange)}

@@ -1,18 +1,25 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from app import database
 from app.capital_allocator import run_capital_allocator_once
 from app.live_state_reconciler import (
+    EXPIRED_RESERVATION_REASON,
     MISMATCHED_SLOT_REASON,
     ORPHAN_REASON,
+    RESERVED_ENTRY_BLOCK_REASON,
+    RESERVED_SLOT_SESSION_POINTER_REASON,
     STALE_POINTER_REASON,
     live_state_warnings,
+    reconcile_expired_order_reservations,
     reconcile_live_state,
     reconcile_orphan_live_active_candidates,
+    reconcile_reserved_entry_blocked_slots,
+    reconcile_reserved_slot_session_pointer,
     reconcile_stale_live_strategy_sessions,
 )
 
@@ -130,6 +137,27 @@ def load_promotions(candidate_id: int) -> list[dict]:
     with database.get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM candidate_strategy_promotions WHERE candidate_strategy_id = ? ORDER BY id ASC",
+            (candidate_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def utc_offset(minutes: int) -> str:
+    return (
+        datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=minutes)
+    ).isoformat().replace("+00:00", "Z")
+
+
+def load_slot(slot_id: int) -> dict:
+    with database.get_connection() as conn:
+        row = conn.execute("SELECT * FROM position_slots WHERE id = ?", (slot_id,)).fetchone()
+    return dict(row)
+
+
+def load_reservations(candidate_id: int) -> list[dict]:
+    with database.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM order_reservations WHERE candidate_strategy_id = ? ORDER BY id ASC",
             (candidate_id,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -306,5 +334,152 @@ class LiveStateReconcilerTests(unittest.TestCase):
         self.assertEqual(database.load_candidate_strategy(candidate_id)["status"], "LIVE_ELIGIBLE")
         self.assertEqual(load_session(wrong_session_id)["status"], "STOPPED")
         self.assertEqual(load_session(wrong_session_id)["last_risk_result"], MISMATCHED_SLOT_REASON)
+        queue = database.load_next_entry_queue(statuses=["QUEUED"])
+        self.assertTrue(any(row["candidate_strategy_id"] == candidate_id for row in queue))
+
+    def test_expired_order_reservation_cleanup_releases_reserved_slot(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        session_id = self._session(candidate_id, status="LIVE_PAUSED")
+        slot = database.load_position_slots(5, "bithumb")[0]
+        database.reserve_position_slot(
+            slot_id=int(slot["id"]),
+            exchange="bithumb",
+            market="KRW-ETH",
+            candidate_strategy_id=candidate_id,
+            live_strategy_session_id=session_id,
+            amount_krw=20_000,
+            reason="TEST_EXPIRED",
+        )
+        database.create_order_reservation(
+            {
+                "request_id": "expired-reservation-test",
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "slot_id": int(slot["id"]),
+                "amount_krw": 20_000,
+                "status": "RESERVED",
+                "expires_at": utc_offset(-5),
+            }
+        )
+
+        result = reconcile_expired_order_reservations(dry_run=False)
+
+        self.assertEqual(result["released_count"], 1)
+        self.assertEqual(load_reservations(candidate_id)[0]["status"], "EXPIRED")
+        released_slot = load_slot(int(slot["id"]))
+        self.assertEqual(released_slot["status"], "EMPTY")
+        self.assertIsNone(released_slot["candidate_strategy_id"])
+        self.assertEqual(load_session(session_id)["status"], "STOPPED")
+        self.assertEqual(load_session(session_id)["last_risk_result"], EXPIRED_RESERVATION_REASON)
+        self.assertEqual(database.load_candidate_strategy(candidate_id)["status"], "LIVE_ELIGIBLE")
+
+    def test_active_order_reservation_is_kept(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        session_id = self._session(candidate_id, status="READY")
+        slot = database.load_position_slots(5, "bithumb")[0]
+        database.reserve_position_slot(
+            slot_id=int(slot["id"]),
+            exchange="bithumb",
+            market="KRW-ETH",
+            candidate_strategy_id=candidate_id,
+            live_strategy_session_id=session_id,
+            amount_krw=20_000,
+            reason="TEST_ACTIVE",
+        )
+        database.create_order_reservation(
+            {
+                "request_id": "active-reservation-test",
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "slot_id": int(slot["id"]),
+                "amount_krw": 20_000,
+                "status": "RESERVED",
+                "expires_at": utc_offset(30),
+            }
+        )
+
+        result = reconcile_expired_order_reservations(dry_run=False)
+
+        self.assertEqual(result["released_count"], 0)
+        self.assertEqual(load_reservations(candidate_id)[0]["status"], "RESERVED")
+        self.assertEqual(load_slot(int(slot["id"]))["status"], "RESERVED")
+        self.assertEqual(load_session(session_id)["status"], "READY")
+
+    def test_reserved_slot_session_pointer_updates_to_active_runtime_session(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        old_session_id = self._session(candidate_id, status="LIVE_PAUSED")
+        new_session_id = self._session(candidate_id, status="RUNNING")
+        slot = database.load_position_slots(5, "bithumb")[0]
+        database.reserve_position_slot(
+            slot_id=int(slot["id"]),
+            exchange="bithumb",
+            market="KRW-ETH",
+            candidate_strategy_id=candidate_id,
+            live_strategy_session_id=old_session_id,
+            amount_krw=20_000,
+            reason="TEST_POINTER",
+        )
+
+        result = reconcile_reserved_slot_session_pointer(dry_run=False)
+
+        self.assertEqual(result["fixed_count"], 1)
+        fixed_slot = load_slot(int(slot["id"]))
+        self.assertEqual(fixed_slot["live_strategy_session_id"], new_session_id)
+        self.assertEqual(fixed_slot["entry_reason"], RESERVED_SLOT_SESSION_POINTER_REASON)
+        self.assertEqual(load_session(old_session_id)["status"], "STOPPED")
+        self.assertEqual(load_session(new_session_id)["status"], "RUNNING")
+
+    def test_repeated_entry_blocker_releases_reserved_candidate_slot(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(status="LIVE_ACTIVE"))
+        session_id = self._session(candidate_id, status="RUNNING")
+        slot = database.load_position_slots(5, "bithumb")[0]
+        database.reserve_position_slot(
+            slot_id=int(slot["id"]),
+            exchange="bithumb",
+            market="KRW-ETH",
+            candidate_strategy_id=candidate_id,
+            live_strategy_session_id=session_id,
+            amount_krw=20_000,
+            reason="TEST_BLOCKED",
+        )
+        database.create_order_reservation(
+            {
+                "request_id": "blocked-reservation-test",
+                "exchange": "bithumb",
+                "market": "KRW-ETH",
+                "candidate_strategy_id": candidate_id,
+                "slot_id": int(slot["id"]),
+                "amount_krw": 20_000,
+                "status": "RESERVED",
+                "expires_at": utc_offset(30),
+            }
+        )
+        for index in range(2):
+            database.insert_live_order_log(
+                {
+                    "request_id": f"blocked-entry-{index}",
+                    "session_id": session_id,
+                    "candidate_strategy_id": candidate_id,
+                    "exchange": "bithumb",
+                    "market": "KRW-ETH",
+                    "side": "bid",
+                    "order_type": "market",
+                    "amount_krw": 20_000,
+                    "risk_result": "PROFIT_ENGINE_BLOCKED_TREND_DOWN",
+                    "status": "BLOCKED",
+                    "order_purpose": "ENTRY",
+                }
+            )
+
+        result = reconcile_reserved_entry_blocked_slots(dry_run=False)
+
+        self.assertEqual(result["released_count"], 1)
+        self.assertEqual(load_reservations(candidate_id)[0]["status"], "RELEASED")
+        self.assertEqual(load_slot(int(slot["id"]))["status"], "EMPTY")
+        self.assertEqual(load_session(session_id)["status"], "STOPPED")
+        self.assertEqual(load_session(session_id)["last_risk_result"], RESERVED_ENTRY_BLOCK_REASON)
+        self.assertEqual(database.load_candidate_strategy(candidate_id)["status"], "LIVE_ELIGIBLE")
         queue = database.load_next_entry_queue(statuses=["QUEUED"])
         self.assertTrue(any(row["candidate_strategy_id"] == candidate_id for row in queue))

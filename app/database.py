@@ -4353,42 +4353,21 @@ def enqueue_next_entry(candidate: dict, *, allocation_score: float, blocked_reas
     expires_at = (now + timedelta(minutes=ttl_minutes)).isoformat().replace("+00:00", "Z")
     now_utc = now.isoformat().replace("+00:00", "Z")
     with get_connection() as conn:
-        existing = conn.execute(
-            """
-            SELECT id FROM next_entry_queue
-            WHERE candidate_strategy_id = ?
-              AND status = 'QUEUED'
-            LIMIT 1
-            """,
-            (int(candidate["id"]),),
-        ).fetchone()
-        if existing:
-            conn.execute(
-                """
-                UPDATE next_entry_queue
-                SET allocation_score = ?,
-                    score = ?,
-                    blocked_reason = ?,
-                    expires_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    allocation_score,
-                    float(candidate.get("score") or 0.0),
-                    blocked_reason,
-                    expires_at,
-                    now_utc,
-                    int(existing["id"]),
-                ),
-            )
-            return int(existing["id"])
-        cursor = conn.execute(
+        conn.execute(
             """
             INSERT INTO next_entry_queue (
                 candidate_strategy_id, market, strategy, unit, score,
                 allocation_score, status, blocked_reason, queued_at, expires_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)
+            ON CONFLICT(candidate_strategy_id, status) DO UPDATE SET
+                market = excluded.market,
+                strategy = excluded.strategy,
+                unit = excluded.unit,
+                score = excluded.score,
+                allocation_score = excluded.allocation_score,
+                blocked_reason = excluded.blocked_reason,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
             """,
             (
                 int(candidate["id"]),
@@ -4403,7 +4382,16 @@ def enqueue_next_entry(candidate: dict, *, allocation_score: float, blocked_reas
                 now_utc,
             ),
         )
-        return int(cursor.lastrowid)
+        row = conn.execute(
+            """
+            SELECT id FROM next_entry_queue
+            WHERE candidate_strategy_id = ?
+              AND status = 'QUEUED'
+            LIMIT 1
+            """,
+            (int(candidate["id"]),),
+        ).fetchone()
+        return int(row["id"]) if row else None
 
 
 def load_next_entry_queue(limit: int = 20, statuses: list[str] | None = None) -> list[dict]:

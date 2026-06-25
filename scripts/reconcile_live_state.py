@@ -14,7 +14,7 @@ from app.live_state_reconciler import reconcile_live_state
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Reconcile LIVE_ACTIVE orphan candidates and stale live session position pointers.")
+    parser = argparse.ArgumentParser(description="Reconcile allocator, slot, reservation, and live session state.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Show proposed updates without changing the database.")
     mode.add_argument("--apply", action="store_true", help="Apply reconciliation changes.")

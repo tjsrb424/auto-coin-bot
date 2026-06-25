@@ -229,9 +229,18 @@ def _health_payload(request: Request) -> dict:
             "orphan_live_active_candidates_count": 0,
             "stale_session_position_pointer_count": 0,
             "mismatched_position_slot_session_count": 0,
+            "expired_order_reservation_count": 0,
+            "reserved_slot_session_pointer_mismatch_count": 0,
+            "reserved_entry_blocked_slot_count": 0,
+            "allocator_last_run_status": "",
+            "allocator_last_error": "",
+            "next_entry_queue_conflict_count": 0,
             "orphan_live_active_candidates": [],
             "stale_session_position_pointers": [],
             "mismatched_position_slot_sessions": [],
+            "expired_order_reservations": [],
+            "reserved_slot_session_pointer_mismatches": [],
+            "reserved_entry_blocked_slots": [],
         }
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_running = bool(scheduler and getattr(scheduler, "running", False))
@@ -257,13 +266,24 @@ def _health_payload(request: Request) -> dict:
         "live_session_status": runtime["strategy_status"] if runtime["strategy_status"] != "STOPPED" else "PAUSED",
         "latest_order_sync_time": runtime["last_order_time_utc"],
         "latest_balance_sync_time": _latest_balance_sync_time_utc,
-        "warnings": state_warnings["warnings"],
-        "orphan_live_active_candidates_count": state_warnings["orphan_live_active_candidates_count"],
-        "stale_session_position_pointer_count": state_warnings["stale_session_position_pointer_count"],
-        "mismatched_position_slot_session_count": state_warnings["mismatched_position_slot_session_count"],
-        "orphan_live_active_candidates": state_warnings["orphan_live_active_candidates"],
-        "stale_session_position_pointers": state_warnings["stale_session_position_pointers"],
-        "mismatched_position_slot_sessions": state_warnings["mismatched_position_slot_sessions"],
+        "warnings": state_warnings.get("warnings", []),
+        "orphan_live_active_candidates_count": state_warnings.get("orphan_live_active_candidates_count", 0),
+        "stale_session_position_pointer_count": state_warnings.get("stale_session_position_pointer_count", 0),
+        "mismatched_position_slot_session_count": state_warnings.get("mismatched_position_slot_session_count", 0),
+        "expired_order_reservation_count": state_warnings.get("expired_order_reservation_count", 0),
+        "reserved_slot_session_pointer_mismatch_count": state_warnings.get(
+            "reserved_slot_session_pointer_mismatch_count", 0
+        ),
+        "reserved_entry_blocked_slot_count": state_warnings.get("reserved_entry_blocked_slot_count", 0),
+        "allocator_last_run_status": state_warnings.get("allocator_last_run_status", ""),
+        "allocator_last_error": state_warnings.get("allocator_last_error", ""),
+        "next_entry_queue_conflict_count": state_warnings.get("next_entry_queue_conflict_count", 0),
+        "orphan_live_active_candidates": state_warnings.get("orphan_live_active_candidates", []),
+        "stale_session_position_pointers": state_warnings.get("stale_session_position_pointers", []),
+        "mismatched_position_slot_sessions": state_warnings.get("mismatched_position_slot_sessions", []),
+        "expired_order_reservations": state_warnings.get("expired_order_reservations", []),
+        "reserved_slot_session_pointer_mismatches": state_warnings.get("reserved_slot_session_pointer_mismatches", []),
+        "reserved_entry_blocked_slots": state_warnings.get("reserved_entry_blocked_slots", []),
     }
 
 

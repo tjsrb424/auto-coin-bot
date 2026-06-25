@@ -190,6 +190,39 @@ class CapitalAllocatorTests(unittest.TestCase):
                     exchange="bithumb",
                 )
 
+    def test_next_entry_queue_upsert_updates_existing_candidate_status_row(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload())
+        candidate = database.load_candidate_strategy(candidate_id)
+
+        first_id = database.enqueue_next_entry(candidate, allocation_score=10, blocked_reason="FIRST")
+        second_id = database.enqueue_next_entry({**candidate, "score": 99}, allocation_score=20, blocked_reason="SECOND")
+
+        self.assertEqual(first_id, second_id)
+        queue = database.load_next_entry_queue(statuses=["QUEUED"])
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["candidate_strategy_id"], candidate_id)
+        self.assertEqual(queue[0]["blocked_reason"], "SECOND")
+        self.assertEqual(queue[0]["allocation_score"], 20)
+
+    def test_allocator_run_does_not_fail_when_candidate_is_already_queued(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload())
+        candidate = database.load_candidate_strategy(candidate_id)
+        database.enqueue_next_entry(candidate, allocation_score=1, blocked_reason="OLD_BLOCK")
+        database.update_bot_operation_policy(
+            "KRW-BTC",
+            {"auto_trading_enabled": False, "max_total_exposure_krw": 500_000, "daily_loss_limit_pct": 5},
+        )
+
+        with patch("app.capital_allocator.is_emergency_stopped", return_value=False), \
+            patch("app.capital_allocator.build_capital_snapshot", return_value=snapshot_payload()):
+            result = run_capital_allocator_once("TEST_QUEUE_UPSERT", exchange="bithumb")
+
+        self.assertTrue(result["ok"])
+        self.assertNotEqual(result["run"]["status"], "FAILED")
+        queue = database.load_next_entry_queue(statuses=["QUEUED"])
+        self.assertEqual(len([row for row in queue if row["candidate_strategy_id"] == candidate_id]), 1)
+        self.assertEqual(queue[0]["blocked_reason"], "POLICY_AUTO_TRADING_DISABLED")
+
     def test_allocator_uses_market_opportunity_score_for_candidate_ordering(self) -> None:
         base_id = database.save_candidate_strategy(candidate_payload(market="KRW-ETH", score=95))
         allow_market("KRW-XRP")
