@@ -8,14 +8,18 @@ from app.database import (
     create_live_position,
     insert_live_recovery_event,
     insert_position_fill_event,
+    load_order_application_ledger,
     load_live_order_logs_by_uuid,
     load_live_position,
     load_live_position_by_entry_order_uuid,
+    load_position_fill_events_by_order_uuid,
     load_open_live_position_for_strategy,
     load_position_fill_event,
+    update_position_fill_event,
     update_live_order_log,
     update_live_position,
     update_live_strategy_session,
+    upsert_order_application_ledger,
 )
 
 
@@ -67,10 +71,13 @@ def _canonical_log(order_log: dict | None, order_uuid: str) -> tuple[dict | None
     logs = load_live_order_logs_by_uuid(order_uuid) if order_uuid else []
     if not logs:
         return order_log, [order_log] if order_log else []
+    def _best(log_items: list[dict]) -> dict:
+        return max(log_items, key=lambda item: (_filled_volume(item, None), str(item.get("updated_at") or ""), int(item.get("id") or 0)))
+
     with_scale = [log for log in logs if _scale_preview(log).get("scale_in")]
     if with_scale:
-        return with_scale[0], logs
-    return logs[0], logs
+        return _best(with_scale), logs
+    return _best(logs), logs
 
 
 def _filled_price(order_log: dict | None, raw_order: dict | None) -> float:
@@ -132,6 +139,185 @@ def _log_event(
             "payload": {"position_id": position_id, **(payload or {})},
         }
     )
+
+
+def _ledger_from_fill_events(order_uuid: str) -> dict | None:
+    events = load_position_fill_events_by_order_uuid(order_uuid)
+    if not events:
+        return None
+    event = events[0]
+    return {
+        "order_uuid": order_uuid,
+        "position_id": int(event["position_id"]),
+        "fill_type": str(event.get("fill_type") or "ENTRY"),
+        "applied_volume": _float(event.get("applied_volume")),
+        "applied_amount_krw": _float(event.get("applied_amount_krw")),
+        "applied_fee": _float(event.get("applied_fee")),
+        "last_exchange_executed_volume": _float(event.get("applied_volume")),
+        "last_exchange_filled_amount_krw": _float(event.get("applied_amount_krw")),
+        "last_exchange_paid_fee": _float(event.get("applied_fee")),
+        "source": str(event.get("source") or ""),
+        "order_log_id": event.get("order_log_id"),
+        "request_id": event.get("request_id"),
+    }
+
+
+def _record_ledger(
+    *,
+    order_uuid: str,
+    position_id: int,
+    fill_type: str,
+    source: str,
+    order_log: dict | None,
+    volume: float,
+    amount: float,
+    fee: float,
+) -> None:
+    upsert_order_application_ledger(
+        {
+            "order_uuid": order_uuid,
+            "position_id": position_id,
+            "fill_type": fill_type,
+            "side": str((order_log or {}).get("side") or "BUY").upper(),
+            "order_purpose": str((order_log or {}).get("order_purpose") or "ENTRY").upper(),
+            "applied_volume": volume,
+            "applied_amount_krw": amount,
+            "applied_fee": fee,
+            "last_exchange_executed_volume": volume,
+            "last_exchange_filled_amount_krw": amount,
+            "last_exchange_paid_fee": fee,
+            "source": source,
+            "order_log_id": (order_log or {}).get("id"),
+            "request_id": (order_log or {}).get("request_id"),
+        }
+    )
+
+
+def _apply_order_uuid_delta(
+    *,
+    ledger: dict,
+    order_uuid: str,
+    order_log: dict | None,
+    logs: list[dict],
+    source: str,
+    session: dict,
+    volume: float,
+    amount: float,
+    fee: float,
+) -> dict:
+    position_id = int(ledger["position_id"])
+    position = load_live_position(position_id)
+    if not position:
+        return {"status": "SKIPPED", "reason": "LEDGER_POSITION_MISSING", "position_id": position_id}
+    previous_exchange_volume = _float(ledger.get("last_exchange_executed_volume") or ledger.get("applied_volume"))
+    previous_exchange_amount = _float(ledger.get("last_exchange_filled_amount_krw") or ledger.get("applied_amount_krw"))
+    previous_exchange_fee = _float(ledger.get("last_exchange_paid_fee") or ledger.get("applied_fee"))
+    delta_volume = max(volume - previous_exchange_volume, 0.0)
+    delta_amount = max(amount - previous_exchange_amount, 0.0)
+    delta_fee = max(fee - previous_exchange_fee, 0.0)
+    _attach_logs(logs, position_id)
+    _record_trade_outcome(order_log, position_id)
+    if delta_volume <= 0.000000000001:
+        _log_event(
+            "DUPLICATE_ORDER_UUID_ALREADY_APPLIED",
+            "WARNING",
+            "Filled BUY order_uuid was already applied; position volume was not changed.",
+            order_log=order_log,
+            order_uuid=order_uuid,
+            position_id=position_id,
+            payload={
+                "source": source,
+                "existing_fill_type": ledger.get("fill_type"),
+                "incoming_executed_volume": volume,
+                "last_exchange_executed_volume": previous_exchange_volume,
+            },
+        )
+        update_live_strategy_session(
+            int(session["id"]),
+            {
+                "current_open_order_uuid": None,
+                "current_position_id": position_id,
+                "last_order_status": "FILLED",
+                "last_risk_result": "DUPLICATE_ORDER_UUID_ALREADY_APPLIED",
+            },
+        )
+        return {
+            "status": "ATTACHED",
+            "position_id": position_id,
+            "fill_type": str(ledger.get("fill_type") or "ENTRY"),
+            "idempotent": True,
+            "duplicate_order_uuid": True,
+        }
+    previous_position_volume = _float(position.get("entry_volume"))
+    previous_position_amount = _float(position.get("entry_amount_krw"))
+    new_volume = previous_position_volume + delta_volume
+    new_amount = previous_position_amount + delta_amount
+    price = amount / volume if volume > 0 else _float(position.get("current_price") or position.get("entry_price"))
+    new_price = new_amount / new_volume if new_volume > 0 else price
+    update_live_position(
+        position_id,
+        {
+            "status": "OPEN",
+            "entry_price": new_price,
+            "entry_volume": new_volume,
+            "entry_amount_krw": new_amount,
+            "current_price": price,
+            "unrealized_pnl": (price * new_volume) - new_amount,
+        },
+    )
+    fill_event = load_position_fill_event(order_uuid, str(ledger.get("fill_type") or "ENTRY"))
+    if fill_event:
+        update_position_fill_event(
+            int(fill_event["id"]),
+            {
+                "applied_volume": _float(fill_event.get("applied_volume")) + delta_volume,
+                "applied_amount_krw": _float(fill_event.get("applied_amount_krw")) + delta_amount,
+                "applied_fee": _float(fill_event.get("applied_fee")) + delta_fee,
+                "source": source,
+            },
+        )
+    _record_ledger(
+        order_uuid=order_uuid,
+        position_id=position_id,
+        fill_type=str(ledger.get("fill_type") or "ENTRY"),
+        source=source,
+        order_log=order_log,
+        volume=volume,
+        amount=amount,
+        fee=fee,
+    )
+    update_live_strategy_session(
+        int(session["id"]),
+        {
+            "current_open_order_uuid": None,
+            "current_position_id": position_id,
+            "last_order_status": "FILLED",
+            "last_risk_result": "ORDER_UUID_DELTA_APPLIED",
+        },
+    )
+    _log_event(
+        "ORDER_UUID_DELTA_APPLIED",
+        "INFO",
+        "Existing BUY order_uuid increased in filled volume; only the delta was applied.",
+        order_log=order_log,
+        order_uuid=order_uuid,
+        position_id=position_id,
+        payload={
+            "source": source,
+            "delta_volume": delta_volume,
+            "delta_amount_krw": delta_amount,
+            "previous_exchange_executed_volume": previous_exchange_volume,
+            "incoming_executed_volume": volume,
+        },
+    )
+    return {
+        "status": "MERGED",
+        "position_id": position_id,
+        "fill_type": str(ledger.get("fill_type") or "ENTRY"),
+        "idempotent": False,
+        "delta_applied": True,
+        "delta_volume": delta_volume,
+    }
 
 
 def _new_position_payload(
@@ -214,6 +400,20 @@ def sync_filled_entry_order_to_position(
     scale_target_id = _resolve_scale_in_target(session, canonical_log, scale_preview)
     fill_type = "SCALE_IN" if scale_target_id else "ENTRY"
 
+    ledger = load_order_application_ledger(order_uuid) or _ledger_from_fill_events(order_uuid)
+    if ledger:
+        return _apply_order_uuid_delta(
+            ledger=ledger,
+            order_uuid=order_uuid,
+            order_log=canonical_log,
+            logs=logs,
+            source=source,
+            session=session,
+            volume=volume,
+            amount=amount,
+            fee=fee,
+        )
+
     existing_event = load_position_fill_event(order_uuid, fill_type)
     if existing_event:
         position_id = int(existing_event["position_id"])
@@ -249,6 +449,16 @@ def sync_filled_entry_order_to_position(
             }
         ):
             return sync_filled_entry_order_to_position(order_log, raw_order, source, session=session)
+        _record_ledger(
+            order_uuid=order_uuid,
+            position_id=scale_target_id,
+            fill_type="SCALE_IN",
+            source=source,
+            order_log=canonical_log,
+            volume=volume,
+            amount=amount,
+            fee=fee,
+        )
         previous_volume = _float(position.get("entry_volume"))
         previous_amount = _float(position.get("entry_amount_krw"))
         new_volume = previous_volume + volume
@@ -308,6 +518,16 @@ def sync_filled_entry_order_to_position(
                     "applied_at": str(existing.get("opened_at") or _utc_now()),
                 }
             )
+        _record_ledger(
+            order_uuid=order_uuid,
+            position_id=position_id,
+            fill_type="ENTRY",
+            source=f"{source}_ADOPT_EXISTING",
+            order_log=canonical_log,
+            volume=_float(existing.get("entry_volume")),
+            amount=_float(existing.get("entry_amount_krw")),
+            fee=fee,
+        )
         update_live_strategy_session(
             int(session["id"]),
             {
@@ -334,6 +554,16 @@ def sync_filled_entry_order_to_position(
             "applied_fee": fee,
             "applied_at": str((canonical_log or {}).get("updated_at") or _utc_now()),
         }
+    )
+    _record_ledger(
+        order_uuid=order_uuid,
+        position_id=position_id,
+        fill_type="ENTRY",
+        source=source,
+        order_log=canonical_log,
+        volume=volume,
+        amount=amount,
+        fee=fee,
     )
     _attach_logs(logs, position_id)
     _record_trade_outcome(canonical_log, position_id)

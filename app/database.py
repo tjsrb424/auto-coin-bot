@@ -42,6 +42,7 @@ REQUIRED_SCHEMA_TABLES = [
     "aggression_preset_logs",
     "strategy_kill_switch_events",
     "position_fill_events",
+    "order_application_ledger",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -860,6 +861,28 @@ def init_db() -> None:
                 FOREIGN KEY(order_log_id) REFERENCES live_order_logs(id)
             );
 
+            CREATE TABLE IF NOT EXISTS order_application_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_uuid TEXT NOT NULL UNIQUE,
+                position_id INTEGER NOT NULL,
+                fill_type TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'BUY',
+                order_purpose TEXT NOT NULL DEFAULT 'ENTRY',
+                applied_volume REAL NOT NULL DEFAULT 0,
+                applied_amount_krw REAL NOT NULL DEFAULT 0,
+                applied_fee REAL NOT NULL DEFAULT 0,
+                last_exchange_executed_volume REAL NOT NULL DEFAULT 0,
+                last_exchange_filled_amount_krw REAL NOT NULL DEFAULT 0,
+                last_exchange_paid_fee REAL NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                order_log_id INTEGER,
+                request_id TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(position_id) REFERENCES live_positions(id),
+                FOREIGN KEY(order_log_id) REFERENCES live_order_logs(id)
+            );
+
             CREATE TABLE IF NOT EXISTS runtime_locks (
                 lock_id TEXT PRIMARY KEY,
                 instance_id TEXT NOT NULL,
@@ -1230,6 +1253,11 @@ def init_db() -> None:
         _ensure_column(conn, "live_positions", "last_trailing_update_at", "TEXT")
         _ensure_column(conn, "live_positions", "scale_in_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "live_positions", "last_scale_in_at", "TEXT")
+        _ensure_column(conn, "order_application_ledger", "side", "TEXT NOT NULL DEFAULT 'BUY'")
+        _ensure_column(conn, "order_application_ledger", "order_purpose", "TEXT NOT NULL DEFAULT 'ENTRY'")
+        _ensure_column(conn, "order_application_ledger", "applied_fee", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_application_ledger", "last_exchange_filled_amount_krw", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "order_application_ledger", "last_exchange_paid_fee", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "selected_strategy_type", "TEXT")
         _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
@@ -4493,6 +4521,30 @@ def load_position_fill_event(order_uuid: str, fill_type: str) -> dict | None:
     return dict(row) if row else None
 
 
+def load_position_fill_events_by_order_uuid(order_uuid: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM position_fill_events
+            WHERE order_uuid = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (order_uuid,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_position_fill_event(event_id: int, updates: dict) -> None:
+    allowed = {"source", "applied_volume", "applied_amount_krw", "applied_fee", "applied_at"}
+    values = {key: updates[key] for key in allowed if key in updates}
+    if not values:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with get_connection() as conn:
+        conn.execute(f"UPDATE position_fill_events SET {assignments} WHERE id = ?", [*values.values(), event_id])
+
+
 def insert_position_fill_event(event: dict) -> bool:
     now_utc = _utc_now()
     with get_connection() as conn:
@@ -4518,6 +4570,71 @@ def insert_position_fill_event(event: dict) -> bool:
             ),
         )
         return cursor.rowcount > 0
+
+
+def load_order_application_ledger(order_uuid: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM order_application_ledger
+            WHERE order_uuid = ?
+            LIMIT 1
+            """,
+            (order_uuid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_order_application_ledger(event: dict) -> dict | None:
+    now_utc = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO order_application_ledger (
+                order_uuid, position_id, fill_type, side, order_purpose,
+                applied_volume, applied_amount_krw, applied_fee,
+                last_exchange_executed_volume, last_exchange_filled_amount_krw,
+                last_exchange_paid_fee, source, order_log_id, request_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_uuid) DO UPDATE SET
+                position_id = excluded.position_id,
+                fill_type = order_application_ledger.fill_type,
+                side = excluded.side,
+                order_purpose = excluded.order_purpose,
+                applied_volume = excluded.applied_volume,
+                applied_amount_krw = excluded.applied_amount_krw,
+                applied_fee = excluded.applied_fee,
+                last_exchange_executed_volume = excluded.last_exchange_executed_volume,
+                last_exchange_filled_amount_krw = excluded.last_exchange_filled_amount_krw,
+                last_exchange_paid_fee = excluded.last_exchange_paid_fee,
+                source = excluded.source,
+                order_log_id = COALESCE(excluded.order_log_id, order_application_ledger.order_log_id),
+                request_id = COALESCE(excluded.request_id, order_application_ledger.request_id),
+                updated_at = excluded.updated_at
+            """,
+            (
+                event["order_uuid"],
+                int(event["position_id"]),
+                event["fill_type"],
+                event.get("side", "BUY"),
+                event.get("order_purpose", "ENTRY"),
+                float(event.get("applied_volume") or 0.0),
+                float(event.get("applied_amount_krw") or 0.0),
+                float(event.get("applied_fee") or 0.0),
+                float(event.get("last_exchange_executed_volume") or event.get("applied_volume") or 0.0),
+                float(event.get("last_exchange_filled_amount_krw") or event.get("applied_amount_krw") or 0.0),
+                float(event.get("last_exchange_paid_fee") or event.get("applied_fee") or 0.0),
+                event.get("source", ""),
+                event.get("order_log_id"),
+                event.get("request_id"),
+                now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM order_application_ledger WHERE order_uuid = ?", (event["order_uuid"],)).fetchone()
+    return dict(row) if row else None
 
 
 def upsert_rebalance_delta_accumulator(

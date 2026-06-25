@@ -20,6 +20,7 @@ from app.live_recovery import (
     run_startup_live_recovery_async,
     sync_open_orders,
 )
+from app.order_fill_repair import repair_duplicate_order_uuid_application
 from app.scale_in_repair import repair_scale_in_duplicate
 from app.risk_manager import compute_risk_state
 
@@ -784,6 +785,116 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
             assert log is not None
             self.assertEqual(log["position_id"], target_position_id)
 
+    def test_same_order_uuid_entry_then_scale_in_does_not_increase_position_again(self) -> None:
+        session_id = create_strategy_session()
+        entry = {
+            **order_log("entry-first"),
+            "session_id": session_id,
+            "status": "FILLED",
+            "order_uuid": "cross-dup",
+            "price": 100_000_000,
+            "volume": 0.00005,
+            "executed_volume": 0.00005,
+            "remaining_volume": 0.0,
+            "filled_amount_krw": 5_000,
+        }
+        database.insert_live_order_log(entry)
+        ensure_filled_entry_order_position(database.get_live_order_log("entry-first"))
+        target_position_id = database.load_open_live_positions("bithumb", "KRW-BTC")[0]["id"]
+        preview = {"policy_preview": {"scale_in": {"scale_in": True, "allowed": True, "position_id": target_position_id}}}
+        database.insert_live_order_log(
+            {
+                **entry,
+                "request_id": "scale-second",
+                "order_preview_payload": preview,
+                "position_id": None,
+            }
+        )
+
+        ensure_filled_entry_order_position(database.get_live_order_log("scale-second"))
+
+        updated = database.load_live_position(target_position_id)
+        assert updated is not None
+        self.assertAlmostEqual(updated["entry_volume"], 0.00005)
+        self.assertAlmostEqual(updated["entry_amount_krw"], 5_000)
+        self.assertIsNone(database.load_position_fill_event("cross-dup", "SCALE_IN"))
+        ledger = database.load_order_application_ledger("cross-dup")
+        assert ledger is not None
+        self.assertEqual(ledger["fill_type"], "ENTRY")
+
+    def test_same_order_uuid_scale_in_then_entry_does_not_increase_position_again(self) -> None:
+        session_id = create_strategy_session()
+        target_position_id = database.create_live_position(live_position(session_id))
+        preview = {"policy_preview": {"scale_in": {"scale_in": True, "allowed": True, "position_id": target_position_id}}}
+        scale = {
+            **order_log("scale-first"),
+            "session_id": session_id,
+            "status": "FILLED",
+            "order_uuid": "cross-dup-reverse",
+            "price": 100_000_000,
+            "volume": 0.00005,
+            "executed_volume": 0.00005,
+            "remaining_volume": 0.0,
+            "filled_amount_krw": 5_000,
+            "order_preview_payload": preview,
+        }
+        database.insert_live_order_log(scale)
+        ensure_filled_entry_order_position(database.get_live_order_log("scale-first"))
+        database.insert_live_order_log({**scale, "request_id": "entry-second", "order_preview_payload": {}, "position_id": None})
+
+        ensure_filled_entry_order_position(database.get_live_order_log("entry-second"))
+
+        updated = database.load_live_position(target_position_id)
+        assert updated is not None
+        self.assertAlmostEqual(updated["entry_volume"], 0.00015)
+        self.assertAlmostEqual(updated["entry_amount_krw"], 15_000)
+        self.assertEqual(updated["scale_in_count"], 1)
+        self.assertIsNone(database.load_position_fill_event("cross-dup-reverse", "ENTRY"))
+        ledger = database.load_order_application_ledger("cross-dup-reverse")
+        assert ledger is not None
+        self.assertEqual(ledger["fill_type"], "SCALE_IN")
+
+    def test_same_order_uuid_partial_fill_applies_only_delta(self) -> None:
+        session_id = create_strategy_session()
+        first = {
+            **order_log("partial-first"),
+            "session_id": session_id,
+            "status": "FILLED",
+            "order_uuid": "partial-delta",
+            "price": 100_000_000,
+            "volume": 0.00005,
+            "executed_volume": 0.00005,
+            "remaining_volume": 0.00003,
+            "filled_amount_krw": 5_000,
+        }
+        database.insert_live_order_log(first)
+        ensure_filled_entry_order_position(database.get_live_order_log("partial-first"))
+        position_id = database.load_open_live_positions("bithumb", "KRW-BTC")[0]["id"]
+        database.insert_live_order_log(
+            {
+                **first,
+                "request_id": "partial-second",
+                "volume": 0.00008,
+                "executed_volume": 0.00008,
+                "remaining_volume": 0.0,
+                "filled_amount_krw": 8_000,
+                "position_id": None,
+            }
+        )
+
+        ensure_filled_entry_order_position(database.get_live_order_log("partial-second"))
+
+        updated = database.load_live_position(position_id)
+        assert updated is not None
+        self.assertAlmostEqual(updated["entry_volume"], 0.00008)
+        self.assertAlmostEqual(updated["entry_amount_krw"], 8_000)
+        event = database.load_position_fill_event("partial-delta", "ENTRY")
+        assert event is not None
+        self.assertAlmostEqual(event["applied_volume"], 0.00008)
+        ledger = database.load_order_application_ledger("partial-delta")
+        assert ledger is not None
+        self.assertAlmostEqual(ledger["last_exchange_executed_volume"], 0.00008)
+
     async def test_duplicate_repair_preview_marks_inactive_ask_accumulator(self) -> None:
         session_id = create_strategy_session()
         target_position_id = database.create_live_position(live_position(session_id, entry_order_uuid="target-entry"))
@@ -882,6 +993,120 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
             second_preview = await repair_scale_in_duplicate(exchange="bithumb", market="KRW-BTC", dry_run=True)
         self.assertEqual(second_preview["duplicate_groups"][0]["duplicate_positions_to_close_or_reconcile"], [])
         self.assertEqual(second_preview["duplicate_groups"][0]["proposed_updates"], [])
+
+    async def test_duplicate_order_uuid_repair_is_idempotent_and_clears_snapshot_mismatch(self) -> None:
+        linked_session_id = create_strategy_session()
+        stale_session_id = create_strategy_session()
+        position_id = database.create_live_position(
+            live_position(
+                linked_session_id,
+                entry_order_uuid="repair-dup",
+                entry_volume=0.0002,
+                entry_amount_krw=20_000,
+                current_price=100_000_000,
+            )
+        )
+        slot = database.load_position_slots(5, "bithumb")[0]
+        with database.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE position_slots
+                SET status='OPEN',
+                    market='KRW-BTC',
+                    candidate_strategy_id=1,
+                    live_position_id=?,
+                    live_strategy_session_id=?,
+                    entry_order_uuid='repair-dup',
+                    allocated_krw=20000,
+                    current_value_krw=20000
+                WHERE id=?
+                """,
+                (position_id, linked_session_id, int(slot["id"])),
+            )
+        database.update_live_strategy_session(linked_session_id, {"current_position_id": position_id})
+        database.update_live_strategy_session(stale_session_id, {"current_position_id": position_id})
+        database.insert_live_order_log(
+            {
+                **order_log("repair-entry-log"),
+                "session_id": linked_session_id,
+                "status": "FILLED",
+                "order_uuid": "repair-dup",
+                "executed_volume": 0.0001,
+                "filled_amount_krw": 10_000,
+                "position_id": position_id,
+            }
+        )
+        database.insert_position_fill_event(
+            {
+                "order_uuid": "repair-dup",
+                "position_id": position_id,
+                "fill_type": "ENTRY",
+                "source": "TEST",
+                "order_log_id": database.get_live_order_log("repair-entry-log")["id"],
+                "request_id": "repair-entry-log",
+                "applied_volume": 0.0001,
+                "applied_amount_krw": 10_000,
+                "applied_fee": 5,
+                "applied_at": "2026-06-16T00:00:00Z",
+            }
+        )
+        database.insert_position_fill_event(
+            {
+                "order_uuid": "repair-dup",
+                "position_id": position_id,
+                "fill_type": "SCALE_IN",
+                "source": "TEST_DUP",
+                "order_log_id": database.get_live_order_log("repair-entry-log")["id"],
+                "request_id": "repair-entry-log",
+                "applied_volume": 0.0001,
+                "applied_amount_krw": 10_000,
+                "applied_fee": 5,
+                "applied_at": "2026-06-16T00:01:00Z",
+            }
+        )
+        broker = AsyncMock()
+        broker.get_balances.return_value = {
+            "by_currency": {"BTC": {"balance": 0.0001, "locked": 0.0, "avg_buy_price": 100_000_000}, "KRW": {"balance": 100_000, "locked": 0.0}}
+        }
+        broker.list_open_orders.return_value = {"orders": []}
+
+        with patch("app.order_fill_repair.get_live_broker", return_value=broker), patch(
+            "app.capital_snapshot.get_live_broker", return_value=broker
+        ):
+            preview = await repair_duplicate_order_uuid_application(
+                position_id=position_id,
+                order_uuid="repair-dup",
+                exchange="bithumb",
+                dry_run=True,
+            )
+            applied = await repair_duplicate_order_uuid_application(
+                position_id=position_id,
+                order_uuid="repair-dup",
+                exchange="bithumb",
+                dry_run=False,
+            )
+            second_preview = await repair_duplicate_order_uuid_application(
+                position_id=position_id,
+                order_uuid="repair-dup",
+                exchange="bithumb",
+                dry_run=True,
+            )
+
+        self.assertTrue(preview["proposed_updates"])
+        self.assertTrue(applied["applied"])
+        self.assertFalse(applied["capital_snapshot_after"]["balance_mismatch_detected"])
+        updated = database.load_live_position(position_id)
+        assert updated is not None
+        self.assertAlmostEqual(updated["entry_volume"], 0.0001)
+        self.assertAlmostEqual(updated["entry_amount_krw"], 10_000)
+        scale_event = database.load_position_fill_event("repair-dup", "SCALE_IN")
+        assert scale_event is not None
+        self.assertEqual(scale_event["applied_volume"], 0.0)
+        stale_session = database.load_live_strategy_session(stale_session_id)
+        assert stale_session is not None
+        self.assertEqual(stale_session["status"], "STOPPED")
+        self.assertIsNone(stale_session["current_position_id"])
+        self.assertEqual(second_preview["proposed_updates"], [])
 
     def test_timeout_exception_detection_blocks_retry_path(self) -> None:
         self.assertTrue(is_timeout_exception(httpx.ReadTimeout("timed out")))

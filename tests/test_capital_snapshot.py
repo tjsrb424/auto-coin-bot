@@ -267,6 +267,20 @@ class CapitalSnapshotTests(unittest.TestCase):
         self.assertNotIn("EXCHANGE_BALANCE_WITHOUT_DB_POSITION:P", snapshot["warnings"])
         self.assertAlmostEqual(snapshot["exchange_position_value_krw"], 96_722_000 * 0.00012416)
 
+    def test_tiny_unmanaged_balance_below_dust_value_does_not_warn(self) -> None:
+        account = {
+            "by_currency": {
+                "KRW": {"balance": 100_000, "locked": 0.0},
+                "BTC": {"balance": 0.00000001, "locked": 0.0, "avg_buy_price": 100_000_000},
+            },
+            "krw": {"balance": 100_000, "locked": 0.0},
+        }
+
+        snapshot = self.run_snapshot(account)
+
+        self.assertFalse(snapshot["balance_mismatch_detected"])
+        self.assertNotIn("EXCHANGE_BALANCE_WITHOUT_DB_POSITION:BTC", snapshot["warnings"])
+
     def test_sellable_volume_uses_smaller_of_db_and_exchange_balance(self) -> None:
         candidate_id = database.save_candidate_strategy(candidate_payload())
         session_id = database.create_live_strategy_session(

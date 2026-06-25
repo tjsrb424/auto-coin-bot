@@ -91,6 +91,17 @@ def _balance_available(balances: dict | None, currency: str) -> float:
     return _available_balance(balances, currency.upper())
 
 
+def _balance_value_krw(item: dict, total: float) -> float | None:
+    for key in ("avg_buy_price", "price", "current_price"):
+        try:
+            price = float(item.get(key) or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price > 0:
+            return total * price
+    return None
+
+
 def _open_order_markets(positions: list[dict], reservations: list[dict], db_orders: list[dict]) -> list[str]:
     markets = {
         str(item.get("market") or "")
@@ -108,6 +119,7 @@ async def build_capital_snapshot_async(exchange: str = "bithumb") -> dict:
     max_slots = _int_env("AUTO_MAX_OPEN_POSITION_COUNT", 5, minimum=1, maximum=20)
     cash_reserve_pct = _float_env("AUTO_CASH_RESERVE_PCT", 5.0)
     max_age_seconds = _int_env("AUTO_CAPITAL_SNAPSHOT_MAX_AGE_SECONDS", 10, minimum=1, maximum=300)
+    dust_value_krw = _float_env("AUTO_CAPITAL_SNAPSHOT_DUST_VALUE_KRW", 100.0)
     ignored_balance_symbols = _csv_env("AUTO_CAPITAL_SNAPSHOT_IGNORED_BALANCE_SYMBOLS", "P")
     positions = load_open_live_positions_for_exchange(exchange)
     reservations = load_active_order_reservations(exchange)
@@ -176,7 +188,8 @@ async def build_capital_snapshot_async(exchange: str = "bithumb") -> dict:
             if symbol == "KRW" or symbol in ignored_balance_symbols or symbol in db_volume_by_symbol:
                 continue
             total = float(item.get("balance") or 0.0) + float(item.get("locked") or 0.0)
-            if total > 0:
+            value_krw = _balance_value_krw(item, total)
+            if total > 0 and (value_krw is None or value_krw > dust_value_krw):
                 warnings.append(f"EXCHANGE_BALANCE_WITHOUT_DB_POSITION:{symbol}")
 
     db_order_ids = {str(order.get("order_uuid") or order.get("request_id") or "") for order in db_orders}
@@ -214,6 +227,7 @@ async def build_capital_snapshot_async(exchange: str = "bithumb") -> dict:
         "daily_loss_limit_pct": float(policy.get("daily_loss_limit_pct") or 0.0),
         "available_krw_balance": available_krw,
         "cash_reserve_krw": cash_reserve,
+        "dust_value_krw": dust_value_krw,
         "db_open_position_value_krw": db_position_value,
         "exchange_position_value_krw": exchange_position_value,
         "pending_buy_reserved_krw": pending_reserved,
