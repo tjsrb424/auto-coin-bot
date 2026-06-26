@@ -250,23 +250,96 @@ class AccountingEpochTests(unittest.TestCase):
             self.assertFalse(before["limited_auto_live_allowed"])
             self.assertFalse(before["full_auto_live_allowed"])
 
-            database.insert_smoke_test_run(
-                {
-                    "smoke_test_id": "smoke-pass",
-                    "exchange_name": "bithumb",
-                    "symbol": "BTC",
-                    "market": "KRW-BTC",
-                    "status": "PASSED",
-                    "completed_at_utc": "2026-06-26T00:10:00Z",
-                    "max_notional_krw": 6000,
-                    "report": {"exchange_fill_count": 2, "ledger_fill_count": 2},
-                }
-            )
-            with patch("app.accounting_epoch._age_minutes", return_value=5):
-                after = limited_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+            self.insert_smoke_run(status="PASSED_AFTER_RECALC")
+            after = limited_auto_live_gate(current_epoch, preflight, exchange="bithumb")
 
         self.assertTrue(after["limited_auto_live_allowed"])
+        self.assertEqual(after["last_smoke_test_status"], "PASSED_AFTER_RECALC")
         self.assertFalse(after["full_auto_live_allowed"])
+        self.assertEqual(after["limited_auto_constraints"]["allowed_symbols"], ["BTC", "ETH"])
+        self.assertIn("rsi", after["limited_auto_constraints"]["blocked_strategies"])
+        self.assertIn("WLD", after["limited_auto_constraints"]["blocked_symbols"])
+        self.assertEqual(after["limited_auto_constraints"]["max_notional_krw"], 6000)
+        self.assertEqual(after["limited_auto_constraints"]["max_orders"], 3)
+
+    def test_limited_auto_recalculates_partial_smoke_to_passed_after_recalc(self) -> None:
+        self.create_epoch()
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        self.insert_smoke_order(
+            request_id="smoke-buy",
+            client_order_id="smoke-buy-client",
+            order_uuid="C0101000003129835396",
+            side="BUY",
+            paid_fee=14.99,
+            trades=[
+                {"uuid": "buy-fill-1", "price": "599600000", "volume": "0.000025", "funds": "14990", "created_at": "2026-06-26T16:54:35+09:00"},
+                {"uuid": "buy-fill-2", "price": "599600000", "volume": "0.000025", "funds": "14990", "created_at": "2026-06-26T16:54:36+09:00"},
+            ],
+        )
+        self.insert_smoke_order(
+            request_id="smoke-sell",
+            client_order_id="smoke-sell-client",
+            order_uuid="C0101000003129835406",
+            side="SELL",
+            paid_fee=14.99,
+            trades=[
+                {"uuid": "sell-fill-1", "price": "599600000", "volume": "0.00005", "funds": "29980", "created_at": "2026-06-26T16:54:39+09:00"},
+            ],
+        )
+        self.insert_smoke_run(
+            status="PARTIAL",
+            report={
+                "exchange_order_uuid_list": ["C0101000003129835396", "C0101000003129835406"],
+                "exchange_fill_count": 3,
+                "ledger_fill_count": 3,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 2,
+                "fee_diff": -14.99,
+                "equity_diff_after": 0,
+                "current_epoch_accounting_pending_count": 0,
+                "current_epoch_accounting_failed_count": 0,
+                "final_runtime_status": "STOPPED",
+            },
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "APP_ENV": "production",
+                "LIVE_TRADING_ENABLED": "true",
+                "BITHUMB_ACCESS_KEY": "access",
+                "BITHUMB_SECRET_KEY": "secret",
+                "LIVE_SMOKE_TEST_ENABLED": "true",
+            },
+            clear=False,
+        ):
+            preflight = build_smoke_test_preflight(exchange="bithumb", symbol="BTC", strategy_name="smoke_test", current_epoch=current_epoch)
+            gate = limited_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertTrue(gate["limited_auto_live_allowed"])
+        self.assertEqual(gate["last_smoke_test_status"], "PASSED_AFTER_RECALC")
+        self.assertEqual((gate["last_smoke_test"]["report"])["duplicate_fill_count"], 0)
+        self.assertEqual((gate["last_smoke_test"]["report"])["fee_diff"], 0)
+
+    def test_limited_auto_blocks_on_accounting_pending_fee_or_equity_diff(self) -> None:
+        self.create_epoch()
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        clean_preflight = {"smoke_test_blockers": [], "open_order_audit_summary": {"exchange_open_order_count": 0, "current_epoch_open_order_count": 0, "unknown_open_order_count": 0}}
+
+        self.insert_smoke_run(status="PASSED_AFTER_RECALC")
+        pending_epoch = {**current_epoch, "current_epoch_accounting_pending_count": 1, "current_epoch_sanity_passed": False, "current_epoch_restart_allowed": False}
+        pending_gate = limited_auto_live_gate(pending_epoch, clean_preflight, exchange="bithumb")
+        self.assertFalse(pending_gate["limited_auto_live_allowed"])
+        self.assertIn("CURRENT_EPOCH_ACCOUNTING_PENDING", {item["code"] for item in pending_gate["limited_auto_live_blockers"]})
+
+        self.insert_smoke_run(smoke_test_id="smoke-fee-diff", status="PASSED_AFTER_RECALC", report={"fee_diff": 10})
+        fee_gate = limited_auto_live_gate(current_epoch, clean_preflight, exchange="bithumb")
+        self.assertFalse(fee_gate["limited_auto_live_allowed"])
+        self.assertIn("SMOKE_FEE_DIFF", {item["code"] for item in fee_gate["limited_auto_live_blockers"]})
+
+        self.insert_smoke_run(smoke_test_id="smoke-equity-diff", status="PASSED_AFTER_RECALC", report={"equity_diff_after": 101})
+        equity_gate = limited_auto_live_gate(current_epoch, clean_preflight, exchange="bithumb")
+        self.assertFalse(equity_gate["limited_auto_live_allowed"])
+        self.assertIn("SMOKE_EQUITY_DIFF", {item["code"] for item in equity_gate["limited_auto_live_blockers"]})
 
     def test_diagnostics_separates_legacy_current_epoch_and_smoke_blockers(self) -> None:
         report = build_trading_diagnostics_report(
@@ -303,6 +376,86 @@ class AccountingEpochTests(unittest.TestCase):
         self.assertIn("CURRENT_EPOCH_MISSING", {item["code"] for item in report["current_epoch_blockers"]})
         self.assertIn("LIVE_SMOKE_TEST_DISABLED", {item["code"] for item in report["smoke_test_blockers"]})
         self.assertFalse(report["full_auto_live_allowed"])
+
+    def insert_smoke_run(self, *, smoke_test_id: str = "smoke-pass", status: str = "PASSED", report: dict | None = None) -> None:
+        base_report = {
+            "smoke_test_status": status,
+            "exchange_fill_count": 3,
+            "ledger_fill_count": 3,
+            "missing_ledger_fill_count": 0,
+            "duplicate_fill_count": 0,
+            "fee_diff": 0,
+            "equity_diff_after": 0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+            "final_runtime_status": "STOPPED",
+        }
+        base_report.update(report or {})
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": smoke_test_id,
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": status,
+                "completed_at_utc": "2026-06-26T00:10:00Z",
+                "max_notional_krw": 6000,
+                "report": base_report,
+            }
+        )
+
+    def insert_smoke_order(
+        self,
+        *,
+        request_id: str,
+        client_order_id: str,
+        order_uuid: str,
+        side: str,
+        paid_fee: float,
+        trades: list[dict],
+    ) -> None:
+        executed_volume = 0.00005
+        filled_amount_krw = 29980
+        database.insert_live_order_log(
+            {
+                "request_id": request_id,
+                "client_order_id": client_order_id,
+                "idempotency_key": f"test:{request_id}",
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "side": side,
+                "order_type": "LIMIT",
+                "price": filled_amount_krw / executed_volume,
+                "volume": executed_volume,
+                "amount_krw": filled_amount_krw,
+                "fee_estimate": paid_fee,
+                "risk_result": "SMOKE_TEST_FILLED",
+                "order_preview_payload": {},
+                "exchange_request_payload_masked": {},
+                "exchange_response_payload": {
+                    "uuid": order_uuid,
+                    "client_order_id": client_order_id,
+                    "market": "KRW-BTC",
+                    "side": "bid" if side == "BUY" else "ask",
+                    "price": str(filled_amount_krw / executed_volume),
+                    "executed_volume": str(executed_volume),
+                    "executed_funds": str(filled_amount_krw),
+                    "paid_fee": str(paid_fee),
+                    "created_at": "2026-06-26T16:54:34+09:00",
+                    "trades": trades,
+                },
+                "status": "FILLED",
+                "order_uuid": order_uuid,
+                "executed_volume": executed_volume,
+                "remaining_volume": 0,
+                "filled_amount_krw": filled_amount_krw,
+                "paid_fee": paid_fee,
+                "order_purpose": "SMOKE_TEST",
+                "strategy_name": "smoke_test",
+                "signal_type": side,
+                "manual_confirmed": True,
+            }
+        )
 
 
 if __name__ == "__main__":

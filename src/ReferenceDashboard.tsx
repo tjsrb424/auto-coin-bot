@@ -4032,6 +4032,10 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const currentEpoch = diagnostics?.current_epoch;
   const smokeTest = diagnostics?.smoke_test_preflight;
   const limitedGate = diagnostics?.limited_auto_live_gate;
+  const lastSmoke = limitedGate?.last_smoke_test ?? null;
+  const lastSmokeReport = lastSmoke?.report ?? {};
+  const lastSmokeStatus = limitedGate?.last_smoke_test_status ?? lastSmoke?.status ?? "-";
+  const limitedNextAction = limitedGate?.limited_auto_next_action ?? "-";
   const openOrderAudit = diagnostics?.open_order_audit ?? smokeTest?.open_order_audit;
   const openOrderSummary = openOrderAudit?.open_order_audit_summary ?? smokeTest?.open_order_audit_summary;
   const ledgerPnl = assetRecon?.ledger_pnl_detail;
@@ -4110,6 +4114,24 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: smokeTest?.smoke_test_allowed ? "green" : "amber"
     },
     {
+      label: "Last Smoke Status",
+      value: String(lastSmokeStatus),
+      detail: `${lastSmoke?.smoke_test_id ?? "-"} - ${limitedGate?.smoke_gate_passed ? "gate passed" : "gate blocked"}`,
+      tone: limitedGate?.smoke_gate_passed ? "green" : "red"
+    },
+    {
+      label: "Smoke Fee Diff",
+      value: formatSignedKrw(lastSmokeReport?.fee_diff),
+      detail: `source ${lastSmokeReport?.fee_source ?? "-"} - ledger ${formatKrw(lastSmokeReport?.ledger_fee_total)}`,
+      tone: Math.abs(Number(lastSmokeReport?.fee_diff ?? 0)) > 5 ? "red" : "green"
+    },
+    {
+      label: "Smoke Equity Diff",
+      value: formatSignedKrw(lastSmokeReport?.equity_diff_after),
+      detail: `pending ${lastSmokeReport?.current_epoch_accounting_pending_count ?? 0} - failed ${lastSmokeReport?.current_epoch_accounting_failed_count ?? 0}`,
+      tone: Math.abs(Number(lastSmokeReport?.equity_diff_after ?? 0)) > 100 ? "red" : "green"
+    },
+    {
       label: "Smoke Enabled",
       value: (smokeTest?.smoke_test_blockers ?? []).some((item: any) => item.code === "LIVE_SMOKE_TEST_DISABLED") ? "OFF" : "ON",
       detail: "one-shot smoke test button remains disabled",
@@ -4150,6 +4172,12 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       value: limitedGate?.limited_auto_live_allowed ? "READY" : "LOCKED",
       detail: (limitedGate?.limited_auto_live_blockers ?? []).slice(0, 2).map((item: any) => item.code).join(" / ") || "BTC/ETH only",
       tone: limitedGate?.limited_auto_live_allowed ? "green" : "amber"
+    },
+    {
+      label: "Next Action",
+      value: String(limitedNextAction),
+      detail: `trust ${currentEpoch?.current_epoch_trust_level ?? "-"} - orders ${limitedGate?.limited_auto_constraints?.max_orders ?? 3}`,
+      tone: limitedGate?.limited_auto_live_allowed ? "cyan" : "amber"
     },
     {
       label: "Full Auto",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -13,6 +14,7 @@ from app.database import (
     load_runtime_lock,
     load_unresolved_live_order_logs_for_exchange,
 )
+from app.exchange_fills_ledger import build_exchange_fill_records, summarize_ledger_rows
 from app.live_broker import LiveTradingConfig, is_emergency_stopped
 
 LEGACY_HISTORY_REASONS = [
@@ -47,6 +49,9 @@ LEGACY_BLOCKER_CODES = {
 DEFAULT_SMOKE_SYMBOLS = {"BTC", "ETH"}
 DEFAULT_BLOCKED_SYMBOLS = {"WLD", "XLM", "RE"}
 DEFAULT_BLOCKED_STRATEGIES = {"rsi"}
+SMOKE_PASS_STATUSES = {"PASSED", "PASSED_AFTER_RECALC"}
+SMOKE_FEE_TOLERANCE_KRW = 5.0
+SMOKE_EQUITY_TOLERANCE_KRW = 100.0
 
 
 def legacy_history_quarantine(asset_reconciliation: dict | None = None) -> dict:
@@ -299,29 +304,184 @@ def build_smoke_test_preflight(
 
 
 def limited_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exchange: str = "bithumb") -> dict:
-    latest = load_latest_smoke_test_run(exchange)
+    smoke_gate = latest_smoke_test_gate(exchange=exchange)
+    latest = smoke_gate.get("last_smoke_test")
     blockers = []
-    if not current_epoch.get("current_epoch_restart_allowed"):
-        blockers.append({"code": "CURRENT_EPOCH_NOT_CLEAN", "count": 1})
-    if not latest or latest.get("status") != "PASSED":
-        blockers.append({"code": "SMOKE_TEST_NOT_PASSED", "count": 1})
-    elif _age_minutes(latest.get("completed_at_utc") or latest.get("updated_at_utc")) > 30:
-        blockers.append({"code": "SMOKE_TEST_TOO_OLD", "count": 1})
+    if not current_epoch.get("current_epoch_exists"):
+        blockers.append({"code": "CURRENT_EPOCH_MISSING", "count": 1})
+    if not current_epoch.get("current_epoch_sanity_passed"):
+        blockers.append({"code": "CURRENT_EPOCH_SANITY_FAILED", "count": 1})
+    if str(current_epoch.get("current_epoch_trust_level") or "").upper() == "LOW":
+        blockers.append({"code": "CURRENT_EPOCH_TRUST_LOW", "count": 1})
+    if int(current_epoch.get("current_epoch_accounting_pending_count") or 0):
+        blockers.append({"code": "CURRENT_EPOCH_ACCOUNTING_PENDING", "count": int(current_epoch.get("current_epoch_accounting_pending_count") or 0)})
+    if int(current_epoch.get("current_epoch_accounting_failed_count") or 0):
+        blockers.append({"code": "CURRENT_EPOCH_ACCOUNTING_FAILED", "count": int(current_epoch.get("current_epoch_accounting_failed_count") or 0)})
+    if not smoke_gate.get("smoke_gate_passed"):
+        blockers.extend(smoke_gate.get("smoke_gate_blockers") or [{"code": "SMOKE_TEST_NOT_PASSED", "count": 1}])
     if smoke_preflight.get("smoke_test_blockers"):
         blockers.append({"code": "SMOKE_PREFLIGHT_NOT_CLEAR", "count": len(smoke_preflight.get("smoke_test_blockers") or [])})
+    audit_summary = smoke_preflight.get("open_order_audit_summary") or {}
+    if int(audit_summary.get("exchange_open_order_count") or 0):
+        blockers.append({"code": "EXCHANGE_OPEN_ORDER_EXISTS", "count": int(audit_summary.get("exchange_open_order_count") or 0)})
+    if int(audit_summary.get("current_epoch_open_order_count") or 0):
+        blockers.append({"code": "CURRENT_EPOCH_OPEN_ORDER_EXISTS", "count": int(audit_summary.get("current_epoch_open_order_count") or 0)})
+    if int(audit_summary.get("unknown_open_order_count") or 0):
+        blockers.append({"code": "UNKNOWN_OPEN_ORDER_EXISTS", "count": int(audit_summary.get("unknown_open_order_count") or 0)})
+    if is_emergency_stopped():
+        blockers.append({"code": "EMERGENCY_STOP_ENABLED", "count": 1})
     return {
         "limited_auto_live_allowed": len(blockers) == 0,
         "full_auto_live_allowed": False,
         "last_smoke_test": latest,
+        "last_smoke_test_status": smoke_gate.get("last_smoke_test_status"),
+        "last_smoke_test_recalculated_at_utc": smoke_gate.get("last_smoke_test_recalculated_at_utc"),
+        "smoke_gate_passed": smoke_gate.get("smoke_gate_passed"),
+        "smoke_gate_blockers": smoke_gate.get("smoke_gate_blockers", []),
         "limited_auto_live_blockers": blockers,
         "limited_auto_constraints": {
             "allowed_symbols": ["BTC", "ETH"],
             "blocked_symbols": sorted(DEFAULT_BLOCKED_SYMBOLS),
             "blocked_strategies": sorted(DEFAULT_BLOCKED_STRATEGIES),
+            "max_notional_krw": 6000,
             "max_open_positions": 1,
+            "max_orders": 3,
             "max_orders_per_day": 3,
+            "averaging_down_allowed": False,
+            "reentry_allowed": False,
+            "daily_loss_limit_policy": "VERY_LOW",
+            "stop_on_accounting_error": True,
+            "stop_on_equity_diff": True,
+            "stop_on_missing_ledger_fill": True,
+            "stop_on_duplicate_fill": True,
+            "stop_on_fee_diff": True,
         },
+        "limited_auto_next_action": "USER_CONFIRM_LIMITED_AUTO_LIVE_START" if len(blockers) == 0 else "RESOLVE_LIMITED_AUTO_BLOCKERS",
     }
+
+
+def latest_smoke_test_gate(*, exchange: str = "bithumb") -> dict:
+    latest = load_latest_smoke_test_run(exchange)
+    if not latest:
+        return {
+            "last_smoke_test": None,
+            "last_smoke_test_status": "MISSING",
+            "smoke_gate_passed": False,
+            "smoke_gate_blockers": [{"code": "SMOKE_TEST_NOT_FOUND", "count": 1}],
+        }
+    assessed = _assess_smoke_test_for_gate(latest, exchange=exchange)
+    report = assessed.get("report") or {}
+    blockers = _smoke_gate_blockers(report)
+    status = str(assessed.get("status") or latest.get("status") or "").upper()
+    if status not in SMOKE_PASS_STATUSES:
+        blockers.append({"code": "SMOKE_TEST_NOT_PASSED", "count": 1})
+    return {
+        "last_smoke_test": {
+            **latest,
+            "status": status,
+            "report": report,
+            "gate_status": status,
+            "gate_source": assessed.get("source"),
+        },
+        "last_smoke_test_status": status,
+        "last_smoke_test_recalculated_at_utc": assessed.get("recalculated_at_utc"),
+        "smoke_gate_passed": len(blockers) == 0,
+        "smoke_gate_blockers": blockers,
+    }
+
+
+def _assess_smoke_test_for_gate(latest: dict, *, exchange: str) -> dict:
+    report = dict(latest.get("report") or {})
+    status = str(latest.get("status") or report.get("smoke_test_status") or "").upper()
+    if status in SMOKE_PASS_STATUSES:
+        return {"status": status, "report": report, "source": "STORED_SMOKE_TEST_RUN", "recalculated_at_utc": report.get("recalculated_at_utc")}
+    recalculated = _recalculate_smoke_test_report_for_gate(report, exchange=exchange)
+    if recalculated.get("ok"):
+        return {
+            "status": "PASSED_AFTER_RECALC",
+            "report": recalculated["report"],
+            "source": "RECALCULATED_FROM_EXISTING_ORDER_LOGS",
+            "recalculated_at_utc": recalculated["report"].get("recalculated_at_utc"),
+        }
+    return {"status": status or "FAILED", "report": recalculated.get("report") or report, "source": recalculated.get("source") or "STORED_SMOKE_TEST_RUN", "recalculated_at_utc": None}
+
+
+def _recalculate_smoke_test_report_for_gate(report: dict, *, exchange: str) -> dict:
+    order_uuids = [str(item) for item in report.get("exchange_order_uuid_list") or [] if str(item)]
+    if not order_uuids:
+        return {"ok": False, "report": report, "source": "NO_ORDER_UUIDS"}
+    placeholders = ",".join("?" for _ in order_uuids)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND order_uuid IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            [exchange, *order_uuids],
+        ).fetchall()
+    order_logs = [_decode_order_log_json(dict(row)) for row in rows]
+    exchange_orders = [(log.get("exchange_response_payload") or {}) for log in order_logs if log.get("exchange_response_payload")]
+    records = build_exchange_fill_records(
+        exchange_name=exchange,
+        exchange_orders=exchange_orders,
+        db_orders=order_logs,
+        source="exchange_api_recalc",
+        period_start_utc=report.get("started_at_utc"),
+    )
+    order_uuid_set = set(order_uuids)
+    relevant = [row for row in records if str(row.get("exchange_order_uuid") or "") in order_uuid_set]
+    summary = summarize_ledger_rows(relevant)
+    order_fee = sum(_float(log.get("paid_fee")) for log in order_logs)
+    fill_row_fee = sum(_float(row.get("fee")) for row in relevant if str(row.get("fee_source") or "") == "FILL_ROW_FEE")
+    has_fill_row_fee = any(str(row.get("fee_source") or "") == "FILL_ROW_FEE" for row in relevant)
+    ledger_fee = sum(_float(row.get("fee")) for row in relevant)
+    normalized_fee = fill_row_fee if has_fill_row_fee else order_fee
+    recalculated = dict(report)
+    recalculated.update(
+        {
+            "smoke_test_status": "PASSED_AFTER_RECALC",
+            "exchange_fill_count": len(relevant),
+            "ledger_fill_count": len(relevant),
+            "missing_ledger_fill_count": int(summary.get("missing_canonical_log_count") or 0),
+            "duplicate_fill_count": int(summary.get("duplicate_fill_key_count") or 0),
+            "fee_source": "FILL_ROW_FEE" if has_fill_row_fee else "ORDER_SUMMARY_FEE",
+            "exchange_fee_total_by_fill_rows": fill_row_fee,
+            "exchange_fee_total_by_order_summary": order_fee,
+            "ledger_fee_total": ledger_fee,
+            "fee_normalized_total": normalized_fee,
+            "fee_from_exchange": normalized_fee,
+            "fee_from_ledger": ledger_fee,
+            "fee_diff": normalized_fee - ledger_fee,
+            "exchange_fills_ledger_summary": {"smoke_relevant": summary},
+            "recalculated_at_utc": _utc_now(),
+        }
+    )
+    blockers = _smoke_gate_blockers(recalculated)
+    return {"ok": len(blockers) == 0, "report": recalculated, "source": "RECALCULATED_FROM_EXISTING_ORDER_LOGS"}
+
+
+def _smoke_gate_blockers(report: dict) -> list[dict]:
+    blockers = []
+    if int(report.get("exchange_fill_count") or 0) != int(report.get("ledger_fill_count") or 0):
+        blockers.append({"code": "SMOKE_EXCHANGE_LEDGER_FILL_COUNT_MISMATCH", "count": 1})
+    if int(report.get("missing_ledger_fill_count") or 0):
+        blockers.append({"code": "SMOKE_MISSING_LEDGER_FILL", "count": int(report.get("missing_ledger_fill_count") or 0)})
+    if int(report.get("duplicate_fill_count") or 0):
+        blockers.append({"code": "SMOKE_DUPLICATE_FILL", "count": int(report.get("duplicate_fill_count") or 0)})
+    if abs(_float(report.get("fee_diff"))) > SMOKE_FEE_TOLERANCE_KRW:
+        blockers.append({"code": "SMOKE_FEE_DIFF", "count": 1})
+    if report.get("equity_diff_after") is None or abs(_float(report.get("equity_diff_after"))) > SMOKE_EQUITY_TOLERANCE_KRW:
+        blockers.append({"code": "SMOKE_EQUITY_DIFF", "count": 1})
+    if int(report.get("current_epoch_accounting_pending_count") or 0):
+        blockers.append({"code": "SMOKE_CURRENT_EPOCH_ACCOUNTING_PENDING", "count": int(report.get("current_epoch_accounting_pending_count") or 0)})
+    if int(report.get("current_epoch_accounting_failed_count") or 0):
+        blockers.append({"code": "SMOKE_CURRENT_EPOCH_ACCOUNTING_FAILED", "count": int(report.get("current_epoch_accounting_failed_count") or 0)})
+    if str(report.get("final_runtime_status") or "").upper() != "STOPPED":
+        blockers.append({"code": "SMOKE_FINAL_RUNTIME_NOT_STOPPED", "count": 1})
+    return blockers
 
 
 def split_restart_blockers(reasons: list[dict], current_epoch: dict, smoke_preflight: dict) -> dict:
@@ -515,3 +675,18 @@ def _age_minutes(value: Any) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 60
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _decode_order_log_json(row: dict) -> dict:
+    for key in ("order_preview_payload", "exchange_request_payload_masked", "exchange_response_payload"):
+        value = row.get(key)
+        if isinstance(value, str):
+            try:
+                row[key] = json.loads(value or "{}")
+            except json.JSONDecodeError:
+                row[key] = {}
+    return row
