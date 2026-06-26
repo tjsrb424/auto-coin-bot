@@ -156,6 +156,7 @@ from app.smart_readiness import build_limited_readiness
 from app.scale_in_repair import repair_scale_in_duplicate
 from app.trading_diagnostics import build_trading_diagnostics_report, restart_block_reason
 from app.exchange_fills_ledger import (
+    build_exchange_fill_accounting_report,
     build_position_valuation_summary,
     compute_realized_pnl_from_ledger,
     load_or_build_ledger_rows,
@@ -2004,6 +2005,7 @@ async def _asset_reconciliation_from_exchange(
     persist_exchange_ledger: bool = False,
 ) -> dict:
     period_start_utc = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    period_end_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     balances, status, error = await _safe_live_balances_for_exchange(exchange)
     if status != "SUCCESS":
         return {
@@ -2068,6 +2070,10 @@ async def _asset_reconciliation_from_exchange(
         })
     ledger = await _read_only_exchange_order_ledger(exchange, ledger_markets, days=days)
     db_orders = _diagnostic_db_orders(exchange, days)
+    all_db_orders = _diagnostic_all_db_orders(exchange, days)
+    sessions = _diagnostic_sessions(exchange, days)
+    position_fill_events = _diagnostic_position_fill_events(days)
+    trade_outcomes = _diagnostic_trade_outcomes(exchange, days)
     open_positions = _diagnostic_open_positions(exchange)
     ledger_rows, ledger_summary = load_or_build_ledger_rows(
         exchange_name=exchange,
@@ -2077,6 +2083,16 @@ async def _asset_reconciliation_from_exchange(
         persist=persist_exchange_ledger,
     )
     ledger_pnl = compute_realized_pnl_from_ledger(ledger_rows)
+    accounting_report = build_exchange_fill_accounting_report(
+        ledger_rows=ledger_rows,
+        canonical_db_orders=db_orders,
+        all_db_orders=all_db_orders,
+        sessions=sessions,
+        position_fill_events=position_fill_events,
+        trade_outcome_logs=trade_outcomes,
+        period_start_utc=period_start_utc,
+        period_end_utc=period_end_utc,
+    )
     position_valuation = build_position_valuation_summary(
         positions=open_positions,
         balances=balances,
@@ -2088,6 +2104,9 @@ async def _asset_reconciliation_from_exchange(
     return {
         "initial_equity": initial_equity,
         "period_start_utc": period_start_utc,
+        "period_end_utc": period_end_utc,
+        "initial_equity_snapshot_at_utc": period_start_utc,
+        "initial_equity_amount": initial_equity,
         "current_equity_from_exchange": current_cash + coin_value,
         "current_cash_krw": current_cash,
         "current_cash_available_krw": krw_available,
@@ -2111,6 +2130,7 @@ async def _asset_reconciliation_from_exchange(
         "exchange_fills_ledger_rows": ledger_rows,
         "exchange_fills_ledger_summary": ledger_summary,
         "exchange_realized_pnl": ledger_pnl,
+        "exchange_fill_accounting": accounting_report,
         "position_valuation_summary": position_valuation,
         "snapshot_unrealized_pnl": position_valuation.get("snapshot_unrealized_pnl"),
         "stale_valuation_effect": position_valuation.get("stale_valuation_effect"),
@@ -2184,6 +2204,69 @@ def _diagnostic_db_orders(exchange: str, days: int) -> list[dict]:
             ORDER BY created_at ASC, id ASC
             """,
             (exchange, cutoff),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _diagnostic_all_db_orders(exchange: str, days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND created_at >= ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (exchange, cutoff),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _diagnostic_sessions(exchange: str, days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_strategy_sessions
+            WHERE exchange = ?
+              AND (created_at >= ? OR updated_at >= ? OR stopped_at >= ?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (exchange, cutoff, cutoff, cutoff),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _diagnostic_position_fill_events(days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM position_fill_events
+            WHERE created_at >= ? OR applied_at >= ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (cutoff, cutoff),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _diagnostic_trade_outcomes(exchange: str, days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM trade_outcome_logs
+            WHERE exchange = ?
+              AND (created_at >= ? OR filled_at >= ? OR updated_at >= ?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (exchange, cutoff, cutoff, cutoff),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -2306,8 +2389,15 @@ async def trading_reconciliation(
         "corrected_equity_diff": asset.get("equity_diff"),
         "corrected_equity_diff_rate": asset.get("equity_diff_rate"),
         "exchange_net_realized_pnl_after_fee": asset.get("exchange_net_realized_pnl_after_fee"),
+        "exchange_net_realized_pnl_after_fee_all_fills": asset.get("exchange_net_realized_pnl_after_fee_all_fills"),
+        "exchange_net_realized_pnl_after_fee_bot_owned": asset.get("exchange_net_realized_pnl_after_fee_bot_owned"),
+        "exchange_net_realized_pnl_after_fee_manual_or_external": asset.get("exchange_net_realized_pnl_after_fee_manual_or_external"),
+        "exchange_net_realized_pnl_after_fee_out_of_scope": asset.get("exchange_net_realized_pnl_after_fee_out_of_scope"),
         "db_net_realized_pnl_after_fee": asset.get("net_realized_pnl_after_fee"),
         "realized_pnl_diff": asset.get("realized_pnl_diff"),
+        "bot_owned_realized_pnl_diff": asset.get("bot_owned_realized_pnl_diff"),
+        "manual_or_external_effect": asset.get("manual_or_external_effect"),
+        "out_of_scope_effect": asset.get("out_of_scope_effect"),
         "total_fee_from_exchange": asset.get("total_fee_from_exchange"),
         "total_fee_from_db": asset.get("total_fee_from_db"),
         "fee_diff": asset.get("fee_diff"),
@@ -2321,6 +2411,18 @@ async def trading_reconciliation(
         "restart_block_reasons": restart_gate.get("reasons", []),
         "expected_equity_formula": asset.get("expected_equity_formula"),
         "equity_diff_breakdown": asset.get("equity_diff_breakdown"),
+        "reconciliation_scope": asset.get("reconciliation_scope"),
+        "deposit_withdrawal_status": asset.get("deposit_withdrawal_status"),
+        "deposit_withdrawal_mismatch_is_verified": asset.get("deposit_withdrawal_mismatch_is_verified"),
+        "deposit_withdrawal_mismatch_note": asset.get("deposit_withdrawal_mismatch_note"),
+        "pnl_source_of_truth": asset.get("pnl_source_of_truth"),
+        "legacy_db_pnl": asset.get("legacy_db_pnl"),
+        "exchange_ledger_pnl": asset.get("exchange_ledger_pnl"),
+        "exchange_fill_ownership_summary": asset.get("exchange_fill_ownership_summary"),
+        "exchange_fill_accounting_status_summary": asset.get("exchange_fill_accounting_status_summary"),
+        "exchange_fill_missing_breakdown": asset.get("exchange_fill_missing_breakdown"),
+        "accounting_pending_count": asset.get("accounting_pending_count"),
+        "accounting_pending_value": asset.get("accounting_pending_value"),
         "fills_match_summary": {
             "ledger": ledger_summary,
             "exchange_fill_match": {

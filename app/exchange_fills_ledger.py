@@ -208,6 +208,127 @@ def compute_realized_pnl_from_ledger(rows: list[dict]) -> dict:
     }
 
 
+def build_exchange_fill_accounting_report(
+    *,
+    ledger_rows: list[dict],
+    canonical_db_orders: list[dict],
+    all_db_orders: list[dict],
+    sessions: list[dict],
+    position_fill_events: list[dict],
+    trade_outcome_logs: list[dict],
+    period_start_utc: str,
+    period_end_utc: str,
+) -> dict:
+    canonical_by_uuid = _rows_by(canonical_db_orders, "order_uuid")
+    canonical_by_client = _rows_by(canonical_db_orders, "client_order_id")
+    all_by_uuid = _rows_by(all_db_orders, "order_uuid")
+    all_by_client = _rows_by(all_db_orders, "client_order_id")
+    fill_events_by_uuid = _rows_by(position_fill_events, "order_uuid")
+    outcomes_by_uuid = _rows_by(trade_outcome_logs, "order_uuid")
+    allowed_symbols = sorted({_symbol(str(row.get("market") or "")) for row in all_db_orders if row.get("market")})
+    allowed_markets = sorted({str(row.get("market") or "") for row in all_db_orders if row.get("market")})
+    allowed_strategies = sorted({str(row.get("strategy_name") or "") for row in all_db_orders if row.get("strategy_name")})
+    session_start, session_end = _session_time_range(sessions)
+
+    classified = []
+    for row in ledger_rows:
+        item = dict(row)
+        order_uuid = str(item.get("exchange_order_uuid") or "")
+        client_order_id = str(item.get("client_order_id") or "")
+        canonical_match = _first(canonical_by_uuid.get(order_uuid)) or _first(canonical_by_client.get(client_order_id))
+        db_order_match = _first(all_by_uuid.get(order_uuid)) or _first(all_by_client.get(client_order_id))
+        session_match = _matching_session(item, sessions)
+        ownership, reason = _ownership_for_fill(
+            item,
+            db_order_match=db_order_match,
+            session_match=session_match,
+            allowed_markets=allowed_markets,
+            period_start_utc=period_start_utc,
+            period_end_utc=period_end_utc,
+        )
+        position_event = _first(fill_events_by_uuid.get(order_uuid))
+        outcome = _first(outcomes_by_uuid.get(order_uuid))
+        accounting_status = _accounting_status(
+            ownership=ownership,
+            canonical_match=canonical_match,
+            position_event=position_event,
+            outcome=outcome,
+        )
+        item.update(
+            {
+                "ownership": ownership,
+                "ownership_reason": reason,
+                "matched_any_db_order_id": (db_order_match or {}).get("id"),
+                "matched_canonical_live_order_log_id": (canonical_match or {}).get("id"),
+                "matched_position_fill_event_id": (position_event or {}).get("id"),
+                "matched_trade_outcome_log_id": (outcome or {}).get("id"),
+                "accounting_status": accounting_status,
+            }
+        )
+        classified.append(item)
+
+    bot_owned = [row for row in classified if row["ownership"] in {"BOT_LIVE_CONFIRMED", "BOT_LIVE_SUSPECTED"}]
+    manual_or_external = [row for row in classified if row["ownership"] == "MANUAL_OR_EXTERNAL"]
+    out_of_scope = [row for row in classified if row["ownership"] == "OUT_OF_RECONCILIATION_SCOPE"]
+    all_pnl = compute_realized_pnl_from_ledger(classified)
+    bot_pnl = compute_realized_pnl_from_ledger(bot_owned)
+    manual_pnl = compute_realized_pnl_from_ledger(manual_or_external)
+    out_of_scope_pnl = compute_realized_pnl_from_ledger(out_of_scope)
+
+    missing_live_position = [row for row in bot_owned if not row.get("matched_position_fill_event_id")]
+    missing_strategy_pnl = [row for row in bot_owned if not row.get("matched_trade_outcome_log_id")]
+    pending = [row for row in classified if row.get("accounting_status") in {"ACCOUNTING_PENDING", "ACCOUNTING_PARTIAL", "ACCOUNTING_FAILED"}]
+    return {
+        "reconciliation_scope": {
+            "reconciliation_start_at_utc": period_start_utc,
+            "reconciliation_end_at_utc": period_end_utc,
+            "bot_live_session_started_at_utc": session_start,
+            "bot_live_session_ended_at_utc": session_end,
+            "allowed_live_symbols": allowed_symbols,
+            "allowed_live_strategies": allowed_strategies,
+        },
+        "ownership_summary": _summary_by(classified, "ownership"),
+        "accounting_status_summary": _summary_by(classified, "accounting_status"),
+        "missing_fill_breakdown": {
+            "exchange_fill_count": len(classified),
+            "db_order_matched_fill_count": _count_with(classified, "matched_any_db_order_id"),
+            "db_order_matched_fill_value": _sum_with(classified, "matched_any_db_order_id"),
+            "db_trade_matched_fill_count": _count_with(classified, "matched_position_fill_event_id"),
+            "db_trade_matched_fill_value": _sum_with(classified, "matched_position_fill_event_id"),
+            "db_trade_source": "position_fill_events",
+            "canonical_live_log_matched_fill_count": _count_with(classified, "matched_canonical_live_order_log_id"),
+            "canonical_live_log_matched_fill_value": _sum_with(classified, "matched_canonical_live_order_log_id"),
+            "missing_db_order_fill_count": _count_without(classified, "matched_any_db_order_id"),
+            "missing_db_order_fill_value": _sum_without(classified, "matched_any_db_order_id"),
+            "missing_db_trade_fill_count": _count_without(classified, "matched_position_fill_event_id"),
+            "missing_db_trade_fill_value": _sum_without(classified, "matched_position_fill_event_id"),
+            "missing_canonical_live_log_fill_count": _count_without(classified, "matched_canonical_live_order_log_id"),
+            "missing_canonical_live_log_fill_value": _sum_without(classified, "matched_canonical_live_order_log_id"),
+            "missing_live_position_accounting_fill_count": len(missing_live_position),
+            "missing_live_position_accounting_fill_value": _sum_value(missing_live_position),
+            "missing_strategy_pnl_fill_count": len(missing_strategy_pnl),
+            "missing_strategy_pnl_fill_value": _sum_value(missing_strategy_pnl),
+        },
+        "pnl_by_ownership": {
+            "exchange_net_realized_pnl_after_fee_all_fills": all_pnl["exchange_net_realized_pnl_after_fee"],
+            "exchange_net_realized_pnl_after_fee_bot_owned": bot_pnl["exchange_net_realized_pnl_after_fee"],
+            "exchange_net_realized_pnl_after_fee_manual_or_external": manual_pnl["exchange_net_realized_pnl_after_fee"],
+            "exchange_net_realized_pnl_after_fee_out_of_scope": out_of_scope_pnl["exchange_net_realized_pnl_after_fee"],
+            "manual_or_external_effect": manual_pnl["exchange_net_realized_pnl_after_fee"],
+            "out_of_scope_effect": out_of_scope_pnl["exchange_net_realized_pnl_after_fee"],
+        },
+        "pnl_source_of_truth": {
+            "actual_equity": "exchange_balance_equity",
+            "realized_pnl": "exchange_fills_ledger",
+            "strategy_pnl": "bot_owned_exchange_fills_ledger",
+            "legacy_db_pnl": "legacy_debug_only",
+        },
+        "classified_fills_sample": _classified_samples(classified),
+        "accounting_pending_count": len(pending),
+        "accounting_pending_value": _sum_value(pending),
+    }
+
+
 def build_position_valuation_summary(
     *,
     positions: list[dict],
@@ -317,6 +438,133 @@ def _match_fill(fill: dict, candidates: list[tuple[int, dict]]) -> tuple[dict | 
     if candidates:
         return None, "uuid/client id candidates existed but price/quantity/fee did not match"
     return None, "no db order matched exchange uuid/client id"
+
+
+def _ownership_for_fill(
+    row: dict,
+    *,
+    db_order_match: dict | None,
+    session_match: dict | None,
+    allowed_markets: list[str],
+    period_start_utc: str,
+    period_end_utc: str,
+) -> tuple[str, str]:
+    executed = _parse_utc(row.get("executed_at_utc"))
+    start = _parse_utc(period_start_utc)
+    end = _parse_utc(period_end_utc)
+    if start and executed and executed < start:
+        return "OUT_OF_RECONCILIATION_SCOPE", "before reconciliation_start_at_utc"
+    if end and executed and executed > end:
+        return "OUT_OF_RECONCILIATION_SCOPE", "after reconciliation_end_at_utc"
+    if db_order_match:
+        if str(db_order_match.get("client_order_id") or "") and str(db_order_match.get("client_order_id") or "") == str(row.get("client_order_id") or ""):
+            return "BOT_LIVE_CONFIRMED", "matched by client_order_id"
+        return "BOT_LIVE_CONFIRMED", "matched by exchange_order_uuid in DB order"
+    if session_match:
+        return "BOT_LIVE_SUSPECTED", "matched by live session time range and market"
+    if allowed_markets and str(row.get("market") or "") not in allowed_markets:
+        return "MANUAL_OR_EXTERNAL", "symbol not traded by bot in reconciliation window"
+    return "MANUAL_OR_EXTERNAL", "no DB evidence"
+
+
+def _accounting_status(
+    *,
+    ownership: str,
+    canonical_match: dict | None,
+    position_event: dict | None,
+    outcome: dict | None,
+) -> str:
+    if ownership in {"MANUAL_OR_EXTERNAL", "OUT_OF_RECONCILIATION_SCOPE"}:
+        return "ACCOUNTING_OUT_OF_SCOPE"
+    if canonical_match and position_event and outcome:
+        return "ACCOUNTING_SYNCED"
+    if canonical_match or position_event or outcome:
+        return "ACCOUNTING_PARTIAL"
+    return "ACCOUNTING_PENDING"
+
+
+def _matching_session(row: dict, sessions: list[dict]) -> dict | None:
+    executed = _parse_utc(row.get("executed_at_utc"))
+    if executed is None:
+        return None
+    market = str(row.get("market") or "")
+    for session in sessions:
+        if str(session.get("market") or "") != market:
+            continue
+        start = _parse_utc(session.get("created_at"))
+        end = _parse_utc(session.get("stopped_at")) or _parse_utc(session.get("updated_at"))
+        if start and executed < start:
+            continue
+        if end and executed > end:
+            continue
+        return session
+    return None
+
+
+def _session_time_range(sessions: list[dict]) -> tuple[str | None, str | None]:
+    starts = [_parse_utc(row.get("created_at")) for row in sessions]
+    ends = [_parse_utc(row.get("stopped_at")) or _parse_utc(row.get("updated_at")) for row in sessions]
+    starts = [value for value in starts if value]
+    ends = [value for value in ends if value]
+    return (_to_utc_string(min(starts)) if starts else None, _to_utc_string(max(ends)) if ends else None)
+
+
+def _rows_by(rows: list[dict], field: str) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        value = str(row.get(field) or "")
+        if value:
+            grouped[value].append(row)
+    return grouped
+
+
+def _first(rows: list[dict] | None) -> dict | None:
+    return rows[0] if rows else None
+
+
+def _summary_by(rows: list[dict], field: str) -> dict:
+    counts = Counter(str(row.get(field) or "UNKNOWN") for row in rows)
+    result = {}
+    for key in sorted(counts):
+        group = [row for row in rows if str(row.get(field) or "UNKNOWN") == key]
+        result[key] = {"count": len(group), "value": _sum_value(group)}
+    return result
+
+
+def _count_with(rows: list[dict], field: str) -> int:
+    return sum(1 for row in rows if row.get(field) is not None)
+
+
+def _count_without(rows: list[dict], field: str) -> int:
+    return sum(1 for row in rows if row.get(field) is None)
+
+
+def _sum_with(rows: list[dict], field: str) -> float:
+    return _sum_value([row for row in rows if row.get(field) is not None])
+
+
+def _sum_without(rows: list[dict], field: str) -> float:
+    return _sum_value([row for row in rows if row.get(field) is None])
+
+
+def _sum_value(rows: list[dict]) -> float:
+    return sum(_float(row.get("executed_value")) for row in rows)
+
+
+def _classified_samples(rows: list[dict]) -> list[dict]:
+    return [
+        {
+            "exchange_order_uuid": row.get("exchange_order_uuid"),
+            "market": row.get("market"),
+            "side": row.get("side"),
+            "executed_value": row.get("executed_value"),
+            "executed_at_utc": row.get("executed_at_utc"),
+            "ownership": row.get("ownership"),
+            "ownership_reason": row.get("ownership_reason"),
+            "accounting_status": row.get("accounting_status"),
+        }
+        for row in rows[:50]
+    ]
 
 
 def _index_by(rows: list[dict], field: str) -> dict[str, list[tuple[int, dict]]]:

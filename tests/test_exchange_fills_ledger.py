@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app import database
 from app.exchange_fills_ledger import (
+    build_exchange_fill_accounting_report,
     build_exchange_fill_records,
     build_position_valuation_summary,
     compute_realized_pnl_from_ledger,
@@ -187,6 +188,150 @@ class ExchangeFillsLedgerTests(unittest.TestCase):
         self.assertNotIn("SHOULD_NOT_LEAK", rendered)
         self.assertNotIn("secret_key", rendered)
         self.assertNotIn("raw_auth_header", rendered)
+
+    def test_exchange_fill_ownership_and_scope_are_classified(self) -> None:
+        report = build_exchange_fill_accounting_report(
+            ledger_rows=[
+                {
+                    "exchange_order_uuid": "C0504000000407836246",
+                    "client_order_id": "client-1",
+                    "market": "KRW-XLM",
+                    "symbol": "XLM",
+                    "side": "BUY",
+                    "quantity": 10,
+                    "executed_value": 1000,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T00:00:00Z",
+                },
+                {
+                    "exchange_order_uuid": "C0101000003115587466",
+                    "client_order_id": "",
+                    "market": "KRW-BTC",
+                    "symbol": "BTC",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "executed_value": 2000,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-24T00:00:00Z",
+                },
+                {
+                    "exchange_order_uuid": "C0786000000800146701",
+                    "client_order_id": "",
+                    "market": "KRW-WLD",
+                    "symbol": "WLD",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "executed_value": 3000,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T00:00:00Z",
+                },
+            ],
+            canonical_db_orders=[db_order()],
+            all_db_orders=[db_order()],
+            sessions=[],
+            position_fill_events=[{"id": 1, "order_uuid": "C0504000000407836246"}],
+            trade_outcome_logs=[{"id": 2, "order_uuid": "C0504000000407836246"}],
+            period_start_utc="2026-06-25T00:00:00Z",
+            period_end_utc="2026-06-26T00:00:00Z",
+        )
+
+        self.assertEqual(report["ownership_summary"]["BOT_LIVE_CONFIRMED"]["count"], 1)
+        self.assertEqual(report["ownership_summary"]["OUT_OF_RECONCILIATION_SCOPE"]["count"], 1)
+        self.assertEqual(report["ownership_summary"]["MANUAL_OR_EXTERNAL"]["count"], 1)
+
+    def test_bot_owned_pnl_is_separate_from_all_fill_pnl(self) -> None:
+        report = build_exchange_fill_accounting_report(
+            ledger_rows=[
+                {
+                    "exchange_order_uuid": "C0504000000407836246",
+                    "client_order_id": "client-1",
+                    "market": "KRW-XLM",
+                    "symbol": "XLM",
+                    "side": "BUY",
+                    "quantity": 10,
+                    "executed_value": 1000,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T00:00:00Z",
+                },
+                {
+                    "exchange_order_uuid": "C0504000000407836247",
+                    "client_order_id": "client-1",
+                    "market": "KRW-XLM",
+                    "symbol": "XLM",
+                    "side": "SELL",
+                    "quantity": 10,
+                    "executed_value": 900,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T01:00:00Z",
+                },
+                {
+                    "exchange_order_uuid": "C0101000003115587466",
+                    "client_order_id": "",
+                    "market": "KRW-BTC",
+                    "symbol": "BTC",
+                    "side": "SELL",
+                    "quantity": 1,
+                    "executed_value": 5000,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T02:00:00Z",
+                },
+            ],
+            canonical_db_orders=[
+                db_order(order_uuid="C0504000000407836246", side="BUY", executed_volume=10, filled_amount_krw=1000),
+                db_order(id=8, order_uuid="C0504000000407836247", side="SELL", executed_volume=10, filled_amount_krw=900),
+            ],
+            all_db_orders=[
+                db_order(order_uuid="C0504000000407836246", side="BUY", executed_volume=10, filled_amount_krw=1000),
+                db_order(id=8, order_uuid="C0504000000407836247", side="SELL", executed_volume=10, filled_amount_krw=900),
+            ],
+            sessions=[],
+            position_fill_events=[],
+            trade_outcome_logs=[],
+            period_start_utc="2026-06-25T00:00:00Z",
+            period_end_utc="2026-06-26T00:00:00Z",
+        )
+
+        pnl = report["pnl_by_ownership"]
+        self.assertEqual(pnl["exchange_net_realized_pnl_after_fee_bot_owned"], -100)
+        self.assertNotEqual(pnl["exchange_net_realized_pnl_after_fee_all_fills"], pnl["exchange_net_realized_pnl_after_fee_bot_owned"])
+        self.assertEqual(report["missing_fill_breakdown"]["missing_live_position_accounting_fill_count"], 2)
+
+    def test_db_order_match_without_canonical_log_is_split_from_canonical_missing(self) -> None:
+        report = build_exchange_fill_accounting_report(
+            ledger_rows=[
+                {
+                    "exchange_order_uuid": "C0504000000407836246",
+                    "client_order_id": "client-1",
+                    "market": "KRW-XLM",
+                    "symbol": "XLM",
+                    "side": "BUY",
+                    "quantity": 10,
+                    "executed_value": 1000,
+                    "fee": 0,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T00:00:00Z",
+                }
+            ],
+            canonical_db_orders=[],
+            all_db_orders=[db_order()],
+            sessions=[],
+            position_fill_events=[],
+            trade_outcome_logs=[],
+            period_start_utc="2026-06-25T00:00:00Z",
+            period_end_utc="2026-06-26T00:00:00Z",
+        )
+
+        missing = report["missing_fill_breakdown"]
+        self.assertEqual(missing["db_order_matched_fill_count"], 1)
+        self.assertEqual(missing["missing_db_order_fill_count"], 0)
+        self.assertEqual(missing["canonical_live_log_matched_fill_count"], 0)
+        self.assertEqual(missing["missing_canonical_live_log_fill_count"], 1)
 
 
 if __name__ == "__main__":

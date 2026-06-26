@@ -439,6 +439,7 @@ def _asset_reconciliation_report(
 ) -> dict:
     deposits = _float(payload.get("deposits"), 0.0)
     withdrawals = _float(payload.get("withdrawals"), 0.0)
+    asset_reconciliation_requested = bool(payload)
     initial_equity = _float(payload.get("initial_equity"), starting_asset_krw)
     current_cash = _float(payload.get("current_cash_krw"), 0.0)
     current_coin_value = _float(payload.get("current_coin_market_value"), 0.0)
@@ -465,18 +466,30 @@ def _asset_reconciliation_report(
     )
     equity_breakdown = dict(reconciliation["equity_diff_breakdown"])
     ledger_summary = payload.get("exchange_fills_ledger_summary", {}) if isinstance(payload.get("exchange_fills_ledger_summary"), dict) else {}
+    accounting = payload.get("exchange_fill_accounting", {}) if isinstance(payload.get("exchange_fill_accounting"), dict) else {}
+    pnl_by_ownership = accounting.get("pnl_by_ownership", {}) if isinstance(accounting.get("pnl_by_ownership"), dict) else {}
     unexplained_before_deposit_estimate = _float(equity_breakdown.get("unexplained"))
     if abs(unexplained_before_deposit_estimate) > 0.000001 and payload.get("deposit_withdrawal_status", "UNAVAILABLE") == "UNAVAILABLE":
-        equity_breakdown["deposit_withdrawal_mismatch"] = _float(equity_breakdown.get("deposit_withdrawal_mismatch")) + unexplained_before_deposit_estimate
+        equity_breakdown["deposit_withdrawal_mismatch"] = 0.0
+        equity_breakdown["unavailable_deposit_withdrawal_ledger"] = unexplained_before_deposit_estimate
+        equity_breakdown["reconciliation_window_mismatch"] = 0.0
+        equity_breakdown["initial_equity_snapshot_mismatch"] = 0.0
+        equity_breakdown["manual_or_external_trade_effect"] = _float(pnl_by_ownership.get("manual_or_external_effect"), 0.0)
+        equity_breakdown["out_of_scope_fill_effect"] = _float(pnl_by_ownership.get("out_of_scope_effect"), 0.0)
+        equity_breakdown["valuation_snapshot_effect"] = _float(payload.get("stale_valuation_effect"), 0.0)
+        equity_breakdown["remaining_deposit_withdrawal_unknown"] = unexplained_before_deposit_estimate
         equity_breakdown["unexplained_before_deposit_withdrawal_estimate"] = unexplained_before_deposit_estimate
         equity_breakdown["unexplained"] = 0.0
         equity_breakdown["unexplained_rate"] = 0.0
-        equity_breakdown["deposit_withdrawal_mismatch_reason"] = "Deposit/withdrawal ledger is unavailable; residual is isolated here instead of changing DB balances."
+        equity_breakdown["deposit_withdrawal_mismatch_reason"] = "Deposit/withdrawal ledger is unavailable; residual is isolated as unknown instead of being treated as verified deposits or withdrawals."
     equity_breakdown["missing_canonical_live_order_log"] = _float(ledger_summary.get("missing_exchange_fill_value"))
     equity_breakdown["synthetic_uuid_effect"] = 0.0
     equity_breakdown["stale_valuation_effect"] = _float(payload.get("stale_valuation_effect"), 0.0)
     equity_breakdown["valuation_snapshot_timing_diff"] = 0.0
     equity_breakdown["dust_balance_effect"] = 0.0
+    exchange_net = (payload.get("exchange_realized_pnl") or {}).get("exchange_net_realized_pnl_after_fee")
+    bot_owned_net = pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_bot_owned")
+    bot_owned_diff = _float(bot_owned_net) - realized_pnl_from_db if bot_owned_net is not None else None
     return {
         "initial_equity": initial_equity,
         "current_equity_from_exchange": current_equity,
@@ -514,20 +527,62 @@ def _asset_reconciliation_report(
         "duplicate_db_accounting": reconciliation["duplicate_db_accounting"],
         "valuation_price_diff_detail": reconciliation["valuation_price_diff_detail"],
         "exchange_fills_ledger_summary": payload.get("exchange_fills_ledger_summary", {}),
-        "exchange_net_realized_pnl_after_fee": (payload.get("exchange_realized_pnl") or {}).get("exchange_net_realized_pnl_after_fee"),
+        "exchange_fill_ownership_summary": accounting.get("ownership_summary", {}),
+        "exchange_fill_accounting_status_summary": accounting.get("accounting_status_summary", {}),
+        "exchange_fill_missing_breakdown": accounting.get("missing_fill_breakdown", {}),
+        "exchange_fill_classified_sample": accounting.get("classified_fills_sample", []),
+        "reconciliation_scope": {
+            **(accounting.get("reconciliation_scope", {}) if isinstance(accounting.get("reconciliation_scope"), dict) else {}),
+            "initial_equity_snapshot_at_utc": payload.get("initial_equity_snapshot_at_utc"),
+            "initial_equity_amount": payload.get("initial_equity_amount", initial_equity),
+        },
+        "pnl_source_of_truth": accounting.get("pnl_source_of_truth", {
+            "actual_equity": "exchange_balance_equity",
+            "realized_pnl": "exchange_fills_ledger",
+            "strategy_pnl": "bot_owned_exchange_fills_ledger",
+            "legacy_db_pnl": "legacy_debug_only",
+        }),
+        "legacy_db_pnl": {
+            "net_realized_pnl_after_fee": realized_pnl_from_db,
+            "unrealized_pnl_from_positions": unrealized_pnl_from_positions,
+            "display_role": "legacy_debug_only",
+        },
+        "exchange_ledger_pnl": {
+            "all_fills": exchange_net,
+            "bot_owned": bot_owned_net,
+            "manual_or_external": pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_manual_or_external"),
+            "out_of_scope": pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_out_of_scope"),
+        },
+        "exchange_net_realized_pnl_after_fee": exchange_net,
         "exchange_gross_realized_pnl_before_fee": (payload.get("exchange_realized_pnl") or {}).get("exchange_gross_realized_pnl_before_fee"),
         "exchange_realized_fee": (payload.get("exchange_realized_pnl") or {}).get("exchange_realized_fee"),
+        "exchange_net_realized_pnl_after_fee_all_fills": pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_all_fills", exchange_net),
+        "exchange_net_realized_pnl_after_fee_bot_owned": bot_owned_net,
+        "exchange_net_realized_pnl_after_fee_manual_or_external": pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_manual_or_external"),
+        "exchange_net_realized_pnl_after_fee_out_of_scope": pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_out_of_scope"),
         "realized_pnl_diff": (
-            _float((payload.get("exchange_realized_pnl") or {}).get("exchange_net_realized_pnl_after_fee")) - realized_pnl_from_db
+            _float(exchange_net) - realized_pnl_from_db
             if payload.get("exchange_realized_pnl")
             else None
         ),
+        "bot_owned_realized_pnl_diff": bot_owned_diff,
+        "manual_or_external_effect": pnl_by_ownership.get("manual_or_external_effect"),
+        "out_of_scope_effect": pnl_by_ownership.get("out_of_scope_effect"),
+        "accounting_pending_count": accounting.get("accounting_pending_count", 0),
+        "accounting_pending_value": accounting.get("accounting_pending_value", 0.0),
         "position_valuation_summary": payload.get("position_valuation_summary", {}),
         "stale_valuation_effect": _float(payload.get("stale_valuation_effect"), 0.0),
         "exchange_ledger_status": payload.get("exchange_ledger_status", "UNAVAILABLE"),
         "exchange_ledger_unavailable_reason": payload.get("exchange_ledger_unavailable_reason"),
         "exchange_ledger_errors": payload.get("exchange_ledger_errors", []),
-        "deposit_withdrawal_status": payload.get("deposit_withdrawal_status", "UNAVAILABLE"),
+        "asset_reconciliation_requested": asset_reconciliation_requested,
+        "deposit_withdrawal_status": payload.get("deposit_withdrawal_status", "UNAVAILABLE") if asset_reconciliation_requested else "NOT_REQUESTED",
+        "deposit_withdrawal_mismatch_is_verified": (payload.get("deposit_withdrawal_status") == "AVAILABLE") if asset_reconciliation_requested else True,
+        "deposit_withdrawal_mismatch_note": (
+            "Deposit/withdrawal ledger is unavailable; no deposit/withdrawal mismatch amount is verified."
+            if asset_reconciliation_requested and payload.get("deposit_withdrawal_status", "UNAVAILABLE") != "AVAILABLE"
+            else "Deposit/withdrawal ledger is available."
+        ),
         "deposit_withdrawal_unavailable_reason": payload.get("deposit_withdrawal_unavailable_reason", "No read-only deposit/withdrawal broker method is configured."),
         "gate_failed": bool(reconciliation["gate_failed"]),
     }
@@ -557,6 +612,13 @@ def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation:
         reasons.append({"code": "FEE_PRESSURE_WARNING", "count": 1})
     if (asset_reconciliation or {}).get("gate_failed"):
         reasons.append({"code": "EQUITY_RECONCILIATION_DIFF", "count": 1})
+    asset_requested = bool((asset_reconciliation or {}).get("asset_reconciliation_requested"))
+    if asset_requested and (asset_reconciliation or {}).get("deposit_withdrawal_status") != "AVAILABLE":
+        reasons.append({"code": "DEPOSIT_WITHDRAWAL_LEDGER_UNAVAILABLE", "count": 1})
+    if asset_requested and not (asset_reconciliation or {}).get("deposit_withdrawal_mismatch_is_verified"):
+        reasons.append({"code": "DEPOSIT_WITHDRAWAL_MISMATCH_UNVERIFIED", "count": 1})
+    if abs(_float((asset_reconciliation or {}).get("bot_owned_realized_pnl_diff"))) > 100.0:
+        reasons.append({"code": "BOT_OWNED_REALIZED_PNL_DIFF", "count": 1})
     asset_match = (asset_reconciliation or {}).get("exchange_fill_match") or {}
     if (asset_match.get("missing_exchange_fill_in_db") or {}).get("count"):
         reasons.append({"code": "EXCHANGE_FILL_MISSING_IN_DB", "count": asset_match["missing_exchange_fill_in_db"]["count"]})
@@ -567,6 +629,13 @@ def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation:
     if abs(_float((asset_reconciliation or {}).get("fee_diff"))) > 100.0:
         reasons.append({"code": "FEE_RECONCILIATION_DIFF", "count": 1})
     ledger_summary = (asset_reconciliation or {}).get("exchange_fills_ledger_summary") or {}
+    missing_breakdown = (asset_reconciliation or {}).get("exchange_fill_missing_breakdown") or {}
+    if missing_breakdown.get("missing_live_position_accounting_fill_count"):
+        reasons.append({"code": "MISSING_LIVE_POSITION_ACCOUNTING_FILL", "count": missing_breakdown.get("missing_live_position_accounting_fill_count")})
+    if missing_breakdown.get("missing_strategy_pnl_fill_count"):
+        reasons.append({"code": "MISSING_STRATEGY_PNL_FILL", "count": missing_breakdown.get("missing_strategy_pnl_fill_count")})
+    if (asset_reconciliation or {}).get("accounting_pending_count"):
+        reasons.append({"code": "ACCOUNTING_PENDING_FILL", "count": asset_reconciliation.get("accounting_pending_count")})
     if ledger_summary.get("missing_canonical_log_count"):
         reasons.append({"code": "MISSING_CANONICAL_LIVE_ORDER_LOG", "count": ledger_summary.get("missing_canonical_log_count")})
     if ledger_summary.get("duplicate_exchange_uuid_count"):

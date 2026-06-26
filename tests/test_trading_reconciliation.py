@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.trading_reconciliation import build_equity_reconciliation
+from app.trading_diagnostics import _restart_gate
 
 
 def db_order(**overrides: object) -> dict:
@@ -204,6 +205,40 @@ class TradingReconciliationTests(unittest.TestCase):
 
         self.assertEqual(report["equity_diff_breakdown"]["unexplained"], -200)
         self.assertTrue(report["gate_failed"])
+
+    def test_deposit_withdrawal_unavailable_blocks_restart_gate(self) -> None:
+        risk = {
+            "duplicate_open_symbols": {"count": 0},
+            "duplicate_session_orders": {"count": 0},
+            "stopped_session_trades": {"count": 0},
+            "expired_reservation_executions": {"count": 0},
+            "duplicate_candle_executions": {"count": 0},
+            "incomplete_candle_usage": {"count": 0},
+            "timestamp_mismatches": {"count": 0},
+            "duplicate_order_uuid": {"count": 0},
+            "duplicate_fill_events": {"count": 0},
+            "overtrade": {"breached": False, "trade_count": 0},
+            "fee_pressure": {"warning": False},
+        }
+        gate = _restart_gate(
+            risk,
+            {"daily_loss_limit_reached": False},
+            {"total_pnl_krw": 0},
+            {
+                "gate_failed": False,
+                "asset_reconciliation_requested": True,
+                "deposit_withdrawal_status": "UNAVAILABLE",
+                "deposit_withdrawal_mismatch_is_verified": False,
+                "exchange_fill_match": {},
+                "exchange_fills_ledger_summary": {},
+                "exchange_fill_missing_breakdown": {},
+            },
+        )
+
+        codes = {reason["code"] for reason in gate["reasons"]}
+        self.assertFalse(gate["allowed"])
+        self.assertIn("DEPOSIT_WITHDRAWAL_LEDGER_UNAVAILABLE", codes)
+        self.assertIn("DEPOSIT_WITHDRAWAL_MISMATCH_UNVERIFIED", codes)
 
 
 if __name__ == "__main__":
