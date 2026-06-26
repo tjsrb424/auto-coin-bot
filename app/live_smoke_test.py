@@ -307,8 +307,22 @@ async def _ticker_prices(exchange: str, markets: list[str]) -> dict[str, float]:
         return {}
     broker = get_live_broker(exchange)
     base_url = getattr(getattr(broker, "config", None), "base_url", "")
-    tickers = await fetch_tickers(markets, base_url=base_url)
-    return {str(item.get("market") or ""): _float(item.get("trade_price") or item.get("close_price")) for item in tickers}
+    prices: dict[str, float] = {}
+    try:
+        tickers = await fetch_tickers(markets, base_url=base_url)
+        prices.update({str(item.get("market") or ""): _float(item.get("trade_price") or item.get("close_price")) for item in tickers})
+    except Exception:
+        prices = {}
+    missing = [market for market in markets if market not in prices]
+    for market in missing:
+        try:
+            tickers = await fetch_tickers([market], base_url=base_url)
+        except Exception:
+            continue
+        if tickers:
+            item = tickers[0]
+            prices[market] = _float(item.get("trade_price") or item.get("close_price"))
+    return prices
 
 
 async def _orderbook_quote(exchange: str, market: str) -> dict:
