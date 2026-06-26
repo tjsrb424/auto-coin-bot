@@ -141,6 +141,7 @@ from app.live_recovery import (
     sync_open_orders,
 )
 from app.accounting_epoch import build_current_epoch_diagnostics, build_open_order_audit, build_smoke_test_preflight, limited_auto_live_gate
+from app.controlled_auto_live import CONFIRMATION_PHRASE as CONTROLLED_AUTO_LIVE_CONFIRMATION, controlled_auto_live_gate, run_controlled_auto_live
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
 from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
 from app.live_state_reconciler import live_state_warnings, reconcile_live_state
@@ -679,6 +680,14 @@ class LimitedAutoLiveRunRequest(BaseModel):
     exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
     symbol: str = Field("BTC", pattern=r"^(BTC|ETH)$")
     amount_krw: float = Field(6000, gt=0, le=6000)
+    confirmation: str = ""
+
+
+class ControlledAutoLiveRunRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    runtime_seconds: int = Field(600, ge=600, le=900)
     confirmation: str = ""
 
 
@@ -2844,6 +2853,85 @@ async def limited_auto_live_run_once(payload: LimitedAutoLiveRunRequest) -> dict
         current_epoch=current_epoch,
     )
     return {"ok": report.get("limited_auto_live_status") == "PASSED", "report": report}
+
+
+@app.get("/api/controlled-auto-live/preflight")
+async def controlled_auto_live_preflight(
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    amount_krw: float = Query(6000, gt=0, le=6000),
+) -> dict:
+    asset = await _asset_reconciliation_from_exchange(exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=exchange,
+        symbol="BTC",
+        strategy_name="limited_auto_live",
+        amount_krw=amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
+    return {
+        "ok": bool(gate.get("controlled_auto_live_allowed")),
+        "exchange": exchange,
+        "amount_krw": min(float(amount_krw), 6000.0),
+        "current_epoch": current_epoch,
+        "smoke_test_preflight": smoke_preflight,
+        "open_order_audit": open_order_audit,
+        "controlled_auto_live_gate": gate,
+        "required_confirmation": CONTROLLED_AUTO_LIVE_CONFIRMATION,
+    }
+
+
+@app.post("/api/controlled-auto-live/run-once")
+async def controlled_auto_live_run_once(payload: ControlledAutoLiveRunRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="limited_auto_live",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    if payload.confirmation != CONTROLLED_AUTO_LIVE_CONFIRMATION:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled auto live confirmation phrase is required.",
+            "required_confirmation": CONTROLLED_AUTO_LIVE_CONFIRMATION,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    if not gate.get("controlled_auto_live_allowed"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled auto live gate is blocked.",
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
+    report = await run_controlled_auto_live(
+        exchange=payload.exchange,
+        symbols=symbols or ["BTC", "ETH"],
+        amount_krw=payload.amount_krw,
+        runtime_seconds=payload.runtime_seconds,
+        confirmation=payload.confirmation,
+        controlled_gate=gate,
+        current_epoch=current_epoch,
+    )
+    return {"ok": report.get("controlled_auto_live_status") == "PASSED", "report": report}
 
 
 @app.get("/api/trading-diagnostics")
