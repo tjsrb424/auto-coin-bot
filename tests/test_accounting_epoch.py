@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app import database
 from app.accounting_epoch import (
+    build_open_order_audit,
     build_current_epoch_diagnostics,
     build_smoke_test_preflight,
     legacy_history_quarantine,
@@ -67,6 +68,28 @@ class AccountingEpochTests(unittest.TestCase):
             }
         )
 
+    def insert_open_order(
+        self,
+        *,
+        request_id: str,
+        order_uuid: str | None,
+        market: str = "KRW-BTC",
+        created_at: str = "2026-06-25T23:00:00Z",
+        status: str = "WAITING",
+    ) -> None:
+        with database.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_order_logs (
+                    request_id, exchange, market, side, order_type, price, volume, amount_krw,
+                    fee_estimate, risk_result, order_preview_payload, exchange_request_payload_masked,
+                    exchange_response_payload, status, order_uuid, order_purpose, created_at, updated_at
+                ) VALUES (?, 'bithumb', ?, 'BUY', 'limit', 100, 1, 100,
+                    0, 'TEST', '{}', '{}', '{}', ?, ?, 'ENTRY', ?, ?)
+                """,
+                (request_id, market, status, order_uuid, created_at, created_at),
+            )
+
     def test_legacy_history_is_low_trust_and_excluded_from_live_decisions(self) -> None:
         legacy = legacy_history_quarantine(
             {
@@ -115,6 +138,98 @@ class AccountingEpochTests(unittest.TestCase):
         with database.get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) AS count FROM live_order_logs").fetchone()["count"]
         self.assertEqual(count, 0)
+
+    def test_exchange_open_order_is_hard_smoke_blocker(self) -> None:
+        self.create_epoch()
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        audit = build_open_order_audit(
+            exchange="bithumb",
+            current_epoch=current_epoch,
+            exchange_open_orders=[
+                {"uuid": "exchange-open", "market": "KRW-BTC", "side": "bid", "state": "wait", "price": "100", "volume": "1"}
+            ],
+            exchange_open_order_status="SUCCESS",
+        )
+
+        preflight = build_smoke_test_preflight(exchange="bithumb", current_epoch=current_epoch, open_order_audit=audit)
+
+        self.assertEqual(audit["open_order_audit_summary"]["exchange_open_order_count"], 1)
+        self.assertIn("EXCHANGE_OPEN_ORDER_EXISTS", {item["code"] for item in preflight["smoke_test_blockers"]})
+        self.assertEqual(audit["open_orders"][0]["recommended_action"], "USER_CONFIRM_CANCEL_REQUIRED")
+
+    def test_current_epoch_open_order_is_hard_smoke_blocker(self) -> None:
+        self.create_epoch()
+        self.insert_open_order(request_id="epoch-open", order_uuid="epoch-open", created_at="2026-06-26T00:01:00Z")
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        audit = build_open_order_audit(
+            exchange="bithumb",
+            current_epoch=current_epoch,
+            exchange_open_orders=[],
+            exchange_open_order_status="SUCCESS",
+        )
+        preflight = build_smoke_test_preflight(exchange="bithumb", current_epoch=current_epoch, open_order_audit=audit)
+
+        self.assertEqual(audit["open_order_audit_summary"]["current_epoch_open_order_count"], 1)
+        self.assertIn("CURRENT_EPOCH_OPEN_ORDER_EXISTS", {item["code"] for item in preflight["smoke_test_blockers"]})
+
+    def test_legacy_db_stale_open_order_is_not_hard_smoke_blocker(self) -> None:
+        self.create_epoch()
+        self.insert_open_order(request_id="legacy-open", order_uuid="legacy-open", created_at="2026-06-25T23:59:00Z")
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        audit = build_open_order_audit(
+            exchange="bithumb",
+            current_epoch=current_epoch,
+            exchange_open_orders=[],
+            exchange_open_order_status="SUCCESS",
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "APP_ENV": "production",
+                "LIVE_TRADING_ENABLED": "true",
+                "BITHUMB_ACCESS_KEY": "access",
+                "BITHUMB_SECRET_KEY": "secret",
+                "LIVE_SMOKE_TEST_ENABLED": "true",
+            },
+            clear=False,
+        ):
+            preflight = build_smoke_test_preflight(exchange="bithumb", current_epoch=current_epoch, open_order_audit=audit)
+
+        codes = {item["code"] for item in preflight["smoke_test_blockers"]}
+        self.assertEqual(audit["open_order_audit_summary"]["db_stale_open_order_count"], 1)
+        self.assertNotIn("CURRENT_EPOCH_OPEN_ORDER_EXISTS", codes)
+        self.assertNotIn("EXCHANGE_OPEN_ORDER_EXISTS", codes)
+        self.assertEqual(audit["open_order_audit_summary"]["smoke_test_blocking_open_order_count"], 0)
+
+    def test_unavailable_exchange_audit_keeps_db_order_as_unknown_blocker(self) -> None:
+        self.create_epoch()
+        self.insert_open_order(request_id="legacy-open-unverified", order_uuid="legacy-unverified", created_at="2026-06-25T23:59:00Z")
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        audit = build_open_order_audit(
+            exchange="bithumb",
+            current_epoch=current_epoch,
+            exchange_open_orders=[],
+            exchange_open_order_status="UNAVAILABLE",
+        )
+        preflight = build_smoke_test_preflight(exchange="bithumb", current_epoch=current_epoch, open_order_audit=audit)
+
+        self.assertEqual(audit["open_order_audit_summary"]["unknown_open_order_count"], 1)
+        self.assertIn("UNKNOWN_OPEN_ORDER_EXISTS", {item["code"] for item in preflight["smoke_test_blockers"]})
+
+    def test_unknown_db_open_order_keeps_hard_smoke_blocker(self) -> None:
+        self.create_epoch()
+        self.insert_open_order(request_id="unknown-open", order_uuid=None, created_at="2026-06-26T00:01:00Z")
+        current_epoch = build_current_epoch_diagnostics(exchange="bithumb", current_equity=263_000)
+        audit = build_open_order_audit(
+            exchange="bithumb",
+            current_epoch=current_epoch,
+            exchange_open_orders=[],
+            exchange_open_order_status="SUCCESS",
+        )
+        preflight = build_smoke_test_preflight(exchange="bithumb", current_epoch=current_epoch, open_order_audit=audit)
+
+        self.assertEqual(audit["open_order_audit_summary"]["unknown_open_order_count"], 1)
+        self.assertIn("UNKNOWN_OPEN_ORDER_EXISTS", {item["code"] for item in preflight["smoke_test_blockers"]})
 
     def test_limited_auto_requires_passed_recent_smoke_and_full_auto_stays_false(self) -> None:
         self.create_epoch()

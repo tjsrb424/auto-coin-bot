@@ -785,6 +785,7 @@ type TradingDiagnostics = {
   current_epoch?: Record<string, any>;
   smoke_test_preflight?: Record<string, any>;
   limited_auto_live_gate?: Record<string, any>;
+  open_order_audit?: Record<string, any>;
   full_auto_live_allowed?: boolean;
   legacy_blockers?: Array<{ code?: string; count?: number }>;
   current_epoch_blockers?: Array<{ code?: string; count?: number }>;
@@ -4031,6 +4032,8 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const currentEpoch = diagnostics?.current_epoch;
   const smokeTest = diagnostics?.smoke_test_preflight;
   const limitedGate = diagnostics?.limited_auto_live_gate;
+  const openOrderAudit = diagnostics?.open_order_audit ?? smokeTest?.open_order_audit;
+  const openOrderSummary = openOrderAudit?.open_order_audit_summary ?? smokeTest?.open_order_audit_summary;
   const ledgerPnl = assetRecon?.ledger_pnl_detail;
   const ledgerTotalPnl = ledgerPnl?.total_pnl_after_estimated_exit_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
   const ledgerRealizedPnl = ledgerPnl?.net_realized_pnl_after_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
@@ -4105,6 +4108,42 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       value: smokeTest?.smoke_test_allowed ? "READY" : "BLOCKED",
       detail: (smokeTest?.smoke_test_blockers ?? []).slice(0, 2).map((item: any) => item.code).join(" / ") || "one-shot only",
       tone: smokeTest?.smoke_test_allowed ? "green" : "amber"
+    },
+    {
+      label: "Smoke Enabled",
+      value: (smokeTest?.smoke_test_blockers ?? []).some((item: any) => item.code === "LIVE_SMOKE_TEST_DISABLED") ? "OFF" : "ON",
+      detail: "one-shot smoke test button remains disabled",
+      tone: "amber"
+    },
+    {
+      label: "Open Order Audit",
+      value: openOrderSummary?.open_order_audit_trust_level ?? openOrderAudit?.open_order_audit_trust_level ?? "UNKNOWN",
+      detail: `total ${openOrderSummary?.open_live_order_count_total ?? 0} - ${openOrderSummary?.exchange_open_order_audit_status ?? "-"}`,
+      tone: openOrderSummary?.smoke_test_blocking_open_order_count ? "red" : "cyan"
+    },
+    {
+      label: "Exchange Open",
+      value: String(openOrderSummary?.exchange_open_order_count ?? 0),
+      detail: "read-only exchange wait orders",
+      tone: openOrderSummary?.exchange_open_order_count ? "red" : "green"
+    },
+    {
+      label: "DB Stale Open",
+      value: String(openOrderSummary?.db_stale_open_order_count ?? 0),
+      detail: "legacy candidates, not current-epoch hard blockers",
+      tone: openOrderSummary?.db_stale_open_order_count ? "amber" : "green"
+    },
+    {
+      label: "Epoch Open",
+      value: String(openOrderSummary?.current_epoch_open_order_count ?? 0),
+      detail: "current epoch open orders block smoke test",
+      tone: openOrderSummary?.current_epoch_open_order_count ? "red" : "green"
+    },
+    {
+      label: "Blocking Open",
+      value: String(openOrderSummary?.smoke_test_blocking_open_order_count ?? 0),
+      detail: openOrderSummary?.next_required_action ?? "-",
+      tone: openOrderSummary?.smoke_test_blocking_open_order_count ? "red" : "green"
     },
     {
       label: "Limited Auto",

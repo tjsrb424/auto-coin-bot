@@ -26,6 +26,7 @@ def build_trading_diagnostics_report(
     days: int = 7,
     starting_asset_krw: float | None = None,
     asset_reconciliation: dict | None = None,
+    open_order_audit: dict | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     start = now - timedelta(days=max(int(days), 1))
@@ -190,7 +191,11 @@ def build_trading_diagnostics_report(
         exchange=exchange,
         current_equity=asset_report.get("current_equity_from_exchange"),
     )
-    smoke_preflight = build_smoke_test_preflight(exchange=exchange, current_epoch=current_epoch)
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=exchange,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
     limited_gate = limited_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     blocker_split = split_restart_blockers(restart_gate.get("reasons", []), current_epoch, smoke_preflight)
     return {
@@ -201,6 +206,7 @@ def build_trading_diagnostics_report(
         "legacy_history": legacy_history,
         "current_epoch": current_epoch,
         "smoke_test_preflight": smoke_preflight,
+        "open_order_audit": open_order_audit or smoke_preflight.get("open_order_audit"),
         "limited_auto_live_gate": limited_gate,
         "full_auto_live_allowed": False,
         **blocker_split,

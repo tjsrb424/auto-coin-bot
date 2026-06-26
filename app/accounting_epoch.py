@@ -11,6 +11,7 @@ from app.database import (
     load_global_bot_operation_policy,
     load_latest_smoke_test_run,
     load_runtime_lock,
+    load_unresolved_live_order_logs_for_exchange,
 )
 from app.live_broker import LiveTradingConfig, is_emergency_stopped
 
@@ -174,6 +175,40 @@ def smoke_test_config() -> dict:
     }
 
 
+def build_open_order_audit(
+    *,
+    exchange: str = "bithumb",
+    current_epoch: dict | None = None,
+    exchange_open_orders: list[dict] | None = None,
+    exchange_open_order_status: str = "UNAVAILABLE",
+    exchange_open_order_errors: list[dict] | None = None,
+) -> dict:
+    epoch = current_epoch or build_current_epoch_diagnostics(exchange=exchange)
+    epoch_start = str(epoch.get("current_epoch_started_at_utc") or "")
+    db_orders = load_unresolved_live_order_logs_for_exchange(exchange)
+    exchange_orders = [order for order in (exchange_open_orders or []) if isinstance(order, dict)]
+    exchange_by_key = _orders_by_identity(exchange_orders, exchange_order=True)
+    db_by_key = _orders_by_identity(db_orders, exchange_order=False)
+    all_keys = sorted(set(exchange_by_key) | set(db_by_key))
+    items = [
+        _open_order_audit_item(
+            db_order=db_by_key.get(key),
+            exchange_order=exchange_by_key.get(key),
+            epoch_start=epoch_start,
+            fallback_key=key,
+        )
+        for key in all_keys
+    ]
+    summary = _open_order_audit_summary(items, exchange_open_order_status, exchange_open_order_errors or [])
+    return {
+        "open_order_audit_status": exchange_open_order_status,
+        "open_order_audit_trust_level": summary["open_order_audit_trust_level"],
+        "open_order_audit_summary": summary,
+        "open_orders": items,
+        "exchange_open_order_errors": exchange_open_order_errors or [],
+    }
+
+
 def build_smoke_test_preflight(
     *,
     exchange: str = "bithumb",
@@ -181,6 +216,7 @@ def build_smoke_test_preflight(
     strategy_name: str = "smoke_test",
     amount_krw: float | None = None,
     current_epoch: dict | None = None,
+    open_order_audit: dict | None = None,
 ) -> dict:
     cfg = smoke_test_config()
     symbol = str(symbol or "BTC").upper()
@@ -226,17 +262,17 @@ def build_smoke_test_preflight(
         blockers.append({"code": "SMOKE_TEST_MAX_ORDERS_TOO_HIGH", "count": cfg["max_orders"]})
     if live_order_idempotency_exists(idempotency_key):
         blockers.append({"code": "DUPLICATE_SMOKE_TEST_IDEMPOTENCY_KEY", "count": 1})
-    with get_connection() as conn:
-        active_orders = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM live_order_logs
-            WHERE exchange = ? AND status IN ('SUBMITTED', 'WAITING', 'PARTIALLY_FILLED')
-            """,
-            (exchange,),
-        ).fetchone()["count"]
-    if active_orders:
-        blockers.append({"code": "OPEN_LIVE_ORDER_EXISTS", "count": int(active_orders)})
+    audit = open_order_audit or build_open_order_audit(exchange=exchange, current_epoch=epoch)
+    audit_summary = audit.get("open_order_audit_summary") or {}
+    exchange_open_count = int(audit_summary.get("exchange_open_order_count") or 0)
+    current_epoch_open_count = int(audit_summary.get("current_epoch_open_order_count") or 0)
+    unknown_open_count = int(audit_summary.get("unknown_open_order_count") or 0)
+    if exchange_open_count:
+        blockers.append({"code": "EXCHANGE_OPEN_ORDER_EXISTS", "count": exchange_open_count})
+    if current_epoch_open_count:
+        blockers.append({"code": "CURRENT_EPOCH_OPEN_ORDER_EXISTS", "count": current_epoch_open_count})
+    if unknown_open_count:
+        blockers.append({"code": "UNKNOWN_OPEN_ORDER_EXISTS", "count": unknown_open_count})
 
     allowed = len(blockers) == 0
     return {
@@ -257,6 +293,8 @@ def build_smoke_test_preflight(
         "confirmation_required": "RUN ONE SHOT LIVE SMOKE TEST" if cfg["require_confirmation"] else "",
         "auto_stop_after_complete": cfg["auto_stop_after_complete"],
         "disable_reentry": cfg["disable_reentry"],
+        "open_order_audit": audit,
+        "open_order_audit_summary": audit_summary,
     }
 
 
@@ -295,6 +333,156 @@ def split_restart_blockers(reasons: list[dict], current_epoch: dict, smoke_prefl
         "smoke_test_blockers": smoke_preflight.get("smoke_test_blockers", []),
         "normal_auto_blockers": normal or reasons,
     }
+
+
+def _orders_by_identity(orders: list[dict], *, exchange_order: bool) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for index, order in enumerate(orders):
+        keys = [
+            str(order.get("uuid") or ""),
+            str(order.get("order_uuid") or ""),
+            str(order.get("exchange_order_uuid") or ""),
+            str(order.get("identifier") or ""),
+            str(order.get("client_order_id") or ""),
+            str(order.get("request_id") or ""),
+        ]
+        key = next((value.strip() for value in keys if value and value.strip()), "")
+        if not key:
+            market = str(order.get("market") or "")
+            side = str(order.get("side") or "")
+            created_at = str(order.get("created_at") or order.get("created_at_utc") or "")
+            prefix = "exchange" if exchange_order else "db"
+            key = f"{prefix}:{market}:{side}:{created_at}:{index}"
+        result[key] = order
+    return result
+
+
+def _open_order_audit_item(
+    *,
+    db_order: dict | None,
+    exchange_order: dict | None,
+    epoch_start: str,
+    fallback_key: str,
+) -> dict:
+    db_exists = db_order is not None
+    exchange_exists = exchange_order is not None
+    created_at = _first_value(db_order, exchange_order, "created_at_utc", "created_at", "order_requested_at_utc")
+    updated_at = _first_value(db_order, exchange_order, "updated_at_utc", "updated_at")
+    belongs_to_current_epoch = bool(created_at and epoch_start and _canonical_time_text(created_at) >= _canonical_time_text(epoch_start))
+    belongs_to_legacy_history = not belongs_to_current_epoch
+    if exchange_exists and db_exists:
+        source = "BOTH"
+    elif exchange_exists:
+        source = "EXCHANGE_OPEN_ORDER"
+        belongs_to_current_epoch = False if not created_at else belongs_to_current_epoch
+        belongs_to_legacy_history = not belongs_to_current_epoch
+    elif db_exists and belongs_to_legacy_history:
+        source = "DB_STALE_ONLY"
+    elif db_exists:
+        source = "DB_OPEN_ORDER"
+    else:
+        source = "UNKNOWN"
+    recommended = _recommended_open_order_action(source, belongs_to_current_epoch)
+    return {
+        "source": source,
+        "internal_order_id": (db_order or {}).get("id"),
+        "live_order_log_id": (db_order or {}).get("id"),
+        "exchange_order_uuid": _first_value(db_order, exchange_order, "order_uuid", "uuid", "exchange_order_uuid"),
+        "client_order_id": _first_value(db_order, exchange_order, "client_order_id", "identifier"),
+        "symbol": _symbol_from_market(str(_first_value(db_order, exchange_order, "market") or "")),
+        "market": _first_value(db_order, exchange_order, "market"),
+        "side": _first_value(db_order, exchange_order, "side"),
+        "order_type": _first_value(db_order, exchange_order, "ord_type", "order_type", "order_purpose"),
+        "status": (db_order or {}).get("status"),
+        "requested_amount_krw": _first_value(db_order, exchange_order, "amount_krw", "requested_amount_krw", "price"),
+        "requested_quantity": _first_value(db_order, exchange_order, "volume", "requested_quantity"),
+        "filled_quantity": _first_value(db_order, exchange_order, "executed_volume", "filled_quantity"),
+        "remaining_quantity": _first_value(db_order, exchange_order, "remaining_volume", "remaining_quantity"),
+        "price": _first_value(db_order, exchange_order, "price"),
+        "created_at_utc": created_at,
+        "updated_at_utc": updated_at,
+        "exchange_status": (exchange_order or {}).get("state") or (exchange_order or {}).get("status"),
+        "exchange_open_order_exists": exchange_exists,
+        "db_open_order_exists": db_exists,
+        "belongs_to_legacy_history": belongs_to_legacy_history,
+        "belongs_to_current_epoch": belongs_to_current_epoch,
+        "recommended_action": recommended,
+        "audit_key": fallback_key,
+    }
+
+
+def _open_order_audit_summary(items: list[dict], status: str, errors: list[dict]) -> dict:
+    exchange_count = sum(1 for item in items if item.get("exchange_open_order_exists"))
+    db_count = sum(1 for item in items if item.get("db_open_order_exists"))
+    current_epoch_count = sum(1 for item in items if item.get("belongs_to_current_epoch"))
+    db_stale_count = sum(1 for item in items if item.get("source") == "DB_STALE_ONLY")
+    exchange_verified = status in {"SUCCESS", "PARTIAL"}
+    unknown_count = (
+        sum(1 for item in items if item.get("source") in {"UNKNOWN", "DB_OPEN_ORDER"} and not item.get("exchange_open_order_exists"))
+        if exchange_verified
+        else db_count
+    )
+    blocking_count = sum(
+        1
+        for item in items
+        if item.get("exchange_open_order_exists") or item.get("belongs_to_current_epoch") or (not exchange_verified and item.get("db_open_order_exists")) or item.get("source") in {"UNKNOWN", "DB_OPEN_ORDER"}
+    )
+    trust = "HIGH" if status == "SUCCESS" else "LOW"
+    if status == "PARTIAL" and not exchange_count:
+        trust = "MEDIUM"
+    return {
+        "open_live_order_count_total": len(items),
+        "exchange_open_order_count": exchange_count,
+        "db_open_order_count": db_count,
+        "db_stale_open_order_count": db_stale_count,
+        "current_epoch_open_order_count": current_epoch_count,
+        "legacy_open_order_count": sum(1 for item in items if item.get("belongs_to_legacy_history")),
+        "unknown_open_order_count": unknown_count,
+        "smoke_test_blocking_open_order_count": blocking_count,
+        "open_order_audit_trust_level": trust,
+        "exchange_open_order_audit_status": status,
+        "exchange_open_order_error_count": len(errors),
+        "next_required_action": _next_open_order_action(exchange_count, current_epoch_count, unknown_count, db_stale_count),
+    }
+
+
+def _recommended_open_order_action(source: str, belongs_to_current_epoch: bool) -> str:
+    if source in {"EXCHANGE_OPEN_ORDER", "BOTH"}:
+        return "USER_CONFIRM_CANCEL_REQUIRED"
+    if belongs_to_current_epoch:
+        return "KEEP_BLOCKED"
+    if source == "DB_STALE_ONLY":
+        return "MARK_LEGACY_STALE_CANDIDATE"
+    return "INVESTIGATE"
+
+
+def _next_open_order_action(exchange_count: int, current_epoch_count: int, unknown_count: int, db_stale_count: int) -> str:
+    if exchange_count:
+        return "USER_CONFIRM_CANCEL_REQUIRED"
+    if current_epoch_count or unknown_count:
+        return "INVESTIGATE"
+    if db_stale_count:
+        return "IGNORE_FOR_CURRENT_EPOCH_PRECHECK"
+    return "SMOKE_PREFLIGHT_OPEN_ORDER_CLEAR"
+
+
+def _first_value(row_a: dict | None, row_b: dict | None, *keys: str) -> Any:
+    for row in (row_a, row_b):
+        if not row:
+            continue
+        for key in keys:
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _canonical_time_text(value: Any) -> str:
+    return str(value or "").replace("+00:00", "Z")
+
+
+def _symbol_from_market(market: str) -> str:
+    return str(market or "").split("-")[-1].upper()
 
 
 def _bool_env(name: str, default: bool) -> bool:
