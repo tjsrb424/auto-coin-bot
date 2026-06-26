@@ -219,8 +219,9 @@ def build_exchange_fill_accounting_report(
     period_start_utc: str,
     period_end_utc: str,
 ) -> dict:
-    canonical_by_uuid = _rows_by(canonical_db_orders, "order_uuid")
-    canonical_by_client = _rows_by(canonical_db_orders, "client_order_id")
+    canonical_filled_orders = [row for row in canonical_db_orders if str(row.get("status") or "").upper() == "FILLED"]
+    canonical_by_uuid = _rows_by(canonical_filled_orders, "order_uuid")
+    canonical_by_client = _rows_by(canonical_filled_orders, "client_order_id")
     all_by_uuid = _rows_by(all_db_orders, "order_uuid")
     all_by_client = _rows_by(all_db_orders, "client_order_id")
     fill_events_by_uuid = _rows_by(position_fill_events, "order_uuid")
