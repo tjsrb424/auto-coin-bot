@@ -293,9 +293,10 @@ def fee_mismatches(db_fills: list[dict], exchange_fills: list[dict], *, toleranc
         matches = exchange_by_uuid.get(uuid, []) if uuid else []
         if not matches:
             continue
-        diff = db_fill["fee"] - matches[0]["fee"]
+        exchange_fill = matches[0][1]
+        diff = db_fill["fee"] - exchange_fill["fee"]
         if abs(diff) > tolerance:
-            items.append({"exchange_order_uuid": uuid, "db_fee": db_fill["fee"], "exchange_fee": matches[0]["fee"], "fee_diff": diff})
+            items.append({"exchange_order_uuid": uuid, "db_fee": db_fill["fee"], "exchange_fee": exchange_fill["fee"], "fee_diff": diff})
             total += diff
     return {"count": len(items), "amount_krw": total, "items": items[:20]}
 

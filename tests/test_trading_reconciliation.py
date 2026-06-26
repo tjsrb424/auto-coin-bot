@@ -134,6 +134,22 @@ class TradingReconciliationTests(unittest.TestCase):
         self.assertEqual(db_only["amount_krw"], 1000)
         self.assertTrue(report["gate_failed"])
 
+    def test_fee_mismatch_uses_indexed_exchange_fill_row(self) -> None:
+        report = build_equity_reconciliation(
+            initial_equity=1000,
+            current_equity_from_exchange=1000,
+            realized_pnl_from_db=0,
+            unrealized_pnl_from_positions=0,
+            total_fee_from_db=2,
+            db_orders=[db_order(order_uuid="C0504000000407836246", paid_fee=2)],
+            db_positions=[],
+            exchange_orders=[exchange_order(uuid="C0504000000407836246", paid_fee="0.5")],
+        )
+
+        self.assertEqual(report["exchange_fill_match"]["fee_mismatches"]["count"], 1)
+        self.assertEqual(report["exchange_fill_match"]["fee_mismatches"]["amount_krw"], 1.5)
+        self.assertTrue(report["gate_failed"])
+
     def test_duplicate_exchange_uuid_and_client_id_are_classified(self) -> None:
         report = build_equity_reconciliation(
             initial_equity=1000,
