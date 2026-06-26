@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from app.accounting_epoch import (
 )
 from app.database import (
     get_live_order_log,
+    get_connection,
     insert_live_order_log,
     insert_smoke_test_run,
     load_current_accounting_epoch,
@@ -26,6 +28,7 @@ from app.database import (
     update_live_order_log,
 )
 from app.exchange_fills_ledger import load_or_build_ledger_rows
+from app.exchange_fills_ledger import summarize_ledger_rows
 from app.live_broker import LiveTradingConfig, get_live_broker, is_emergency_stopped, masked_exchange_request
 from app.live_recovery import normalize_exchange_order, reconcile_order_log
 from app.upbit import fetch_tickers
@@ -270,19 +273,116 @@ def _persist_smoke_ledger(exchange: str, order_logs: list[dict]) -> dict:
     after_count = len(ledger_rows)
     order_uuids = {str(log.get("order_uuid") or "") for log in db_orders if log.get("order_uuid")}
     relevant_rows = [row for row in ledger_rows if str(row.get("exchange_order_uuid") or "") in order_uuids]
-    fee_from_ledger = sum(_float(row.get("fee")) for row in relevant_rows)
-    fee_from_exchange = sum(_float(log.get("paid_fee")) for log in db_orders)
+    assessment = _assess_smoke_ledger_rows(relevant_rows, db_orders)
     return {
         "exchange_fill_count": len(relevant_rows),
         "ledger_fill_count": len(relevant_rows),
-        "missing_ledger_fill_count": int(summary.get("missing_canonical_log_count") or 0),
-        "duplicate_fill_count": int(summary.get("duplicate_exchange_uuid_count") or 0),
-        "fee_from_exchange": fee_from_exchange,
-        "fee_from_ledger": fee_from_ledger,
-        "fee_diff": fee_from_exchange - fee_from_ledger,
+        "missing_ledger_fill_count": int(assessment["ledger_summary"].get("missing_canonical_log_count") or 0),
+        "duplicate_fill_count": int(assessment["ledger_summary"].get("duplicate_fill_key_count") or 0),
+        "fee_from_exchange": assessment["fee_normalized_total"],
+        "fee_from_ledger": assessment["ledger_fee_total"],
+        "fee_diff": assessment["fee_normalized_total"] - assessment["ledger_fee_total"],
         "ledger_row_count_before": before_count,
         "ledger_row_count_after": after_count,
-        "exchange_fills_ledger_summary": summary,
+        "exchange_fills_ledger_summary": {**summary, "smoke_relevant": assessment["ledger_summary"]},
+        **assessment,
+    }
+
+
+def recalculate_smoke_test_report(smoke_test_id: str, *, exchange: str = "bithumb") -> dict:
+    """Re-score a stored smoke test without placing, canceling, or mutating orders."""
+    with get_connection() as conn:
+        run = conn.execute("SELECT * FROM live_smoke_test_runs WHERE smoke_test_id = ?", (smoke_test_id,)).fetchone()
+        if run is None:
+            return {"ok": False, "smoke_test_id": smoke_test_id, "error": "SMOKE_TEST_NOT_FOUND"}
+        report = json.loads(run["report_json"] or "{}")
+        order_uuids = [str(item) for item in report.get("exchange_order_uuid_list") or [] if str(item)]
+        if not order_uuids:
+            return {"ok": False, "smoke_test_id": smoke_test_id, "error": "SMOKE_TEST_HAS_NO_ORDER_UUIDS", "report": report}
+        placeholders = ",".join("?" for _ in order_uuids)
+        order_logs = [
+            _decode_order_log_json(dict(row))
+            for row in conn.execute(
+                f"""
+                SELECT *
+                FROM live_order_logs
+                WHERE order_uuid IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                order_uuids,
+            ).fetchall()
+        ]
+    exchange_orders = [(log.get("exchange_response_payload") or {}) for log in order_logs if log]
+    epoch = load_current_accounting_epoch(exchange)
+    start = str((epoch or {}).get("epoch_started_at_utc") or report.get("started_at_utc") or "1970-01-01T00:00:00Z")
+    rebuilt_rows, rebuilt_summary = load_or_build_ledger_rows(
+        exchange_name=exchange,
+        period_start_utc=start,
+        exchange_orders=exchange_orders,
+        db_orders=order_logs,
+        persist=False,
+    )
+    relevant_rows = [row for row in rebuilt_rows if str(row.get("exchange_order_uuid") or "") in set(order_uuids)]
+    assessment = _assess_smoke_ledger_rows(relevant_rows, order_logs)
+    recalculated = dict(report)
+    recalculated.update(
+        {
+            "exchange_fill_count": len(relevant_rows),
+            "ledger_fill_count": len(relevant_rows),
+            "missing_ledger_fill_count": int(assessment["ledger_summary"].get("missing_canonical_log_count") or 0),
+            "duplicate_fill_count": int(assessment["ledger_summary"].get("duplicate_fill_key_count") or 0),
+            "fee_from_exchange": assessment["fee_normalized_total"],
+            "fee_from_ledger": assessment["ledger_fee_total"],
+            "fee_diff": assessment["fee_normalized_total"] - assessment["ledger_fee_total"],
+            "exchange_fills_ledger_summary": {**rebuilt_summary, "smoke_relevant": assessment["ledger_summary"]},
+            "recalculated_at_utc": _utc_now(),
+            "recalculation_source": "EXISTING_SMOKE_TEST_EXCHANGE_RESPONSE_PAYLOAD",
+            **assessment,
+        }
+    )
+    status, reasons = _pass_fail(recalculated)
+    if status == "PASSED" and report.get("smoke_test_status") != "PASSED":
+        status = "PASSED_AFTER_RECALC"
+    recalculated["smoke_test_status"] = status
+    recalculated["pass_fail_reasons"] = [] if status == "PASSED_AFTER_RECALC" else reasons
+    return {
+        "ok": status in {"PASSED", "PASSED_AFTER_RECALC"},
+        "smoke_test_id": smoke_test_id,
+        "original_status": report.get("smoke_test_status"),
+        "recalculated_status": status,
+        "pass_fail_reasons": recalculated["pass_fail_reasons"],
+        "report": recalculated,
+    }
+
+
+def _decode_order_log_json(row: dict) -> dict:
+    for key in ("order_preview_payload", "exchange_request_payload_masked", "exchange_response_payload"):
+        value = row.get(key)
+        if isinstance(value, str):
+            try:
+                row[key] = json.loads(value or "{}")
+            except json.JSONDecodeError:
+                row[key] = {}
+    return row
+
+
+def _assess_smoke_ledger_rows(ledger_rows: list[dict], order_logs: list[dict]) -> dict:
+    ledger_summary = summarize_ledger_rows(ledger_rows)
+    order_summary_fee = sum(_float(log.get("paid_fee")) for log in order_logs)
+    fill_row_fee_total = sum(_float(row.get("fee")) for row in ledger_rows if str(row.get("fee_source") or "") == "FILL_ROW_FEE")
+    ledger_fee_total = sum(_float(row.get("fee")) for row in ledger_rows)
+    has_fill_row_fee = any(str(row.get("fee_source") or "") == "FILL_ROW_FEE" for row in ledger_rows)
+    fee_source = "FILL_ROW_FEE" if has_fill_row_fee else "ORDER_SUMMARY_FEE"
+    normalized_total = fill_row_fee_total if has_fill_row_fee else order_summary_fee
+    fee_double_count_suspected = bool(order_summary_fee and ledger_fee_total > order_summary_fee + FEE_TOLERANCE_KRW and not has_fill_row_fee)
+    return {
+        "ledger_summary": ledger_summary,
+        "fee_source": fee_source,
+        "exchange_fee_total_by_fill_rows": fill_row_fee_total,
+        "exchange_fee_total_by_order_summary": order_summary_fee,
+        "ledger_fee_total": ledger_fee_total,
+        "fee_double_count_suspected": fee_double_count_suspected,
+        "fee_normalized_total": normalized_total,
     }
 
 

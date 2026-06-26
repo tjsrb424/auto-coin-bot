@@ -927,6 +927,9 @@ def init_db() -> None:
                 executed_value REAL NOT NULL DEFAULT 0,
                 fee REAL NOT NULL DEFAULT 0,
                 fee_currency TEXT NOT NULL DEFAULT 'KRW',
+                fee_source TEXT NOT NULL DEFAULT 'UNKNOWN',
+                exchange_fee_total_by_fill_rows REAL NOT NULL DEFAULT 0,
+                exchange_fee_total_by_order_summary REAL NOT NULL DEFAULT 0,
                 executed_at_utc TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'exchange_api',
                 matched_db_order_id INTEGER,
@@ -1359,6 +1362,9 @@ def init_db() -> None:
         _ensure_column(conn, "order_application_ledger", "last_exchange_filled_amount_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_application_ledger", "last_exchange_paid_fee", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "exchange_fills_ledger", "internal_order_ref", "TEXT")
+        _ensure_column(conn, "exchange_fills_ledger", "fee_source", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _ensure_column(conn, "exchange_fills_ledger", "exchange_fee_total_by_fill_rows", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "exchange_fills_ledger", "exchange_fee_total_by_order_summary", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "decision_snapshots", "selected_strategy_type", "TEXT")
         _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
@@ -5166,11 +5172,13 @@ def upsert_exchange_fill_ledger(fill: dict) -> dict | None:
             INSERT INTO exchange_fills_ledger (
                 exchange_name, exchange_order_uuid, internal_order_ref, exchange_fill_id,
                 fill_key, client_order_id, symbol, market, side, price, quantity,
-                executed_value, fee, fee_currency, executed_at_utc, source,
+                executed_value, fee, fee_currency, fee_source,
+                exchange_fee_total_by_fill_rows, exchange_fee_total_by_order_summary,
+                executed_at_utc, source,
                 matched_db_order_id, matched_live_order_log_id, matched_session_id,
                 matched_strategy_name, match_status, match_reason,
                 created_at_utc, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(exchange_name, fill_key) DO UPDATE SET
                 exchange_order_uuid = excluded.exchange_order_uuid,
                 internal_order_ref = excluded.internal_order_ref,
@@ -5184,6 +5192,9 @@ def upsert_exchange_fill_ledger(fill: dict) -> dict | None:
                 executed_value = excluded.executed_value,
                 fee = excluded.fee,
                 fee_currency = excluded.fee_currency,
+                fee_source = excluded.fee_source,
+                exchange_fee_total_by_fill_rows = excluded.exchange_fee_total_by_fill_rows,
+                exchange_fee_total_by_order_summary = excluded.exchange_fee_total_by_order_summary,
                 executed_at_utc = excluded.executed_at_utc,
                 source = excluded.source,
                 matched_db_order_id = excluded.matched_db_order_id,
@@ -5209,6 +5220,9 @@ def upsert_exchange_fill_ledger(fill: dict) -> dict | None:
                 float(fill.get("executed_value") or fill.get("amount_krw") or 0.0),
                 float(fill.get("fee") or 0.0),
                 fill.get("fee_currency") or "KRW",
+                fill.get("fee_source") or "UNKNOWN",
+                float(fill.get("exchange_fee_total_by_fill_rows") or 0.0),
+                float(fill.get("exchange_fee_total_by_order_summary") or 0.0),
                 fill["executed_at_utc"],
                 fill.get("source") or "exchange_api",
                 fill.get("matched_db_order_id"),

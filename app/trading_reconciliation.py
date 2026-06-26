@@ -172,8 +172,28 @@ def normalize_exchange_fills(exchange_orders: list[dict]) -> list[dict]:
     for order in exchange_orders:
         trades = order.get("trades") if isinstance(order, dict) else None
         if isinstance(trades, list) and trades:
-            for trade in trades:
-                fills.append(_normalize_exchange_trade(order, trade))
+            fill_row_fees = [_explicit_fee(trade) for trade in trades]
+            order_summary_fee = _float(order.get("paid_fee")) or _float(order.get("reserved_fee"))
+            has_fill_row_fee = any(fee is not None for fee in fill_row_fees)
+            trade_amounts = [_trade_amount(order, trade) for trade in trades]
+            amount_total = sum(trade_amounts)
+            for index, trade in enumerate(trades):
+                allocated_order_fee = 0.0
+                if not has_fill_row_fee and order_summary_fee:
+                    if amount_total > 0:
+                        allocated_order_fee = order_summary_fee * (trade_amounts[index] / amount_total)
+                    else:
+                        allocated_order_fee = order_summary_fee / len(trades)
+                fills.append(
+                    _normalize_exchange_trade(
+                        order,
+                        trade,
+                        fill_sequence=index,
+                        allocated_order_summary_fee=allocated_order_fee,
+                        order_summary_fee=order_summary_fee,
+                        has_fill_row_fee=has_fill_row_fee,
+                    )
+                )
             continue
         fill = _normalize_exchange_trade(order, None)
         if fill["quantity"] > 0 or fill["amount_krw"] > 0:
@@ -310,28 +330,71 @@ def timestamp_is_non_utc(value: Any) -> bool:
     return True
 
 
-def _normalize_exchange_trade(order: dict, trade: dict | None) -> dict:
+def _normalize_exchange_trade(
+    order: dict,
+    trade: dict | None,
+    *,
+    fill_sequence: int | None = None,
+    allocated_order_summary_fee: float = 0.0,
+    order_summary_fee: float | None = None,
+    has_fill_row_fee: bool = False,
+) -> dict:
     source = trade or order or {}
     volume = _float(source.get("volume")) or _float(source.get("executed_volume")) or _float(order.get("executed_volume"))
     amount = _float(source.get("funds")) or _float(source.get("executed_funds")) or _float(source.get("filled_amount_krw")) or _float(order.get("executed_funds"))
     price = _float(source.get("price")) or (_float(amount) / volume if volume else 0.0)
     if not amount and price and volume:
         amount = price * volume
+    explicit_fee = _explicit_fee(source)
+    if explicit_fee is not None:
+        fee = explicit_fee
+        fee_source = "FILL_ROW_FEE"
+    elif trade is not None and allocated_order_summary_fee:
+        fee = allocated_order_summary_fee
+        fee_source = "ORDER_SUMMARY_FEE"
+    else:
+        fee = _float(source.get("paid_fee")) or _float(order.get("paid_fee"))
+        fee_source = "ORDER_SUMMARY_FEE" if fee else "NO_FEE_REPORTED"
     return {
         "source": "exchange",
         "exchange_order_uuid": str(order.get("uuid") or order.get("order_uuid") or ""),
         "client_order_id": str(order.get("client_order_id") or order.get("identifier") or ""),
         "trade_uuid": str(source.get("uuid") or source.get("trade_uuid") or ""),
+        "fill_sequence": fill_sequence,
         "market": str(order.get("market") or source.get("market") or ""),
         "symbol": _symbol(str(order.get("market") or source.get("market") or "")),
         "side": _side(order),
         "price": price,
         "quantity": volume,
         "amount_krw": amount,
-        "fee": _float(source.get("fee")) or _float(source.get("paid_fee")) or _float(order.get("paid_fee")),
+        "fee": fee,
         "fee_currency": str(source.get("fee_currency") or "KRW"),
+        "fee_source": fee_source,
+        "exchange_fee_total_by_fill_rows": sum(f for f in [_explicit_fee(item) for item in order.get("trades", [])] if f is not None) if isinstance(order.get("trades"), list) else (fee if explicit_fee is not None else 0.0),
+        "exchange_fee_total_by_order_summary": _float(order_summary_fee if order_summary_fee is not None else order.get("paid_fee")),
+        "fill_row_fee_present": bool(explicit_fee is not None or has_fill_row_fee),
         "executed_at_utc": _canonical_utc(source.get("created_at") or source.get("executed_at") or order.get("created_at")),
     }
+
+
+def _explicit_fee(source: dict | None) -> float | None:
+    if not isinstance(source, dict):
+        return None
+    for key in ("fee", "trade_fee"):
+        if source.get(key) not in (None, ""):
+            return _float(source.get(key))
+    return None
+
+
+def _trade_amount(order: dict, trade: dict) -> float:
+    amount = _float(trade.get("funds")) or _float(trade.get("executed_funds")) or _float(trade.get("filled_amount_krw"))
+    if amount:
+        return amount
+    volume = _float(trade.get("volume")) or _float(trade.get("executed_volume"))
+    price = _float(trade.get("price"))
+    if volume and price:
+        return volume * price
+    return 0.0
 
 
 def _best_fill_match(fill: dict, candidates: list[tuple[int, dict]], matched: set[int]) -> int | None:

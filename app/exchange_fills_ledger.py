@@ -24,6 +24,16 @@ def is_synthetic_order_uuid(value: Any) -> bool:
 
 
 def canonical_fill_key(fill: dict) -> str:
+    exchange_fill_id = str(fill.get("exchange_fill_id") or fill.get("trade_uuid") or "")
+    if exchange_fill_id:
+        raw = "|".join(
+            [
+                str(fill.get("exchange_name") or fill.get("exchange") or "bithumb"),
+                str(fill.get("exchange_order_uuid") or ""),
+                exchange_fill_id,
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     raw = "|".join(
         [
             str(fill.get("exchange_name") or fill.get("exchange") or "bithumb"),
@@ -34,6 +44,7 @@ def canonical_fill_key(fill: dict) -> str:
             _num(fill.get("quantity")),
             _num(fill.get("fee")),
             str(fill.get("executed_at_utc") or ""),
+            str(fill.get("fill_sequence") if fill.get("fill_sequence") is not None else ""),
         ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -56,15 +67,17 @@ def build_exchange_fill_records(
     db_by_uuid = _index_by(db_fills, "exchange_order_uuid")
     db_by_client = _index_by(db_fills, "client_order_id")
     uuid_counts = Counter(fill.get("exchange_order_uuid") for fill in exchange_fills if fill.get("exchange_order_uuid"))
+    fill_key_counts = Counter(canonical_fill_key({"exchange_name": exchange_name, **fill}) for fill in exchange_fills)
     records = []
     for fill in exchange_fills:
         order_uuid = str(fill.get("exchange_order_uuid") or "")
         client_order_id = str(fill.get("client_order_id") or "")
         match, reason = _match_fill(fill, db_by_uuid.get(order_uuid, []) + db_by_client.get(client_order_id, []))
         match_status = "UNMATCHED"
-        if uuid_counts.get(order_uuid, 0) > 1 and order_uuid:
-            match_status = "DUPLICATE_EXCHANGE_UUID"
-            reason = "same exchange_order_uuid appears more than once in the exchange ledger payload"
+        fill_key = canonical_fill_key({"exchange_name": exchange_name, **fill})
+        if fill_key_counts.get(fill_key, 0) > 1:
+            match_status = "DUPLICATE_FILL_KEY"
+            reason = "same canonical fill key appears more than once in the exchange ledger payload"
         elif match:
             match_status = "MATCHED_DB_ORDER"
         elif order_uuid and is_real_exchange_order_uuid(order_uuid):
@@ -88,6 +101,11 @@ def build_exchange_fill_records(
             "executed_value": fill["amount_krw"],
             "fee": fill["fee"],
             "fee_currency": fill.get("fee_currency") or "KRW",
+            "fee_source": fill.get("fee_source") or "UNKNOWN",
+            "exchange_fee_total_by_fill_rows": fill.get("exchange_fee_total_by_fill_rows"),
+            "exchange_fee_total_by_order_summary": fill.get("exchange_fee_total_by_order_summary"),
+            "fill_sequence": fill.get("fill_sequence"),
+            "multi_fill_same_order_uuid": bool(order_uuid and uuid_counts.get(order_uuid, 0) > 1),
             "executed_at_utc": _to_utc_string(fill.get("executed_at_utc")),
             "source": source,
             "matched_db_order_id": (match or {}).get("id"),
@@ -97,7 +115,7 @@ def build_exchange_fill_records(
             "match_status": match_status,
             "match_reason": reason,
         }
-        record["fill_key"] = canonical_fill_key(record)
+        record["fill_key"] = fill_key
         records.append(record)
     return records
 
@@ -134,12 +152,20 @@ def load_or_build_ledger_rows(
 
 def summarize_ledger_rows(rows: list[dict]) -> dict:
     by_status = Counter(str(row.get("match_status") or "UNMATCHED") for row in rows)
+    by_fee_source = Counter(str(row.get("fee_source") or "UNKNOWN") for row in rows)
+    fill_key_counts = Counter(str(row.get("fill_key") or canonical_fill_key(row)) for row in rows)
+    duplicate_fill_key_count = sum(1 for count in fill_key_counts.values() if count > 1)
     return {
         "row_count": len(rows),
         "status_counts": dict(sorted(by_status.items())),
         "missing_canonical_log_count": by_status.get("MISSING_CANONICAL_LOG", 0),
         "synthetic_uuid_count": by_status.get("SYNTHETIC_UUID_ONLY", 0),
         "duplicate_exchange_uuid_count": by_status.get("DUPLICATE_EXCHANGE_UUID", 0),
+        "duplicate_fill_key_count": duplicate_fill_key_count,
+        "duplicate_fill_count": duplicate_fill_key_count,
+        "multi_fill_order_uuid_count": sum(1 for row in rows if row.get("multi_fill_same_order_uuid")),
+        "fee_source_counts": dict(sorted(by_fee_source.items())),
+        "ledger_fee_total": sum(_float(row.get("fee")) for row in rows),
         "missing_exchange_fill_value": sum(float(row.get("executed_value") or 0.0) for row in rows if row.get("match_status") == "MISSING_CANONICAL_LOG"),
     }
 
@@ -602,6 +628,10 @@ def _match_fill(fill: dict, candidates: list[tuple[int, dict]]) -> tuple[dict | 
             return candidate, "matched by uuid/client id, side, quantity, value, and fee"
         if quantity_match and value_match:
             return candidate, "matched by uuid/client id, side, quantity, and value; fee differs"
+        partial_quantity_match = _float(candidate.get("quantity")) + 0.00000001 >= _float(fill.get("quantity")) > 0
+        partial_value_match = _float(candidate.get("amount_krw")) + 5.0 >= _float(fill.get("amount_krw")) > 0
+        if partial_quantity_match and partial_value_match:
+            return candidate, "matched partial fill by uuid/client id, side, and bounded quantity/value"
     if candidates:
         return None, "uuid/client id candidates existed but price/quantity/fee did not match"
     return None, "no db order matched exchange uuid/client id"

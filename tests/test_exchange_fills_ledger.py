@@ -17,6 +17,7 @@ from app.exchange_fills_ledger import (
     is_real_exchange_order_uuid,
     persist_exchange_fill_records,
     real_duplicate_exchange_uuid_groups,
+    summarize_ledger_rows,
 )
 
 
@@ -81,6 +82,73 @@ class ExchangeFillsLedgerTests(unittest.TestCase):
         with database.get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) AS count FROM exchange_fills_ledger").fetchone()["count"]
         self.assertEqual(count, 1)
+
+    def test_multi_fill_same_exchange_order_uuid_is_not_duplicate_fill(self) -> None:
+        order = exchange_order(
+            executed_volume="10",
+            executed_funds="2810",
+            paid_fee="1.405",
+            trades=[
+                {"uuid": "trade-1", "price": "281", "volume": "4", "funds": "1124", "created_at": "2026-06-25T13:02:36+09:00"},
+                {"uuid": "trade-2", "price": "281", "volume": "6", "funds": "1686", "created_at": "2026-06-25T13:02:37+09:00"},
+            ],
+        )
+
+        records = build_exchange_fill_records(exchange_name="bithumb", exchange_orders=[order], db_orders=[db_order(executed_volume=10, filled_amount_krw=2810, paid_fee=1.405)])
+        summary = summarize_ledger_rows(records)
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(summary["duplicate_fill_key_count"], 0)
+        self.assertEqual(summary["duplicate_fill_count"], 0)
+        self.assertEqual(summary["multi_fill_order_uuid_count"], 2)
+        self.assertEqual({row["match_status"] for row in records}, {"MATCHED_DB_ORDER"})
+
+    def test_duplicate_fill_count_uses_canonical_fill_key(self) -> None:
+        fill = {
+            "fill_key": "same-fill-key",
+            "exchange_order_uuid": "C0504000000407836246",
+            "market": "KRW-XLM",
+            "side": "BUY",
+            "quantity": 5,
+            "executed_value": 1405,
+            "fee": 0.5,
+            "executed_at_utc": "2026-06-25T04:02:36Z",
+        }
+
+        summary = summarize_ledger_rows([fill, dict(fill)])
+
+        self.assertEqual(summary["duplicate_fill_key_count"], 1)
+        self.assertEqual(summary["duplicate_fill_count"], 1)
+
+    def test_order_summary_fee_is_allocated_once_across_trade_rows(self) -> None:
+        order = exchange_order(
+            executed_volume="10",
+            executed_funds="2810",
+            paid_fee="1.405",
+            trades=[
+                {"uuid": "trade-1", "price": "281", "volume": "4", "funds": "1124", "created_at": "2026-06-25T13:02:36+09:00"},
+                {"uuid": "trade-2", "price": "281", "volume": "6", "funds": "1686", "created_at": "2026-06-25T13:02:37+09:00"},
+            ],
+        )
+
+        records = build_exchange_fill_records(exchange_name="bithumb", exchange_orders=[order], db_orders=[db_order(executed_volume=10, filled_amount_krw=2810, paid_fee=1.405)])
+
+        self.assertAlmostEqual(sum(row["fee"] for row in records), 1.405)
+        self.assertEqual({row["fee_source"] for row in records}, {"ORDER_SUMMARY_FEE"})
+
+    def test_fill_row_fee_is_source_of_truth_when_present(self) -> None:
+        order = exchange_order(
+            paid_fee="999",
+            trades=[
+                {"uuid": "trade-1", "price": "281", "volume": "4", "funds": "1124", "fee": "0.4", "created_at": "2026-06-25T13:02:36+09:00"},
+                {"uuid": "trade-2", "price": "281", "volume": "6", "funds": "1686", "fee": "0.6", "created_at": "2026-06-25T13:02:37+09:00"},
+            ],
+        )
+
+        records = build_exchange_fill_records(exchange_name="bithumb", exchange_orders=[order], db_orders=[db_order(executed_volume=10, filled_amount_krw=2810, paid_fee=1)])
+
+        self.assertAlmostEqual(sum(row["fee"] for row in records), 1.0)
+        self.assertEqual({row["fee_source"] for row in records}, {"FILL_ROW_FEE"})
 
     def test_smart_order_uuid_is_not_real_exchange_uuid_or_duplicate(self) -> None:
         self.assertFalse(is_real_exchange_order_uuid("smart-order-uuid"))
