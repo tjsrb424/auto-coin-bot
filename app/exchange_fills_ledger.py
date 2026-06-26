@@ -144,10 +144,13 @@ def summarize_ledger_rows(rows: list[dict]) -> dict:
     }
 
 
-def compute_realized_pnl_from_ledger(rows: list[dict]) -> dict:
+def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict[str, float] | None = None, fee_rate: float = 0.0005) -> dict:
+    valuation_prices = valuation_prices or {}
     lots: dict[str, deque[dict]] = defaultdict(deque)
     gross = 0.0
-    fees = 0.0
+    buy_fee_total = 0.0
+    sell_fee_total = 0.0
+    non_krw_fee_total = 0.0
     unpaired_sell_value = 0.0
     realized_trades = []
     for row in sorted(rows, key=lambda item: (str(item.get("executed_at_utc") or ""), int(item.get("id") or 0))):
@@ -155,11 +158,16 @@ def compute_realized_pnl_from_ledger(rows: list[dict]) -> dict:
         side = str(row.get("side") or "").upper()
         quantity = _float(row.get("quantity"))
         value = _float(row.get("executed_value"))
-        fee = _float(row.get("fee")) if str(row.get("fee_currency") or "KRW").upper() == "KRW" else 0.0
+        fee_currency = str(row.get("fee_currency") or "KRW").upper()
+        raw_fee = _float(row.get("fee"))
+        fee = raw_fee if fee_currency == "KRW" else 0.0
+        if fee_currency != "KRW":
+            non_krw_fee_total += raw_fee
         if quantity <= 0:
             continue
         if side == "BUY":
             lots[market].append({"quantity": quantity, "cost": value, "fee": fee})
+            buy_fee_total += fee
             continue
         if side != "SELL":
             continue
@@ -181,14 +189,16 @@ def compute_realized_pnl_from_ledger(rows: list[dict]) -> dict:
         if remaining > 0.000000000001:
             unpaired_sell_value += value * (remaining / quantity)
         sell_fee = fee
+        sell_fee_total += sell_fee
         trade_gross = value - basis
         trade_fee = buy_fee + sell_fee
         gross += trade_gross
-        fees += trade_fee
         realized_trades.append(
             {
                 "market": market,
                 "exchange_order_uuid": row.get("exchange_order_uuid"),
+                "strategy_name": row.get("matched_strategy_name") or row.get("strategy_name"),
+                "session_id": row.get("matched_session_id") or row.get("session_id"),
                 "executed_value": value,
                 "basis_before_fee": basis,
                 "gross_pnl_before_fee": trade_gross,
@@ -198,10 +208,60 @@ def compute_realized_pnl_from_ledger(rows: list[dict]) -> dict:
                 "unpaired_quantity": remaining,
             }
         )
+    open_positions = []
+    open_cost_basis = 0.0
+    open_quantity = 0.0
+    unrealized_before_fee = 0.0
+    estimated_exit_fee = 0.0
+    for market, queue in sorted(lots.items()):
+        quantity = sum(_float(lot.get("quantity")) for lot in queue)
+        cost = sum(_float(lot.get("cost")) for lot in queue)
+        fee_basis = sum(_float(lot.get("fee")) for lot in queue)
+        price = _float(valuation_prices.get(market))
+        value = quantity * price
+        market_unrealized = value - cost
+        market_exit_fee = max(value * fee_rate, 0.0)
+        open_cost_basis += cost
+        open_quantity += quantity
+        unrealized_before_fee += market_unrealized
+        estimated_exit_fee += market_exit_fee
+        if quantity > 0.000000000001:
+            open_positions.append(
+                {
+                    "market": market,
+                    "open_position_quantity": quantity,
+                    "open_position_cost_basis": cost,
+                    "open_position_buy_fee_basis": fee_basis,
+                    "avg_entry_price": cost / quantity if quantity else 0.0,
+                    "current_valuation_price": price,
+                    "current_valuation_value": value,
+                    "unrealized_pnl_before_estimated_exit_fee": market_unrealized,
+                    "estimated_exit_fee": market_exit_fee,
+                    "unrealized_pnl_after_estimated_exit_fee": market_unrealized - market_exit_fee,
+                }
+            )
+    realized_fee_total = sum(_float(trade.get("allocated_buy_fee")) + _float(trade.get("sell_fee")) for trade in realized_trades)
     return {
+        "pnl_accounting_method": "FIFO",
+        "fee_currency_policy": "KRW fees reduce realized PnL; non-KRW fees are reported separately and not converted.",
         "exchange_gross_realized_pnl_before_fee": gross,
-        "exchange_realized_fee": fees,
-        "exchange_net_realized_pnl_after_fee": gross - fees,
+        "gross_realized_pnl_before_fee": gross,
+        "buy_fee_total": buy_fee_total,
+        "sell_fee_total": sell_fee_total,
+        "realized_fee_total": realized_fee_total,
+        "exchange_realized_fee": realized_fee_total,
+        "non_krw_fee_total": non_krw_fee_total,
+        "exchange_net_realized_pnl_after_fee": gross - realized_fee_total,
+        "net_realized_pnl_after_fee": gross - realized_fee_total,
+        "open_position_cost_basis": open_cost_basis,
+        "open_position_quantity": open_quantity,
+        "avg_entry_price": open_cost_basis / open_quantity if open_quantity else 0.0,
+        "current_valuation_price": None,
+        "unrealized_pnl_before_estimated_exit_fee": unrealized_before_fee,
+        "estimated_exit_fee": estimated_exit_fee,
+        "unrealized_pnl_after_estimated_exit_fee": unrealized_before_fee - estimated_exit_fee,
+        "total_pnl_after_estimated_exit_fee": gross - realized_fee_total + unrealized_before_fee - estimated_exit_fee,
+        "open_positions_by_market": open_positions,
         "unpaired_sell_value_krw": unpaired_sell_value,
         "realized_trade_count": len(realized_trades),
         "realized_trades": realized_trades[:50],
@@ -216,9 +276,11 @@ def build_exchange_fill_accounting_report(
     sessions: list[dict],
     position_fill_events: list[dict],
     trade_outcome_logs: list[dict],
+    valuation_prices: dict[str, float] | None = None,
     period_start_utc: str,
     period_end_utc: str,
 ) -> dict:
+    valuation_prices = valuation_prices or {}
     canonical_filled_orders = [row for row in canonical_db_orders if str(row.get("status") or "").upper() == "FILLED"]
     canonical_by_uuid = _rows_by(canonical_filled_orders, "order_uuid")
     canonical_by_client = _rows_by(canonical_filled_orders, "client_order_id")
@@ -255,15 +317,34 @@ def build_exchange_fill_accounting_report(
             position_event=position_event,
             outcome=outcome,
         )
+        missing_reasons = _missing_reasons(
+            item,
+            db_order_match=db_order_match,
+            canonical_match=canonical_match,
+            position_event=position_event,
+            outcome=outcome,
+            session_match=session_match,
+        )
         item.update(
             {
                 "ownership": ownership,
                 "ownership_reason": reason,
                 "matched_any_db_order_id": (db_order_match or {}).get("id"),
                 "matched_canonical_live_order_log_id": (canonical_match or {}).get("id"),
+                "matched_session_id": item.get("matched_session_id")
+                or (canonical_match or {}).get("session_id")
+                or (db_order_match or {}).get("session_id")
+                or (session_match or {}).get("id"),
+                "matched_strategy_name": item.get("matched_strategy_name")
+                or (canonical_match or {}).get("strategy_name")
+                or (canonical_match or {}).get("strategy")
+                or (db_order_match or {}).get("strategy_name")
+                or (db_order_match or {}).get("strategy")
+                or (session_match or {}).get("strategy_name"),
                 "matched_position_fill_event_id": (position_event or {}).get("id"),
                 "matched_trade_outcome_log_id": (outcome or {}).get("id"),
                 "accounting_status": accounting_status,
+                "missing_reasons": missing_reasons,
             }
         )
         classified.append(item)
@@ -271,14 +352,27 @@ def build_exchange_fill_accounting_report(
     bot_owned = [row for row in classified if row["ownership"] in {"BOT_LIVE_CONFIRMED", "BOT_LIVE_SUSPECTED"}]
     manual_or_external = [row for row in classified if row["ownership"] == "MANUAL_OR_EXTERNAL"]
     out_of_scope = [row for row in classified if row["ownership"] == "OUT_OF_RECONCILIATION_SCOPE"]
-    all_pnl = compute_realized_pnl_from_ledger(classified)
-    bot_pnl = compute_realized_pnl_from_ledger(bot_owned)
-    manual_pnl = compute_realized_pnl_from_ledger(manual_or_external)
-    out_of_scope_pnl = compute_realized_pnl_from_ledger(out_of_scope)
+    all_pnl = compute_realized_pnl_from_ledger(classified, valuation_prices=valuation_prices)
+    bot_pnl = compute_realized_pnl_from_ledger(bot_owned, valuation_prices=valuation_prices)
+    manual_pnl = compute_realized_pnl_from_ledger(manual_or_external, valuation_prices=valuation_prices)
+    out_of_scope_pnl = compute_realized_pnl_from_ledger(out_of_scope, valuation_prices=valuation_prices)
+    realized_by_uuid = {
+        str(trade.get("exchange_order_uuid") or ""): trade
+        for trade in bot_pnl.get("realized_trades", [])
+        if trade.get("exchange_order_uuid")
+    }
 
     missing_live_position = [row for row in bot_owned if not row.get("matched_position_fill_event_id")]
     missing_strategy_pnl = [row for row in bot_owned if not row.get("matched_trade_outcome_log_id")]
-    pending = [row for row in classified if row.get("accounting_status") in {"ACCOUNTING_PENDING", "ACCOUNTING_PARTIAL", "ACCOUNTING_FAILED"}]
+    pending = [row for row in classified if row.get("accounting_status") == "ACCOUNTING_PENDING"]
+    partial = [row for row in classified if row.get("accounting_status") == "ACCOUNTING_PARTIAL"]
+    failed = [row for row in classified if row.get("accounting_status") == "ACCOUNTING_FAILED"]
+    synced = [row for row in classified if row.get("accounting_status") == "ACCOUNTING_SYNCED"]
+    legacy_missing = [row for row in classified if row.get("accounting_status") == "ACCOUNTING_LEGACY_MISSING_CANONICAL_LOG"]
+    trace = _missing_fill_trace(bot_owned, realized_by_uuid)
+    ledger_strategy_pnl = _grouped_pnl(bot_owned, "matched_strategy_name", "strategy_name", valuation_prices)
+    ledger_symbol_pnl = _grouped_pnl(bot_owned, "symbol", "symbol", valuation_prices)
+    ledger_session_pnl = _grouped_pnl(bot_owned, "matched_session_id", "session_id", valuation_prices)
     return {
         "reconciliation_scope": {
             "reconciliation_start_at_utc": period_start_utc,
@@ -317,16 +411,32 @@ def build_exchange_fill_accounting_report(
             "exchange_net_realized_pnl_after_fee_out_of_scope": out_of_scope_pnl["exchange_net_realized_pnl_after_fee"],
             "manual_or_external_effect": manual_pnl["exchange_net_realized_pnl_after_fee"],
             "out_of_scope_effect": out_of_scope_pnl["exchange_net_realized_pnl_after_fee"],
+            "bot_owned_unrealized_pnl_after_estimated_exit_fee": bot_pnl["unrealized_pnl_after_estimated_exit_fee"],
+            "bot_owned_total_pnl_after_estimated_exit_fee": bot_pnl["total_pnl_after_estimated_exit_fee"],
         },
+        "ledger_pnl_detail": bot_pnl,
+        "ledger_strategy_pnl": ledger_strategy_pnl,
+        "ledger_symbol_pnl": ledger_symbol_pnl,
+        "ledger_session_pnl": ledger_session_pnl,
         "pnl_source_of_truth": {
+            "pnl_source_of_truth": "EXCHANGE_FILLS_LEDGER",
             "actual_equity": "exchange_balance_equity",
             "realized_pnl": "exchange_fills_ledger",
+            "unrealized_pnl": "exchange_fills_ledger",
             "strategy_pnl": "bot_owned_exchange_fills_ledger",
+            "symbol_pnl": "bot_owned_exchange_fills_ledger",
+            "dashboard_pnl": "bot_owned_exchange_fills_ledger",
             "legacy_db_pnl": "legacy_debug_only",
         },
+        "missing_fill_trace": trace["items"],
+        "missing_fill_trace_summary": trace["summary"],
         "classified_fills_sample": _classified_samples(classified),
         "accounting_pending_count": len(pending),
         "accounting_pending_value": _sum_value(pending),
+        "accounting_partial_count": len(partial),
+        "accounting_failed_count": len(failed),
+        "accounting_synced_count": len(synced),
+        "accounting_legacy_missing_canonical_log_count": len(legacy_missing),
     }
 
 
@@ -477,9 +587,11 @@ def _accounting_status(
 ) -> str:
     if ownership in {"MANUAL_OR_EXTERNAL", "OUT_OF_RECONCILIATION_SCOPE"}:
         return "ACCOUNTING_OUT_OF_SCOPE"
+    if canonical_match is None:
+        return "ACCOUNTING_LEGACY_MISSING_CANONICAL_LOG"
     if canonical_match and position_event and outcome:
         return "ACCOUNTING_SYNCED"
-    if canonical_match or position_event or outcome:
+    if position_event or outcome:
         return "ACCOUNTING_PARTIAL"
     return "ACCOUNTING_PENDING"
 
@@ -566,6 +678,142 @@ def _classified_samples(rows: list[dict]) -> list[dict]:
         }
         for row in rows[:50]
     ]
+
+
+def _missing_reasons(
+    row: dict,
+    *,
+    db_order_match: dict | None,
+    canonical_match: dict | None,
+    position_event: dict | None,
+    outcome: dict | None,
+    session_match: dict | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if canonical_match is None:
+        reasons.append("MISSING_FILLED_EVENT_ROW")
+        if db_order_match:
+            status = str(db_order_match.get("status") or "").upper()
+            if status and status != "FILLED":
+                reasons.append("ORDER_STATUS_UPDATED_WITHOUT_FILL_EVENT")
+            else:
+                reasons.append("LEGACY_SCHEMA_NO_FILL_ROW")
+        else:
+            reasons.append("BROKER_RESPONSE_NOT_LOGGED")
+    if _timestamp_is_non_utc(row.get("executed_at_utc")):
+        reasons.append("TIMESTAMP_MISMATCH")
+    if session_match is None and not row.get("matched_session_id") and db_order_match is None:
+        reasons.append("SESSION_MISMATCH")
+    strategy = (canonical_match or db_order_match or {}).get("strategy_name") or row.get("matched_strategy_name")
+    if not strategy:
+        reasons.append("STRATEGY_METADATA_MISSING")
+    if position_event is None:
+        reasons.append("LIVE_POSITION_ACCOUNTING_MISSING")
+    if outcome is None:
+        reasons.append("STRATEGY_PNL_ACCOUNTING_MISSING")
+    return reasons or ["UNKNOWN"]
+
+
+def _missing_fill_trace(bot_owned_rows: list[dict], realized_by_uuid: dict[str, dict]) -> dict:
+    items = []
+    reason_counts: Counter[str] = Counter()
+    estimated_total = 0.0
+    for row in bot_owned_rows:
+        canonical_exists = row.get("matched_canonical_live_order_log_id") is not None
+        position_exists = row.get("matched_position_fill_event_id") is not None
+        outcome_exists = row.get("matched_trade_outcome_log_id") is not None
+        if canonical_exists and position_exists and outcome_exists:
+            continue
+        reasons = list(row.get("missing_reasons") or ["UNKNOWN"])
+        reason_counts.update(reasons)
+        trade = realized_by_uuid.get(str(row.get("exchange_order_uuid") or "")) or {}
+        estimated_pnl = _float(trade.get("net_pnl_after_fee"))
+        estimated_total += estimated_pnl
+        items.append(
+            {
+                "exchange_fill_ledger_id": row.get("id"),
+                "exchange_order_uuid": row.get("exchange_order_uuid"),
+                "client_order_id": row.get("client_order_id"),
+                "symbol": row.get("symbol") or _symbol(str(row.get("market") or "")),
+                "side": row.get("side"),
+                "price": row.get("price"),
+                "quantity": row.get("quantity"),
+                "executed_value": row.get("executed_value"),
+                "fee": row.get("fee"),
+                "executed_at_utc": row.get("executed_at_utc"),
+                "matched_db_order_id": row.get("matched_any_db_order_id"),
+                "matched_live_order_log_id": row.get("matched_canonical_live_order_log_id"),
+                "matched_session_id": row.get("matched_session_id"),
+                "matched_strategy_name": row.get("matched_strategy_name"),
+                "canonical_filled_log_exists": canonical_exists,
+                "live_position_accounting_exists": position_exists,
+                "strategy_pnl_accounting_exists": outcome_exists,
+                "dashboard_pnl_accounting_exists": outcome_exists,
+                "missing_reason": reasons[0],
+                "missing_reasons": reasons,
+                "estimated_pnl_impact": estimated_pnl,
+            }
+        )
+    return {
+        "items": items,
+        "summary": {
+            "count": len(items),
+            "reason_counts": dict(sorted(reason_counts.items())),
+            "estimated_pnl_impact": estimated_total,
+        },
+    }
+
+
+def _grouped_pnl(
+    rows: list[dict],
+    group_field: str,
+    output_key: str,
+    valuation_prices: dict[str, float] | None,
+) -> list[dict]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        key = row.get(group_field)
+        if group_field == "symbol":
+            key = row.get("symbol") or _symbol(str(row.get("market") or ""))
+        if key is None or key == "":
+            key = "unknown"
+        grouped[str(key)].append(row)
+
+    result = []
+    for key, group in grouped.items():
+        pnl = compute_realized_pnl_from_ledger(group, valuation_prices=valuation_prices)
+        realized_trades = list(pnl.get("realized_trades") or [])
+        wins = [_float(trade.get("net_pnl_after_fee")) for trade in realized_trades if _float(trade.get("net_pnl_after_fee")) > 0]
+        losses = [_float(trade.get("net_pnl_after_fee")) for trade in realized_trades if _float(trade.get("net_pnl_after_fee")) < 0]
+        closed = len(wins) + len(losses)
+        item = {
+            output_key: key,
+            "fill_count": len(group),
+            "trade_count": len(group),
+            "buy_count": sum(1 for row in group if str(row.get("side") or "").upper() == "BUY"),
+            "sell_count": sum(1 for row in group if str(row.get("side") or "").upper() == "SELL"),
+            "gross_realized_pnl_before_fee": pnl.get("gross_realized_pnl_before_fee", 0.0),
+            "net_realized_pnl_after_fee": pnl.get("net_realized_pnl_after_fee", 0.0),
+            "gross_pnl": pnl.get("gross_realized_pnl_before_fee", 0.0),
+            "net_pnl": pnl.get("net_realized_pnl_after_fee", 0.0),
+            "fee_total": pnl.get("realized_fee_total", 0.0),
+            "open_quantity": pnl.get("open_position_quantity", 0.0),
+            "unrealized_pnl": pnl.get("unrealized_pnl_after_estimated_exit_fee", 0.0),
+            "total_pnl": pnl.get("total_pnl_after_estimated_exit_fee", 0.0),
+            "win_rate": len(wins) / closed if closed else 0.0,
+            "avg_win": sum(wins) / len(wins) if wins else 0.0,
+            "avg_loss": sum(losses) / len(losses) if losses else 0.0,
+            "max_loss_trade": min(losses) if losses else 0.0,
+        }
+        result.append(item)
+    return sorted(result, key=lambda item: _float(item.get("total_pnl")))
+
+
+def _timestamp_is_non_utc(value: Any) -> bool:
+    if not value:
+        return False
+    raw = str(value)
+    return not (raw.endswith("Z") or raw.endswith("+00:00"))
 
 
 def _index_by(rows: list[dict], field: str) -> dict[str, list[tuple[int, dict]]]:

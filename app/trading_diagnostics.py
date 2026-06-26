@@ -165,12 +165,37 @@ def build_trading_diagnostics_report(
         positions=positions,
         payload=asset_reconciliation or {},
     )
+    asset_report["legacy_strategy_pnl"] = strategy_pnl
+    asset_report["legacy_symbol_pnl"] = symbol_pnl
+    asset_report["strategy_pnl_diff"] = _pnl_diff_rows(
+        asset_report.get("ledger_strategy_pnl", []),
+        strategy_pnl,
+        "strategy_name",
+    )
+    asset_report["symbol_pnl_diff"] = _pnl_diff_rows(
+        asset_report.get("ledger_symbol_pnl", []),
+        symbol_pnl,
+        "symbol",
+    )
     restart_gate = _restart_gate(risk_diagnostics, safety_limits, summary, asset_report)
     return {
         "generated_at_utc": _to_iso(now),
         "exchange": exchange,
         "summary": summary,
         "asset_reconciliation": asset_report,
+        "pnl_source_of_truth": asset_report.get("pnl_source_of_truth"),
+        "legacy_db_pnl_is_debug_only": asset_report.get("legacy_db_pnl_is_debug_only"),
+        "exchange_ledger_pnl_enabled": asset_report.get("exchange_ledger_pnl_enabled"),
+        "strategy_pnl_source": asset_report.get("strategy_pnl_source"),
+        "symbol_pnl_source": asset_report.get("symbol_pnl_source"),
+        "dashboard_pnl_source": asset_report.get("dashboard_pnl_source"),
+        "ledger_strategy_pnl": asset_report.get("ledger_strategy_pnl", []),
+        "ledger_symbol_pnl": asset_report.get("ledger_symbol_pnl", []),
+        "ledger_session_pnl": asset_report.get("ledger_session_pnl", []),
+        "legacy_strategy_pnl": strategy_pnl,
+        "legacy_symbol_pnl": symbol_pnl,
+        "strategy_pnl_diff": asset_report.get("strategy_pnl_diff", []),
+        "symbol_pnl_diff": asset_report.get("symbol_pnl_diff", []),
         "symbol_pnl": symbol_pnl,
         "strategy_pnl": strategy_pnl,
         "risk_diagnostics": risk_diagnostics,
@@ -309,6 +334,28 @@ def _finalize_pnl_rows(rows: Any, key: str) -> list[dict]:
         row["gross_pnl"] = row["net_pnl"] + row["fee_total"]
         result.append(row)
     return sorted(result, key=lambda item: item["net_pnl"])
+
+
+def _pnl_diff_rows(ledger_rows: list[dict], legacy_rows: list[dict], key: str) -> list[dict]:
+    ledger_by_key = {str(row.get(key) or "unknown"): row for row in ledger_rows}
+    legacy_by_key = {str(row.get(key) or "unknown"): row for row in legacy_rows}
+    result = []
+    for name in sorted(set(ledger_by_key) | set(legacy_by_key)):
+        ledger = ledger_by_key.get(name, {})
+        legacy = legacy_by_key.get(name, {})
+        ledger_pnl = _float(ledger.get("total_pnl"), _float(ledger.get("net_pnl")))
+        legacy_pnl = _float(legacy.get("net_pnl"))
+        result.append(
+            {
+                key: name,
+                "ledger_total_pnl": ledger_pnl,
+                "legacy_net_pnl": legacy_pnl,
+                "diff": ledger_pnl - legacy_pnl,
+                "ledger_fill_count": _float(ledger.get("fill_count")),
+                "legacy_trade_count": _float(legacy.get("trade_count")),
+            }
+        )
+    return sorted(result, key=lambda item: abs(_float(item.get("diff"))), reverse=True)
 
 
 def _risk_diagnostics(
@@ -487,9 +534,24 @@ def _asset_reconciliation_report(
     equity_breakdown["stale_valuation_effect"] = _float(payload.get("stale_valuation_effect"), 0.0)
     equity_breakdown["valuation_snapshot_timing_diff"] = 0.0
     equity_breakdown["dust_balance_effect"] = 0.0
+    ledger_detail = accounting.get("ledger_pnl_detail", {}) if isinstance(accounting.get("ledger_pnl_detail"), dict) else {}
+    trace_summary = accounting.get("missing_fill_trace_summary", {}) if isinstance(accounting.get("missing_fill_trace_summary"), dict) else {}
+    open_position_entry_amount = sum(
+        _float(position.get("entry_amount_krw"))
+        for position in positions
+        if str(position.get("status") or "").upper() in OPEN_POSITION_STATUSES
+    )
+    equity_breakdown["rounding_or_precision_diff"] = _float(equity_breakdown.get("rounding_diff"))
+    equity_breakdown["open_position_cost_basis_diff"] = _float(ledger_detail.get("open_position_cost_basis")) - open_position_entry_amount
+    equity_breakdown["estimated_exit_fee_effect"] = _float(ledger_detail.get("estimated_exit_fee"))
+    equity_breakdown["unavailable_deposit_withdrawal_effect"] = _float(equity_breakdown.get("remaining_deposit_withdrawal_unknown"))
+    equity_breakdown["missing_canonical_log_accounting_effect"] = _float(trace_summary.get("estimated_pnl_impact"))
     exchange_net = (payload.get("exchange_realized_pnl") or {}).get("exchange_net_realized_pnl_after_fee")
     bot_owned_net = pnl_by_ownership.get("exchange_net_realized_pnl_after_fee_bot_owned")
     bot_owned_diff = _float(bot_owned_net) - realized_pnl_from_db if bot_owned_net is not None else None
+    equity_breakdown["legacy_position_accounting_effect"] = _float(bot_owned_diff)
+    equity_breakdown["remaining_unexplained"] = _float(equity_breakdown.get("unexplained"))
+    source = accounting.get("pnl_source_of_truth", {}) if isinstance(accounting.get("pnl_source_of_truth"), dict) else {}
     return {
         "initial_equity": initial_equity,
         "current_equity_from_exchange": current_equity,
@@ -531,17 +593,28 @@ def _asset_reconciliation_report(
         "exchange_fill_accounting_status_summary": accounting.get("accounting_status_summary", {}),
         "exchange_fill_missing_breakdown": accounting.get("missing_fill_breakdown", {}),
         "exchange_fill_classified_sample": accounting.get("classified_fills_sample", []),
+        "missing_fill_trace_summary": accounting.get("missing_fill_trace_summary", {}),
+        "missing_fill_trace": accounting.get("missing_fill_trace", []),
         "reconciliation_scope": {
             **(accounting.get("reconciliation_scope", {}) if isinstance(accounting.get("reconciliation_scope"), dict) else {}),
             "initial_equity_snapshot_at_utc": payload.get("initial_equity_snapshot_at_utc"),
             "initial_equity_amount": payload.get("initial_equity_amount", initial_equity),
         },
-        "pnl_source_of_truth": accounting.get("pnl_source_of_truth", {
+        "pnl_source_of_truth": source or {
             "actual_equity": "exchange_balance_equity",
             "realized_pnl": "exchange_fills_ledger",
             "strategy_pnl": "bot_owned_exchange_fills_ledger",
             "legacy_db_pnl": "legacy_debug_only",
-        }),
+        },
+        "legacy_db_pnl_is_debug_only": True,
+        "exchange_ledger_pnl_enabled": True,
+        "strategy_pnl_source": source.get("strategy_pnl", "bot_owned_exchange_fills_ledger"),
+        "symbol_pnl_source": source.get("symbol_pnl", "bot_owned_exchange_fills_ledger"),
+        "dashboard_pnl_source": source.get("dashboard_pnl", "bot_owned_exchange_fills_ledger"),
+        "ledger_pnl_detail": ledger_detail,
+        "ledger_strategy_pnl": accounting.get("ledger_strategy_pnl", []),
+        "ledger_symbol_pnl": accounting.get("ledger_symbol_pnl", []),
+        "ledger_session_pnl": accounting.get("ledger_session_pnl", []),
         "legacy_db_pnl": {
             "net_realized_pnl_after_fee": realized_pnl_from_db,
             "unrealized_pnl_from_positions": unrealized_pnl_from_positions,
@@ -570,6 +643,10 @@ def _asset_reconciliation_report(
         "out_of_scope_effect": pnl_by_ownership.get("out_of_scope_effect"),
         "accounting_pending_count": accounting.get("accounting_pending_count", 0),
         "accounting_pending_value": accounting.get("accounting_pending_value", 0.0),
+        "accounting_partial_count": accounting.get("accounting_partial_count", 0),
+        "accounting_failed_count": accounting.get("accounting_failed_count", 0),
+        "accounting_synced_count": accounting.get("accounting_synced_count", 0),
+        "accounting_legacy_missing_canonical_log_count": accounting.get("accounting_legacy_missing_canonical_log_count", 0),
         "position_valuation_summary": payload.get("position_valuation_summary", {}),
         "stale_valuation_effect": _float(payload.get("stale_valuation_effect"), 0.0),
         "exchange_ledger_status": payload.get("exchange_ledger_status", "UNAVAILABLE"),
@@ -584,6 +661,9 @@ def _asset_reconciliation_report(
             else "Deposit/withdrawal ledger is available."
         ),
         "deposit_withdrawal_unavailable_reason": payload.get("deposit_withdrawal_unavailable_reason", "No read-only deposit/withdrawal broker method is configured."),
+        "manual_initial_snapshot_required": asset_reconciliation_requested and payload.get("deposit_withdrawal_status", "UNAVAILABLE") != "AVAILABLE",
+        "initial_equity_snapshot_source": "operator_query_parameter_or_policy_default",
+        "initial_equity_snapshot_trust_level": "LOW" if asset_reconciliation_requested and payload.get("deposit_withdrawal_status", "UNAVAILABLE") != "AVAILABLE" else "HIGH",
         "gate_failed": bool(reconciliation["gate_failed"]),
     }
 
@@ -636,6 +716,12 @@ def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation:
         reasons.append({"code": "MISSING_STRATEGY_PNL_FILL", "count": missing_breakdown.get("missing_strategy_pnl_fill_count")})
     if (asset_reconciliation or {}).get("accounting_pending_count"):
         reasons.append({"code": "ACCOUNTING_PENDING_FILL", "count": asset_reconciliation.get("accounting_pending_count")})
+    if (asset_reconciliation or {}).get("accounting_partial_count"):
+        reasons.append({"code": "ACCOUNTING_PARTIAL_FILL", "count": asset_reconciliation.get("accounting_partial_count")})
+    if (asset_reconciliation or {}).get("accounting_failed_count"):
+        reasons.append({"code": "ACCOUNTING_FAILED_FILL", "count": asset_reconciliation.get("accounting_failed_count")})
+    if (asset_reconciliation or {}).get("accounting_legacy_missing_canonical_log_count"):
+        reasons.append({"code": "ACCOUNTING_LEGACY_MISSING_CANONICAL_LOG", "count": asset_reconciliation.get("accounting_legacy_missing_canonical_log_count")})
     if ledger_summary.get("missing_canonical_log_count"):
         reasons.append({"code": "MISSING_CANONICAL_LIVE_ORDER_LOG", "count": ledger_summary.get("missing_canonical_log_count")})
     if ledger_summary.get("duplicate_exchange_uuid_count"):

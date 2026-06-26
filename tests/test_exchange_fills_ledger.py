@@ -332,6 +332,66 @@ class ExchangeFillsLedgerTests(unittest.TestCase):
         self.assertEqual(missing["missing_db_order_fill_count"], 0)
         self.assertEqual(missing["canonical_live_log_matched_fill_count"], 0)
         self.assertEqual(missing["missing_canonical_live_log_fill_count"], 1)
+        self.assertEqual(report["accounting_legacy_missing_canonical_log_count"], 1)
+        self.assertEqual(report["accounting_status_summary"]["ACCOUNTING_LEGACY_MISSING_CANONICAL_LOG"]["count"], 1)
+        trace = report["missing_fill_trace"][0]
+        self.assertEqual(trace["exchange_order_uuid"], "C0504000000407836246")
+        self.assertFalse(trace["canonical_filled_log_exists"])
+        self.assertIn("MISSING_FILLED_EVENT_ROW", trace["missing_reasons"])
+        self.assertIn("LEGACY_SCHEMA_NO_FILL_ROW", trace["missing_reasons"])
+
+    def test_ledger_strategy_and_symbol_pnl_are_source_of_truth(self) -> None:
+        buy = {
+            "exchange_order_uuid": "C0504000000407836246",
+            "client_order_id": "client-1",
+            "market": "KRW-XLM",
+            "symbol": "XLM",
+            "side": "BUY",
+            "quantity": 10,
+            "executed_value": 1000,
+            "fee": 2,
+            "fee_currency": "KRW",
+            "executed_at_utc": "2026-06-25T00:00:00Z",
+        }
+        sell = {
+            "exchange_order_uuid": "C0504000000407836247",
+            "client_order_id": "client-2",
+            "market": "KRW-XLM",
+            "symbol": "XLM",
+            "side": "SELL",
+            "quantity": 5,
+            "executed_value": 600,
+            "fee": 1,
+            "fee_currency": "KRW",
+            "executed_at_utc": "2026-06-25T01:00:00Z",
+        }
+        report = build_exchange_fill_accounting_report(
+            ledger_rows=[buy, sell],
+            canonical_db_orders=[
+                db_order(order_uuid="C0504000000407836246", side="BUY", executed_volume=10, filled_amount_krw=1000),
+                db_order(id=8, client_order_id="client-2", order_uuid="C0504000000407836247", side="SELL", executed_volume=5, filled_amount_krw=600),
+            ],
+            all_db_orders=[
+                db_order(order_uuid="C0504000000407836246", side="BUY", executed_volume=10, filled_amount_krw=1000),
+                db_order(id=8, client_order_id="client-2", order_uuid="C0504000000407836247", side="SELL", executed_volume=5, filled_amount_krw=600),
+            ],
+            sessions=[],
+            position_fill_events=[{"id": 1, "order_uuid": "C0504000000407836246"}, {"id": 2, "order_uuid": "C0504000000407836247"}],
+            trade_outcome_logs=[{"id": 3, "order_uuid": "C0504000000407836246"}, {"id": 4, "order_uuid": "C0504000000407836247"}],
+            valuation_prices={"KRW-XLM": 130},
+            period_start_utc="2026-06-25T00:00:00Z",
+            period_end_utc="2026-06-26T00:00:00Z",
+        )
+
+        self.assertEqual(report["pnl_source_of_truth"]["pnl_source_of_truth"], "EXCHANGE_FILLS_LEDGER")
+        self.assertEqual(report["ledger_pnl_detail"]["pnl_accounting_method"], "FIFO")
+        self.assertEqual(report["ledger_pnl_detail"]["gross_realized_pnl_before_fee"], 100)
+        self.assertEqual(report["ledger_pnl_detail"]["realized_fee_total"], 2)
+        self.assertEqual(report["ledger_pnl_detail"]["net_realized_pnl_after_fee"], 98)
+        self.assertEqual(report["ledger_pnl_detail"]["open_position_quantity"], 5)
+        self.assertEqual(report["ledger_symbol_pnl"][0]["symbol"], "XLM")
+        self.assertEqual(report["ledger_symbol_pnl"][0]["total_pnl"], 247.675)
+        self.assertEqual(report["ledger_strategy_pnl"][0]["strategy_name"], "smart_autonomous")
 
 
 if __name__ == "__main__":

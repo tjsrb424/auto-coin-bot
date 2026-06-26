@@ -152,6 +152,49 @@ class TradingDiagnosticsTests(unittest.TestCase):
         self.assertTrue(report["asset_reconciliation"]["gate_failed"])
         self.assertIn("EQUITY_RECONCILIATION_DIFF", {reason["code"] for reason in report["restart_gate"]["reasons"]})
 
+    def test_ledger_source_of_truth_and_accounting_partial_block_restart(self) -> None:
+        report = build_trading_diagnostics_report(
+            exchange="bithumb",
+            days=7,
+            starting_asset_krw=300_000,
+            asset_reconciliation={
+                "initial_equity": 300_000,
+                "current_equity_from_exchange": 300_000,
+                "current_cash_krw": 300_000,
+                "current_coin_market_value": 0,
+                "exchange_fill_accounting": {
+                    "pnl_source_of_truth": {
+                        "pnl_source_of_truth": "EXCHANGE_FILLS_LEDGER",
+                        "strategy_pnl": "bot_owned_exchange_fills_ledger",
+                        "symbol_pnl": "bot_owned_exchange_fills_ledger",
+                        "dashboard_pnl": "bot_owned_exchange_fills_ledger",
+                        "legacy_db_pnl": "legacy_debug_only",
+                    },
+                    "ledger_pnl_detail": {"net_realized_pnl_after_fee": -10, "total_pnl_after_estimated_exit_fee": -10},
+                    "ledger_strategy_pnl": [{"strategy_name": "rsi", "total_pnl": -10, "fill_count": 1}],
+                    "ledger_symbol_pnl": [{"symbol": "XLM", "total_pnl": -10, "fill_count": 1}],
+                    "ledger_session_pnl": [{"session_id": "1", "total_pnl": -10, "fill_count": 1}],
+                    "accounting_status_summary": {"ACCOUNTING_PARTIAL": {"count": 1, "value": 1000}},
+                    "missing_fill_breakdown": {},
+                    "accounting_pending_count": 0,
+                    "accounting_partial_count": 1,
+                    "accounting_failed_count": 0,
+                    "accounting_synced_count": 0,
+                    "accounting_legacy_missing_canonical_log_count": 0,
+                },
+            },
+        )
+
+        asset = report["asset_reconciliation"]
+        self.assertEqual(report["pnl_source_of_truth"]["pnl_source_of_truth"], "EXCHANGE_FILLS_LEDGER")
+        self.assertTrue(report["legacy_db_pnl_is_debug_only"])
+        self.assertTrue(report["exchange_ledger_pnl_enabled"])
+        self.assertEqual(report["dashboard_pnl_source"], "bot_owned_exchange_fills_ledger")
+        self.assertEqual(report["ledger_strategy_pnl"][0]["strategy_name"], "rsi")
+        self.assertEqual(asset["ledger_symbol_pnl"][0]["symbol"], "XLM")
+        self.assertIn("ACCOUNTING_PARTIAL_FILL", {reason["code"] for reason in report["restart_gate"]["reasons"]})
+        self.assertFalse(report["restart_gate"]["allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()

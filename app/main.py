@@ -2082,7 +2082,7 @@ async def _asset_reconciliation_from_exchange(
         db_orders=db_orders,
         persist=persist_exchange_ledger,
     )
-    ledger_pnl = compute_realized_pnl_from_ledger(ledger_rows)
+    ledger_pnl = compute_realized_pnl_from_ledger(ledger_rows, valuation_prices=valuation_prices)
     accounting_report = build_exchange_fill_accounting_report(
         ledger_rows=ledger_rows,
         canonical_db_orders=db_orders,
@@ -2090,6 +2090,7 @@ async def _asset_reconciliation_from_exchange(
         sessions=sessions,
         position_fill_events=position_fill_events,
         trade_outcome_logs=trade_outcomes,
+        valuation_prices=valuation_prices,
         period_start_utc=period_start_utc,
         period_end_utc=period_end_utc,
     )
@@ -2416,13 +2417,32 @@ async def trading_reconciliation(
         "deposit_withdrawal_mismatch_is_verified": asset.get("deposit_withdrawal_mismatch_is_verified"),
         "deposit_withdrawal_mismatch_note": asset.get("deposit_withdrawal_mismatch_note"),
         "pnl_source_of_truth": asset.get("pnl_source_of_truth"),
+        "legacy_db_pnl_is_debug_only": asset.get("legacy_db_pnl_is_debug_only"),
+        "exchange_ledger_pnl_enabled": asset.get("exchange_ledger_pnl_enabled"),
+        "strategy_pnl_source": asset.get("strategy_pnl_source"),
+        "symbol_pnl_source": asset.get("symbol_pnl_source"),
+        "dashboard_pnl_source": asset.get("dashboard_pnl_source"),
         "legacy_db_pnl": asset.get("legacy_db_pnl"),
         "exchange_ledger_pnl": asset.get("exchange_ledger_pnl"),
+        "ledger_pnl_detail": asset.get("ledger_pnl_detail"),
+        "ledger_strategy_pnl": asset.get("ledger_strategy_pnl"),
+        "ledger_symbol_pnl": asset.get("ledger_symbol_pnl"),
+        "ledger_session_pnl": asset.get("ledger_session_pnl"),
+        "legacy_strategy_pnl": asset.get("legacy_strategy_pnl"),
+        "legacy_symbol_pnl": asset.get("legacy_symbol_pnl"),
+        "strategy_pnl_diff": asset.get("strategy_pnl_diff"),
+        "symbol_pnl_diff": asset.get("symbol_pnl_diff"),
         "exchange_fill_ownership_summary": asset.get("exchange_fill_ownership_summary"),
         "exchange_fill_accounting_status_summary": asset.get("exchange_fill_accounting_status_summary"),
         "exchange_fill_missing_breakdown": asset.get("exchange_fill_missing_breakdown"),
+        "missing_fill_trace_summary": asset.get("missing_fill_trace_summary"),
+        "missing_fill_trace": asset.get("missing_fill_trace"),
         "accounting_pending_count": asset.get("accounting_pending_count"),
         "accounting_pending_value": asset.get("accounting_pending_value"),
+        "accounting_partial_count": asset.get("accounting_partial_count"),
+        "accounting_failed_count": asset.get("accounting_failed_count"),
+        "accounting_synced_count": asset.get("accounting_synced_count"),
+        "accounting_legacy_missing_canonical_log_count": asset.get("accounting_legacy_missing_canonical_log_count"),
         "fills_match_summary": {
             "ledger": ledger_summary,
             "exchange_fill_match": {
@@ -2436,6 +2456,9 @@ async def trading_reconciliation(
         "position_valuation_summary": position_summary,
         "exchange_ledger_status": asset.get("exchange_ledger_status"),
         "exchange_ledger_errors": asset.get("exchange_ledger_errors", []),
+        "manual_initial_snapshot_required": asset.get("manual_initial_snapshot_required"),
+        "initial_equity_snapshot_source": asset.get("initial_equity_snapshot_source"),
+        "initial_equity_snapshot_trust_level": asset.get("initial_equity_snapshot_trust_level"),
     }
 
 

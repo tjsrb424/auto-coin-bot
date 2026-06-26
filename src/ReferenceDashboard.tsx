@@ -712,7 +712,52 @@ type TradingDiagnostics = {
     equity_diff?: number | null;
     equity_diff_rate?: number | null;
     gate_failed?: boolean;
+    pnl_source_of_truth?: Record<string, any>;
+    legacy_db_pnl_is_debug_only?: boolean;
+    exchange_ledger_pnl_enabled?: boolean;
+    dashboard_pnl_source?: string;
+    exchange_ledger_pnl?: {
+      all_fills?: number | null;
+      bot_owned?: number | null;
+      manual_or_external?: number | null;
+      out_of_scope?: number | null;
+    };
+    ledger_pnl_detail?: {
+      net_realized_pnl_after_fee?: number;
+      unrealized_pnl_after_estimated_exit_fee?: number;
+      total_pnl_after_estimated_exit_fee?: number;
+      realized_fee_total?: number;
+      open_position_quantity?: number;
+    };
+    legacy_db_pnl?: {
+      net_realized_pnl_after_fee?: number;
+      unrealized_pnl_from_positions?: number;
+      display_role?: string;
+    };
+    ledger_strategy_pnl?: Array<Record<string, any>>;
+    ledger_symbol_pnl?: Array<Record<string, any>>;
+    strategy_pnl_diff?: Array<Record<string, any>>;
+    symbol_pnl_diff?: Array<Record<string, any>>;
+    missing_fill_trace_summary?: { count?: number; estimated_pnl_impact?: number; reason_counts?: Record<string, number> };
+    accounting_pending_count?: number;
+    accounting_partial_count?: number;
+    accounting_failed_count?: number;
+    accounting_legacy_missing_canonical_log_count?: number;
+    bot_owned_realized_pnl_diff?: number | null;
   };
+  pnl_source_of_truth?: Record<string, any>;
+  legacy_db_pnl_is_debug_only?: boolean;
+  exchange_ledger_pnl_enabled?: boolean;
+  strategy_pnl_source?: string;
+  symbol_pnl_source?: string;
+  dashboard_pnl_source?: string;
+  ledger_strategy_pnl?: Array<Record<string, any>>;
+  ledger_symbol_pnl?: Array<Record<string, any>>;
+  ledger_session_pnl?: Array<Record<string, any>>;
+  legacy_strategy_pnl?: Array<Record<string, any>>;
+  legacy_symbol_pnl?: Array<Record<string, any>>;
+  strategy_pnl_diff?: Array<Record<string, any>>;
+  symbol_pnl_diff?: Array<Record<string, any>>;
   restart_gate?: {
     allowed?: boolean;
     mode?: string;
@@ -3956,14 +4001,30 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const safety = diagnostics?.safety_limits;
   const gate = diagnostics?.restart_gate;
   const assetRecon = diagnostics?.asset_reconciliation;
-  const worstStrategy = diagnostics?.strategy_pnl?.[0];
-  const worstSymbol = diagnostics?.symbol_pnl?.[0];
+  const ledgerPnl = assetRecon?.ledger_pnl_detail;
+  const ledgerTotalPnl = ledgerPnl?.total_pnl_after_estimated_exit_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
+  const ledgerRealizedPnl = ledgerPnl?.net_realized_pnl_after_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
+  const ledgerUnrealizedPnl = ledgerPnl?.unrealized_pnl_after_estimated_exit_fee;
+  const worstStrategy: any = diagnostics?.ledger_strategy_pnl?.[0] ?? assetRecon?.ledger_strategy_pnl?.[0] ?? diagnostics?.strategy_pnl?.[0];
+  const worstSymbol: any = diagnostics?.ledger_symbol_pnl?.[0] ?? assetRecon?.ledger_symbol_pnl?.[0] ?? diagnostics?.symbol_pnl?.[0];
+  const legacyDiff: any = assetRecon?.strategy_pnl_diff?.[0] ?? diagnostics?.strategy_pnl_diff?.[0];
+  const accountingMissing =
+    (assetRecon?.accounting_pending_count ?? 0)
+    + (assetRecon?.accounting_partial_count ?? 0)
+    + (assetRecon?.accounting_failed_count ?? 0)
+    + (assetRecon?.accounting_legacy_missing_canonical_log_count ?? 0);
   const diagnosticCards = [
     {
-      label: "Today PnL",
-      value: formatSignedKrw(summary?.total_pnl_krw ?? data.risk?.risk_state?.daily_total_pnl),
-      detail: `7D ${formatRatioPercent(summary?.cumulative_return_pct, 2)} · ${summary?.trade_count ?? 0} trades`,
-      tone: (summary?.total_pnl_krw ?? 0) < 0 ? "red" : "green"
+      label: "Exchange Equity",
+      value: formatKrw(assetRecon?.current_equity_from_exchange ?? summary?.current_asset_krw),
+      detail: `diff ${formatSignedKrw(assetRecon?.equity_diff)} · restart ${gate?.allowed ? "OK" : "BLOCKED"}`,
+      tone: gate?.allowed === false || assetRecon?.gate_failed ? "red" : "green"
+    },
+    {
+      label: "Ledger PnL",
+      value: formatSignedKrw(ledgerTotalPnl ?? summary?.total_pnl_krw ?? data.risk?.risk_state?.daily_total_pnl),
+      detail: `real ${formatSignedKrw(ledgerRealizedPnl)} · unrl ${formatSignedKrw(ledgerUnrealizedPnl)}`,
+      tone: (ledgerTotalPnl ?? summary?.total_pnl_krw ?? 0) < 0 ? "red" : "green"
     },
     {
       label: "Loss Limit",
@@ -3978,22 +4039,22 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: gate?.allowed === false ? "red" : "cyan"
     },
     {
-      label: "Strategy PnL",
-      value: formatSignedKrw(worstStrategy?.net_pnl),
-      detail: `${worstStrategy?.strategy_name ?? "-"} · win ${formatRatioPercent((worstStrategy?.win_rate ?? 0) * 100, 1)}`,
-      tone: (worstStrategy?.net_pnl ?? 0) < 0 ? "red" : "green"
+      label: "Ledger Strategy",
+      value: formatSignedKrw(worstStrategy?.total_pnl ?? worstStrategy?.net_pnl),
+      detail: `${worstStrategy?.strategy_name ?? "-"} · fills ${worstStrategy?.fill_count ?? worstStrategy?.trade_count ?? 0}`,
+      tone: (worstStrategy?.total_pnl ?? worstStrategy?.net_pnl ?? 0) < 0 ? "red" : "green"
     },
     {
-      label: "Symbol PnL",
-      value: formatSignedKrw(worstSymbol?.net_pnl),
+      label: "Ledger Symbol",
+      value: formatSignedKrw(worstSymbol?.total_pnl ?? worstSymbol?.net_pnl),
       detail: `${worstSymbol?.symbol ?? "-"} · fee ${formatKrw(worstSymbol?.fee_total)}`,
-      tone: (worstSymbol?.net_pnl ?? 0) < 0 ? "red" : "green"
+      tone: (worstSymbol?.total_pnl ?? worstSymbol?.net_pnl ?? 0) < 0 ? "red" : "green"
     },
     {
-      label: "Fees",
-      value: formatKrw(summary?.total_fee_krw),
-      detail: `buy ${formatKrw(summary?.total_buy_amount_krw)} · sell ${formatKrw(summary?.total_sell_amount_krw)}`,
-      tone: "cyan"
+      label: "Legacy Debug",
+      value: formatSignedKrw(legacyDiff?.diff ?? assetRecon?.bot_owned_realized_pnl_diff),
+      detail: `missing ${assetRecon?.missing_fill_trace_summary?.count ?? 0} · accounting ${accountingMissing}`,
+      tone: (assetRecon?.missing_fill_trace_summary?.count ?? 0) > 0 || accountingMissing > 0 ? "red" : "cyan"
     }
   ];
 
@@ -4012,6 +4073,11 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
             <p title={card.detail}>{card.detail}</p>
           </RefPanel>
         ))}
+      </div>
+      <div className="ref-diagnostics-ledger-note">
+        <p>현재 손익 기준은 exchange_fills_ledger입니다.</p>
+        <p>Legacy DB PnL은 과거 누락 fill 때문에 debug 참고용입니다.</p>
+        <p>Accounting pending 또는 missing fill이 존재하면 실거래 재가동이 차단됩니다.</p>
       </div>
     </section>
   );
