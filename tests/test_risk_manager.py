@@ -139,6 +139,99 @@ class RiskManagerTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["block_code"], "BLOCKED_CONSECUTIVE_LOSS_LIMIT")
 
+    def test_requested_max_open_positions_guard_blocks_entry(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "OPEN",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.001,
+                "entry_amount_krw": 100_000,
+                "current_price": 100_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": 0,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+            }
+        )
+        env = {
+            "MAX_OPEN_POSITIONS": "1",
+            "RISK_BLOCK_ON_OPEN_POSITION": "false",
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+            "RISK_MAX_DAILY_LOSS_KRW": "999999",
+            "RISK_MAX_DAILY_LOSS_PERCENT": "99",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["block_code"], "BLOCKED_MAX_OPEN_POSITIONS")
+
+    def test_requested_symbol_allocation_guard_blocks_entry(self) -> None:
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 10_000,
+                "max_orders_per_day": 1,
+            }
+        )
+        database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 1,
+                "strategy_name": "ma_cross",
+                "status": "OPEN",
+                "entry_price": 100_000_000,
+                "entry_volume": 0.00025,
+                "entry_amount_krw": 25_000,
+                "current_price": 100_000_000,
+                "unrealized_pnl": 0,
+                "realized_pnl": 0,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+            }
+        )
+        env = {
+            "MAX_SYMBOL_ALLOCATION_RATE": "0.1",
+            "MAX_OPEN_POSITIONS": "5",
+            "RISK_BLOCK_ON_OPEN_POSITION": "false",
+            "RISK_MIN_COOLDOWN_SECONDS": "0",
+            "RISK_MAX_DAILY_LOSS_KRW": "999999",
+            "RISK_MAX_DAILY_LOSS_PERCENT": "99",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = check_order_risk(order=order(), purpose="ENTRY", base_result={"allowed": True}, is_auto=True)
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["block_code"], "BLOCKED_MAX_SYMBOL_ALLOCATION")
+
     def test_small_loss_resets_consecutive_loss_count(self) -> None:
         base = datetime.now(timezone.utc).replace(microsecond=0)
         for index in range(4):

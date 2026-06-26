@@ -89,6 +89,7 @@ from app.smart_decision import record_shadow_decision
 from app.shadow_report import build_shadow_report
 from app.smart_promotion import evaluate_promotion, is_smart_live_mode, smart_engine_live_mode
 from app.strategies import apply_strategy
+from app.trading_diagnostics import restart_block_reason
 from app.upbit import fetch_minute_candles
 
 logger = logging.getLogger("uvicorn.error")
@@ -314,6 +315,16 @@ def start_live_strategy_pilot(*, candidate_strategy_id: int | None = None, confi
     policy = load_global_bot_operation_policy()
     if not policy.get("auto_trading_enabled"):
         return {"ok": False, "message": "bot_operation_policy.auto_trading_enabled is OFF.", **live_strategy_status()}
+    if runtime_setting_bool("LIVE_RESTART_REQUIRES_DIAGNOSTIC_CLEAR", True):
+        gate = restart_block_reason(config.allowed_exchange)
+        if not gate.get("allowed"):
+            return {
+                "ok": False,
+                "message": "Live restart is blocked until trading diagnostics are clear.",
+                "block_code": gate.get("block_code"),
+                "diagnostic_reasons": gate.get("reasons", []),
+                **live_strategy_status(),
+            }
     session_id = create_live_strategy_session(
         {
             "exchange": config.allowed_exchange,

@@ -152,6 +152,7 @@ from app.shadow_report import build_shadow_report
 from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
 from app.scale_in_repair import repair_scale_in_duplicate
+from app.trading_diagnostics import build_trading_diagnostics_report
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
     AUTO_STRATEGY_CONFIRMATION,
@@ -1928,6 +1929,15 @@ async def repair_scale_in_duplicate_endpoint(
 @app.get("/api/risk/status")
 def risk_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     return get_risk_dashboard(exchange, DEFAULT_MARKET)
+
+
+@app.get("/api/trading-diagnostics")
+def trading_diagnostics(
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    days: int = Query(7, ge=1, le=30),
+    starting_asset_krw: float | None = Query(None, gt=0),
+) -> dict:
+    return build_trading_diagnostics_report(exchange=exchange, days=days, starting_asset_krw=starting_asset_krw)
 
 
 @app.get("/api/risk/policy-blocks/latest")

@@ -14,6 +14,7 @@ from app.database import (
     load_global_bot_operation_policy,
     load_latest_risk_state,
     load_open_live_positions,
+    load_open_live_positions_for_exchange,
     load_reconcilable_live_order_logs,
     load_risk_logs,
     market_is_live_allowed,
@@ -38,9 +39,12 @@ class RiskConfig:
     max_orders_per_day: int
     max_entry_orders_per_day: int
     max_exit_orders_per_day: int
+    max_open_positions: int
     max_consecutive_losses: int
+    stop_after_consecutive_losses: int
     consecutive_loss_min_krw: float
     min_cooldown_seconds: int
+    loss_cooldown_seconds: int
     block_on_balance_mismatch: bool
     block_on_partial_fill: bool
     block_on_open_order: bool
@@ -57,21 +61,29 @@ class RiskConfig:
 
     @classmethod
     def from_env(cls) -> "RiskConfig":
+        max_daily_loss_rate = _loss_rate_env("DAILY_MAX_LOSS_RATE", os.getenv("RISK_MAX_DAILY_LOSS_PERCENT", "20"))
+        max_orders = runtime_setting_int("RISK_MAX_ORDERS_PER_DAY", 3)
+        max_trade_count = int(_float(os.getenv("MAX_TRADE_COUNT_PER_DAY"), max_orders))
+        max_consecutive = int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "4"))
+        stop_after_losses = int(_float(os.getenv("STOP_AFTER_CONSECUTIVE_LOSSES"), max_consecutive))
         return cls(
-            max_daily_loss_percent=float(os.getenv("RISK_MAX_DAILY_LOSS_PERCENT", "20")),
-            max_daily_loss_krw=float(os.getenv("RISK_MAX_DAILY_LOSS_KRW", "10000")),
+            max_daily_loss_percent=max_daily_loss_rate * 100,
+            max_daily_loss_krw=float(os.getenv("DAILY_MAX_LOSS_KRW", os.getenv("RISK_MAX_DAILY_LOSS_KRW", "10000"))),
             account_equity_krw=float(os.getenv("RISK_ACCOUNT_EQUITY_KRW", "300000")),
-            max_orders_per_day=runtime_setting_int("RISK_MAX_ORDERS_PER_DAY", 3),
+            max_orders_per_day=max_trade_count,
             max_entry_orders_per_day=runtime_setting_int("RISK_MAX_ENTRY_ORDERS_PER_DAY", 2),
             max_exit_orders_per_day=runtime_setting_int("RISK_MAX_EXIT_ORDERS_PER_DAY", 3),
-            max_consecutive_losses=int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "4")),
+            max_open_positions=int(_float(os.getenv("MAX_OPEN_POSITIONS"), _float(os.getenv("AUTO_MAX_OPEN_POSITION_COUNT"), 5))),
+            max_consecutive_losses=max_consecutive,
+            stop_after_consecutive_losses=stop_after_losses,
             consecutive_loss_min_krw=float(os.getenv("RISK_CONSECUTIVE_LOSS_MIN_KRW", "500")),
             min_cooldown_seconds=runtime_setting_int("RISK_MIN_COOLDOWN_SECONDS", 1800),
+            loss_cooldown_seconds=max(int(_float(os.getenv("COOLDOWN_AFTER_LOSS_MINUTES"), 0) * 60), 0),
             block_on_balance_mismatch=runtime_setting_bool("RISK_BLOCK_ON_BALANCE_MISMATCH", True),
             block_on_partial_fill=runtime_setting_bool("RISK_BLOCK_ON_PARTIAL_FILL", True),
             block_on_open_order=runtime_setting_bool("RISK_BLOCK_ON_OPEN_ORDER", True),
             block_on_open_position=os.getenv("RISK_BLOCK_ON_OPEN_POSITION", "true").lower() == "true",
-            max_position_ratio_percent=runtime_setting_float("RISK_MAX_POSITION_RATIO_PERCENT", 20.0),
+            max_position_ratio_percent=_symbol_allocation_percent(),
             max_order_krw=runtime_setting_float("RISK_MAX_ORDER_KRW", 30000.0),
             volatility_window=int(os.getenv("RISK_VOLATILITY_WINDOW", "5")),
             volatility_block_percent=float(os.getenv("RISK_VOLATILITY_BLOCK_PERCENT", "2")),
@@ -441,6 +453,39 @@ def check_order_risk(
     elif purpose == "ENTRY":
         ok("position_check", {"scale_in": scale_in_order, "same_strategy_position_open": same_strategy_position_open})
 
+    if purpose == "ENTRY" and side in {"BUY", "BID"}:
+        exchange_open_positions = load_open_live_positions_for_exchange(exchange)
+        if config.max_open_positions > 0 and len(exchange_open_positions) >= config.max_open_positions and not scale_in_order:
+            block(
+                "BLOCKED_MAX_OPEN_POSITIONS",
+                check_name="max_open_positions_check",
+                detail={"open_position_count": len(exchange_open_positions), "max_open_positions": config.max_open_positions},
+            )
+        else:
+            ok("max_open_positions_check", {"open_position_count": len(exchange_open_positions), "max_open_positions": config.max_open_positions})
+        symbol_cap_krw = policy_limit * (config.max_position_ratio_percent / 100.0) if policy_limit > 0 else 0.0
+        projected_symbol_value = _current_bot_position_value_krw(exchange, market, market_snapshot) + amount
+        if symbol_cap_krw > 0 and projected_symbol_value > symbol_cap_krw and not profit_engine_entry:
+            block(
+                "BLOCKED_MAX_SYMBOL_ALLOCATION",
+                check_name="symbol_allocation_check",
+                detail={
+                    "market": market,
+                    "projected_symbol_value_krw": projected_symbol_value,
+                    "max_symbol_allocation_krw": symbol_cap_krw,
+                    "max_symbol_allocation_rate": config.max_position_ratio_percent / 100.0,
+                },
+            )
+        else:
+            ok(
+                "symbol_allocation_check",
+                {
+                    "market": market,
+                    "projected_symbol_value_krw": projected_symbol_value,
+                    "max_symbol_allocation_krw": symbol_cap_krw,
+                },
+            )
+
     if config.block_on_open_order and state["open_order_count"] > 0:
         block("BLOCKED_OPEN_ORDER_EXISTS", check_name="open_order_check")
     else:
@@ -470,7 +515,11 @@ def check_order_risk(
     else:
         ok("daily_limit_check")
 
-    if purpose == "ENTRY" and state["consecutive_loss_count"] >= config.max_consecutive_losses:
+    if (
+        purpose == "ENTRY"
+        and config.stop_after_consecutive_losses > 0
+        and state["consecutive_loss_count"] >= config.stop_after_consecutive_losses
+    ):
         block("BLOCKED_CONSECUTIVE_LOSS_LIMIT", check_name="loss_streak_check")
     else:
         ok("loss_streak_check")
@@ -481,6 +530,13 @@ def check_order_risk(
     else:
         ok("cooldown_check")
     result["cooldown_remaining_seconds"] = cooldown_remaining
+
+    loss_cooldown_remaining = cooldown_remaining_seconds(state.get("last_loss_time_utc"), config.loss_cooldown_seconds)
+    if purpose == "ENTRY" and loss_cooldown_remaining > 0:
+        block("BLOCKED_COOLDOWN_AFTER_LOSS", f"{loss_cooldown_remaining}s loss cooldown remaining.", "loss_cooldown_check")
+    else:
+        ok("loss_cooldown_check")
+    result["loss_cooldown_remaining_seconds"] = loss_cooldown_remaining
 
     duplicate = duplicate_order_exists(
         exchange=exchange,
@@ -669,6 +725,17 @@ def _daily_loss_basis_krw(account_equity_krw: float | None, config: RiskConfig) 
     if equity <= 0:
         equity = config.account_equity_krw
     return max(equity, 1.0)
+
+
+def _loss_rate_env(key: str, fallback: str | None) -> float:
+    raw = _float(os.getenv(key), _float(fallback, 20.0))
+    return raw / 100.0 if raw > 1 else raw
+
+
+def _symbol_allocation_percent() -> float:
+    if os.getenv("MAX_SYMBOL_ALLOCATION_RATE") is not None:
+        return _float(os.getenv("MAX_SYMBOL_ALLOCATION_RATE"), 0.2) * 100.0
+    return runtime_setting_float("RISK_MAX_POSITION_RATIO_PERCENT", 20.0)
 
 
 def _balance_total(balances: dict | None, currency: str) -> float:

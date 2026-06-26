@@ -642,6 +642,57 @@ type HealthStatus = {
   latest_order_sync_time?: string | null;
 };
 
+type TradingDiagnostics = {
+  generated_at_utc?: string;
+  summary?: {
+    starting_asset_krw?: number;
+    current_asset_krw?: number;
+    total_pnl_krw?: number;
+    cumulative_return_pct?: number;
+    trade_count?: number;
+    total_buy_amount_krw?: number;
+    total_sell_amount_krw?: number;
+    total_fee_krw?: number;
+    realized_pnl_krw?: number;
+    unrealized_pnl_krw?: number;
+  };
+  symbol_pnl?: Array<{
+    symbol?: string;
+    trade_count?: number;
+    buy_count?: number;
+    sell_count?: number;
+    gross_pnl?: number;
+    fee_total?: number;
+    net_pnl?: number;
+    win_rate?: number;
+    avg_win?: number;
+    avg_loss?: number;
+    max_loss_trade?: number;
+  }>;
+  strategy_pnl?: Array<{
+    strategy_name?: string;
+    trade_count?: number;
+    gross_pnl?: number;
+    fee_total?: number;
+    net_pnl?: number;
+    win_rate?: number;
+    avg_holding_minutes?: number;
+  }>;
+  risk_diagnostics?: Record<string, any>;
+  safety_limits?: {
+    daily_max_loss_krw?: number;
+    daily_max_loss_rate?: number;
+    daily_loss_limit_reached?: boolean;
+    max_trade_count_per_day?: number;
+  };
+  restart_gate?: {
+    allowed?: boolean;
+    mode?: string;
+    stop_reason?: string | null;
+    reasons?: Array<{ code?: string; count?: number }>;
+  };
+};
+
 type DashboardData = {
   candles: Candle[];
   chartUnit: number;
@@ -677,6 +728,7 @@ type DashboardData = {
   botPolicy: BotPolicy | null;
   aggressionPresets: AggressionPresetStatus | null;
   health: HealthStatus | null;
+  diagnostics: TradingDiagnostics | null;
   recoveryEvents: RecoveryEvent[];
   errors: string[];
   updatedAt: string | null;
@@ -783,6 +835,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     botPolicy: null,
     aggressionPresets: null,
     health: null,
+    diagnostics: null,
     recoveryEvents: [],
     errors: [],
     updatedAt: null
@@ -799,7 +852,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         }
       };
 
-      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, profitEngineStatusResult, botPolicyResult, aggressionPresetResult, health] = await Promise.all([
+      const [candlesResult, status, ordersResult, paper, forward, candidatesResult, autoPilot, liveStrategy, runtimeStatus, analysisLatestResult, analysisHistoryResult, shadowReportResult, smartEngineStatusResult, profitEngineStatusResult, botPolicyResult, aggressionPresetResult, health, diagnostics] = await Promise.all([
         settle("캔들", fetchJson<{ candles?: Candle[]; unit?: number }>(`/api/candles?market=${MARKET}&unit=${chartUnit}&count=120`)),
         settle("실거래 상태", fetchJson<LiveStatus>(`/api/live/status?exchange=${selectedExchange}`)),
         settle("주문", fetchJson<{ orders?: LiveOrder[]; recovery_events?: RecoveryEvent[] }>("/api/live-orders")),
@@ -816,7 +869,8 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         settle("Profit Engine", fetchJson<ProfitEngineStatus>(`/api/profit-engine/status?market=${MARKET}&exchange=${selectedExchange}`)),
         settle("운용정책", fetchJson<{ policy?: BotPolicy }>(`/api/bot/policy?market=${MARKET}&exchange=${selectedExchange}`)),
         settle("공격성 프리셋", fetchJson<AggressionPresetStatus>(`/api/aggression-presets?market=${MARKET}`)),
-        settle("Health", fetchJson<HealthStatus>("/health"))
+        settle("Health", fetchJson<HealthStatus>("/health")),
+        settle("Trading diagnostics", fetchJson<TradingDiagnostics>(`/api/trading-diagnostics?exchange=${selectedExchange}&days=7&starting_asset_krw=300000`))
       ]);
 
       const exchange = (status?.exchange === "upbit" || status?.exchange === "bithumb") ? status.exchange : selectedExchange;
@@ -846,6 +900,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
         botPolicy: botPolicyResult?.policy ?? null,
         aggressionPresets: aggressionPresetResult,
         health,
+        diagnostics,
         recoveryEvents: ordersResult?.recovery_events ?? [],
         errors,
         updatedAt: new Date().toISOString()
@@ -3868,6 +3923,50 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: readinessTone
     }
   ];
+  const diagnostics = data.diagnostics;
+  const summary = diagnostics?.summary;
+  const safety = diagnostics?.safety_limits;
+  const gate = diagnostics?.restart_gate;
+  const worstStrategy = diagnostics?.strategy_pnl?.[0];
+  const worstSymbol = diagnostics?.symbol_pnl?.[0];
+  const diagnosticCards = [
+    {
+      label: "Today PnL",
+      value: formatSignedKrw(summary?.total_pnl_krw ?? data.risk?.risk_state?.daily_total_pnl),
+      detail: `7D ${formatRatioPercent(summary?.cumulative_return_pct, 2)} · ${summary?.trade_count ?? 0} trades`,
+      tone: (summary?.total_pnl_krw ?? 0) < 0 ? "red" : "green"
+    },
+    {
+      label: "Loss Limit",
+      value: formatKrw(safety?.daily_max_loss_krw ?? policy?.daily_loss_limit_krw),
+      detail: `hit ${safety?.daily_loss_limit_reached ? "YES" : "NO"} · restart ${gate?.allowed ? "OK" : "BLOCKED"}`,
+      tone: safety?.daily_loss_limit_reached || gate?.allowed === false ? "red" : "amber"
+    },
+    {
+      label: "Stop Reason",
+      value: gate?.stop_reason ?? data.liveStrategy?.session?.last_risk_result ?? "-",
+      detail: (gate?.reasons ?? []).slice(0, 2).map((item) => `${item.code}:${item.count ?? 1}`).join(" · ") || "diagnostic clear",
+      tone: gate?.allowed === false ? "red" : "cyan"
+    },
+    {
+      label: "Strategy PnL",
+      value: formatSignedKrw(worstStrategy?.net_pnl),
+      detail: `${worstStrategy?.strategy_name ?? "-"} · win ${formatRatioPercent((worstStrategy?.win_rate ?? 0) * 100, 1)}`,
+      tone: (worstStrategy?.net_pnl ?? 0) < 0 ? "red" : "green"
+    },
+    {
+      label: "Symbol PnL",
+      value: formatSignedKrw(worstSymbol?.net_pnl),
+      detail: `${worstSymbol?.symbol ?? "-"} · fee ${formatKrw(worstSymbol?.fee_total)}`,
+      tone: (worstSymbol?.net_pnl ?? 0) < 0 ? "red" : "green"
+    },
+    {
+      label: "Fees",
+      value: formatKrw(summary?.total_fee_krw),
+      detail: `buy ${formatKrw(summary?.total_buy_amount_krw)} · sell ${formatKrw(summary?.total_sell_amount_krw)}`,
+      tone: "cyan"
+    }
+  ];
 
   return (
     <section className="ref-auto-ops-section">
@@ -3877,7 +3976,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
         <button>운용설정 보기 <ChevronRight size={16} /></button>
       </div>
       <div className="ref-auto-ops-grid">
-        {cards.map((card) => (
+        {diagnosticCards.map((card) => (
           <RefPanel key={card.label} className={`ref-auto-ops-card ${card.tone}`}>
             <span>{card.label}</span>
             <strong title={card.value}>{card.value}</strong>
