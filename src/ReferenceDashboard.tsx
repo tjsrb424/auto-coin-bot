@@ -781,6 +781,15 @@ type TradingDiagnostics = {
     stop_reason?: string | null;
     reasons?: Array<{ code?: string; count?: number }>;
   };
+  legacy_history?: Record<string, any>;
+  current_epoch?: Record<string, any>;
+  smoke_test_preflight?: Record<string, any>;
+  limited_auto_live_gate?: Record<string, any>;
+  full_auto_live_allowed?: boolean;
+  legacy_blockers?: Array<{ code?: string; count?: number }>;
+  current_epoch_blockers?: Array<{ code?: string; count?: number }>;
+  smoke_test_blockers?: Array<{ code?: string; count?: number }>;
+  normal_auto_blockers?: Array<{ code?: string; count?: number }>;
 };
 
 type DashboardData = {
@@ -4018,6 +4027,10 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const safety = diagnostics?.safety_limits;
   const gate = diagnostics?.restart_gate;
   const assetRecon = diagnostics?.asset_reconciliation;
+  const legacyHistory = diagnostics?.legacy_history;
+  const currentEpoch = diagnostics?.current_epoch;
+  const smokeTest = diagnostics?.smoke_test_preflight;
+  const limitedGate = diagnostics?.limited_auto_live_gate;
   const ledgerPnl = assetRecon?.ledger_pnl_detail;
   const ledgerTotalPnl = ledgerPnl?.total_pnl_after_estimated_exit_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
   const ledgerRealizedPnl = ledgerPnl?.net_realized_pnl_after_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
@@ -4074,6 +4087,36 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       value: formatSignedKrw(legacyDiff?.diff ?? assetRecon?.bot_owned_realized_pnl_diff),
       detail: `missing ${assetRecon?.missing_fill_trace_summary?.count ?? 0} · accounting ${accountingMissing}`,
       tone: (assetRecon?.missing_fill_trace_summary?.count ?? 0) > 0 || accountingMissing > 0 ? "red" : "cyan"
+    },
+    {
+      label: "Legacy History",
+      value: legacyHistory?.history_trust_level ?? "LOW",
+      detail: legacyHistory?.legacy_contaminated ? "debug only - live risk excluded" : "clean",
+      tone: legacyHistory?.history_trust_level === "LOW" ? "red" : "green"
+    },
+    {
+      label: "Current Epoch",
+      value: currentEpoch?.current_epoch_trust_level ?? "MISSING",
+      detail: `${currentEpoch?.current_epoch_id ?? "-"} - pnl ${formatSignedKrw(currentEpoch?.current_epoch_total_pnl)}`,
+      tone: currentEpoch?.current_epoch_restart_allowed ? "green" : "amber"
+    },
+    {
+      label: "Smoke Test",
+      value: smokeTest?.smoke_test_allowed ? "READY" : "BLOCKED",
+      detail: (smokeTest?.smoke_test_blockers ?? []).slice(0, 2).map((item: any) => item.code).join(" / ") || "one-shot only",
+      tone: smokeTest?.smoke_test_allowed ? "green" : "amber"
+    },
+    {
+      label: "Limited Auto",
+      value: limitedGate?.limited_auto_live_allowed ? "READY" : "LOCKED",
+      detail: (limitedGate?.limited_auto_live_blockers ?? []).slice(0, 2).map((item: any) => item.code).join(" / ") || "BTC/ETH only",
+      tone: limitedGate?.limited_auto_live_allowed ? "green" : "amber"
+    },
+    {
+      label: "Full Auto",
+      value: diagnostics?.full_auto_live_allowed ? "READY" : "OFF",
+      detail: "full auto remains disabled",
+      tone: diagnostics?.full_auto_live_allowed ? "green" : "red"
     }
   ];
 

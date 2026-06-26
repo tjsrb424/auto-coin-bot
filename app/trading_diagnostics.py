@@ -6,6 +6,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.database import get_connection, load_global_bot_operation_policy
+from app.accounting_epoch import (
+    build_current_epoch_diagnostics,
+    build_smoke_test_preflight,
+    legacy_history_quarantine,
+    limited_auto_live_gate,
+    split_restart_blockers,
+)
 from app.trading_reconciliation import build_equity_reconciliation
 
 OPEN_POSITION_STATUSES = ("OPEN", "EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED")
@@ -178,11 +185,25 @@ def build_trading_diagnostics_report(
         "symbol",
     )
     restart_gate = _restart_gate(risk_diagnostics, safety_limits, summary, asset_report)
+    legacy_history = legacy_history_quarantine(asset_report)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=exchange,
+        current_equity=asset_report.get("current_equity_from_exchange"),
+    )
+    smoke_preflight = build_smoke_test_preflight(exchange=exchange, current_epoch=current_epoch)
+    limited_gate = limited_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
+    blocker_split = split_restart_blockers(restart_gate.get("reasons", []), current_epoch, smoke_preflight)
     return {
         "generated_at_utc": _to_iso(now),
         "exchange": exchange,
         "summary": summary,
         "asset_reconciliation": asset_report,
+        "legacy_history": legacy_history,
+        "current_epoch": current_epoch,
+        "smoke_test_preflight": smoke_preflight,
+        "limited_auto_live_gate": limited_gate,
+        "full_auto_live_allowed": False,
+        **blocker_split,
         "pnl_source_of_truth": asset_report.get("pnl_source_of_truth"),
         "legacy_db_pnl_is_debug_only": asset_report.get("legacy_db_pnl_is_debug_only"),
         "exchange_ledger_pnl_enabled": asset_report.get("exchange_ledger_pnl_enabled"),

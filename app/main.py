@@ -47,6 +47,7 @@ from app.database import (
     insert_live_order_log,
     load_aggression_preset_logs,
     insert_smart_rehearsal_review,
+    create_accounting_epoch,
     insert_risk_log,
     insert_candles,
     load_live_eligible_candidate_strategies,
@@ -70,6 +71,7 @@ from app.database import (
     load_latest_forward_session,
     load_open_live_positions,
     load_runtime_lock,
+    load_current_accounting_epoch,
     load_strategy_kill_switch_events,
     load_trade_history_logs,
     load_latest_paper_session,
@@ -138,6 +140,7 @@ from app.live_recovery import (
     run_startup_live_recovery_async,
     sync_open_orders,
 )
+from app.accounting_epoch import build_current_epoch_diagnostics, build_smoke_test_preflight
 from app.live_state_reconciler import live_state_warnings, reconcile_live_state
 from app.live_exit import (
     approve_exit_candidate,
@@ -648,6 +651,19 @@ class RuntimeStartRequest(BaseModel):
     candidate_strategy_id: int | None = None
     confirmation: str = ""
     order_confirmation: str = ""
+
+
+class AccountingEpochCreateRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    confirmation: str = ""
+    cost_basis_policy: str = Field("MARK_TO_MARKET", pattern=r"^(MARK_TO_MARKET|UNKNOWN_LEGACY_COST)$")
+
+
+class SmokeTestPreflightRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbol: str = Field("BTC", pattern=r"^(BTC|ETH|WLD|XLM|RE|STRAX|ID)$")
+    strategy_name: str = "smoke_test"
+    amount_krw: float | None = Field(None, gt=0)
 
 
 class SmartRehearsalReviewRequest(BaseModel):
@@ -2495,6 +2511,132 @@ def risk_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dic
     return get_risk_dashboard(exchange, DEFAULT_MARKET)
 
 
+def _accounting_epoch_from_asset_snapshot(exchange: str, asset: dict, *, cost_basis_policy: str) -> dict:
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    positions = []
+    for coin in asset.get("coins", []) if isinstance(asset.get("coins"), list) else []:
+        quantity = float((coin or {}).get("quantity") or 0.0)
+        value = float((coin or {}).get("value_krw") or 0.0)
+        price = float((coin or {}).get("price") or 0.0)
+        if quantity <= 0:
+            continue
+        positions.append(
+            {
+                "symbol": str(coin.get("market") or "").split("-")[-1],
+                "market": coin.get("market"),
+                "opening_quantity": quantity,
+                "opening_cost_basis": value if cost_basis_policy == "MARK_TO_MARKET" else None,
+                "opening_avg_entry_price": price if cost_basis_policy == "MARK_TO_MARKET" else None,
+                "opening_position_value": value,
+                "available_quantity": coin.get("available_quantity"),
+                "locked_quantity": coin.get("locked_quantity"),
+            }
+        )
+    return {
+        "exchange_name": exchange,
+        "epoch_started_at_utc": now_utc,
+        "starting_exchange_equity": float(asset.get("current_equity_from_exchange") or 0.0),
+        "starting_cash_krw": float(asset.get("current_cash_krw") or 0.0),
+        "starting_positions": positions,
+        "starting_position_count": len(positions),
+        "starting_valuation_source": "bithumb_ticker",
+        "starting_valuation_snapshot_at_utc": now_utc,
+        "cost_basis_policy": cost_basis_policy,
+        "epoch_status": "ACTIVE",
+        "epoch_trust_level": "MEDIUM" if asset.get("balance_fetch_status") == "SUCCESS" else "LOW",
+        "legacy_history_isolated": True,
+    }
+
+
+@app.get("/api/accounting-epochs/current")
+async def current_accounting_epoch(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    asset = await _asset_reconciliation_from_exchange(exchange, None, days=1, persist_exchange_ledger=False)
+    return {
+        "epoch": load_current_accounting_epoch(exchange),
+        "current_epoch": build_current_epoch_diagnostics(
+            exchange=exchange,
+            current_equity=asset.get("current_equity_from_exchange"),
+        ),
+    }
+
+
+@app.post("/api/accounting-epochs/current")
+async def create_current_accounting_epoch(payload: AccountingEpochCreateRequest, request: Request) -> dict:
+    policy = load_global_bot_operation_policy()
+    runtime = load_runtime_lock(RUNTIME_LOCK_ID)
+    blockers = []
+    if policy.get("auto_trading_enabled"):
+        blockers.append({"code": "DB_AUTO_TRADING_MUST_REMAIN_FALSE", "count": 1})
+    if str((runtime or {}).get("status") or "").upper() != "STOPPED":
+        blockers.append({"code": "NORMAL_AUTO_RUNTIME_NOT_STOPPED", "count": 1})
+    if payload.confirmation != "CREATE ACCOUNTING EPOCH":
+        blockers.append({"code": "ACCOUNTING_EPOCH_CONFIRMATION_REQUIRED", "count": 1})
+    if blockers:
+        return {
+            "ok": False,
+            "message": "Accounting epoch creation is blocked.",
+            "blockers": blockers,
+            **_runtime_status_payload(request),
+        }
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    if asset.get("balance_fetch_status") != "SUCCESS":
+        return {"ok": False, "message": "Balance snapshot failed.", "asset_reconciliation": asset}
+    epoch = create_accounting_epoch(
+        _accounting_epoch_from_asset_snapshot(
+            payload.exchange,
+            asset,
+            cost_basis_policy=payload.cost_basis_policy,
+        )
+    )
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    return {"ok": True, "epoch": epoch, "current_epoch": current_epoch, "asset_snapshot": {
+        "current_equity_from_exchange": asset.get("current_equity_from_exchange"),
+        "current_cash_krw": asset.get("current_cash_krw"),
+        "current_coin_market_value": asset.get("current_coin_market_value"),
+        "coin_count": len(asset.get("coins", []) or []),
+    }}
+
+
+@app.get("/api/live-smoke-test/preflight")
+async def live_smoke_test_preflight(
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    symbol: str = Query("BTC", pattern=r"^(BTC|ETH|WLD|XLM|RE|STRAX|ID)$"),
+    strategy_name: str = Query("smoke_test"),
+    amount_krw: float | None = Query(None, gt=0),
+) -> dict:
+    asset = await _asset_reconciliation_from_exchange(exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    return build_smoke_test_preflight(
+        exchange=exchange,
+        symbol=symbol,
+        strategy_name=strategy_name,
+        amount_krw=amount_krw,
+        current_epoch=current_epoch,
+    )
+
+
+@app.post("/api/live-smoke-test/preflight")
+async def live_smoke_test_preflight_post(payload: SmokeTestPreflightRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    return build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol=payload.symbol,
+        strategy_name=payload.strategy_name,
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+    )
+
+
 @app.get("/api/trading-diagnostics")
 async def trading_diagnostics(
     exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
@@ -2537,6 +2679,16 @@ async def trading_reconciliation(
     return {
         "generated_at_utc": report.get("generated_at_utc"),
         "exchange": report.get("exchange"),
+        "legacy_history": report.get("legacy_history"),
+        "current_epoch": report.get("current_epoch"),
+        "smoke_test_preflight": report.get("smoke_test_preflight"),
+        "limited_auto_live_gate": report.get("limited_auto_live_gate"),
+        "legacy_blockers": report.get("legacy_blockers", []),
+        "current_epoch_blockers": report.get("current_epoch_blockers", []),
+        "smoke_test_blockers": report.get("smoke_test_blockers", []),
+        "normal_auto_blockers": report.get("normal_auto_blockers", []),
+        "limited_auto_live_allowed": (report.get("limited_auto_live_gate") or {}).get("limited_auto_live_allowed"),
+        "full_auto_live_allowed": report.get("full_auto_live_allowed", False),
         "current_equity_from_exchange": asset.get("current_equity_from_exchange"),
         "corrected_expected_equity": asset.get("expected_equity"),
         "corrected_equity_diff": asset.get("equity_diff"),

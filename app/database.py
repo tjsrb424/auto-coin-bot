@@ -45,6 +45,8 @@ REQUIRED_SCHEMA_TABLES = [
     "position_fill_events",
     "order_application_ledger",
     "exchange_fills_ledger",
+    "accounting_epochs",
+    "live_smoke_test_runs",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -937,6 +939,40 @@ def init_db() -> None:
                 updated_at_utc TEXT NOT NULL,
                 UNIQUE(exchange_name, fill_key),
                 FOREIGN KEY(matched_live_order_log_id) REFERENCES live_order_logs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS accounting_epochs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                epoch_id TEXT NOT NULL UNIQUE,
+                epoch_started_at_utc TEXT NOT NULL,
+                exchange_name TEXT NOT NULL DEFAULT 'bithumb',
+                starting_exchange_equity REAL NOT NULL DEFAULT 0,
+                starting_cash_krw REAL NOT NULL DEFAULT 0,
+                starting_positions_json TEXT NOT NULL DEFAULT '[]',
+                starting_position_count INTEGER NOT NULL DEFAULT 0,
+                starting_valuation_source TEXT NOT NULL DEFAULT '',
+                starting_valuation_snapshot_at_utc TEXT,
+                cost_basis_policy TEXT NOT NULL DEFAULT 'MARK_TO_MARKET',
+                epoch_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                epoch_trust_level TEXT NOT NULL DEFAULT 'MEDIUM',
+                legacy_history_isolated INTEGER NOT NULL DEFAULT 1,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS live_smoke_test_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                smoke_test_id TEXT NOT NULL UNIQUE,
+                exchange_name TEXT NOT NULL DEFAULT 'bithumb',
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PREFLIGHT_ONLY',
+                started_at_utc TEXT,
+                completed_at_utc TEXT,
+                max_notional_krw REAL NOT NULL DEFAULT 0,
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS runtime_locks (
@@ -5210,6 +5246,132 @@ def load_exchange_fills_ledger(exchange: str = "bithumb", *, since_utc: str | No
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def create_accounting_epoch(epoch: dict) -> dict:
+    now_utc = _utc_now()
+    exchange_name = str(epoch.get("exchange_name") or epoch.get("exchange") or "bithumb")
+    epoch_id = str(epoch.get("epoch_id") or f"epoch-{exchange_name}-{now_utc.replace(':', '').replace('-', '').replace('Z', '')}")
+    started_at = str(epoch.get("epoch_started_at_utc") or now_utc)
+    positions_json = json.dumps(epoch.get("starting_positions") or epoch.get("starting_positions_json") or [], ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE accounting_epochs
+            SET epoch_status = 'ARCHIVED', updated_at_utc = ?
+            WHERE exchange_name = ? AND epoch_status = 'ACTIVE'
+            """,
+            (now_utc, exchange_name),
+        )
+        conn.execute(
+            """
+            INSERT INTO accounting_epochs (
+                epoch_id, epoch_started_at_utc, exchange_name,
+                starting_exchange_equity, starting_cash_krw,
+                starting_positions_json, starting_position_count,
+                starting_valuation_source, starting_valuation_snapshot_at_utc,
+                cost_basis_policy, epoch_status, epoch_trust_level,
+                legacy_history_isolated, created_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                epoch_id,
+                started_at,
+                exchange_name,
+                float(epoch.get("starting_exchange_equity") or 0.0),
+                float(epoch.get("starting_cash_krw") or 0.0),
+                positions_json,
+                int(epoch.get("starting_position_count") or len(epoch.get("starting_positions") or [])),
+                str(epoch.get("starting_valuation_source") or "bithumb_ticker"),
+                epoch.get("starting_valuation_snapshot_at_utc") or started_at,
+                str(epoch.get("cost_basis_policy") or "MARK_TO_MARKET"),
+                str(epoch.get("epoch_status") or "ACTIVE"),
+                str(epoch.get("epoch_trust_level") or "MEDIUM"),
+                1 if epoch.get("legacy_history_isolated", True) else 0,
+                now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM accounting_epochs WHERE epoch_id = ?", (epoch_id,)).fetchone()
+    return _decode_accounting_epoch(dict(row)) if row else {}
+
+
+def load_current_accounting_epoch(exchange: str = "bithumb") -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM accounting_epochs
+            WHERE exchange_name = ? AND epoch_status = 'ACTIVE'
+            ORDER BY epoch_started_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange,),
+        ).fetchone()
+    return _decode_accounting_epoch(dict(row)) if row else None
+
+
+def load_latest_smoke_test_run(exchange: str = "bithumb") -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM live_smoke_test_runs
+            WHERE exchange_name = ?
+            ORDER BY created_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange,),
+        ).fetchone()
+    return _decode_smoke_test_run(dict(row)) if row else None
+
+
+def insert_smoke_test_run(run: dict) -> dict:
+    now_utc = _utc_now()
+    smoke_test_id = str(run.get("smoke_test_id") or f"smoke-{now_utc.replace(':', '').replace('-', '').replace('Z', '')}")
+    report_json = json.dumps(run.get("report") or run.get("report_json") or {}, ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO live_smoke_test_runs (
+                smoke_test_id, exchange_name, symbol, market, status,
+                started_at_utc, completed_at_utc, max_notional_krw,
+                report_json, created_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                smoke_test_id,
+                str(run.get("exchange_name") or run.get("exchange") or "bithumb"),
+                str(run.get("symbol") or "BTC"),
+                str(run.get("market") or "KRW-BTC"),
+                str(run.get("status") or "PREFLIGHT_ONLY"),
+                run.get("started_at_utc"),
+                run.get("completed_at_utc"),
+                float(run.get("max_notional_krw") or 0.0),
+                report_json,
+                now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute("SELECT * FROM live_smoke_test_runs WHERE smoke_test_id = ?", (smoke_test_id,)).fetchone()
+    return _decode_smoke_test_run(dict(row)) if row else {}
+
+
+def _decode_accounting_epoch(row: dict) -> dict:
+    row["legacy_history_isolated"] = bool(row.get("legacy_history_isolated"))
+    try:
+        row["starting_positions"] = json.loads(row.get("starting_positions_json") or "[]")
+    except json.JSONDecodeError:
+        row["starting_positions"] = []
+    return row
+
+
+def _decode_smoke_test_run(row: dict) -> dict:
+    try:
+        row["report"] = json.loads(row.get("report_json") or "{}")
+    except json.JSONDecodeError:
+        row["report"] = {}
+    return row
 
 
 def upsert_rebalance_delta_accumulator(
