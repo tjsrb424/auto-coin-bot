@@ -552,6 +552,40 @@ def _asset_reconciliation_report(
     equity_breakdown["legacy_position_accounting_effect"] = _float(bot_owned_diff)
     equity_breakdown["remaining_unexplained"] = _float(equity_breakdown.get("unexplained"))
     source = accounting.get("pnl_source_of_truth", {}) if isinstance(accounting.get("pnl_source_of_truth"), dict) else {}
+    ledger_strategy_pnl = accounting.get("ledger_strategy_pnl", []) if isinstance(accounting.get("ledger_strategy_pnl"), list) else []
+    ledger_symbol_pnl = accounting.get("ledger_symbol_pnl", []) if isinstance(accounting.get("ledger_symbol_pnl"), list) else []
+    ledger_session_pnl = accounting.get("ledger_session_pnl", []) if isinstance(accounting.get("ledger_session_pnl"), list) else []
+    total_pnl_sanity = _total_pnl_sanity_check(
+        initial_equity=initial_equity,
+        current_equity=current_equity,
+        deposits=deposits,
+        withdrawals=withdrawals,
+        ledger_detail=ledger_detail,
+    )
+    allocation = _pnl_allocation_check(
+        ledger_detail=ledger_detail,
+        strategy_rows=ledger_strategy_pnl,
+        symbol_rows=ledger_symbol_pnl,
+        session_rows=ledger_session_pnl,
+    )
+    opening_inventory = payload.get("opening_inventory_report") if isinstance(payload.get("opening_inventory_report"), dict) else _default_opening_inventory_report()
+    account_bridge = _account_equity_bridge(
+        initial_equity=initial_equity,
+        current_equity=current_equity,
+        current_cash=current_cash,
+        current_coin_value=current_coin_value,
+        deposits=deposits,
+        withdrawals=withdrawals,
+        ledger_detail=ledger_detail,
+        opening_inventory=opening_inventory,
+        deposit_withdrawal_status=str(payload.get("deposit_withdrawal_status", "UNAVAILABLE")),
+    )
+    pnl_trust_level = _pnl_trust_level(
+        total_pnl_sanity=total_pnl_sanity,
+        opening_inventory=opening_inventory,
+        deposit_withdrawal_status=str(payload.get("deposit_withdrawal_status", "UNAVAILABLE")),
+        allocation=allocation,
+    )
     return {
         "initial_equity": initial_equity,
         "current_equity_from_exchange": current_equity,
@@ -612,9 +646,16 @@ def _asset_reconciliation_report(
         "symbol_pnl_source": source.get("symbol_pnl", "bot_owned_exchange_fills_ledger"),
         "dashboard_pnl_source": source.get("dashboard_pnl", "bot_owned_exchange_fills_ledger"),
         "ledger_pnl_detail": ledger_detail,
-        "ledger_strategy_pnl": accounting.get("ledger_strategy_pnl", []),
-        "ledger_symbol_pnl": accounting.get("ledger_symbol_pnl", []),
-        "ledger_session_pnl": accounting.get("ledger_session_pnl", []),
+        "ledger_strategy_pnl": ledger_strategy_pnl,
+        "ledger_symbol_pnl": ledger_symbol_pnl,
+        "ledger_session_pnl": ledger_session_pnl,
+        "window_comparison_summary": payload.get("window_comparison_summary", {}),
+        "opening_inventory_report": opening_inventory,
+        "account_equity_bridge": account_bridge,
+        "total_pnl_sanity_check": total_pnl_sanity,
+        "pnl_allocation_check": allocation,
+        "unrealized_pnl_allocation_check": allocation.get("unrealized_pnl_allocation", {}),
+        "pnl_trust_level": pnl_trust_level,
         "legacy_db_pnl": {
             "net_realized_pnl_after_fee": realized_pnl_from_db,
             "unrealized_pnl_from_positions": unrealized_pnl_from_positions,
@@ -664,8 +705,150 @@ def _asset_reconciliation_report(
         "manual_initial_snapshot_required": asset_reconciliation_requested and payload.get("deposit_withdrawal_status", "UNAVAILABLE") != "AVAILABLE",
         "initial_equity_snapshot_source": "operator_query_parameter_or_policy_default",
         "initial_equity_snapshot_trust_level": "LOW" if asset_reconciliation_requested and payload.get("deposit_withdrawal_status", "UNAVAILABLE") != "AVAILABLE" else "HIGH",
-        "gate_failed": bool(reconciliation["gate_failed"]),
+        "gate_failed": bool(reconciliation["gate_failed"]) or not bool(total_pnl_sanity.get("total_pnl_sanity_passed", True)) or pnl_trust_level == "LOW",
     }
+
+
+def _total_pnl_sanity_check(
+    *,
+    initial_equity: float,
+    current_equity: Any,
+    deposits: float,
+    withdrawals: float,
+    ledger_detail: dict,
+) -> dict:
+    equity = _float(current_equity) if current_equity is not None else None
+    ledger_total = _float(ledger_detail.get("total_pnl_after_estimated_exit_fee"))
+    equity_based = None if equity is None else equity - initial_equity - deposits + withdrawals
+    diff = None if equity_based is None else ledger_total - equity_based
+    denominator = max(abs(initial_equity), 1.0)
+    diff_rate = None if diff is None else abs(diff) / denominator
+    passed = bool(diff is not None and (abs(diff) <= 100.0 or (diff_rate is not None and diff_rate <= 0.001)))
+    return {
+        "equity_based_total_pnl": equity_based,
+        "ledger_total_pnl": ledger_total,
+        "total_pnl_sanity_diff": diff,
+        "total_pnl_sanity_diff_rate": diff_rate,
+        "total_pnl_sanity_passed": passed,
+        "threshold_krw": 100.0,
+        "threshold_rate": 0.001,
+    }
+
+
+def _pnl_allocation_check(*, ledger_detail: dict, strategy_rows: list[dict], symbol_rows: list[dict], session_rows: list[dict]) -> dict:
+    account_total = _float(ledger_detail.get("total_pnl_after_estimated_exit_fee"))
+    account_unrealized = _float(ledger_detail.get("unrealized_pnl_after_estimated_exit_fee"))
+    strategy_total = sum(_float(row.get("total_pnl")) for row in strategy_rows)
+    symbol_total = sum(_float(row.get("total_pnl")) for row in symbol_rows)
+    session_total = sum(_float(row.get("total_pnl")) for row in session_rows)
+    strategy_unrealized = sum(_float(row.get("unrealized_pnl")) for row in strategy_rows)
+    symbol_unrealized = sum(_float(row.get("unrealized_pnl")) for row in symbol_rows)
+    session_unrealized = sum(_float(row.get("unrealized_pnl")) for row in session_rows)
+    strategy_diff = strategy_total - account_total
+    symbol_diff = symbol_total - account_total
+    session_diff = session_total - account_total
+    strategy_unrealized_diff = strategy_unrealized - account_unrealized
+    symbol_unrealized_diff = symbol_unrealized - account_unrealized
+    session_unrealized_diff = session_unrealized - account_unrealized
+    causes = []
+    if any(abs(value) > 100.0 for value in (strategy_diff, symbol_diff, session_diff)):
+        if any(not str(row.get("strategy_name") or row.get("symbol") or row.get("session_id") or "").strip() for row in strategy_rows + symbol_rows + session_rows):
+            causes.append("missing_strategy_metadata")
+        if any(abs(value) > 100.0 for value in (strategy_unrealized_diff, symbol_unrealized_diff, session_unrealized_diff)):
+            causes.append("open_position_strategy_attribution_missing")
+        causes.append("unknown_allocation_diff")
+    unrealized_duplicate_suspected = any(abs(value) > 100.0 for value in (strategy_unrealized_diff, symbol_unrealized_diff, session_unrealized_diff))
+    return {
+        "account_total_pnl": account_total,
+        "strategy_total_pnl_sum": strategy_total,
+        "symbol_total_pnl_sum": symbol_total,
+        "session_total_pnl_sum": session_total,
+        "strategy_allocation_diff": strategy_diff,
+        "symbol_allocation_diff": symbol_diff,
+        "session_allocation_diff": session_diff,
+        "allocation_method": "fill-attributed FIFO with open-lot valuation by group",
+        "allocation_confidence": "HIGH" if not causes else "LOW",
+        "allocation_diff_causes": sorted(set(causes)),
+        "unrealized_pnl_allocation": {
+            "account_unrealized_pnl": account_unrealized,
+            "strategy_unrealized_pnl_sum": strategy_unrealized,
+            "symbol_unrealized_pnl_sum": symbol_unrealized,
+            "session_unrealized_pnl_sum": session_unrealized,
+            "strategy_unrealized_pnl_diff": strategy_unrealized_diff,
+            "symbol_unrealized_pnl_diff": symbol_unrealized_diff,
+            "session_unrealized_pnl_diff": session_unrealized_diff,
+            "unrealized_pnl_allocation_diff": max(abs(strategy_unrealized_diff), abs(symbol_unrealized_diff), abs(session_unrealized_diff)),
+            "unrealized_pnl_duplicate_suspected": unrealized_duplicate_suspected,
+        },
+    }
+
+
+def _default_opening_inventory_report() -> dict:
+    return {
+        "opening_snapshot_available": False,
+        "opening_snapshot_trust_level": "LOW",
+        "opening_source": "UNAVAILABLE",
+        "opening_cash_krw": None,
+        "opening_positions_by_symbol": [],
+        "opening_position_value": 0.0,
+        "opening_cost_basis": 0.0,
+    }
+
+
+def _account_equity_bridge(
+    *,
+    initial_equity: float,
+    current_equity: Any,
+    current_cash: float,
+    current_coin_value: float,
+    deposits: float,
+    withdrawals: float,
+    ledger_detail: dict,
+    opening_inventory: dict,
+    deposit_withdrawal_status: str,
+) -> dict:
+    realized = _float(ledger_detail.get("net_realized_pnl_after_fee"))
+    unrealized = _float(ledger_detail.get("unrealized_pnl_after_estimated_exit_fee"))
+    estimated_exit_fee = _float(ledger_detail.get("estimated_exit_fee"))
+    total_fee = _float(ledger_detail.get("realized_fee_total"))
+    expected = initial_equity + deposits - withdrawals + realized + unrealized
+    equity = _float(current_equity) if current_equity is not None else None
+    diff = None if equity is None else equity - expected
+    diff_rate = None if diff is None else abs(diff) / max(abs(initial_equity), 1.0)
+    return {
+        "initial_equity": initial_equity,
+        "deposits": deposits,
+        "withdrawals": withdrawals,
+        "deposit_withdrawal_status": deposit_withdrawal_status,
+        "opening_cash_krw": opening_inventory.get("opening_cash_krw"),
+        "opening_position_value": opening_inventory.get("opening_position_value"),
+        "total_buy_value": ledger_detail.get("buy_value", 0.0),
+        "total_sell_value": ledger_detail.get("sell_value", 0.0),
+        "total_fee": total_fee,
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "estimated_exit_fee": estimated_exit_fee,
+        "current_cash_krw": current_cash,
+        "current_position_value": current_coin_value,
+        "current_exchange_equity": equity,
+        "expected_exchange_equity": expected,
+        "equity_bridge_diff": diff,
+        "equity_bridge_diff_rate": diff_rate,
+        "trust_level": "LOW" if deposit_withdrawal_status != "AVAILABLE" or not opening_inventory.get("opening_snapshot_available") else "HIGH",
+        "formula": "initial_equity + deposits - withdrawals + ledger_realized_pnl + ledger_unrealized_pnl_after_estimated_exit_fee",
+    }
+
+
+def _pnl_trust_level(*, total_pnl_sanity: dict, opening_inventory: dict, deposit_withdrawal_status: str, allocation: dict) -> str:
+    if not total_pnl_sanity.get("total_pnl_sanity_passed"):
+        return "LOW"
+    if not opening_inventory.get("opening_snapshot_available"):
+        return "LOW"
+    if deposit_withdrawal_status != "AVAILABLE":
+        return "LOW"
+    if allocation.get("allocation_confidence") == "LOW":
+        return "LOW"
+    return "HIGH"
 
 
 def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation: dict | None = None) -> dict:
@@ -697,6 +880,27 @@ def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation:
         reasons.append({"code": "DEPOSIT_WITHDRAWAL_LEDGER_UNAVAILABLE", "count": 1})
     if asset_requested and not (asset_reconciliation or {}).get("deposit_withdrawal_mismatch_is_verified"):
         reasons.append({"code": "DEPOSIT_WITHDRAWAL_MISMATCH_UNVERIFIED", "count": 1})
+    sanity = (asset_reconciliation or {}).get("total_pnl_sanity_check") or {}
+    if sanity and not sanity.get("total_pnl_sanity_passed", True):
+        reasons.append({"code": "TOTAL_PNL_SANITY_FAILED", "count": 1})
+    if (asset_reconciliation or {}).get("pnl_trust_level") == "LOW":
+        reasons.append({"code": "PNL_TRUST_LEVEL_LOW", "count": 1})
+    opening = (asset_reconciliation or {}).get("opening_inventory_report") or {}
+    if opening and not opening.get("opening_snapshot_available", True):
+        reasons.append({"code": "OPENING_SNAPSHOT_UNAVAILABLE", "count": 1})
+    bridge = (asset_reconciliation or {}).get("account_equity_bridge") or {}
+    if abs(_float(bridge.get("equity_bridge_diff_rate"))) > 0.001:
+        reasons.append({"code": "EQUITY_BRIDGE_DIFF", "count": 1})
+    allocation = (asset_reconciliation or {}).get("pnl_allocation_check") or {}
+    unrealized_allocation = (asset_reconciliation or {}).get("unrealized_pnl_allocation_check") or {}
+    if unrealized_allocation.get("unrealized_pnl_duplicate_suspected"):
+        reasons.append({"code": "UNREALIZED_PNL_DUPLICATE_SUSPECTED", "count": 1})
+    if abs(_float(allocation.get("strategy_allocation_diff"))) > 100.0:
+        reasons.append({"code": "STRATEGY_PNL_ALLOCATION_DIFF", "count": 1})
+    if abs(_float(allocation.get("symbol_allocation_diff"))) > 100.0:
+        reasons.append({"code": "SYMBOL_PNL_ALLOCATION_DIFF", "count": 1})
+    if abs(_float(allocation.get("session_allocation_diff"))) > 100.0:
+        reasons.append({"code": "SESSION_PNL_ALLOCATION_DIFF", "count": 1})
     if abs(_float((asset_reconciliation or {}).get("bot_owned_realized_pnl_diff"))) > 100.0:
         reasons.append({"code": "BOT_OWNED_REALIZED_PNL_DIFF", "count": 1})
     asset_match = (asset_reconciliation or {}).get("exchange_fill_match") or {}

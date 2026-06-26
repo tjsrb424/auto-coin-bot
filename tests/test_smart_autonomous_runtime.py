@@ -30,7 +30,15 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
-        self.env_patch = patch.dict("os.environ", {"DATABASE_URL": ""}, clear=False)
+        self.env_patch = patch.dict(
+            "os.environ",
+            {
+                "DATABASE_URL": "",
+                "LIVE_ORDER_REQUIRES_DIAGNOSTIC_CLEAR": "false",
+                "LIVE_RESTART_REQUIRES_DIAGNOSTIC_CLEAR": "false",
+            },
+            clear=False,
+        )
         self.env_patch.start()
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()

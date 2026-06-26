@@ -753,10 +753,6 @@ def _entry_order_execution_preflight(session: dict, market: str) -> tuple[bool, 
     lock = load_runtime_lock("auto-trading")
     if str((lock or {}).get("status") or "").upper() != "RUNNING":
         return False, "BLOCKED_RUNTIME_LOCK_NOT_RUNNING", None
-    if runtime_setting_bool("LIVE_ORDER_REQUIRES_DIAGNOSTIC_CLEAR", True):
-        gate = restart_block_reason(str(session.get("exchange") or "bithumb"))
-        if not gate.get("allowed"):
-            return False, "BLOCKED_DIAGNOSTIC_GATE_FAILED", None
     reservation = load_pending_order_reservation(
         exchange=str(session.get("exchange") or "bithumb"),
         market=market,
@@ -781,6 +777,10 @@ def _entry_order_execution_preflight(session: dict, market: str) -> tuple[bool, 
             previous_statuses=[str(reservation.get("status") or "")],
         )
         return False, "BLOCKED_RESERVATION_NOT_PENDING", reservation
+    if runtime_setting_bool("LIVE_ORDER_REQUIRES_DIAGNOSTIC_CLEAR", True):
+        gate = restart_block_reason(str(session.get("exchange") or "bithumb"))
+        if not gate.get("allowed"):
+            return False, "BLOCKED_DIAGNOSTIC_GATE_FAILED", None
     return True, "ALLOWED", reservation
 
 

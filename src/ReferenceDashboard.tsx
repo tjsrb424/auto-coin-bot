@@ -744,6 +744,23 @@ type TradingDiagnostics = {
     accounting_failed_count?: number;
     accounting_legacy_missing_canonical_log_count?: number;
     bot_owned_realized_pnl_diff?: number | null;
+    total_pnl_sanity_check?: {
+      equity_based_total_pnl?: number | null;
+      ledger_total_pnl?: number | null;
+      total_pnl_sanity_diff?: number | null;
+      total_pnl_sanity_diff_rate?: number | null;
+      total_pnl_sanity_passed?: boolean;
+    };
+    pnl_trust_level?: "HIGH" | "MEDIUM" | "LOW" | string;
+    account_equity_bridge?: Record<string, any>;
+    opening_inventory_report?: {
+      opening_snapshot_available?: boolean;
+      opening_snapshot_trust_level?: string;
+      opening_source?: string;
+    };
+    pnl_allocation_check?: Record<string, any>;
+    unrealized_pnl_allocation_check?: Record<string, any>;
+    window_comparison_summary?: Record<string, any>;
   };
   pnl_source_of_truth?: Record<string, any>;
   legacy_db_pnl_is_debug_only?: boolean;
@@ -4005,6 +4022,8 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const ledgerTotalPnl = ledgerPnl?.total_pnl_after_estimated_exit_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
   const ledgerRealizedPnl = ledgerPnl?.net_realized_pnl_after_fee ?? assetRecon?.exchange_ledger_pnl?.bot_owned;
   const ledgerUnrealizedPnl = ledgerPnl?.unrealized_pnl_after_estimated_exit_fee;
+  const sanity = assetRecon?.total_pnl_sanity_check;
+  const pnlTrustLevel = assetRecon?.pnl_trust_level ?? (sanity?.total_pnl_sanity_passed === false ? "LOW" : "UNKNOWN");
   const worstStrategy: any = diagnostics?.ledger_strategy_pnl?.[0] ?? assetRecon?.ledger_strategy_pnl?.[0] ?? diagnostics?.strategy_pnl?.[0];
   const worstSymbol: any = diagnostics?.ledger_symbol_pnl?.[0] ?? assetRecon?.ledger_symbol_pnl?.[0] ?? diagnostics?.symbol_pnl?.[0];
   const legacyDiff: any = assetRecon?.strategy_pnl_diff?.[0] ?? diagnostics?.strategy_pnl_diff?.[0];
@@ -4023,8 +4042,8 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     {
       label: "Ledger PnL",
       value: formatSignedKrw(ledgerTotalPnl ?? summary?.total_pnl_krw ?? data.risk?.risk_state?.daily_total_pnl),
-      detail: `real ${formatSignedKrw(ledgerRealizedPnl)} · unrl ${formatSignedKrw(ledgerUnrealizedPnl)}`,
-      tone: (ledgerTotalPnl ?? summary?.total_pnl_krw ?? 0) < 0 ? "red" : "green"
+      detail: `trust ${pnlTrustLevel} · real ${formatSignedKrw(ledgerRealizedPnl)} · unrl ${formatSignedKrw(ledgerUnrealizedPnl)}`,
+      tone: pnlTrustLevel === "LOW" || sanity?.total_pnl_sanity_passed === false ? "red" : (ledgerTotalPnl ?? summary?.total_pnl_krw ?? 0) < 0 ? "red" : "green"
     },
     {
       label: "Loss Limit",
@@ -4045,10 +4064,10 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: (worstStrategy?.total_pnl ?? worstStrategy?.net_pnl ?? 0) < 0 ? "red" : "green"
     },
     {
-      label: "Ledger Symbol",
-      value: formatSignedKrw(worstSymbol?.total_pnl ?? worstSymbol?.net_pnl),
-      detail: `${worstSymbol?.symbol ?? "-"} · fee ${formatKrw(worstSymbol?.fee_total)}`,
-      tone: (worstSymbol?.total_pnl ?? worstSymbol?.net_pnl ?? 0) < 0 ? "red" : "green"
+      label: "PnL Sanity",
+      value: formatSignedKrw(sanity?.total_pnl_sanity_diff),
+      detail: `equity ${formatSignedKrw(sanity?.equity_based_total_pnl)} · ledger ${formatSignedKrw(sanity?.ledger_total_pnl)}`,
+      tone: sanity?.total_pnl_sanity_passed === false ? "red" : "green"
     },
     {
       label: "Legacy Debug",

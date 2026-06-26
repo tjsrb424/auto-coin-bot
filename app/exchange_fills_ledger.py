@@ -153,7 +153,14 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
     non_krw_fee_total = 0.0
     unpaired_sell_value = 0.0
     realized_trades = []
-    for row in sorted(rows, key=lambda item: (str(item.get("executed_at_utc") or ""), int(item.get("id") or 0))):
+    fifo_trace = []
+    warning_counts: Counter[str] = Counter()
+    fill_keys_seen: Counter[str] = Counter()
+    buy_count = 0
+    sell_count = 0
+    buy_value = 0.0
+    sell_value = 0.0
+    for index, row in enumerate(sorted(rows, key=lambda item: (str(item.get("executed_at_utc") or ""), int(item.get("id") or 0)))):
         market = str(row.get("market") or "")
         side = str(row.get("side") or "").upper()
         quantity = _float(row.get("quantity"))
@@ -161,16 +168,38 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
         fee_currency = str(row.get("fee_currency") or "KRW").upper()
         raw_fee = _float(row.get("fee"))
         fee = raw_fee if fee_currency == "KRW" else 0.0
+        fill_key = str(row.get("fill_key") or canonical_fill_key(row))
+        fill_keys_seen[fill_key] += 1
+        warnings = []
+        if fill_keys_seen[fill_key] > 1:
+            warnings.append("DUPLICATE_FILL_KEY_REAPPLIED")
         if fee_currency != "KRW":
             non_krw_fee_total += raw_fee
+            warnings.append("NON_KRW_FEE_NOT_CONVERTED")
+        queue_before = _queue_snapshot(lots[market])
+        matched_lots = []
+        realized_before_fee = 0.0
+        realized_fee = 0.0
         if quantity <= 0:
+            warnings.append("NON_POSITIVE_QUANTITY")
+            warning_counts.update(warnings)
+            fifo_trace.append(_fifo_trace_row(index, row, queue_before, _queue_snapshot(lots[market]), matched_lots, 0.0, 0.0, 0.0, warnings))
             continue
         if side == "BUY":
             lots[market].append({"quantity": quantity, "cost": value, "fee": fee})
             buy_fee_total += fee
+            buy_count += 1
+            buy_value += value
+            warning_counts.update(warnings)
+            fifo_trace.append(_fifo_trace_row(index, row, queue_before, _queue_snapshot(lots[market]), matched_lots, 0.0, 0.0, 0.0, warnings))
             continue
         if side != "SELL":
+            warnings.append("UNKNOWN_SIDE_IGNORED")
+            warning_counts.update(warnings)
+            fifo_trace.append(_fifo_trace_row(index, row, queue_before, _queue_snapshot(lots[market]), matched_lots, 0.0, 0.0, 0.0, warnings))
             continue
+        sell_count += 1
+        sell_value += value
         remaining = quantity
         basis = 0.0
         buy_fee = 0.0
@@ -180,6 +209,15 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
             ratio = used / lot["quantity"] if lot["quantity"] > 0 else 0.0
             basis += lot["cost"] * ratio
             buy_fee += lot["fee"] * ratio
+            matched_lots.append(
+                {
+                    "quantity": used,
+                    "cost_basis": lot["cost"] * ratio,
+                    "allocated_buy_fee": lot["fee"] * ratio,
+                    "lot_quantity_before": lot["quantity"],
+                    "lot_cost_before": lot["cost"],
+                }
+            )
             lot["quantity"] -= used
             lot["cost"] -= lot["cost"] * ratio
             lot["fee"] -= lot["fee"] * ratio
@@ -188,11 +226,14 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
                 lots[market].popleft()
         if remaining > 0.000000000001:
             unpaired_sell_value += value * (remaining / quantity)
+            warnings.append("SELL_EXCEEDS_OPEN_QUANTITY")
         sell_fee = fee
         sell_fee_total += sell_fee
         trade_gross = value - basis
         trade_fee = buy_fee + sell_fee
         gross += trade_gross
+        realized_before_fee = trade_gross
+        realized_fee = trade_fee
         realized_trades.append(
             {
                 "market": market,
@@ -208,6 +249,8 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
                 "unpaired_quantity": remaining,
             }
         )
+        warning_counts.update(warnings)
+        fifo_trace.append(_fifo_trace_row(index, row, queue_before, _queue_snapshot(lots[market]), matched_lots, realized_before_fee, realized_fee, trade_gross - trade_fee, warnings))
     open_positions = []
     open_cost_basis = 0.0
     open_quantity = 0.0
@@ -244,6 +287,11 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
     return {
         "pnl_accounting_method": "FIFO",
         "fee_currency_policy": "KRW fees reduce realized PnL; non-KRW fees are reported separately and not converted.",
+        "fill_count": len(rows),
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "buy_value": buy_value,
+        "sell_value": sell_value,
         "exchange_gross_realized_pnl_before_fee": gross,
         "gross_realized_pnl_before_fee": gross,
         "buy_fee_total": buy_fee_total,
@@ -265,6 +313,14 @@ def compute_realized_pnl_from_ledger(rows: list[dict], *, valuation_prices: dict
         "unpaired_sell_value_krw": unpaired_sell_value,
         "realized_trade_count": len(realized_trades),
         "realized_trades": realized_trades[:50],
+        "fifo_trace": fifo_trace[:200],
+        "fifo_trace_summary": {
+            "trace_count": len(fifo_trace),
+            "warning_counts": dict(sorted(warning_counts.items())),
+            "duplicate_fill_key_count": sum(1 for count in fill_keys_seen.values() if count > 1),
+            "sell_exceeds_open_quantity_count": warning_counts.get("SELL_EXCEEDS_OPEN_QUANTITY", 0),
+            "unpaired_sell_value_krw": unpaired_sell_value,
+        },
     }
 
 
@@ -712,6 +768,56 @@ def _missing_reasons(
     if outcome is None:
         reasons.append("STRATEGY_PNL_ACCOUNTING_MISSING")
     return reasons or ["UNKNOWN"]
+
+
+def _queue_snapshot(queue: deque[dict]) -> dict:
+    quantity = sum(_float(lot.get("quantity")) for lot in queue)
+    cost = sum(_float(lot.get("cost")) for lot in queue)
+    fee = sum(_float(lot.get("fee")) for lot in queue)
+    return {
+        "quantity": quantity,
+        "cost_basis": cost,
+        "fee_basis": fee,
+        "avg_entry_price": cost / quantity if quantity else 0.0,
+        "lot_count": len(queue),
+    }
+
+
+def _fifo_trace_row(
+    index: int,
+    row: dict,
+    queue_before: dict,
+    queue_after: dict,
+    matched_lots: list[dict],
+    realized_pnl_before_fee: float,
+    realized_fee: float,
+    realized_pnl_after_fee: float,
+    warnings: list[str],
+) -> dict:
+    return {
+        "fill_id": row.get("id") or row.get("exchange_fill_id") or index + 1,
+        "exchange_order_uuid": row.get("exchange_order_uuid"),
+        "executed_at_utc": row.get("executed_at_utc"),
+        "symbol": row.get("symbol") or _symbol(str(row.get("market") or "")),
+        "market": row.get("market"),
+        "side": row.get("side"),
+        "price": row.get("price"),
+        "quantity": row.get("quantity"),
+        "executed_value": row.get("executed_value"),
+        "fee": row.get("fee"),
+        "fee_currency": row.get("fee_currency"),
+        "queue_before": queue_before,
+        "queue_after": queue_after,
+        "matched_lots": matched_lots,
+        "realized_pnl_before_fee": realized_pnl_before_fee,
+        "realized_fee": realized_fee,
+        "realized_pnl_after_fee": realized_pnl_after_fee,
+        "remaining_open_quantity": queue_after.get("quantity", 0.0),
+        "remaining_cost_basis": queue_after.get("cost_basis", 0.0),
+        "avg_entry_price_after_fill": queue_after.get("avg_entry_price", 0.0),
+        "error_or_warning": warnings[0] if warnings else None,
+        "warnings": warnings,
+    }
 
 
 def _missing_fill_trace(bot_owned_rows: list[dict], realized_by_uuid: dict[str, dict]) -> dict:

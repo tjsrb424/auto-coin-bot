@@ -195,6 +195,81 @@ class TradingDiagnosticsTests(unittest.TestCase):
         self.assertIn("ACCOUNTING_PARTIAL_FILL", {reason["code"] for reason in report["restart_gate"]["reasons"]})
         self.assertFalse(report["restart_gate"]["allowed"])
 
+    def test_total_pnl_sanity_failure_sets_low_trust_and_blocks_restart(self) -> None:
+        report = build_trading_diagnostics_report(
+            exchange="bithumb",
+            days=7,
+            starting_asset_krw=300_000,
+            asset_reconciliation={
+                "initial_equity": 300_000,
+                "current_equity_from_exchange": 263_000,
+                "current_cash_krw": 263_000,
+                "current_coin_market_value": 0,
+                "deposits": 0,
+                "withdrawals": 0,
+                "deposit_withdrawal_status": "UNAVAILABLE",
+                "opening_inventory_report": {
+                    "opening_snapshot_available": False,
+                    "opening_snapshot_trust_level": "LOW",
+                    "opening_source": "UNAVAILABLE",
+                },
+                "exchange_fill_accounting": {
+                    "ledger_pnl_detail": {
+                        "net_realized_pnl_after_fee": -66_000,
+                        "unrealized_pnl_after_estimated_exit_fee": -121_000,
+                        "total_pnl_after_estimated_exit_fee": -187_000,
+                        "realized_fee_total": 4_700,
+                    },
+                    "ledger_strategy_pnl": [{"strategy_name": "rsi", "total_pnl": -187_000, "unrealized_pnl": -121_000}],
+                    "ledger_symbol_pnl": [{"symbol": "XLM", "total_pnl": -187_000, "unrealized_pnl": -121_000}],
+                    "ledger_session_pnl": [{"session_id": "1", "total_pnl": -187_000, "unrealized_pnl": -121_000}],
+                    "missing_fill_breakdown": {},
+                },
+            },
+        )
+
+        asset = report["asset_reconciliation"]
+        self.assertFalse(asset["total_pnl_sanity_check"]["total_pnl_sanity_passed"])
+        self.assertEqual(asset["pnl_trust_level"], "LOW")
+        codes = {reason["code"] for reason in report["restart_gate"]["reasons"]}
+        self.assertIn("TOTAL_PNL_SANITY_FAILED", codes)
+        self.assertIn("PNL_TRUST_LEVEL_LOW", codes)
+        self.assertIn("OPENING_SNAPSHOT_UNAVAILABLE", codes)
+        self.assertFalse(report["restart_gate"]["allowed"])
+
+    def test_allocation_diff_blocks_restart(self) -> None:
+        report = build_trading_diagnostics_report(
+            exchange="bithumb",
+            days=7,
+            starting_asset_krw=300_000,
+            asset_reconciliation={
+                "initial_equity": 300_000,
+                "current_equity_from_exchange": 299_950,
+                "current_cash_krw": 299_950,
+                "current_coin_market_value": 0,
+                "deposit_withdrawal_status": "AVAILABLE",
+                "opening_inventory_report": {
+                    "opening_snapshot_available": True,
+                    "opening_snapshot_trust_level": "HIGH",
+                    "opening_source": "manual_snapshot",
+                },
+                "exchange_fill_accounting": {
+                    "ledger_pnl_detail": {
+                        "net_realized_pnl_after_fee": -50,
+                        "unrealized_pnl_after_estimated_exit_fee": 0,
+                        "total_pnl_after_estimated_exit_fee": -50,
+                    },
+                    "ledger_strategy_pnl": [{"strategy_name": "rsi", "total_pnl": -500, "unrealized_pnl": 0}],
+                    "ledger_symbol_pnl": [{"symbol": "XLM", "total_pnl": -50, "unrealized_pnl": 0}],
+                    "ledger_session_pnl": [{"session_id": "1", "total_pnl": -50, "unrealized_pnl": 0}],
+                    "missing_fill_breakdown": {},
+                },
+            },
+        )
+
+        self.assertIn("STRATEGY_PNL_ALLOCATION_DIFF", {reason["code"] for reason in report["restart_gate"]["reasons"]})
+        self.assertFalse(report["restart_gate"]["allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()

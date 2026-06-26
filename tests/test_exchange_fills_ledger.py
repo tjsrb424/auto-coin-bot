@@ -393,6 +393,46 @@ class ExchangeFillsLedgerTests(unittest.TestCase):
         self.assertEqual(report["ledger_symbol_pnl"][0]["total_pnl"], 247.675)
         self.assertEqual(report["ledger_strategy_pnl"][0]["strategy_name"], "smart_autonomous")
 
+    def test_fifo_trace_warns_when_sell_exceeds_open_quantity(self) -> None:
+        pnl = compute_realized_pnl_from_ledger(
+            [
+                {
+                    "exchange_order_uuid": "C0504000000407836247",
+                    "market": "KRW-XLM",
+                    "symbol": "XLM",
+                    "side": "SELL",
+                    "quantity": 5,
+                    "executed_value": 600,
+                    "fee": 1,
+                    "fee_currency": "KRW",
+                    "executed_at_utc": "2026-06-25T01:00:00Z",
+                }
+            ]
+        )
+
+        self.assertEqual(pnl["fifo_trace_summary"]["sell_exceeds_open_quantity_count"], 1)
+        self.assertIn("SELL_EXCEEDS_OPEN_QUANTITY", pnl["fifo_trace"][0]["warnings"])
+        self.assertEqual(pnl["unpaired_sell_value_krw"], 600)
+
+    def test_duplicate_fill_key_is_flagged_in_fifo_trace(self) -> None:
+        fill = {
+            "fill_key": "same-fill",
+            "exchange_order_uuid": "C0504000000407836246",
+            "market": "KRW-XLM",
+            "symbol": "XLM",
+            "side": "BUY",
+            "quantity": 5,
+            "executed_value": 500,
+            "fee": 1,
+            "fee_currency": "KRW",
+            "executed_at_utc": "2026-06-25T00:00:00Z",
+        }
+
+        pnl = compute_realized_pnl_from_ledger([fill, dict(fill)])
+
+        self.assertEqual(pnl["fifo_trace_summary"]["duplicate_fill_key_count"], 1)
+        self.assertIn("DUPLICATE_FILL_KEY_REAPPLIED", pnl["fifo_trace"][1]["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()

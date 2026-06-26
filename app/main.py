@@ -2004,8 +2004,12 @@ async def _asset_reconciliation_from_exchange(
     days: int = 7,
     persist_exchange_ledger: bool = False,
 ) -> dict:
-    period_start_utc = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    period_end_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    period_start_utc = (now_utc - timedelta(days=max(int(days), 1))).isoformat().replace("+00:00", "Z")
+    period_end_utc = now_utc.isoformat().replace("+00:00", "Z")
+    full_start_utc = _diagnostic_live_session_start(exchange) or period_start_utc
+    full_start_dt = _parse_utc_datetime(full_start_utc) or (now_utc - timedelta(days=max(int(days), 1)))
+    full_days = max(int(days), int(ceil(max((now_utc - full_start_dt).total_seconds(), 0) / 86400)) + 1)
     balances, status, error = await _safe_live_balances_for_exchange(exchange)
     if status != "SUCCESS":
         return {
@@ -2042,7 +2046,7 @@ async def _asset_reconciliation_from_exchange(
             coin_quantities[f"KRW-{symbol}"] = total
             coin_available_quantities[f"KRW-{symbol}"] = available
             coin_locked_quantities[f"KRW-{symbol}"] = locked
-    ledger_markets = _diagnostic_ledger_markets(exchange, days, extra_markets=list(coin_quantities.keys()))
+    ledger_markets = _diagnostic_ledger_markets(exchange, full_days, extra_markets=list(coin_quantities.keys()))
     snapshots = await _market_snapshots(list(coin_quantities.keys()), exchange=exchange)
     valuation_snapshot_at_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     valuation_prices = {market: float((snapshot or {}).get("price") or 0.0) for market, snapshot in snapshots.items()}
@@ -2068,12 +2072,17 @@ async def _asset_reconciliation_from_exchange(
             "locked_value_krw": locked_value,
             "value_krw": value,
         })
-    ledger = await _read_only_exchange_order_ledger(exchange, ledger_markets, days=days)
+    ledger = await _read_only_exchange_order_ledger(exchange, ledger_markets, days=full_days)
     db_orders = _diagnostic_db_orders(exchange, days)
     all_db_orders = _diagnostic_all_db_orders(exchange, days)
     sessions = _diagnostic_sessions(exchange, days)
+    db_orders_full = _diagnostic_db_orders(exchange, full_days)
+    all_db_orders_full = _diagnostic_all_db_orders(exchange, full_days)
+    sessions_full = _diagnostic_sessions(exchange, full_days)
     position_fill_events = _diagnostic_position_fill_events(days)
     trade_outcomes = _diagnostic_trade_outcomes(exchange, days)
+    position_fill_events_full = _diagnostic_position_fill_events(full_days)
+    trade_outcomes_full = _diagnostic_trade_outcomes(exchange, full_days)
     open_positions = _diagnostic_open_positions(exchange)
     ledger_rows, ledger_summary = load_or_build_ledger_rows(
         exchange_name=exchange,
@@ -2081,6 +2090,13 @@ async def _asset_reconciliation_from_exchange(
         exchange_orders=ledger.get("orders", []),
         db_orders=db_orders,
         persist=persist_exchange_ledger,
+    )
+    full_ledger_rows, full_ledger_summary = load_or_build_ledger_rows(
+        exchange_name=exchange,
+        period_start_utc=full_start_utc,
+        exchange_orders=ledger.get("orders", []),
+        db_orders=db_orders_full,
+        persist=False,
     )
     ledger_pnl = compute_realized_pnl_from_ledger(ledger_rows, valuation_prices=valuation_prices)
     accounting_report = build_exchange_fill_accounting_report(
@@ -2094,6 +2110,43 @@ async def _asset_reconciliation_from_exchange(
         period_start_utc=period_start_utc,
         period_end_utc=period_end_utc,
     )
+    full_accounting_report = build_exchange_fill_accounting_report(
+        ledger_rows=full_ledger_rows,
+        canonical_db_orders=db_orders_full,
+        all_db_orders=all_db_orders_full,
+        sessions=sessions_full,
+        position_fill_events=position_fill_events_full,
+        trade_outcome_logs=trade_outcomes_full,
+        valuation_prices=valuation_prices,
+        period_start_utc=full_start_utc,
+        period_end_utc=period_end_utc,
+    )
+    opening_inventory = _opening_inventory_report_from_ledger(
+        full_ledger_rows,
+        period_start_utc=period_start_utc,
+        valuation_prices=valuation_prices,
+    )
+    window_comparison = {
+        "current_window": _ledger_window_summary(
+            label="current_7d_window",
+            start_utc=period_start_utc,
+            end_utc=period_end_utc,
+            ledger_rows=ledger_rows,
+            accounting_report=accounting_report,
+            current_exchange_equity=current_cash + coin_value,
+            initial_equity=initial_equity,
+        ),
+        "live_session_full_window": _ledger_window_summary(
+            label="live_session_full_window",
+            start_utc=full_start_utc,
+            end_utc=period_end_utc,
+            ledger_rows=full_ledger_rows,
+            accounting_report=full_accounting_report,
+            current_exchange_equity=current_cash + coin_value,
+            initial_equity=initial_equity,
+        ),
+        "comparison_note": "Full-window collection uses available read-only exchange order pages plus DB order UUID lookups; opening account cash/balance snapshot is unavailable.",
+    }
     position_valuation = build_position_valuation_summary(
         positions=open_positions,
         balances=balances,
@@ -2130,8 +2183,12 @@ async def _asset_reconciliation_from_exchange(
         "exchange_ledger_order_count": len(ledger.get("orders", [])),
         "exchange_fills_ledger_rows": ledger_rows,
         "exchange_fills_ledger_summary": ledger_summary,
+        "exchange_fills_ledger_full_summary": full_ledger_summary,
         "exchange_realized_pnl": ledger_pnl,
         "exchange_fill_accounting": accounting_report,
+        "exchange_fill_accounting_full_window": full_accounting_report,
+        "window_comparison_summary": window_comparison,
+        "opening_inventory_report": opening_inventory,
         "position_valuation_summary": position_valuation,
         "snapshot_unrealized_pnl": position_valuation.get("snapshot_unrealized_pnl"),
         "stale_valuation_effect": position_valuation.get("stale_valuation_effect"),
@@ -2166,6 +2223,101 @@ def _diagnostic_ledger_markets(exchange: str, days: int, *, extra_markets: list[
     for row in rows:
         markets.append(str(row["market"]))
     return list(dict.fromkeys(market for market in markets if market))
+
+
+def _diagnostic_live_session_start(exchange: str) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(created_at) AS started_at
+            FROM live_strategy_sessions
+            WHERE exchange = ?
+              AND created_at IS NOT NULL
+              AND created_at != ''
+            """,
+            (exchange,),
+        ).fetchone()
+    return str(row["started_at"]) if row and row["started_at"] else None
+
+
+def _ledger_window_summary(
+    *,
+    label: str,
+    start_utc: str,
+    end_utc: str,
+    ledger_rows: list[dict],
+    accounting_report: dict,
+    current_exchange_equity: float,
+    initial_equity: float | None,
+) -> dict:
+    pnl = accounting_report.get("ledger_pnl_detail") if isinstance(accounting_report.get("ledger_pnl_detail"), dict) else {}
+    return {
+        "label": label,
+        "reconciliation_start_at_utc": start_utc,
+        "reconciliation_end_at_utc": end_utc,
+        "exchange_fill_count": len(ledger_rows),
+        "buy_count": pnl.get("buy_count", sum(1 for row in ledger_rows if str(row.get("side") or "").upper() == "BUY")),
+        "sell_count": pnl.get("sell_count", sum(1 for row in ledger_rows if str(row.get("side") or "").upper() == "SELL")),
+        "buy_value": pnl.get("buy_value", sum(float(row.get("executed_value") or 0.0) for row in ledger_rows if str(row.get("side") or "").upper() == "BUY")),
+        "sell_value": pnl.get("sell_value", sum(float(row.get("executed_value") or 0.0) for row in ledger_rows if str(row.get("side") or "").upper() == "SELL")),
+        "realized_pnl": pnl.get("net_realized_pnl_after_fee"),
+        "unrealized_pnl": pnl.get("unrealized_pnl_after_estimated_exit_fee"),
+        "total_pnl": pnl.get("total_pnl_after_estimated_exit_fee"),
+        "open_position_quantity": pnl.get("open_position_quantity"),
+        "open_position_cost_basis": pnl.get("open_position_cost_basis"),
+        "current_exchange_equity": current_exchange_equity,
+        "corrected_expected_equity": (initial_equity or 0.0) + float(pnl.get("total_pnl_after_estimated_exit_fee") or 0.0),
+        "equity_diff": current_exchange_equity - ((initial_equity or 0.0) + float(pnl.get("total_pnl_after_estimated_exit_fee") or 0.0)),
+        "equity_diff_rate": abs(current_exchange_equity - ((initial_equity or 0.0) + float(pnl.get("total_pnl_after_estimated_exit_fee") or 0.0))) / max(float(initial_equity or 1.0), 1.0),
+    }
+
+
+def _opening_inventory_report_from_ledger(
+    ledger_rows: list[dict],
+    *,
+    period_start_utc: str,
+    valuation_prices: dict[str, float],
+) -> dict:
+    start = _parse_utc_datetime(period_start_utc)
+    before_rows = [row for row in ledger_rows if start and (_parse_utc_datetime(row.get("executed_at_utc")) or start) < start]
+    pnl = compute_realized_pnl_from_ledger(before_rows, valuation_prices=valuation_prices)
+    positions = []
+    for item in pnl.get("open_positions_by_market", []):
+        market = str(item.get("market") or "")
+        quantity = float(item.get("open_position_quantity") or 0.0)
+        cost = float(item.get("open_position_cost_basis") or 0.0)
+        positions.append(
+            {
+                "symbol": market.split("-")[-1] if "-" in market else market,
+                "market": market,
+                "opening_quantity": quantity,
+                "opening_cost_basis": cost,
+                "opening_avg_entry_price": cost / quantity if quantity else 0.0,
+                "opening_position_value": item.get("current_valuation_value", 0.0),
+            }
+        )
+    return {
+        "opening_snapshot_available": False,
+        "opening_snapshot_trust_level": "LOW",
+        "opening_source": "derived_from_prior_exchange_fills_without_account_snapshot" if before_rows else "UNAVAILABLE",
+        "opening_cash_krw": None,
+        "opening_positions_by_symbol": positions,
+        "opening_quantity": sum(float(item.get("opening_quantity") or 0.0) for item in positions),
+        "opening_cost_basis": sum(float(item.get("opening_cost_basis") or 0.0) for item in positions),
+        "opening_avg_entry_price": None,
+        "opening_position_value": sum(float(item.get("opening_position_value") or 0.0) for item in positions),
+        "prior_fill_count": len(before_rows),
+        "note": "Historical account cash/balance snapshot at reconciliation_start_at_utc is unavailable; PnL trust remains LOW.",
+    }
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return _parse_utc(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _diagnostic_order_uuids(exchange: str, days: int, *, limit: int) -> list[str]:
@@ -2428,6 +2580,13 @@ async def trading_reconciliation(
         "ledger_strategy_pnl": asset.get("ledger_strategy_pnl"),
         "ledger_symbol_pnl": asset.get("ledger_symbol_pnl"),
         "ledger_session_pnl": asset.get("ledger_session_pnl"),
+        "window_comparison_summary": asset.get("window_comparison_summary"),
+        "opening_inventory_report": asset.get("opening_inventory_report"),
+        "account_equity_bridge": asset.get("account_equity_bridge"),
+        "total_pnl_sanity_check": asset.get("total_pnl_sanity_check"),
+        "pnl_allocation_check": asset.get("pnl_allocation_check"),
+        "unrealized_pnl_allocation_check": asset.get("unrealized_pnl_allocation_check"),
+        "pnl_trust_level": asset.get("pnl_trust_level"),
         "legacy_strategy_pnl": asset.get("legacy_strategy_pnl"),
         "legacy_symbol_pnl": asset.get("legacy_symbol_pnl"),
         "strategy_pnl_diff": asset.get("strategy_pnl_diff"),
