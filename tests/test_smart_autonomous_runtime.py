@@ -35,6 +35,14 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()
         database.init_db()
+        database.acquire_runtime_lock(
+            lock_id="auto-trading",
+            instance_id="test-instance",
+            hostname="test-host",
+            app_env="test",
+            runtime_owner="test",
+            ttl_seconds=300,
+        )
 
     def tearDown(self) -> None:
         self.db_patch.stop()
@@ -49,7 +57,7 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "candidate_strategy_id": 0,
                 "strategy_name": "smart_autonomous",
                 "strategy_parameters": {},
-                "status": "READY",
+                "status": "RUNNING",
                 "auto_enabled": True,
                 "initial_balance_krw": 0.0,
                 "max_order_krw": 30_000,
@@ -58,6 +66,17 @@ class SmartAutonomousRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         session = database.load_latest_live_strategy_session()
         assert session is not None
+        database.create_order_reservation(
+            {
+                "request_id": f"test-reservation-{session_id}",
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": 0,
+                "amount_krw": 30_000,
+                "status": "PENDING",
+                "expires_at_utc": "2099-01-01T00:00:00Z",
+            }
+        )
         return {**session, "id": session_id}
 
     def create_intent(

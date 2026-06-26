@@ -17,6 +17,7 @@ def build_trading_diagnostics_report(
     exchange: str = "bithumb",
     days: int = 7,
     starting_asset_krw: float | None = None,
+    asset_reconciliation: dict | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     start = now - timedelta(days=max(int(days), 1))
@@ -154,11 +155,19 @@ def build_trading_diagnostics_report(
         summary=summary,
     )
     safety_limits = _safety_limits(policy, summary, open_positions)
-    restart_gate = _restart_gate(risk_diagnostics, safety_limits, summary)
+    asset_report = _asset_reconciliation_report(
+        starting_asset_krw=start_asset,
+        realized_pnl_from_db=realized_pnl,
+        unrealized_pnl_from_positions=unrealized_pnl,
+        total_fee=fee_total,
+        payload=asset_reconciliation or {},
+    )
+    restart_gate = _restart_gate(risk_diagnostics, safety_limits, summary, asset_report)
     return {
         "generated_at_utc": _to_iso(now),
         "exchange": exchange,
         "summary": summary,
+        "asset_reconciliation": asset_report,
         "symbol_pnl": symbol_pnl,
         "strategy_pnl": strategy_pnl,
         "risk_diagnostics": risk_diagnostics,
@@ -353,8 +362,10 @@ def _risk_diagnostics(
                 break
         if created and candle and created < candle + timedelta(minutes=1) and str(order.get("status")) in {"SUBMITTED", "WAITING", "FILLED"}:
             incomplete_candle_usage.append(_order_sample(order))
-        candle_raw = str(order.get("candle_time_utc") or "")
-        if candle_raw and not candle_raw.endswith("Z") and "+" not in candle_raw[-6:]:
+        candle_raw = str(order.get("candle_close_at_utc") or order.get("candle_time_utc") or "")
+        signal_raw = str(order.get("signal_generated_at_utc") or "")
+        requested_raw = str(order.get("order_requested_at_utc") or "")
+        if any(_timestamp_is_non_utc(raw) for raw in (candle_raw, signal_raw, requested_raw)):
             timestamp_mismatches.append(_order_sample(order))
 
     max_trade_count = _int_env("MAX_TRADE_COUNT_PER_DAY", _int_env("RISK_MAX_ORDERS_PER_DAY", 0))
@@ -413,7 +424,43 @@ def _safety_limits(policy: dict, summary: dict, open_positions: list[dict]) -> d
     }
 
 
-def _restart_gate(risk: dict, limits: dict, summary: dict) -> dict:
+def _asset_reconciliation_report(
+    *,
+    starting_asset_krw: float,
+    realized_pnl_from_db: float,
+    unrealized_pnl_from_positions: float,
+    total_fee: float,
+    payload: dict,
+) -> dict:
+    deposits = _float(payload.get("deposits"), 0.0)
+    withdrawals = _float(payload.get("withdrawals"), 0.0)
+    initial_equity = _float(payload.get("initial_equity"), starting_asset_krw)
+    current_cash = _float(payload.get("current_cash_krw"), 0.0)
+    current_coin_value = _float(payload.get("current_coin_market_value"), 0.0)
+    current_equity = payload.get("current_equity_from_exchange")
+    if current_equity is None:
+        current_equity = current_cash + current_coin_value if (current_cash or current_coin_value) else None
+    expected_equity = initial_equity + deposits - withdrawals + realized_pnl_from_db + unrealized_pnl_from_positions - total_fee
+    equity_diff = None if current_equity is None else _float(current_equity) - expected_equity
+    equity_diff_rate = None if equity_diff is None else abs(equity_diff) / max(initial_equity, 1.0)
+    return {
+        "initial_equity": initial_equity,
+        "current_equity_from_exchange": current_equity,
+        "current_cash_krw": current_cash,
+        "current_coin_market_value": current_coin_value,
+        "realized_pnl_from_db": realized_pnl_from_db,
+        "unrealized_pnl_from_positions": unrealized_pnl_from_positions,
+        "total_fee": total_fee,
+        "deposits": deposits,
+        "withdrawals": withdrawals,
+        "expected_equity": expected_equity,
+        "equity_diff": equity_diff,
+        "equity_diff_rate": equity_diff_rate,
+        "gate_failed": bool(equity_diff is not None and (abs(equity_diff) > 100.0 or (equity_diff_rate or 0.0) > 0.001)),
+    }
+
+
+def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation: dict | None = None) -> dict:
     reasons = []
     critical_checks = [
         ("DUPLICATE_OPEN_SYMBOL", risk["duplicate_open_symbols"]["count"]),
@@ -435,6 +482,8 @@ def _restart_gate(risk: dict, limits: dict, summary: dict) -> dict:
         reasons.append({"code": "MAX_TRADE_COUNT_REACHED", "count": risk["overtrade"]["trade_count"]})
     if risk["fee_pressure"]["warning"]:
         reasons.append({"code": "FEE_PRESSURE_WARNING", "count": 1})
+    if (asset_reconciliation or {}).get("gate_failed"):
+        reasons.append({"code": "EQUITY_RECONCILIATION_DIFF", "count": 1})
     if _float(summary.get("total_pnl_krw")) < 0:
         reasons.append({"code": "SEVEN_DAY_PNL_NEGATIVE", "count": 1})
     return {
@@ -469,6 +518,7 @@ def _order_sample(order: dict) -> dict:
         "risk_result": order.get("risk_result"),
         "created_at": order.get("created_at"),
         "candle_time_utc": order.get("candle_time_utc"),
+        "candle_close_at_utc": order.get("candle_close_at_utc"),
     }
 
 
@@ -510,6 +560,17 @@ def _float(value: Any, default: float = 0.0) -> float:
 def _parse_utc(value: Any) -> datetime | None:
     if not value:
         return None
+
+
+def _timestamp_is_non_utc(value: str) -> bool:
+    if not value:
+        return False
+    normalized = str(value).replace(" ", "T")
+    if normalized.endswith("Z"):
+        return False
+    if normalized.endswith("+00:00"):
+        return False
+    return True
     normalized = str(value).replace(" ", "T")
     if normalized.endswith("Z"):
         normalized = normalized[:-1] + "+00:00"

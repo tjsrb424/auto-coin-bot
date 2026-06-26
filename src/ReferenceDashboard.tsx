@@ -315,6 +315,12 @@ type RuntimeStatus = {
   exchange?: DashboardExchange | string;
   live_trading_enabled?: boolean;
   live_auto_trading_enabled?: boolean;
+  env_live_trading_enabled?: boolean;
+  db_auto_trading_enabled?: boolean;
+  runtime_lock_status?: string;
+  live_session_status?: string;
+  diagnostic_gate_passed?: boolean;
+  effective_auto_trading_enabled?: boolean;
   auto_strategy_pilot_enabled?: boolean;
   smart_autonomous_trading_enabled?: boolean;
   runtime_status?: "OFF" | "RUNNING" | "PAUSED" | "STOPPED" | "EMERGENCY_STOPPED" | string;
@@ -637,6 +643,13 @@ type HealthStatus = {
   emergency_stop_status?: string;
   live_trading_enabled?: boolean;
   auto_trading_enabled?: boolean;
+  env_live_trading_enabled?: boolean;
+  db_auto_trading_enabled?: boolean;
+  runtime_lock_status?: string;
+  live_session_status?: string;
+  diagnostic_gate_passed?: boolean;
+  diagnostic_gate_reasons?: Array<{ code?: string; count?: number }>;
+  effective_auto_trading_enabled?: boolean;
   auto_runtime_status?: string;
   latest_balance_sync_time?: string | null;
   latest_order_sync_time?: string | null;
@@ -684,6 +697,21 @@ type TradingDiagnostics = {
     daily_max_loss_rate?: number;
     daily_loss_limit_reached?: boolean;
     max_trade_count_per_day?: number;
+  };
+  asset_reconciliation?: {
+    initial_equity?: number;
+    current_equity_from_exchange?: number | null;
+    current_cash_krw?: number;
+    current_coin_market_value?: number;
+    realized_pnl_from_db?: number;
+    unrealized_pnl_from_positions?: number;
+    total_fee?: number;
+    deposits?: number;
+    withdrawals?: number;
+    expected_equity?: number;
+    equity_diff?: number | null;
+    equity_diff_rate?: number | null;
+    gate_failed?: boolean;
   };
   restart_gate?: {
     allowed?: boolean;
@@ -3927,6 +3955,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const summary = diagnostics?.summary;
   const safety = diagnostics?.safety_limits;
   const gate = diagnostics?.restart_gate;
+  const assetRecon = diagnostics?.asset_reconciliation;
   const worstStrategy = diagnostics?.strategy_pnl?.[0];
   const worstSymbol = diagnostics?.symbol_pnl?.[0];
   const diagnosticCards = [
@@ -3944,7 +3973,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     },
     {
       label: "Stop Reason",
-      value: gate?.stop_reason ?? data.liveStrategy?.session?.last_risk_result ?? "-",
+      value: gate?.stop_reason ?? (assetRecon?.gate_failed ? "EQUITY_RECONCILIATION_DIFF" : data.liveStrategy?.session?.last_risk_result) ?? "-",
       detail: (gate?.reasons ?? []).slice(0, 2).map((item) => `${item.code}:${item.count ?? 1}`).join(" · ") || "diagnostic clear",
       tone: gate?.allowed === false ? "red" : "cyan"
     },
@@ -5340,6 +5369,7 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
   const totalPnl = liveAccount?.totalPnl ?? data.paper?.balance?.total_pnl ?? data.forward?.balance?.total_pnl ?? data.risk?.risk_state?.daily_total_pnl ?? null;
   const totalReturn = liveAccount?.totalReturn ?? data.paper?.balance?.total_return ?? data.forward?.balance?.total_return ?? null;
   const isAutoTradingOn = isRuntimeRunning(data);
+  const effectiveAutoTradingEnabled = data.health?.effective_auto_trading_enabled ?? data.runtimeStatus?.effective_auto_trading_enabled ?? false;
 
   const toggleAutoTrading = React.useCallback(async () => {
     if (isAutoToggling) return;
@@ -5349,6 +5379,10 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
       if (isAutoTradingOn) {
         await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/stop");
       } else {
+        if (!effectiveAutoTradingEnabled) {
+          const reason = data.health?.diagnostic_gate_reasons?.[0]?.code ?? data.diagnostics?.restart_gate?.stop_reason ?? "EFFECTIVE_AUTO_TRADING_DISABLED";
+          throw new Error(`자동매매 시작 차단: ${reason}`);
+        }
         const confirmation = window.prompt(`Smart Autonomous Live를 시작하려면 확인 문구를 입력하세요: ${AUTO_TRADING_CONFIRMATION}`)?.trim();
         if (confirmation !== AUTO_TRADING_CONFIRMATION) throw new Error("확인 문구가 일치하지 않아 자동매매 시작을 취소했습니다.");
         const body = await postJson<RuntimeStatus & { ok?: boolean; message?: string }>("/api/runtime/start", {
@@ -5364,7 +5398,7 @@ function ReferenceDashboardContent({ onLogout }: { onLogout: () => Promise<void>
     } finally {
       setIsAutoToggling(false);
     }
-  }, [isAutoToggling, isAutoTradingOn, refresh]);
+  }, [data.diagnostics?.restart_gate?.stop_reason, data.health?.diagnostic_gate_reasons, effectiveAutoTradingEnabled, isAutoToggling, isAutoTradingOn, refresh]);
 
   const importExchangePosition = React.useCallback(async () => {
     if (isImportingPosition) return;

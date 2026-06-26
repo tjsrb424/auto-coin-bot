@@ -34,6 +34,8 @@ from app.database import (
     load_open_live_position,
     load_open_live_position_for_strategy,
     load_open_live_positions_for_exchange,
+    load_pending_order_reservation,
+    load_runtime_lock,
     load_running_live_strategy_sessions,
     mark_rebalance_delta_accumulator,
     mark_rebalance_delta_accumulators,
@@ -98,6 +100,8 @@ AUTO_STRATEGY_CONFIRMATION = "돈은 속도가 아니라 규율로 지킨다"
 AUTO_STRATEGY_ORDER_CONFIRMATION = "PLACE AUTO LIVE ORDER"
 SMART_AUTONOMOUS_STRATEGY_NAME = "smart_autonomous"
 SMART_AUTONOMOUS_CANDIDATE_ID = 0
+DEFAULT_LIVE_BLOCKED_STRATEGIES = {"rsi"}
+DEFAULT_LIVE_BLOCKED_SYMBOLS = {"WLD", "XLM", "RE"}
 
 
 @dataclass(frozen=True)
@@ -191,6 +195,39 @@ def _session_candidate(session: dict, config: LiveStrategyConfig) -> dict | None
 
 def _session_market(session: dict, config: LiveStrategyConfig) -> str:
     return str(session.get("market") or config.allowed_market or "KRW-BTC")
+
+
+def _configured_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return {item.upper() for item in default}
+    return {item.strip().upper() for item in raw.split(",") if item.strip()}
+
+
+def _market_symbol(market: str) -> str:
+    return market.split("-")[-1].upper() if "-" in market else market.upper()
+
+
+def _live_strategy_disabled_reason(session: dict) -> str | None:
+    strategy = str(session.get("strategy_name") or "").strip().lower()
+    if strategy and strategy.upper() in _configured_csv_set("LIVE_BLOCKED_STRATEGIES", DEFAULT_LIVE_BLOCKED_STRATEGIES):
+        return "BLOCKED_LIVE_STRATEGY_DISABLED"
+    market = str(session.get("market") or "")
+    if _market_symbol(market) in _configured_csv_set("LIVE_BLOCKED_SYMBOLS", DEFAULT_LIVE_BLOCKED_SYMBOLS):
+        return "BLOCKED_LIVE_SYMBOL_DISABLED"
+    return None
+
+
+def _order_idempotency_key(session: dict, market: str, candle_time_utc: str | None, signal_type: str | None, side: str) -> str:
+    return ":".join(
+        [
+            str(session.get("id") or ""),
+            _market_symbol(market),
+            str(session.get("strategy_name") or "").lower(),
+            str(candle_time_utc or ""),
+            str(signal_type or side or "").upper(),
+        ]
+    )
 
 
 def _active_selector_candidate() -> dict | None:
@@ -662,8 +699,15 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
         return "BLOCKED_EXCHANGE_NOT_ALLOWED"
     if session_market != "KRW-BTC" and not market_is_live_allowed("bithumb", session_market):
         return "BLOCKED_MARKET_NOT_ALLOWED"
+    live_disabled = _live_strategy_disabled_reason({**session, "market": session_market})
+    if live_disabled:
+        return live_disabled
     if not load_global_bot_operation_policy().get("auto_trading_enabled"):
         return "SMART_POLICY_AUTO_TRADING_DISABLED"
+    if runtime_setting_bool("LIVE_ORDER_REQUIRES_DIAGNOSTIC_CLEAR", True):
+        gate = restart_block_reason("bithumb")
+        if not gate.get("allowed"):
+            return "BLOCKED_DIAGNOSTIC_GATE_FAILED"
     if config.allowed_order_type != "limit":
         return "BLOCKED_ORDER_TYPE_NOT_ALLOWED"
     if config.market_order_enabled:
@@ -683,6 +727,61 @@ async def _precheck_block_reason(session: dict, config: LiveStrategyConfig, live
     if check_cooldown and last_order_time and _seconds_since(str(last_order_time)) < config.cooldown_seconds:
         return "BLOCKED_COOLDOWN"
     return None
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = str(value).replace(" ", "T")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    if "+" not in normalized[-6:] and "-" not in normalized[-6:]:
+        normalized = f"{normalized}+00:00"
+    try:
+        return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _entry_order_execution_preflight(session: dict, market: str) -> tuple[bool, str, dict | None]:
+    session_id = int(session.get("id") or 0)
+    candidate_id = int(session.get("candidate_strategy_id") or 0)
+    if str(session.get("status") or "").upper() != "RUNNING":
+        return False, "BLOCKED_SESSION_NOT_RUNNING", None
+    if not load_global_bot_operation_policy().get("auto_trading_enabled"):
+        return False, "BLOCKED_DB_AUTO_TRADING_DISABLED", None
+    lock = load_runtime_lock("auto-trading")
+    if str((lock or {}).get("status") or "").upper() != "RUNNING":
+        return False, "BLOCKED_RUNTIME_LOCK_NOT_RUNNING", None
+    if runtime_setting_bool("LIVE_ORDER_REQUIRES_DIAGNOSTIC_CLEAR", True):
+        gate = restart_block_reason(str(session.get("exchange") or "bithumb"))
+        if not gate.get("allowed"):
+            return False, "BLOCKED_DIAGNOSTIC_GATE_FAILED", None
+    reservation = load_pending_order_reservation(
+        exchange=str(session.get("exchange") or "bithumb"),
+        market=market,
+        candidate_strategy_id=candidate_id,
+    )
+    if not reservation:
+        return False, "BLOCKED_RESERVATION_MISSING", None
+    expires_at = _parse_utc(str(reservation.get("effective_expires_at_utc") or reservation.get("expires_at_utc") or reservation.get("expires_at") or ""))
+    if expires_at and expires_at <= datetime.now(timezone.utc):
+        update_order_reservation_status(
+            candidate_strategy_id=candidate_id,
+            market=market,
+            status="EXPIRED",
+            previous_statuses=["PENDING", "RESERVED"],
+        )
+        return False, "BLOCKED_EXPIRED_RESERVATION", reservation
+    if str(reservation.get("status") or "").upper() not in {"PENDING", "RESERVED"}:
+        update_order_reservation_status(
+            candidate_strategy_id=candidate_id,
+            market=market,
+            status="BLOCKED",
+            previous_statuses=[str(reservation.get("status") or "")],
+        )
+        return False, "BLOCKED_RESERVATION_NOT_PENDING", reservation
+    return True, "ALLOWED", reservation
 
 
 def _smart_bid_cap_preview(
@@ -1673,9 +1772,12 @@ async def _submit_smart_intent_order(
     )
     cap_preview = {**cap_preview, **price_preview}
     request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
+    idempotency_key = _order_idempotency_key(session, market, candle["candle_time_utc"], signal.get("signal"), "BUY")
     order = {
         "request_id": request_id,
         "client_order_id": request_id[:36],
+        "idempotency_key": idempotency_key,
+        "signal_type": signal.get("signal") or "BUY",
         "exchange": "bithumb",
         "market": market,
         "side": "BUY",
@@ -1737,7 +1839,20 @@ async def _submit_smart_intent_order(
         _insert_blocked_log(session, promotion["promotion_blockers"][0] if promotion["promotion_blockers"] else "SMART_PROMOTION_BLOCKED", "Smart Engine limited order blocked.", candle["candle_time_utc"], signal, order, risk_preview)
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_PROMOTION_BLOCKED", "last_order_status": "BLOCKED"})
         return True
-    insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview))
+    preflight_ok, preflight_reason, _reservation = _entry_order_execution_preflight(session, market)
+    if not preflight_ok:
+        _insert_blocked_log(session, preflight_reason, preflight_reason, candle["candle_time_utc"], signal, order, {**risk_preview, "risk_result": preflight_reason})
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": [preflight_reason], "status": "BLOCKED"})
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": preflight_reason, "last_order_status": "BLOCKED"})
+        return True
+    try:
+        insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview))
+    except ValueError as exc:
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": str(exc), "last_order_status": "BLOCKED"})
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": [str(exc)], "status": "BLOCKED"})
+        return True
     _record_execution_quality(
         request_id=request_id,
         market_regime=market_regime,
@@ -1866,9 +1981,12 @@ async def _submit_smart_intent_sell_order(
     }
     amount = volume * price
     request_id = f"smart-rehearsal-{uuid.uuid4().hex[:18]}"
+    idempotency_key = _order_idempotency_key(session, market, candle["candle_time_utc"], signal.get("signal"), "SELL")
     order = {
         "request_id": request_id,
         "client_order_id": request_id[:36],
+        "idempotency_key": idempotency_key,
+        "signal_type": signal.get("signal") or "SELL",
         "exchange": "bithumb",
         "market": market,
         "side": "SELL",
@@ -1923,7 +2041,13 @@ async def _submit_smart_intent_sell_order(
         _insert_blocked_log(session, promotion["promotion_blockers"][0] if promotion["promotion_blockers"] else "SMART_PROMOTION_BLOCKED", "Smart Engine limited sell blocked.", candle["candle_time_utc"], signal, order, risk_preview)
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "SMART_PROMOTION_BLOCKED", "last_order_status": "BLOCKED"})
         return True
-    insert_live_order_log({**_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview), "position_id": position.get("id"), "order_purpose": "EXIT", "is_auto_exit": True})
+    try:
+        insert_live_order_log({**_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk_preview), "position_id": position.get("id"), "order_purpose": "EXIT", "is_auto_exit": True})
+    except ValueError as exc:
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": str(exc), "last_order_status": "BLOCKED"})
+        if intent_id:
+            update_order_intent(int(intent_id), {"promotion_status": "BLOCKED", "promotion_blockers": [str(exc)], "status": "BLOCKED"})
+        return True
     try:
         response = await broker.place_order(order)
         order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
@@ -2039,9 +2163,12 @@ async def _submit_entry_order(
             return
     volume = amount / price if price > 0 else 0.0
     request_id = f"strategy-{uuid.uuid4().hex[:24]}"
+    idempotency_key = _order_idempotency_key(session, market, candle["candle_time_utc"], signal.get("signal"), "BUY")
     order = {
         "request_id": request_id,
         "client_order_id": request_id[:36],
+        "idempotency_key": idempotency_key,
+        "signal_type": signal.get("signal") or "BUY",
         "exchange": "bithumb",
         "market": market,
         "side": "BUY",
@@ -2099,7 +2226,17 @@ async def _submit_entry_order(
         update_live_strategy_session(int(session["id"]), {"last_risk_result": "BLOCKED_INSUFFICIENT_BALANCE", "last_order_status": "BLOCKED"})
         return
 
-    insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk))
+    preflight_ok, preflight_reason, _reservation = _entry_order_execution_preflight(session, market)
+    if not preflight_ok:
+        _insert_blocked_log(session, preflight_reason, preflight_reason, candle["candle_time_utc"], signal, order, {**risk, "risk_result": preflight_reason})
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": preflight_reason, "last_order_status": "BLOCKED"})
+        return
+
+    try:
+        insert_live_order_log(_log_payload(session, "PREVIEWED", "ALLOWED", candle["candle_time_utc"], signal, order, risk))
+    except ValueError as exc:
+        update_live_strategy_session(int(session["id"]), {"last_risk_result": str(exc), "last_order_status": "BLOCKED"})
+        return
     _record_execution_quality(
         request_id=request_id,
         market_regime=market_regime,
@@ -2113,7 +2250,7 @@ async def _submit_entry_order(
             candidate_strategy_id=int(session["candidate_strategy_id"]),
             market=market,
             status="ORDER_SUBMITTED",
-            previous_statuses=["RESERVED"],
+            previous_statuses=["PENDING", "RESERVED"],
         )
         update_live_order_log(
             request_id,
@@ -2154,7 +2291,7 @@ async def _submit_entry_order(
                         candidate_strategy_id=int(session["candidate_strategy_id"]),
                         market=market,
                         status="FILLED",
-                        previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+                        previous_statuses=["ORDER_SUBMITTED", "PENDING", "RESERVED"],
                     )
                     updates.update(
                         {
@@ -2183,7 +2320,7 @@ async def _submit_entry_order(
                 candidate_strategy_id=int(session["candidate_strategy_id"]),
                 market=market,
                 status="ORDER_SUBMITTED",
-                previous_statuses=["RESERVED"],
+                previous_statuses=["PENDING", "RESERVED"],
             )
             update_live_strategy_session(
                 int(session["id"]),
@@ -2208,7 +2345,7 @@ async def _submit_entry_order(
             candidate_strategy_id=int(session["candidate_strategy_id"]),
             market=market,
             status="FAILED",
-            previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+            previous_statuses=["ORDER_SUBMITTED", "PENDING", "RESERVED"],
         )
         update_live_strategy_session(int(session["id"]), {"status": "ERROR", "last_order_status": "FAILED", "last_risk_result": "BLOCKED_API_RESPONSE_ERROR"})
 
@@ -2254,7 +2391,7 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
             candidate_strategy_id=int(session["candidate_strategy_id"]),
             market=str(session.get("market") or config.allowed_market),
             status="FILLED",
-            previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+            previous_statuses=["ORDER_SUBMITTED", "PENDING", "RESERVED"],
         )
         update_live_strategy_session(
             session_id,
@@ -2275,7 +2412,7 @@ async def _sync_live_strategy_order_status_async(session: dict, config: LiveStra
             candidate_strategy_id=int(session["candidate_strategy_id"]),
             market=str(session.get("market") or config.allowed_market),
             status="CANCELED",
-            previous_statuses=["ORDER_SUBMITTED", "RESERVED"],
+            previous_statuses=["ORDER_SUBMITTED", "PENDING", "RESERVED"],
         )
         update_live_strategy_session(
             session_id,
@@ -2453,6 +2590,12 @@ def _log_payload(session: dict, status: str, risk_result: str, candle_time_utc: 
         "strategy_name": session.get("strategy_name"),
         "signal_reason": (signal or {}).get("reason"),
         "candle_time_utc": candle_time_utc,
+        "candle_close_at_utc": candle_time_utc,
+        "signal_generated_at_utc": _utc_now(),
+        "order_requested_at_utc": _utc_now(),
+        "client_order_id": order.get("client_order_id") or order["request_id"][:36],
+        "idempotency_key": order.get("idempotency_key"),
+        "signal_type": order.get("signal_type") or (signal or {}).get("signal") or order.get("side"),
         "order_purpose": order.get("order_purpose", "ENTRY"),
     }
 
@@ -2514,18 +2657,7 @@ def _update_order_by_uuid(order_uuid: str, status: str, response: dict) -> None:
 
 
 def _insert_order_status_event(request_id: str, order_uuid: str, status: str, response: dict) -> None:
-    current = get_live_order_log(request_id)
-    if current is None or _has_recent_status_event(order_uuid, status):
-        return
-    event_payload = {
-        **current,
-        "request_id": f"{request_id}-{status.lower()}-{uuid.uuid4().hex[:8]}",
-        "status": status,
-        "exchange_response_payload": response,
-        "order_uuid": order_uuid,
-        "error_message": current.get("error_message") if status == "FAILED" else None,
-    }
-    insert_live_order_log(event_payload)
+    return
 
 
 def _is_strategy_order_event_request(request_id: str) -> bool:

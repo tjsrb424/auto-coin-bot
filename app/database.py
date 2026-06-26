@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 DB_PATH = Path(__file__).resolve().parent.parent / "coin_bot_lab.db"
 
@@ -30,6 +30,7 @@ REQUIRED_SCHEMA_TABLES = [
     "paper_forward_equity_points",
     "paper_forward_orders",
     "live_order_logs",
+    "live_order_idempotency",
     "live_positions",
     "position_slots",
     "capital_allocation_runs",
@@ -593,9 +594,33 @@ def init_db() -> None:
                 manual_confirmed INTEGER NOT NULL DEFAULT 0,
                 strategy_name TEXT,
                 signal_reason TEXT,
+                signal_type TEXT,
                 candle_time_utc TEXT,
+                client_order_id TEXT,
+                idempotency_key TEXT,
+                candle_close_at_utc TEXT,
+                signal_generated_at_utc TEXT,
+                order_requested_at_utc TEXT,
+                order_executed_at_utc TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS live_order_idempotency (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                request_id TEXT NOT NULL UNIQUE,
+                client_order_id TEXT,
+                exchange_order_uuid TEXT,
+                exchange TEXT NOT NULL,
+                market TEXT NOT NULL,
+                session_id INTEGER,
+                strategy_name TEXT NOT NULL DEFAULT '',
+                signal_type TEXT NOT NULL DEFAULT '',
+                candle_close_at_utc TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'CLAIMED',
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS live_strategy_sessions (
@@ -1243,7 +1268,15 @@ def init_db() -> None:
         _ensure_column(conn, "live_order_logs", "manual_confirmed", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "live_order_logs", "strategy_name", "TEXT")
         _ensure_column(conn, "live_order_logs", "signal_reason", "TEXT")
+        _ensure_column(conn, "live_order_logs", "signal_type", "TEXT")
         _ensure_column(conn, "live_order_logs", "candle_time_utc", "TEXT")
+        _ensure_column(conn, "live_order_logs", "client_order_id", "TEXT")
+        _ensure_column(conn, "live_order_logs", "idempotency_key", "TEXT")
+        _ensure_column(conn, "live_order_logs", "candle_close_at_utc", "TEXT")
+        _ensure_column(conn, "live_order_logs", "signal_generated_at_utc", "TEXT")
+        _ensure_column(conn, "live_order_logs", "order_requested_at_utc", "TEXT")
+        _ensure_column(conn, "live_order_logs", "order_executed_at_utc", "TEXT")
+        _ensure_column(conn, "order_reservations", "expires_at_utc", "TEXT")
         _ensure_column(conn, "risk_logs", "read_status", "TEXT NOT NULL DEFAULT 'UNREAD'")
         _ensure_column(conn, "risk_logs", "resolved_at", "TEXT")
         _ensure_column(conn, "risk_logs", "resolution_action", "TEXT")
@@ -2890,9 +2923,131 @@ def mark_forward_session_error(session_id: int, message: str) -> None:
         )
 
 
+def _is_live_order_status_event_request(request_id: str | None) -> bool:
+    value = str(request_id or "")
+    return (
+        "-submitted-" in value
+        or "-waiting-" in value
+        or "-partial" in value
+        or "-canceled-" in value
+        or "-filled-" in value
+        or "-failed-" in value
+    )
+
+
+def _canonical_utc(value: Any, default: str | None = None) -> str | None:
+    if value is None or value == "":
+        return default
+    parsed = _parse_utc(str(value))
+    if parsed is None:
+        return str(value)
+    return _format_utc(parsed)
+
+
+def _live_order_should_claim_idempotency(log: dict) -> bool:
+    if not log.get("idempotency_key"):
+        return False
+    if _is_live_order_status_event_request(log.get("request_id")):
+        return False
+    return str(log.get("status") or "").upper() not in {"BLOCKED", "FAILED", "ERROR"}
+
+
+def _find_canonical_live_order_by_uuid(conn: sqlite3.Connection, order_uuid: str, exclude_request_id: str | None = None) -> dict | None:
+    if not order_uuid:
+        return None
+    params: list[object] = [order_uuid]
+    exclude_sql = ""
+    if exclude_request_id:
+        exclude_sql = "AND request_id != ?"
+        params.append(exclude_request_id)
+    row = conn.execute(
+        f"""
+        SELECT *
+        FROM live_order_logs
+        WHERE order_uuid = ?
+          {exclude_sql}
+          AND request_id NOT LIKE '%-submitted%'
+          AND request_id NOT LIKE '%-waiting-%'
+          AND request_id NOT LIKE '%-partial%'
+          AND request_id NOT LIKE '%-canceled-%'
+          AND request_id NOT LIKE '%-filled-%'
+          AND request_id NOT LIKE '%-failed-%'
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def live_order_idempotency_exists(idempotency_key: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM live_order_idempotency WHERE idempotency_key = ? LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+    return row is not None
+
+
 def insert_live_order_log(log: dict) -> int:
     now_utc = _utc_now()
+    request_id = str(log["request_id"])
+    client_order_id = str(log.get("client_order_id") or request_id[:36])
+    candle_close_at_utc = _canonical_utc(log.get("candle_close_at_utc") or log.get("candle_time_utc"), log.get("candle_time_utc"))
+    normalized_log = {
+        **log,
+        "request_id": request_id,
+        "client_order_id": client_order_id,
+        "candle_time_utc": _canonical_utc(log.get("candle_time_utc"), log.get("candle_time_utc")),
+        "candle_close_at_utc": candle_close_at_utc,
+        "signal_generated_at_utc": _canonical_utc(log.get("signal_generated_at_utc"), now_utc),
+        "order_requested_at_utc": _canonical_utc(log.get("order_requested_at_utc"), now_utc),
+        "order_executed_at_utc": _canonical_utc(log.get("order_executed_at_utc")),
+    }
     with get_connection() as conn:
+        existing_client = conn.execute(
+            """
+            SELECT request_id
+            FROM live_order_logs
+            WHERE client_order_id = ?
+              AND request_id != ?
+            LIMIT 1
+            """,
+            (client_order_id, request_id),
+        ).fetchone()
+        if existing_client and not _is_live_order_status_event_request(request_id):
+            raise ValueError("DUPLICATE_CLIENT_ORDER_ID")
+        order_uuid = str(normalized_log.get("order_uuid") or "")
+        existing_uuid = _find_canonical_live_order_by_uuid(conn, order_uuid) if order_uuid and not _is_live_order_status_event_request(request_id) else None
+        if existing_uuid:
+            raise ValueError("DUPLICATE_EXCHANGE_ORDER_UUID")
+        if _live_order_should_claim_idempotency(normalized_log):
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO live_order_idempotency (
+                        idempotency_key, request_id, client_order_id, exchange_order_uuid,
+                        exchange, market, session_id, strategy_name, signal_type,
+                        candle_close_at_utc, status, created_at_utc, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLAIMED', ?, ?)
+                    """,
+                    (
+                        normalized_log["idempotency_key"],
+                        request_id,
+                        client_order_id,
+                        order_uuid or None,
+                        normalized_log.get("exchange", "upbit"),
+                        normalized_log["market"],
+                        normalized_log.get("session_id"),
+                        normalized_log.get("strategy_name") or "",
+                        normalized_log.get("signal_type") or str(normalized_log.get("side") or ""),
+                        candle_close_at_utc or now_utc,
+                        now_utc,
+                        now_utc,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("DUPLICATE_IDEMPOTENCY_KEY") from exc
         cursor = conn.execute(
             """
             INSERT INTO live_order_logs (
@@ -2902,44 +3057,53 @@ def insert_live_order_log(log: dict) -> int:
                 status, error_message, order_uuid, executed_volume, remaining_volume,
                 filled_amount_krw, paid_fee, position_id, exit_candidate_id, order_purpose,
                 exit_reason, expected_pnl, actual_pnl, is_auto_exit, manual_confirmed,
-                strategy_name, signal_reason,
-                candle_time_utc, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                strategy_name, signal_reason, signal_type,
+                candle_time_utc, client_order_id, idempotency_key, candle_close_at_utc,
+                signal_generated_at_utc, order_requested_at_utc, order_executed_at_utc,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                log["request_id"],
-                log.get("session_id"),
-                log.get("candidate_strategy_id"),
-                log.get("exchange", "upbit"),
-                log["market"],
-                log["side"],
-                log["order_type"],
-                log.get("price"),
-                log.get("volume"),
-                log.get("amount_krw"),
-                log.get("fee_estimate", 0.0),
-                log["risk_result"],
-                json.dumps(log.get("order_preview_payload", {}), ensure_ascii=False),
-                json.dumps(log.get("exchange_request_payload_masked", {}), ensure_ascii=False),
-                json.dumps(log.get("exchange_response_payload", {}), ensure_ascii=False),
-                log["status"],
-                log.get("error_message"),
-                log.get("order_uuid"),
-                log.get("executed_volume", 0.0),
-                log.get("remaining_volume", 0.0),
-                log.get("filled_amount_krw", 0.0),
-                log.get("paid_fee", 0.0),
-                log.get("position_id"),
-                log.get("exit_candidate_id"),
-                log.get("order_purpose", "ENTRY"),
-                log.get("exit_reason"),
-                log.get("expected_pnl", 0.0),
-                log.get("actual_pnl"),
-                1 if log.get("is_auto_exit", False) else 0,
-                1 if log.get("manual_confirmed", False) else 0,
-                log.get("strategy_name"),
-                log.get("signal_reason"),
-                log.get("candle_time_utc"),
+                normalized_log["request_id"],
+                normalized_log.get("session_id"),
+                normalized_log.get("candidate_strategy_id"),
+                normalized_log.get("exchange", "upbit"),
+                normalized_log["market"],
+                normalized_log["side"],
+                normalized_log["order_type"],
+                normalized_log.get("price"),
+                normalized_log.get("volume"),
+                normalized_log.get("amount_krw"),
+                normalized_log.get("fee_estimate", 0.0),
+                normalized_log["risk_result"],
+                json.dumps(normalized_log.get("order_preview_payload", {}), ensure_ascii=False),
+                json.dumps(normalized_log.get("exchange_request_payload_masked", {}), ensure_ascii=False),
+                json.dumps(normalized_log.get("exchange_response_payload", {}), ensure_ascii=False),
+                normalized_log["status"],
+                normalized_log.get("error_message"),
+                normalized_log.get("order_uuid"),
+                normalized_log.get("executed_volume", 0.0),
+                normalized_log.get("remaining_volume", 0.0),
+                normalized_log.get("filled_amount_krw", 0.0),
+                normalized_log.get("paid_fee", 0.0),
+                normalized_log.get("position_id"),
+                normalized_log.get("exit_candidate_id"),
+                normalized_log.get("order_purpose", "ENTRY"),
+                normalized_log.get("exit_reason"),
+                normalized_log.get("expected_pnl", 0.0),
+                normalized_log.get("actual_pnl"),
+                1 if normalized_log.get("is_auto_exit", False) else 0,
+                1 if normalized_log.get("manual_confirmed", False) else 0,
+                normalized_log.get("strategy_name"),
+                normalized_log.get("signal_reason"),
+                normalized_log.get("signal_type"),
+                normalized_log.get("candle_time_utc"),
+                normalized_log.get("client_order_id"),
+                normalized_log.get("idempotency_key"),
+                normalized_log.get("candle_close_at_utc"),
+                normalized_log.get("signal_generated_at_utc"),
+                normalized_log.get("order_requested_at_utc"),
+                normalized_log.get("order_executed_at_utc"),
                 now_utc,
                 now_utc,
             ),
@@ -2953,7 +3117,20 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
         return
     merged = {**current, **updates}
     now_utc = _utc_now()
+    merged["candle_time_utc"] = _canonical_utc(merged.get("candle_time_utc"), merged.get("candle_time_utc"))
+    merged["candle_close_at_utc"] = _canonical_utc(merged.get("candle_close_at_utc") or merged.get("candle_time_utc"), merged.get("candle_close_at_utc"))
+    merged["signal_generated_at_utc"] = _canonical_utc(merged.get("signal_generated_at_utc"), merged.get("signal_generated_at_utc"))
+    merged["order_requested_at_utc"] = _canonical_utc(merged.get("order_requested_at_utc"), merged.get("order_requested_at_utc"))
+    merged["order_executed_at_utc"] = _canonical_utc(merged.get("order_executed_at_utc"), merged.get("order_executed_at_utc"))
     with get_connection() as conn:
+        order_uuid = str(merged.get("order_uuid") or "")
+        if order_uuid and not _is_live_order_status_event_request(request_id):
+            duplicate = _find_canonical_live_order_by_uuid(conn, order_uuid, exclude_request_id=request_id)
+            if duplicate:
+                merged["status"] = "FAILED"
+                merged["risk_result"] = "DUPLICATE_EXCHANGE_ORDER_UUID"
+                merged["error_message"] = f"Duplicate exchange order uuid already recorded by request_id={duplicate.get('request_id')}"
+                merged["order_uuid"] = current.get("order_uuid")
         conn.execute(
             """
             UPDATE live_order_logs
@@ -2979,7 +3156,14 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
                 manual_confirmed = ?,
                 strategy_name = ?,
                 signal_reason = ?,
+                signal_type = ?,
                 candle_time_utc = ?,
+                client_order_id = ?,
+                idempotency_key = ?,
+                candle_close_at_utc = ?,
+                signal_generated_at_utc = ?,
+                order_requested_at_utc = ?,
+                order_executed_at_utc = ?,
                 updated_at = ?
             WHERE request_id = ?
             """,
@@ -3006,11 +3190,34 @@ def update_live_order_log(request_id: str, updates: dict) -> None:
                 1 if merged.get("manual_confirmed", False) else 0,
                 merged.get("strategy_name"),
                 merged.get("signal_reason"),
+                merged.get("signal_type"),
                 merged.get("candle_time_utc"),
+                merged.get("client_order_id"),
+                merged.get("idempotency_key"),
+                merged.get("candle_close_at_utc"),
+                merged.get("signal_generated_at_utc"),
+                merged.get("order_requested_at_utc"),
+                merged.get("order_executed_at_utc"),
                 now_utc,
                 request_id,
             ),
         )
+        if merged.get("idempotency_key"):
+            conn.execute(
+                """
+                UPDATE live_order_idempotency
+                SET exchange_order_uuid = COALESCE(?, exchange_order_uuid),
+                    status = ?,
+                    updated_at_utc = ?
+                WHERE idempotency_key = ?
+                """,
+                (
+                    merged.get("order_uuid"),
+                    str(merged.get("status") or "CLAIMED"),
+                    now_utc,
+                    merged.get("idempotency_key"),
+                ),
+            )
 
 
 def get_live_order_log(request_id: str) -> dict | None:
@@ -3677,6 +3884,8 @@ def _normalize_live_order_log(row: dict) -> dict:
     row["exchange_response_payload"] = json.loads(row.get("exchange_response_payload") or "{}")
     row["is_auto_exit"] = bool(row.get("is_auto_exit"))
     row["manual_confirmed"] = bool(row.get("manual_confirmed"))
+    row["client_order_id"] = row.get("client_order_id") or row.get("request_id")
+    row["candle_close_at_utc"] = row.get("candle_close_at_utc") or row.get("candle_time_utc")
     return row
 
 
@@ -4013,9 +4222,9 @@ def reconcile_position_slots(max_slots: int = 5, exchange: str = "bithumb") -> l
             SET status = 'EXPIRED',
                 updated_at = ?
             WHERE exchange = ?
-              AND status IN ('RESERVED', 'ORDER_SUBMITTED')
-              AND expires_at IS NOT NULL
-              AND expires_at <= ?
+              AND status IN ('PENDING', 'RESERVED', 'ORDER_SUBMITTED')
+              AND COALESCE(expires_at_utc, expires_at) IS NOT NULL
+              AND COALESCE(expires_at_utc, expires_at) <= ?
             """,
             (now_utc, exchange, now_utc),
         )
@@ -4046,7 +4255,7 @@ def reconcile_position_slots(max_slots: int = 5, exchange: str = "bithumb") -> l
                   FROM order_reservations r
                   WHERE r.slot_id = position_slots.id
                     AND r.status IN ('RESERVED', 'ORDER_SUBMITTED')
-                    AND (r.expires_at IS NULL OR r.expires_at > ?)
+                    AND (COALESCE(r.expires_at_utc, r.expires_at) IS NULL OR COALESCE(r.expires_at_utc, r.expires_at) > ?)
               )
             """,
             (now_utc, now_utc, exchange, now_utc),
@@ -4216,13 +4425,14 @@ def reserve_position_slot(
 
 def create_order_reservation(reservation: dict) -> int:
     now_utc = _utc_now()
+    expires_at = _canonical_utc(reservation.get("expires_at_utc") or reservation.get("expires_at"))
     with get_connection() as conn:
         cursor = conn.execute(
             """
             INSERT INTO order_reservations (
                 request_id, exchange, market, candidate_strategy_id, slot_id,
-                amount_krw, status, expires_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                amount_krw, status, expires_at, expires_at_utc, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 reservation["request_id"],
@@ -4231,8 +4441,9 @@ def create_order_reservation(reservation: dict) -> int:
                 int(reservation["candidate_strategy_id"]),
                 reservation.get("slot_id"),
                 float(reservation["amount_krw"]),
-                reservation.get("status", "RESERVED"),
-                reservation.get("expires_at"),
+                reservation.get("status", "PENDING"),
+                expires_at,
+                expires_at,
                 now_utc,
                 now_utc,
             ),
@@ -4247,8 +4458,8 @@ def load_active_order_reservations(exchange: str = "bithumb") -> list[dict]:
             SELECT *
             FROM order_reservations
             WHERE exchange = ?
-              AND status IN ('RESERVED', 'ORDER_SUBMITTED')
-              AND (expires_at IS NULL OR expires_at > ?)
+              AND status IN ('PENDING', 'RESERVED', 'ORDER_SUBMITTED')
+              AND (COALESCE(expires_at_utc, expires_at) IS NULL OR COALESCE(expires_at_utc, expires_at) > ?)
             ORDER BY created_at ASC, id ASC
             """,
             (exchange, _utc_now()),
@@ -4263,7 +4474,7 @@ def update_order_reservation_status(
     status: str,
     previous_statuses: list[str] | None = None,
 ) -> int:
-    previous_statuses = previous_statuses or ["RESERVED", "ORDER_SUBMITTED"]
+    previous_statuses = previous_statuses or ["PENDING", "RESERVED", "ORDER_SUBMITTED"]
     filters = [f"status IN ({', '.join('?' for _ in previous_statuses)})"]
     where_params: list[object] = [*previous_statuses]
     if candidate_strategy_id is not None:
@@ -4284,6 +4495,29 @@ def update_order_reservation_status(
             [status, _utc_now(), *where_params],
         )
         return conn.total_changes - before
+
+
+def load_pending_order_reservation(
+    *,
+    exchange: str = "bithumb",
+    market: str,
+    candidate_strategy_id: int,
+) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *, COALESCE(expires_at_utc, expires_at) AS effective_expires_at_utc
+            FROM order_reservations
+            WHERE exchange = ?
+              AND market = ?
+              AND candidate_strategy_id = ?
+              AND status IN ('PENDING', 'RESERVED')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange, market, int(candidate_strategy_id)),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def finalize_entry_lifecycle_for_position(
@@ -5171,20 +5405,23 @@ def count_live_strategy_orders_today(exchange: str, market: str) -> int:
 
 
 def has_live_strategy_order_for_signal(session_id: int, candidate_strategy_id: int, market: str, candle_time_utc: str, signal: str, side: str) -> bool:
+    normalized_candle = _canonical_utc(candle_time_utc, candle_time_utc)
     with get_connection() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT id FROM live_order_logs
             WHERE session_id = ?
               AND candidate_strategy_id = ?
               AND market = ?
-              AND candle_time_utc = ?
+              AND COALESCE(candle_close_at_utc, candle_time_utc) = ?
               AND side = ?
+              AND COALESCE(signal_type, '') = ?
               AND strategy_name IS NOT NULL
               AND status IN ('BLOCKED', 'PREVIEWED', 'SUBMITTED', 'WAITING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'FAILED', 'ERROR')
+{LIVE_ORDER_EVENT_REQUEST_ID_FILTER}
             LIMIT 1
             """,
-            (session_id, candidate_strategy_id, market, candle_time_utc, side),
+            (session_id, candidate_strategy_id, market, normalized_candle, side, str(signal or "")),
         ).fetchone()
     return row is not None
 

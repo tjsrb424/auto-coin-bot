@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import uuid
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -54,6 +55,7 @@ from app.database import (
     load_market_universe_item_by_id,
     load_candidate_strategy,
     load_bot_operation_policy,
+    load_global_bot_operation_policy,
     load_latest_live_paper_session,
     load_decision_snapshot,
     load_decision_snapshots,
@@ -152,7 +154,7 @@ from app.shadow_report import build_shadow_report
 from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
 from app.scale_in_repair import repair_scale_in_duplicate
-from app.trading_diagnostics import build_trading_diagnostics_report
+from app.trading_diagnostics import build_trading_diagnostics_report, restart_block_reason
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
     AUTO_STRATEGY_CONFIRMATION,
@@ -207,11 +209,40 @@ def _format_candle_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "")
 
 
+def _effective_auto_trading_status(exchange: str, runtime: dict | None = None) -> dict:
+    runtime = runtime or {}
+    live_config = LiveTradingConfig.for_exchange(exchange)
+    db_policy = load_global_bot_operation_policy()
+    lock = runtime.get("runtime_lock") or load_runtime_lock(RUNTIME_LOCK_ID)
+    try:
+        diagnostic_gate = restart_block_reason(exchange)
+    except Exception as exc:
+        diagnostic_gate = {
+            "allowed": False,
+            "block_code": "DIAGNOSTIC_GATE_ERROR",
+            "reasons": [{"code": f"DIAGNOSTIC_GATE_ERROR:{exc.__class__.__name__}", "count": 1}],
+        }
+    env_enabled = bool(live_config.live_trading_enabled)
+    db_enabled = bool(db_policy.get("auto_trading_enabled"))
+    emergency_off = not is_emergency_stopped()
+    diagnostic_passed = bool(diagnostic_gate.get("allowed"))
+    return {
+        "env_live_trading_enabled": env_enabled,
+        "db_auto_trading_enabled": db_enabled,
+        "runtime_lock_status": str((lock or {}).get("status") or "STOPPED"),
+        "live_session_status": str(runtime.get("strategy_status") or "STOPPED"),
+        "diagnostic_gate_passed": diagnostic_passed,
+        "diagnostic_gate_reasons": diagnostic_gate.get("reasons", []),
+        "effective_auto_trading_enabled": bool(env_enabled and db_enabled and emergency_off and diagnostic_passed),
+    }
+
+
 def _health_payload(request: Request) -> dict:
     runtime = _runtime_status_payload(request)
     selected_exchange = os.getenv("AUTO_ALLOWED_EXCHANGE", os.getenv("EXCHANGE", "bithumb")).strip().lower()
     if selected_exchange not in {"upbit", "bithumb"}:
         selected_exchange = "bithumb"
+    effective = _effective_auto_trading_status(selected_exchange, runtime)
     database_status = "UNKNOWN"
     try:
         with get_connection() as conn:
@@ -260,11 +291,17 @@ def _health_payload(request: Request) -> dict:
         "risk_manager_status": risk_state.get("status", "UNKNOWN"),
         "emergency_stop_status": "ON" if is_emergency_stopped() else "OFF",
         "live_trading_enabled": runtime["live_trading_enabled"],
-        "auto_trading_enabled": runtime["live_auto_trading_enabled"],
+        "auto_trading_enabled": effective["effective_auto_trading_enabled"],
+        "env_live_trading_enabled": effective["env_live_trading_enabled"],
+        "db_auto_trading_enabled": effective["db_auto_trading_enabled"],
+        "runtime_lock_status": effective["runtime_lock_status"],
+        "diagnostic_gate_passed": effective["diagnostic_gate_passed"],
+        "diagnostic_gate_reasons": effective["diagnostic_gate_reasons"],
+        "effective_auto_trading_enabled": effective["effective_auto_trading_enabled"],
         "auto_strategy_enabled": runtime["auto_strategy_pilot_enabled"],
         "auto_runtime_status": runtime["runtime_status"],
         "auto_strategy_status": runtime["strategy_status"],
-        "live_session_status": runtime["strategy_status"] if runtime["strategy_status"] != "STOPPED" else "PAUSED",
+        "live_session_status": effective["live_session_status"] if effective["live_session_status"] != "STOPPED" else "PAUSED",
         "latest_order_sync_time": runtime["last_order_time_utc"],
         "latest_balance_sync_time": _latest_balance_sync_time_utc,
         "warnings": state_warnings.get("warnings", []),
@@ -848,6 +885,34 @@ def get_runtime_status(request: Request) -> dict:
 def start_runtime_endpoint(payload: RuntimeStartRequest, request: Request, background_tasks: BackgroundTasks) -> dict:
     if payload.confirmation != AUTO_STRATEGY_CONFIRMATION:
         raise HTTPException(status_code=400, detail=f"{AUTO_STRATEGY_CONFIRMATION} confirmation is required.")
+    selected_exchange = os.getenv("AUTO_ALLOWED_EXCHANGE", os.getenv("EXCHANGE", "bithumb")).strip().lower()
+    effective = _effective_auto_trading_status(selected_exchange if selected_exchange in {"upbit", "bithumb"} else "bithumb")
+    if not effective["effective_auto_trading_enabled"]:
+        return {
+            "ok": False,
+            "message": "자동매매 시작이 진단/정책 게이트에서 차단되었습니다.",
+            "block_code": "EFFECTIVE_AUTO_TRADING_DISABLED",
+            **effective,
+            **_runtime_status_payload(request),
+        }
+    asset_reconciliation = asyncio.run(_asset_reconciliation_from_exchange(
+        selected_exchange if selected_exchange in {"upbit", "bithumb"} else "bithumb",
+        float(os.getenv("DIAGNOSTIC_STARTING_ASSET_KRW", "300000")),
+    ))
+    diagnostic_report = build_trading_diagnostics_report(
+        exchange=selected_exchange if selected_exchange in {"upbit", "bithumb"} else "bithumb",
+        starting_asset_krw=float(os.getenv("DIAGNOSTIC_STARTING_ASSET_KRW", "300000")),
+        asset_reconciliation=asset_reconciliation,
+    )
+    if not diagnostic_report.get("restart_gate", {}).get("allowed"):
+        return {
+            "ok": False,
+            "message": "자동매매 시작이 거래 진단 리포트에서 차단되었습니다.",
+            "block_code": "LIVE_RESTART_BLOCKED_BY_DIAGNOSTICS",
+            "diagnostic_reasons": diagnostic_report.get("restart_gate", {}).get("reasons", []),
+            "asset_reconciliation": diagnostic_report.get("asset_reconciliation"),
+            **_runtime_status_payload(request),
+        }
     acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("admin-ui", request)
     if not acquired:
         return {
@@ -1926,18 +1991,69 @@ async def repair_scale_in_duplicate_endpoint(
     return {**result, "recent_events": recent_recovery_events()}
 
 
+async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: float | None) -> dict:
+    balances, status, error = await _safe_live_balances_for_exchange(exchange)
+    if status != "SUCCESS":
+        return {
+            "initial_equity": initial_equity,
+            "current_equity_from_exchange": None,
+            "current_cash_krw": 0.0,
+            "current_coin_market_value": 0.0,
+            "deposits": 0.0,
+            "withdrawals": 0.0,
+            "balance_fetch_status": status,
+            "balance_error": error,
+        }
+    by_currency = balances.get("by_currency") or {}
+    krw = by_currency.get("KRW") or balances.get("krw") or {}
+    current_cash = float(krw.get("balance") or 0.0) + float(krw.get("locked") or 0.0)
+    coin_quantities: dict[str, float] = {}
+    for currency, item in by_currency.items():
+        symbol = str(currency or "").upper()
+        if not symbol or symbol == "KRW":
+            continue
+        total = float((item or {}).get("balance") or 0.0) + float((item or {}).get("locked") or 0.0)
+        if total > 0:
+            coin_quantities[f"KRW-{symbol}"] = total
+    snapshots = await _market_snapshots(list(coin_quantities.keys()), exchange=exchange)
+    coin_value = 0.0
+    coins = []
+    for market, quantity in coin_quantities.items():
+        price = float((snapshots.get(market) or {}).get("price") or 0.0)
+        value = quantity * price
+        coin_value += value
+        coins.append({"market": market, "quantity": quantity, "price": price, "value_krw": value})
+    return {
+        "initial_equity": initial_equity,
+        "current_equity_from_exchange": current_cash + coin_value,
+        "current_cash_krw": current_cash,
+        "current_coin_market_value": coin_value,
+        "deposits": 0.0,
+        "withdrawals": 0.0,
+        "balance_fetch_status": status,
+        "balance_error": error,
+        "coins": coins,
+    }
+
+
 @app.get("/api/risk/status")
 def risk_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     return get_risk_dashboard(exchange, DEFAULT_MARKET)
 
 
 @app.get("/api/trading-diagnostics")
-def trading_diagnostics(
+async def trading_diagnostics(
     exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
     days: int = Query(7, ge=1, le=30),
     starting_asset_krw: float | None = Query(None, gt=0),
 ) -> dict:
-    return build_trading_diagnostics_report(exchange=exchange, days=days, starting_asset_krw=starting_asset_krw)
+    asset_reconciliation = await _asset_reconciliation_from_exchange(exchange, starting_asset_krw)
+    return build_trading_diagnostics_report(
+        exchange=exchange,
+        days=days,
+        starting_asset_krw=starting_asset_krw,
+        asset_reconciliation=asset_reconciliation,
+    )
 
 
 @app.get("/api/risk/policy-blocks/latest")
@@ -2213,6 +2329,9 @@ def get_auto_live_pilot_status() -> dict:
 
 @app.post("/api/auto-live-pilot/start")
 def start_auto_live_pilot_endpoint(payload: AutoLivePilotStartRequest, request: Request) -> dict:
+    effective = _effective_auto_trading_status("bithumb")
+    if not effective["effective_auto_trading_enabled"]:
+        return {"ok": False, "message": "자동매매 시작이 진단/정책 게이트에서 차단되었습니다.", "block_code": "EFFECTIVE_AUTO_TRADING_DISABLED", **effective}
     acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("auto-live-pilot-api", request)
     if not acquired:
         return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **(status_payload or auto_live_pilot_status())}
@@ -2246,6 +2365,9 @@ def get_live_strategy_pilot_status() -> dict:
 
 @app.post("/api/live-strategy-pilot/start")
 def start_live_strategy_pilot_endpoint(payload: LiveStrategyPilotStartRequest, request: Request) -> dict:
+    effective = _effective_auto_trading_status("bithumb")
+    if not effective["effective_auto_trading_enabled"]:
+        return {"ok": False, "message": "자동매매 시작이 진단/정책 게이트에서 차단되었습니다.", "block_code": "EFFECTIVE_AUTO_TRADING_DISABLED", **effective}
     acquired, current_lock, status_payload = _try_acquire_runtime_lock_for_start("live-strategy-pilot-api", request)
     if not acquired:
         return {"ok": False, "message": "다른 서버 인스턴스가 이미 자동매매 Runtime을 실행 중입니다.", "runtime_lock": current_lock, **(status_payload or live_strategy_status())}

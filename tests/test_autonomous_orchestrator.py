@@ -198,7 +198,10 @@ class AutonomousOrchestratorTests(unittest.TestCase):
 
         background_tasks = BackgroundTasks()
         payload = RuntimeStartRequest(confirmation=AUTO_STRATEGY_CONFIRMATION)
-        with patch("app.main._try_acquire_runtime_lock_for_start", return_value=(True, {}, None)), \
+        with patch("app.main._effective_auto_trading_status", return_value={"effective_auto_trading_enabled": True}), \
+            patch("app.main._asset_reconciliation_from_exchange", new=AsyncMock(return_value={})), \
+            patch("app.main.build_trading_diagnostics_report", return_value={"restart_gate": {"allowed": True}}), \
+            patch("app.main._try_acquire_runtime_lock_for_start", return_value=(True, {}, None)), \
             patch("app.main.start_live_strategy_pilot", return_value={"ok": True}), \
             patch("app.main._runtime_status_payload", return_value={"runtime_status": "RUNNING"}), \
             patch("app.main.autonomous_orchestrator_config", return_value={"on_start_enabled": True}), \

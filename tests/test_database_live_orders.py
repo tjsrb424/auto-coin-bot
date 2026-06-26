@@ -156,3 +156,26 @@ class DatabaseLiveOrderTests(unittest.TestCase):
 
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0]["request_id"], "strategy-request-canceled-event")
+
+    def test_same_candle_signal_idempotency_key_is_inserted_once(self) -> None:
+        first = {
+            **live_order_log("idempotent-request-1", "PREVIEWED", order_uuid=""),
+            "client_order_id": "client-1",
+            "idempotency_key": "1:BTC:rsi:2026-06-25T00:00:00Z:BUY",
+            "candle_time_utc": "2026-06-25T00:00:00Z",
+            "candle_close_at_utc": "2026-06-25T00:00:00Z",
+            "signal_type": "BUY",
+        }
+        database.insert_live_order_log(first)
+
+        duplicate = {**first, "request_id": "idempotent-request-2", "client_order_id": "client-2"}
+        with self.assertRaisesRegex(ValueError, "DUPLICATE_IDEMPOTENCY_KEY"):
+            database.insert_live_order_log(duplicate)
+
+        self.assertTrue(database.live_order_idempotency_exists("1:BTC:rsi:2026-06-25T00:00:00Z:BUY"))
+
+    def test_duplicate_client_order_id_is_blocked(self) -> None:
+        database.insert_live_order_log({**live_order_log("client-request-1", "PREVIEWED", order_uuid=""), "client_order_id": "same-client"})
+
+        with self.assertRaisesRegex(ValueError, "DUPLICATE_CLIENT_ORDER_ID"):
+            database.insert_live_order_log({**live_order_log("client-request-2", "PREVIEWED", order_uuid=""), "client_order_id": "same-client"})

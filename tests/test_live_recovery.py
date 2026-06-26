@@ -805,13 +805,13 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         database.insert_live_order_log(
             {
                 **entry,
-                "request_id": "scale-second",
+                "request_id": "scale-second-filled-event",
                 "order_preview_payload": preview,
                 "position_id": None,
             }
         )
 
-        ensure_filled_entry_order_position(database.get_live_order_log("scale-second"))
+        ensure_filled_entry_order_position(database.get_live_order_log("scale-second-filled-event"))
 
         updated = database.load_live_position(target_position_id)
         assert updated is not None
@@ -840,9 +840,9 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         }
         database.insert_live_order_log(scale)
         ensure_filled_entry_order_position(database.get_live_order_log("scale-first"))
-        database.insert_live_order_log({**scale, "request_id": "entry-second", "order_preview_payload": {}, "position_id": None})
+        database.insert_live_order_log({**scale, "request_id": "entry-second-filled-event", "order_preview_payload": {}, "position_id": None})
 
-        ensure_filled_entry_order_position(database.get_live_order_log("entry-second"))
+        ensure_filled_entry_order_position(database.get_live_order_log("entry-second-filled-event"))
 
         updated = database.load_live_position(target_position_id)
         assert updated is not None
@@ -873,7 +873,7 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         database.insert_live_order_log(
             {
                 **first,
-                "request_id": "partial-second",
+                "request_id": "partial-second-filled-event",
                 "volume": 0.00008,
                 "executed_volume": 0.00008,
                 "remaining_volume": 0.0,
@@ -882,7 +882,7 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        ensure_filled_entry_order_position(database.get_live_order_log("partial-second"))
+        ensure_filled_entry_order_position(database.get_live_order_log("partial-second-filled-event"))
 
         updated = database.load_live_position(position_id)
         assert updated is not None
@@ -951,7 +951,7 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "order_preview_payload": preview,
         }
         database.insert_live_order_log(base)
-        database.insert_live_order_log({**base, "request_id": "duplicate-entry-log-filled", "position_id": None})
+        database.insert_live_order_log({**base, "request_id": "duplicate-entry-log-filled-event", "position_id": None})
         database.update_live_strategy_session(session_id, {"current_position_id": duplicate_position_id})
         database.upsert_rebalance_delta_accumulator(
             session_id=session_id,
@@ -976,7 +976,7 @@ class LiveRecoveryTests(unittest.IsolatedAsyncioTestCase):
         assert session is not None
         self.assertEqual(session["current_position_id"], target_position_id)
         self.assertEqual(database.get_live_order_log("duplicate-entry-log")["position_id"], target_position_id)
-        self.assertEqual(database.get_live_order_log("duplicate-entry-log-filled")["position_id"], target_position_id)
+        self.assertEqual(database.get_live_order_log("duplicate-entry-log-filled-event")["position_id"], target_position_id)
         event = database.load_position_fill_event(duplicate_uuid, "SCALE_IN")
         assert event is not None
         self.assertEqual(event["position_id"], target_position_id)
