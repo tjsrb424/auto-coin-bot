@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -50,6 +52,9 @@ DEFAULT_RUNTIME_SECONDS = 600
 MAX_RUNTIME_SECONDS = 900
 TICK_INTERVAL_SECONDS = 60
 MIN_EXPECTED_EDGE_RATE = 0.006
+DRY_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED DRY RUN FORCE BUY"
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exchange: str = "bithumb") -> dict:
@@ -89,6 +94,7 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
             "stop_on_fee_diff": True,
             "stop_on_equity_diff": True,
             "stop_on_open_order": True,
+            "dry_run_force_buy_available": True,
         },
         "controlled_auto_next_action": "USER_CONFIRM_CONTROLLED_AUTO_LIVE_START" if len(blockers) == 0 else "RESOLVE_CONTROLLED_AUTO_BLOCKERS",
     }
@@ -183,6 +189,9 @@ async def run_controlled_auto_live(
         "client_order_id_list": [],
         "gross_pnl": 0.0,
         "net_pnl_after_fee": 0.0,
+        "run_realized_pnl": 0.0,
+        "run_unrealized_pnl_delta": 0.0,
+        "run_mark_to_market_delta": 0.0,
         "total_fee": 0.0,
         "spread_slippage_estimate": 0.0,
         "exchange_fill_count": 0,
@@ -195,7 +204,13 @@ async def run_controlled_auto_live(
         "equity_diff_after": None,
         "current_epoch_pnl_before": None,
         "current_epoch_pnl_after": None,
+        "current_epoch_pnl_delta": None,
+        "account_epoch_pnl_before": None,
+        "account_epoch_pnl_after": None,
+        "account_epoch_pnl_delta": None,
         "run_pnl": 0.0,
+        "pnl_explanation": "",
+        "report_notes": [],
         "current_epoch_accounting_pending_count": None,
         "current_epoch_accounting_failed_count": None,
         "final_runtime_status": None,
@@ -221,6 +236,7 @@ async def run_controlled_auto_live(
         if not current_epoch.get("current_epoch_sanity_passed"):
             return _finalize(report, "ABORTED", ["CURRENT_EPOCH_SANITY_FAILED"], controlled_gate=controlled_gate)
         report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        report["account_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
 
         broker = get_live_broker(exchange)
         held_position: dict[str, Any] | None = None
@@ -325,6 +341,140 @@ async def run_controlled_auto_live(
         return await _finalize_after_orders(report, exchange, ordered_logs, "PASSED", [], before_equity, controlled_gate)
     except Exception as exc:
         return _finalize(report, "FAILED", [f"CONTROLLED_AUTO_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"], controlled_gate=controlled_gate)
+
+
+async def run_controlled_auto_live_dry_run_force_buy(
+    *,
+    exchange: str = "bithumb",
+    symbol: str = "BTC",
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    runtime_seconds: int = DEFAULT_RUNTIME_SECONDS,
+    confirmation: str,
+    current_epoch: dict | None = None,
+) -> dict:
+    exchange = (exchange or "bithumb").lower()
+    symbol = (symbol or "BTC").upper()
+    runtime_seconds = min(max(int(runtime_seconds), 1), 600)
+    notional = min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW)
+    started_at = _utc_now()
+    run_id = f"controlled-dry-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+    report: dict[str, Any] = {
+        "controlled_run_id": run_id,
+        "controlled_auto_live_status": "FAILED",
+        "started_at_utc": started_at,
+        "completed_at_utc": None,
+        "runtime_limit_seconds": runtime_seconds,
+        "runtime_seconds": 0,
+        "dry_run": True,
+        "forced_signal": True,
+        "forced_signal_type": "BUY",
+        "symbol": symbol,
+        "market": f"KRW-{symbol}",
+        "strategy": "ma_cross",
+        "order_count_limit": 1,
+        "order_count": 0,
+        "order_preview_count": 0,
+        "exchange_fill_count": 0,
+        "ledger_fill_count": 0,
+        "missing_ledger_fill_count": 0,
+        "duplicate_fill_count": 0,
+        "fee_diff": 0.0,
+        "equity_before": None,
+        "equity_after": None,
+        "equity_diff_after": 0.0,
+        "current_epoch_pnl_before": None,
+        "current_epoch_pnl_after": None,
+        "current_epoch_pnl_delta": 0.0,
+        "account_epoch_pnl_before": None,
+        "account_epoch_pnl_after": None,
+        "account_epoch_pnl_delta": 0.0,
+        "current_epoch_accounting_pending_count": None,
+        "current_epoch_accounting_failed_count": None,
+        "run_realized_pnl": 0.0,
+        "run_unrealized_pnl_delta": 0.0,
+        "run_mark_to_market_delta": 0.0,
+        "run_pnl": 0.0,
+        "risk_decision": {},
+        "order_preview": {},
+        "final_runtime_status": None,
+        "pass_fail_reasons": [],
+    }
+    try:
+        if confirmation != DRY_RUN_CONFIRMATION_PHRASE:
+            return _finalize(report, "ABORTED", ["CONTROLLED_DRY_RUN_CONFIRMATION_REQUIRED"])
+        if not _full_auto_live_disabled():
+            return _finalize(report, "ABORTED", ["FULL_AUTO_LIVE_MUST_REMAIN_FALSE"])
+        if symbol not in ALLOWED_SYMBOLS or symbol in BLOCKED_SYMBOLS:
+            return _finalize(report, "ABORTED", ["CONTROLLED_DRY_RUN_SYMBOL_NOT_ALLOWED"])
+        if is_emergency_stopped():
+            return _finalize(report, "ABORTED", ["EMERGENCY_STOP_ENABLED"])
+        if load_global_bot_operation_policy().get("auto_trading_enabled"):
+            return _finalize(report, "ABORTED", ["DB_AUTO_TRADING_MUST_REMAIN_FALSE"])
+        runtime = load_runtime_lock("auto-trading")
+        if str((runtime or {}).get("status") or "").upper() != "STOPPED":
+            return _finalize(report, "ABORTED", ["RUNTIME_LOCK_MUST_REMAIN_STOPPED"])
+        if notional <= 0 or notional > MAX_NOTIONAL_KRW:
+            return _finalize(report, "ABORTED", ["CONTROLLED_DRY_RUN_AMOUNT_EXCEEDS_LIMIT"])
+        before_equity = await _current_equity(exchange)
+        report["equity_before"] = before_equity
+        report["equity_after"] = before_equity
+        current_epoch = current_epoch or build_current_epoch_diagnostics(exchange=exchange, current_equity=before_equity)
+        if not current_epoch.get("current_epoch_sanity_passed"):
+            return _finalize(report, "ABORTED", ["CURRENT_EPOCH_SANITY_FAILED"])
+        report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        report["current_epoch_pnl_after"] = current_epoch.get("current_epoch_total_pnl")
+        report["account_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        report["account_epoch_pnl_after"] = current_epoch.get("current_epoch_total_pnl")
+        report["current_epoch_pnl_delta"] = 0.0
+        report["account_epoch_pnl_delta"] = 0.0
+        report["current_epoch_accounting_pending_count"] = int(current_epoch.get("current_epoch_accounting_pending_count") or 0)
+        report["current_epoch_accounting_failed_count"] = int(current_epoch.get("current_epoch_accounting_failed_count") or 0)
+        quote = await _orderbook_quote(exchange, f"KRW-{symbol}")
+        price = _float(quote.get("best_ask"))
+        volume = _round_volume(notional / price) if price > 0 else 0.0
+        fee_rate = LiveTradingConfig.for_exchange(exchange).fee_rate
+        estimated_fee = notional * fee_rate
+        estimated_spread = max(_float(quote.get("best_ask")) - _float(quote.get("best_bid")), 0.0) * volume
+        min_order_krw = LiveTradingConfig.for_exchange(exchange).min_order_krw
+        blockers = []
+        if price <= 0 or volume <= 0:
+            blockers.append("ORDERBOOK_UNAVAILABLE")
+        if notional < min_order_krw:
+            blockers.append("ORDER_BELOW_MINIMUM")
+        order_preview = {
+            "request_id": f"{run_id}-preview-buy-1",
+            "client_order_id": f"{run_id[:24]}-dry-buy-1"[:36],
+            "idempotency_key": f"controlled-dry-run:{exchange}:{symbol}:{run_id}:BUY:1",
+            "exchange": exchange,
+            "market": f"KRW-{symbol}",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": price,
+            "volume": volume,
+            "amount_krw": notional,
+            "estimated_fee": estimated_fee,
+            "estimated_slippage": estimated_spread,
+            "min_order_krw": min_order_krw,
+            "strategy_name": "ma_cross",
+            "signal_type": "BUY",
+            "forced_signal": True,
+            "dry_run": True,
+        }
+        risk_decision = {
+            "allowed": len(blockers) == 0,
+            "risk_result": "DRY_RUN_ALLOWED" if not blockers else "DRY_RUN_BLOCKED",
+            "blockers": blockers,
+            "reason": "Forced dry-run BUY preview only; no exchange order or ledger write is performed.",
+            "full_auto_live_allowed": False,
+            "db_auto_trading_enabled": False,
+            "runtime_lock_status": str((runtime or {}).get("status") or "UNKNOWN").upper(),
+        }
+        report["order_preview"] = order_preview
+        report["order_preview_count"] = 1
+        report["risk_decision"] = risk_decision
+        return _finalize(report, "PASSED" if risk_decision["allowed"] else "STOPPED", blockers)
+    except Exception as exc:
+        return _finalize(report, "FAILED", [f"CONTROLLED_DRY_RUN_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"])
 
 
 async def _select_entry_decision(exchange: str, symbols: list[str], notional: float) -> dict:
@@ -574,6 +724,18 @@ async def _finalize_after_orders(
     report["equity_diff_after"] = 0.0 if after_equity is not None else None
     after_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=after_equity)
     report["current_epoch_pnl_after"] = after_epoch.get("current_epoch_total_pnl")
+    report["account_epoch_pnl_after"] = after_epoch.get("current_epoch_total_pnl")
+    epoch_before = _float(report.get("account_epoch_pnl_before"))
+    epoch_after = _float(report.get("account_epoch_pnl_after"))
+    epoch_delta = epoch_after - epoch_before
+    report["current_epoch_pnl_delta"] = epoch_delta
+    report["account_epoch_pnl_delta"] = epoch_delta
+    report["run_unrealized_pnl_delta"] = _float(report.get("run_mark_to_market_delta"))
+    if int(report.get("order_count") or 0) == 0 and abs(epoch_delta) > 0:
+        note = "No orders were executed; account epoch PnL movement is existing-position mark-to-market change, not this run's trading PnL."
+        report["pnl_explanation"] = "이번 run의 매매 손익이 아니라 기존 보유자산 평가손익 변화입니다."
+        report.setdefault("report_notes", []).append(note)
+        logger.info("[controlled-auto-live] zero-order epoch pnl moved: delta=%s note=%s", epoch_delta, note)
     report["current_epoch_accounting_pending_count"] = int(after_epoch.get("current_epoch_accounting_pending_count") or 0)
     report["current_epoch_accounting_failed_count"] = int(after_epoch.get("current_epoch_accounting_failed_count") or 0)
     report["runtime_seconds"] = max(0, int((_parse_utc(_utc_now()) - _parse_utc(str(report["started_at_utc"]))).total_seconds()))
@@ -595,7 +757,10 @@ def _apply_realized_position_pnl(report: dict, position: dict) -> None:
     report["gross_pnl"] = _float(report.get("gross_pnl")) + gross
     report["total_fee"] = _float(report.get("total_fee")) + total_fee
     report["net_pnl_after_fee"] = _float(report.get("net_pnl_after_fee")) + net
-    report["run_pnl"] = report["net_pnl_after_fee"]
+    report["run_realized_pnl"] = _float(report.get("run_realized_pnl")) + net
+    report["run_unrealized_pnl_delta"] = 0.0
+    report["run_mark_to_market_delta"] = 0.0
+    report["run_pnl"] = report["run_realized_pnl"]
     report["spread_slippage_estimate"] = _float(report.get("spread_slippage_estimate")) + spread
 
 
@@ -681,6 +846,14 @@ def _runtime_guards_pass(exchange: str) -> bool:
         and live_config.api_key_loaded
         and live_config.live_trading_enabled
     )
+
+
+def _full_auto_live_disabled() -> bool:
+    truthy = {"1", "true", "yes", "on", "enabled"}
+    for key in ("FULL_AUTO_LIVE", "FULL_AUTO_LIVE_ENABLED", "AUTO_FULL_LIVE_ENABLED"):
+        if str(os.getenv(key, "false")).strip().lower() in truthy:
+            return False
+    return True
 
 
 def _round_trip_cost_rate(quote: dict) -> float:
