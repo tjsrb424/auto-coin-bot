@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.database import get_connection, load_global_bot_operation_policy
+from app.trading_reconciliation import build_equity_reconciliation
 
 OPEN_POSITION_STATUSES = ("OPEN", "EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED")
 ORDER_ACTIVE_STATUSES = ("SUBMITTED", "WAITING", "PARTIALLY_FILLED")
@@ -160,6 +161,8 @@ def build_trading_diagnostics_report(
         realized_pnl_from_db=realized_pnl,
         unrealized_pnl_from_positions=unrealized_pnl,
         total_fee=fee_total,
+        orders=orders,
+        positions=positions,
         payload=asset_reconciliation or {},
     )
     restart_gate = _restart_gate(risk_diagnostics, safety_limits, summary, asset_report)
@@ -430,6 +433,8 @@ def _asset_reconciliation_report(
     realized_pnl_from_db: float,
     unrealized_pnl_from_positions: float,
     total_fee: float,
+    orders: list[dict],
+    positions: list[dict],
     payload: dict,
 ) -> dict:
     deposits = _float(payload.get("deposits"), 0.0)
@@ -440,9 +445,23 @@ def _asset_reconciliation_report(
     current_equity = payload.get("current_equity_from_exchange")
     if current_equity is None:
         current_equity = current_cash + current_coin_value if (current_cash or current_coin_value) else None
-    expected_equity = initial_equity + deposits - withdrawals + realized_pnl_from_db + unrealized_pnl_from_positions - total_fee
-    equity_diff = None if current_equity is None else _float(current_equity) - expected_equity
-    equity_diff_rate = None if equity_diff is None else abs(equity_diff) / max(initial_equity, 1.0)
+    reconciliation = build_equity_reconciliation(
+        initial_equity=initial_equity,
+        current_equity_from_exchange=_float(current_equity) if current_equity is not None else None,
+        realized_pnl_from_db=realized_pnl_from_db,
+        unrealized_pnl_from_positions=unrealized_pnl_from_positions,
+        total_fee_from_db=total_fee,
+        db_orders=orders,
+        db_positions=positions,
+        exchange_orders=payload.get("exchange_orders") if "exchange_orders" in payload else None,
+        exchange_balances=payload.get("balances") if isinstance(payload.get("balances"), dict) else {},
+        valuation_prices=payload.get("valuation_prices") if isinstance(payload.get("valuation_prices"), dict) else {},
+        period_start_utc=str(payload.get("period_start_utc") or ""),
+        deposits=deposits,
+        withdrawals=withdrawals,
+        fee_rate=_float(os.getenv("LIVE_FEE_RATE"), 0.0005),
+        open_order_fee_adjustment=_float(payload.get("open_order_fee_adjustment"), 0.0),
+    )
     return {
         "initial_equity": initial_equity,
         "current_equity_from_exchange": current_equity,
@@ -451,12 +470,38 @@ def _asset_reconciliation_report(
         "realized_pnl_from_db": realized_pnl_from_db,
         "unrealized_pnl_from_positions": unrealized_pnl_from_positions,
         "total_fee": total_fee,
+        "gross_realized_pnl_before_fee": reconciliation["gross_realized_pnl_before_fee"],
+        "realized_fee": reconciliation["realized_fee"],
+        "net_realized_pnl_after_fee": reconciliation["net_realized_pnl_after_fee"],
+        "realized_pnl_fee_treatment": reconciliation["realized_pnl_fee_treatment"],
+        "unrealized_pnl_before_fee": reconciliation["unrealized_pnl_before_fee"],
+        "estimated_exit_fee": reconciliation["estimated_exit_fee"],
+        "unrealized_pnl_after_estimated_fee": reconciliation["unrealized_pnl_after_estimated_fee"],
+        "total_fee_from_db": reconciliation["total_fee_from_db"],
+        "total_fee_from_exchange": reconciliation["total_fee_from_exchange"],
+        "fee_diff": reconciliation["fee_diff"],
         "deposits": deposits,
         "withdrawals": withdrawals,
-        "expected_equity": expected_equity,
-        "equity_diff": equity_diff,
-        "equity_diff_rate": equity_diff_rate,
-        "gate_failed": bool(equity_diff is not None and (abs(equity_diff) > 100.0 or (equity_diff_rate or 0.0) > 0.001)),
+        "expected_equity": reconciliation["expected_equity"],
+        "legacy_expected_equity_with_double_fee": reconciliation["legacy_expected_equity_with_double_fee"],
+        "expected_equity_formula": reconciliation["expected_equity_formula"],
+        "current_equity_formula": reconciliation["current_equity_formula"],
+        "current_equity_uses_locked_balances": reconciliation["current_equity_uses_locked_balances"],
+        "locked_krw_value": reconciliation["locked_krw_value"],
+        "locked_coin_market_value": reconciliation["locked_coin_market_value"],
+        "equity_diff": reconciliation["equity_diff"],
+        "equity_diff_rate": reconciliation["equity_diff_rate"],
+        "equity_diff_breakdown": reconciliation["equity_diff_breakdown"],
+        "exchange_fill_match": reconciliation["exchange_fill_match"],
+        "duplicate_exchange_uuid_in_db": reconciliation["duplicate_exchange_uuid_in_db"],
+        "duplicate_client_order_id_in_db": reconciliation["duplicate_client_order_id_in_db"],
+        "duplicate_db_accounting": reconciliation["duplicate_db_accounting"],
+        "valuation_price_diff_detail": reconciliation["valuation_price_diff_detail"],
+        "exchange_ledger_status": payload.get("exchange_ledger_status", "UNAVAILABLE"),
+        "exchange_ledger_unavailable_reason": payload.get("exchange_ledger_unavailable_reason"),
+        "deposit_withdrawal_status": payload.get("deposit_withdrawal_status", "UNAVAILABLE"),
+        "deposit_withdrawal_unavailable_reason": payload.get("deposit_withdrawal_unavailable_reason", "No read-only deposit/withdrawal broker method is configured."),
+        "gate_failed": bool(reconciliation["gate_failed"]),
     }
 
 
@@ -484,6 +529,15 @@ def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation:
         reasons.append({"code": "FEE_PRESSURE_WARNING", "count": 1})
     if (asset_reconciliation or {}).get("gate_failed"):
         reasons.append({"code": "EQUITY_RECONCILIATION_DIFF", "count": 1})
+    asset_match = (asset_reconciliation or {}).get("exchange_fill_match") or {}
+    if (asset_match.get("missing_exchange_fill_in_db") or {}).get("count"):
+        reasons.append({"code": "EXCHANGE_FILL_MISSING_IN_DB", "count": asset_match["missing_exchange_fill_in_db"]["count"]})
+    if (asset_match.get("db_only_trade") or {}).get("count"):
+        reasons.append({"code": "DB_TRADE_MISSING_IN_EXCHANGE", "count": asset_match["db_only_trade"]["count"]})
+    if ((asset_reconciliation or {}).get("duplicate_client_order_id_in_db") or {}).get("count"):
+        reasons.append({"code": "DUPLICATE_CLIENT_ORDER_ID", "count": asset_reconciliation["duplicate_client_order_id_in_db"]["count"]})
+    if abs(_float((asset_reconciliation or {}).get("fee_diff"))) > 100.0:
+        reasons.append({"code": "FEE_RECONCILIATION_DIFF", "count": 1})
     if _float(summary.get("total_pnl_krw")) < 0:
         reasons.append({"code": "SEVEN_DAY_PNL_NEGATIVE", "count": 1})
     return {
@@ -516,7 +570,17 @@ def _order_sample(order: dict) -> dict:
         "order_purpose": order.get("order_purpose"),
         "status": order.get("status"),
         "risk_result": order.get("risk_result"),
+        "client_order_id": order.get("client_order_id"),
+        "idempotency_key": order.get("idempotency_key"),
+        "strategy": order.get("strategy_name"),
+        "amount": _order_amount(order),
+        "price": order.get("price"),
+        "fee": order.get("paid_fee"),
+        "executed_volume": order.get("executed_volume"),
+        "estimated_pnl_impact_krw": order.get("actual_pnl") if order.get("actual_pnl") is not None else order.get("expected_pnl"),
+        "exchange_linked": bool(order.get("order_uuid")),
         "created_at": order.get("created_at"),
+        "executed_at_utc": order.get("order_executed_at_utc") or order.get("updated_at"),
         "candle_time_utc": order.get("candle_time_utc"),
         "candle_close_at_utc": order.get("candle_close_at_utc"),
     }
@@ -560,6 +624,15 @@ def _float(value: Any, default: float = 0.0) -> float:
 def _parse_utc(value: Any) -> datetime | None:
     if not value:
         return None
+    normalized = str(value).replace(" ", "T")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    if "+" not in normalized[-6:] and "-" not in normalized[-6:]:
+        normalized = f"{normalized}+00:00"
+    try:
+        return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _timestamp_is_non_utc(value: str) -> bool:
@@ -571,15 +644,6 @@ def _timestamp_is_non_utc(value: str) -> bool:
     if normalized.endswith("+00:00"):
         return False
     return True
-    normalized = str(value).replace(" ", "T")
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    if "+" not in normalized[-6:] and "-" not in normalized[-6:]:
-        normalized = f"{normalized}+00:00"
-    try:
-        return datetime.fromisoformat(normalized).astimezone(timezone.utc)
-    except ValueError:
-        return None
 
 
 def _to_iso(value: datetime) -> str:

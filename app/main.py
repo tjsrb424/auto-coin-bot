@@ -1991,11 +1991,13 @@ async def repair_scale_in_duplicate_endpoint(
     return {**result, "recent_events": recent_recovery_events()}
 
 
-async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: float | None) -> dict:
+async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: float | None, *, days: int = 7) -> dict:
+    period_start_utc = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     balances, status, error = await _safe_live_balances_for_exchange(exchange)
     if status != "SUCCESS":
         return {
             "initial_equity": initial_equity,
+            "period_start_utc": period_start_utc,
             "current_equity_from_exchange": None,
             "current_cash_krw": 0.0,
             "current_coin_market_value": 0.0,
@@ -2003,36 +2005,179 @@ async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: flo
             "withdrawals": 0.0,
             "balance_fetch_status": status,
             "balance_error": error,
+            "exchange_ledger_status": "UNAVAILABLE",
+            "exchange_ledger_unavailable_reason": "Balance fetch failed before read-only order ledger collection.",
+            "deposit_withdrawal_status": "UNAVAILABLE",
+            "deposit_withdrawal_unavailable_reason": "No read-only deposit/withdrawal broker method is configured.",
         }
     by_currency = balances.get("by_currency") or {}
     krw = by_currency.get("KRW") or balances.get("krw") or {}
-    current_cash = float(krw.get("balance") or 0.0) + float(krw.get("locked") or 0.0)
+    krw_available = float(krw.get("balance") or 0.0)
+    krw_locked = float(krw.get("locked") or 0.0)
+    current_cash = krw_available + krw_locked
     coin_quantities: dict[str, float] = {}
+    coin_available_quantities: dict[str, float] = {}
+    coin_locked_quantities: dict[str, float] = {}
     for currency, item in by_currency.items():
         symbol = str(currency or "").upper()
         if not symbol or symbol == "KRW":
             continue
-        total = float((item or {}).get("balance") or 0.0) + float((item or {}).get("locked") or 0.0)
+        available = float((item or {}).get("balance") or 0.0)
+        locked = float((item or {}).get("locked") or 0.0)
+        total = available + locked
         if total > 0:
             coin_quantities[f"KRW-{symbol}"] = total
+            coin_available_quantities[f"KRW-{symbol}"] = available
+            coin_locked_quantities[f"KRW-{symbol}"] = locked
+    ledger_markets = _diagnostic_ledger_markets(exchange, days, extra_markets=list(coin_quantities.keys()))
     snapshots = await _market_snapshots(list(coin_quantities.keys()), exchange=exchange)
+    valuation_prices = {market: float((snapshot or {}).get("price") or 0.0) for market, snapshot in snapshots.items()}
     coin_value = 0.0
+    coin_available_value = 0.0
+    coin_locked_value = 0.0
     coins = []
     for market, quantity in coin_quantities.items():
         price = float((snapshots.get(market) or {}).get("price") or 0.0)
         value = quantity * price
+        available_value = coin_available_quantities.get(market, 0.0) * price
+        locked_value = coin_locked_quantities.get(market, 0.0) * price
         coin_value += value
-        coins.append({"market": market, "quantity": quantity, "price": price, "value_krw": value})
+        coin_available_value += available_value
+        coin_locked_value += locked_value
+        coins.append({
+            "market": market,
+            "available_quantity": coin_available_quantities.get(market, 0.0),
+            "locked_quantity": coin_locked_quantities.get(market, 0.0),
+            "quantity": quantity,
+            "price": price,
+            "available_value_krw": available_value,
+            "locked_value_krw": locked_value,
+            "value_krw": value,
+        })
+    ledger = await _read_only_exchange_order_ledger(exchange, ledger_markets, days=days)
     return {
         "initial_equity": initial_equity,
+        "period_start_utc": period_start_utc,
         "current_equity_from_exchange": current_cash + coin_value,
         "current_cash_krw": current_cash,
+        "current_cash_available_krw": krw_available,
+        "current_cash_locked_krw": krw_locked,
         "current_coin_market_value": coin_value,
+        "current_coin_available_market_value": coin_available_value,
+        "current_coin_locked_market_value": coin_locked_value,
         "deposits": 0.0,
         "withdrawals": 0.0,
         "balance_fetch_status": status,
         "balance_error": error,
+        "balances": balances,
+        "valuation_prices": valuation_prices,
         "coins": coins,
+        "exchange_orders": ledger.get("orders", []),
+        "exchange_ledger_status": ledger.get("status"),
+        "exchange_ledger_unavailable_reason": ledger.get("unavailable_reason"),
+        "exchange_ledger_errors": ledger.get("errors", []),
+        "exchange_ledger_market_count": len(ledger_markets),
+        "exchange_ledger_order_count": len(ledger.get("orders", [])),
+        "deposit_withdrawal_status": "UNAVAILABLE",
+        "deposit_withdrawal_unavailable_reason": "No read-only deposit/withdrawal broker method is configured.",
+    }
+
+
+def _diagnostic_ledger_markets(exchange: str, days: int, *, extra_markets: list[str] | None = None) -> list[str]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    markets = list(extra_markets or [])
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT market
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND created_at >= ?
+              AND market IS NOT NULL
+              AND market != ''
+            UNION
+            SELECT DISTINCT market
+            FROM live_positions
+            WHERE exchange = ?
+              AND (created_at >= ? OR closed_at >= ? OR status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED'))
+              AND market IS NOT NULL
+              AND market != ''
+            ORDER BY market ASC
+            """,
+            (exchange, cutoff, exchange, cutoff, cutoff),
+        ).fetchall()
+    for row in rows:
+        markets.append(str(row["market"]))
+    return list(dict.fromkeys(market for market in markets if market))
+
+
+def _diagnostic_order_uuids(exchange: str, days: int, *, limit: int) -> list[str]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT order_uuid
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND created_at >= ?
+              AND order_uuid IS NOT NULL
+              AND order_uuid != ''
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (exchange, cutoff, max(int(limit), 1)),
+        ).fetchall()
+    return [str(row["order_uuid"]) for row in rows]
+
+
+async def _read_only_exchange_order_ledger(exchange: str, markets: list[str], *, days: int) -> dict:
+    if not markets:
+        return {"status": "EMPTY", "orders": [], "errors": []}
+    try:
+        broker = get_live_broker(exchange)
+    except Exception as exc:
+        return {"status": "UNAVAILABLE", "orders": [], "errors": [], "unavailable_reason": str(exc)}
+    max_pages = max(int(os.getenv("DIAGNOSTIC_EXCHANGE_ORDER_PAGE_LIMIT", "3")), 1)
+    page_limit = min(max(int(os.getenv("DIAGNOSTIC_EXCHANGE_ORDER_PAGE_SIZE", "100")), 1), 100)
+    uuid_limit = max(int(os.getenv("DIAGNOSTIC_EXCHANGE_ORDER_UUID_LIMIT", "200")), 1)
+    orders_by_uuid: dict[str, dict] = {}
+    errors = []
+    for market in markets:
+        for state in ("done", "cancel", "wait"):
+            for page in range(1, max_pages + 1):
+                try:
+                    response = await broker.list_orders(market, state=state, page=page, limit=page_limit)
+                    raw_orders = response.get("orders", []) if isinstance(response, dict) else []
+                    if isinstance(raw_orders, dict):
+                        raw_orders = [raw_orders]
+                    if not raw_orders:
+                        break
+                    for order in raw_orders:
+                        if not isinstance(order, dict):
+                            continue
+                        uuid_value = str(order.get("uuid") or order.get("order_uuid") or "")
+                        key = uuid_value or f"{market}:{state}:{page}:{len(orders_by_uuid)}"
+                        orders_by_uuid[key] = order
+                    if len(raw_orders) < page_limit:
+                        break
+                except Exception as exc:
+                    errors.append({"market": market, "state": state, "page": page, "error": str(exc)[:240]})
+                    break
+    for order_uuid in _diagnostic_order_uuids(exchange, days, limit=uuid_limit):
+        if order_uuid in orders_by_uuid:
+            continue
+        try:
+            order = await broker.get_order(order_uuid)
+            if isinstance(order, dict):
+                orders_by_uuid[order_uuid] = order
+        except Exception as exc:
+            errors.append({"order_uuid": order_uuid, "error": str(exc)[:240]})
+    status = "SUCCESS" if orders_by_uuid or not errors else "UNAVAILABLE"
+    return {
+        "status": status,
+        "orders": list(orders_by_uuid.values()),
+        "errors": errors[:50],
+        "unavailable_reason": None if status != "UNAVAILABLE" else "Read-only exchange order history calls failed.",
     }
 
 
@@ -2047,13 +2192,28 @@ async def trading_diagnostics(
     days: int = Query(7, ge=1, le=30),
     starting_asset_krw: float | None = Query(None, gt=0),
 ) -> dict:
-    asset_reconciliation = await _asset_reconciliation_from_exchange(exchange, starting_asset_krw)
+    asset_reconciliation = await _asset_reconciliation_from_exchange(exchange, starting_asset_krw, days=days)
     return build_trading_diagnostics_report(
         exchange=exchange,
         days=days,
         starting_asset_krw=starting_asset_krw,
         asset_reconciliation=asset_reconciliation,
     )
+
+
+@app.get("/api/trading-reconciliation")
+async def trading_reconciliation(
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    days: int = Query(7, ge=1, le=30),
+    starting_asset_krw: float | None = Query(None, gt=0),
+) -> dict:
+    report = await trading_diagnostics(exchange=exchange, days=days, starting_asset_krw=starting_asset_krw)
+    return {
+        "generated_at_utc": report.get("generated_at_utc"),
+        "exchange": report.get("exchange"),
+        "asset_reconciliation": report.get("asset_reconciliation"),
+        "restart_gate": report.get("restart_gate"),
+    }
 
 
 @app.get("/api/risk/policy-blocks/latest")

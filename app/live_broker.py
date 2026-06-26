@@ -24,6 +24,7 @@ class BrokerInterface(Protocol):
     async def create_order_preview(self, order: dict) -> dict: ...
     async def place_order(self, order: dict) -> dict: ...
     async def get_order(self, order_id: str) -> dict: ...
+    async def list_orders(self, market: str, state: str = "done", page: int = 1, limit: int = 100) -> dict: ...
     async def list_open_orders(self, market: str) -> dict: ...
     async def cancel_order(self, order_id: str) -> dict: ...
 
@@ -280,6 +281,10 @@ class UpbitBroker(BaseJwtBroker):
         result = await self._request("GET", "/v1/orders", {"market": market, "state": "wait"})
         return {"orders": result if isinstance(result, list) else result}
 
+    async def list_orders(self, market: str, state: str = "done", page: int = 1, limit: int = 100) -> dict:
+        result = await self._request("GET", "/v1/orders", {"market": market, "state": state, "page": page, "limit": limit})
+        return {"orders": result if isinstance(result, list) else result}
+
     async def cancel_order(self, order_id: str) -> dict:
         result = await self._request("DELETE", "/v1/order", {"uuid": order_id})
         return result if isinstance(result, dict) else {"raw": result}
@@ -350,6 +355,10 @@ class BithumbBroker(BaseJwtBroker):
 
     async def list_open_orders(self, market: str) -> dict:
         result = await self._request("GET", "/v1/orders", {"market": market, "state": "wait"})
+        return {"orders": result if isinstance(result, list) else result}
+
+    async def list_orders(self, market: str, state: str = "done", page: int = 1, limit: int = 100) -> dict:
+        result = await self._request("GET", "/v1/orders", {"market": market, "state": state, "page": page, "limit": limit})
         return {"orders": result if isinstance(result, list) else result}
 
     async def cancel_order(self, order_id: str) -> dict:
