@@ -141,6 +141,7 @@ from app.live_recovery import (
     sync_open_orders,
 )
 from app.accounting_epoch import build_current_epoch_diagnostics, build_open_order_audit, build_smoke_test_preflight
+from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
 from app.live_state_reconciler import live_state_warnings, reconcile_live_state
 from app.live_exit import (
     approve_exit_candidate,
@@ -664,6 +665,13 @@ class SmokeTestPreflightRequest(BaseModel):
     symbol: str = Field("BTC", pattern=r"^(BTC|ETH|WLD|XLM|RE|STRAX|ID)$")
     strategy_name: str = "smoke_test"
     amount_krw: float | None = Field(None, gt=0)
+
+
+class SmokeTestRunRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbol: str = Field("BTC", pattern=r"^(BTC|ETH)$")
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    confirmation: str = ""
 
 
 class SmartRehearsalReviewRequest(BaseModel):
@@ -2705,6 +2713,48 @@ async def live_smoke_test_preflight_post(payload: SmokeTestPreflightRequest) -> 
         current_epoch=current_epoch,
         open_order_audit=open_order_audit,
     )
+
+
+@app.post("/api/live-smoke-test/run")
+async def live_smoke_test_run(payload: SmokeTestRunRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, payload.symbol)
+    preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol=payload.symbol,
+        strategy_name="smoke_test",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    if payload.confirmation != SMOKE_TEST_CONFIRMATION:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Smoke test confirmation phrase is required.",
+            "required_confirmation": SMOKE_TEST_CONFIRMATION,
+            "preflight": preflight,
+        }
+    if preflight.get("smoke_test_blockers"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Smoke test preflight is blocked.",
+            "preflight": preflight,
+        }
+    report = await run_one_shot_live_smoke_test(
+        exchange=payload.exchange,
+        symbol=payload.symbol,
+        amount_krw=payload.amount_krw,
+        confirmation=payload.confirmation,
+        open_order_audit=open_order_audit,
+        current_epoch=current_epoch,
+    )
+    return {"ok": report.get("smoke_test_status") == "PASSED", "report": report}
 
 
 @app.get("/api/trading-diagnostics")
