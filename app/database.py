@@ -44,6 +44,7 @@ REQUIRED_SCHEMA_TABLES = [
     "strategy_kill_switch_events",
     "position_fill_events",
     "order_application_ledger",
+    "exchange_fills_ledger",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -908,6 +909,36 @@ def init_db() -> None:
                 FOREIGN KEY(order_log_id) REFERENCES live_order_logs(id)
             );
 
+            CREATE TABLE IF NOT EXISTS exchange_fills_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange_name TEXT NOT NULL,
+                exchange_order_uuid TEXT,
+                internal_order_ref TEXT,
+                exchange_fill_id TEXT,
+                fill_key TEXT NOT NULL,
+                client_order_id TEXT,
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                quantity REAL NOT NULL DEFAULT 0,
+                executed_value REAL NOT NULL DEFAULT 0,
+                fee REAL NOT NULL DEFAULT 0,
+                fee_currency TEXT NOT NULL DEFAULT 'KRW',
+                executed_at_utc TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'exchange_api',
+                matched_db_order_id INTEGER,
+                matched_live_order_log_id INTEGER,
+                matched_session_id INTEGER,
+                matched_strategy_name TEXT,
+                match_status TEXT NOT NULL DEFAULT 'UNMATCHED',
+                match_reason TEXT NOT NULL DEFAULT '',
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                UNIQUE(exchange_name, fill_key),
+                FOREIGN KEY(matched_live_order_log_id) REFERENCES live_order_logs(id)
+            );
+
             CREATE TABLE IF NOT EXISTS runtime_locks (
                 lock_id TEXT PRIMARY KEY,
                 instance_id TEXT NOT NULL,
@@ -1291,6 +1322,7 @@ def init_db() -> None:
         _ensure_column(conn, "order_application_ledger", "applied_fee", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_application_ledger", "last_exchange_filled_amount_krw", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_application_ledger", "last_exchange_paid_fee", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "exchange_fills_ledger", "internal_order_ref", "TEXT")
         _ensure_column(conn, "decision_snapshots", "selected_strategy_type", "TEXT")
         _ensure_column(conn, "decision_snapshots", "internal_signals_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "decision_snapshots", "max_total_exposure_krw", "REAL NOT NULL DEFAULT 0")
@@ -5086,6 +5118,98 @@ def upsert_order_application_ledger(event: dict) -> dict | None:
         )
         row = conn.execute("SELECT * FROM order_application_ledger WHERE order_uuid = ?", (event["order_uuid"],)).fetchone()
     return dict(row) if row else None
+
+
+def upsert_exchange_fill_ledger(fill: dict) -> dict | None:
+    now_utc = _utc_now()
+    exchange_name = str(fill.get("exchange_name") or fill.get("exchange") or "bithumb")
+    fill_key = str(fill["fill_key"])
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO exchange_fills_ledger (
+                exchange_name, exchange_order_uuid, internal_order_ref, exchange_fill_id,
+                fill_key, client_order_id, symbol, market, side, price, quantity,
+                executed_value, fee, fee_currency, executed_at_utc, source,
+                matched_db_order_id, matched_live_order_log_id, matched_session_id,
+                matched_strategy_name, match_status, match_reason,
+                created_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(exchange_name, fill_key) DO UPDATE SET
+                exchange_order_uuid = excluded.exchange_order_uuid,
+                internal_order_ref = excluded.internal_order_ref,
+                exchange_fill_id = excluded.exchange_fill_id,
+                client_order_id = excluded.client_order_id,
+                symbol = excluded.symbol,
+                market = excluded.market,
+                side = excluded.side,
+                price = excluded.price,
+                quantity = excluded.quantity,
+                executed_value = excluded.executed_value,
+                fee = excluded.fee,
+                fee_currency = excluded.fee_currency,
+                executed_at_utc = excluded.executed_at_utc,
+                source = excluded.source,
+                matched_db_order_id = excluded.matched_db_order_id,
+                matched_live_order_log_id = excluded.matched_live_order_log_id,
+                matched_session_id = excluded.matched_session_id,
+                matched_strategy_name = excluded.matched_strategy_name,
+                match_status = excluded.match_status,
+                match_reason = excluded.match_reason,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                exchange_name,
+                fill.get("exchange_order_uuid") or None,
+                fill.get("internal_order_ref"),
+                fill.get("exchange_fill_id"),
+                fill_key,
+                fill.get("client_order_id"),
+                fill.get("symbol") or "",
+                fill["market"],
+                fill["side"],
+                float(fill.get("price") or 0.0),
+                float(fill.get("quantity") or 0.0),
+                float(fill.get("executed_value") or fill.get("amount_krw") or 0.0),
+                float(fill.get("fee") or 0.0),
+                fill.get("fee_currency") or "KRW",
+                fill["executed_at_utc"],
+                fill.get("source") or "exchange_api",
+                fill.get("matched_db_order_id"),
+                fill.get("matched_live_order_log_id"),
+                fill.get("matched_session_id"),
+                fill.get("matched_strategy_name"),
+                fill.get("match_status") or "UNMATCHED",
+                fill.get("match_reason") or "",
+                fill.get("created_at_utc") or now_utc,
+                now_utc,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM exchange_fills_ledger WHERE exchange_name = ? AND fill_key = ?",
+            (exchange_name, fill_key),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def load_exchange_fills_ledger(exchange: str = "bithumb", *, since_utc: str | None = None) -> list[dict]:
+    params: list[object] = [exchange]
+    since_sql = ""
+    if since_utc:
+        since_sql = "AND executed_at_utc >= ?"
+        params.append(since_utc)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM exchange_fills_ledger
+            WHERE exchange_name = ?
+              {since_sql}
+            ORDER BY executed_at_utc ASC, id ASC
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_rebalance_delta_accumulator(

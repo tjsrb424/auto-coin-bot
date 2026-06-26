@@ -445,11 +445,12 @@ def _asset_reconciliation_report(
     current_equity = payload.get("current_equity_from_exchange")
     if current_equity is None:
         current_equity = current_cash + current_coin_value if (current_cash or current_coin_value) else None
+    snapshot_unrealized_pnl = _float(payload.get("snapshot_unrealized_pnl"), unrealized_pnl_from_positions)
     reconciliation = build_equity_reconciliation(
         initial_equity=initial_equity,
         current_equity_from_exchange=_float(current_equity) if current_equity is not None else None,
         realized_pnl_from_db=realized_pnl_from_db,
-        unrealized_pnl_from_positions=unrealized_pnl_from_positions,
+        unrealized_pnl_from_positions=snapshot_unrealized_pnl,
         total_fee_from_db=total_fee,
         db_orders=orders,
         db_positions=positions,
@@ -462,6 +463,20 @@ def _asset_reconciliation_report(
         fee_rate=_float(os.getenv("LIVE_FEE_RATE"), 0.0005),
         open_order_fee_adjustment=_float(payload.get("open_order_fee_adjustment"), 0.0),
     )
+    equity_breakdown = dict(reconciliation["equity_diff_breakdown"])
+    ledger_summary = payload.get("exchange_fills_ledger_summary", {}) if isinstance(payload.get("exchange_fills_ledger_summary"), dict) else {}
+    unexplained_before_deposit_estimate = _float(equity_breakdown.get("unexplained"))
+    if abs(unexplained_before_deposit_estimate) > 0.000001 and payload.get("deposit_withdrawal_status", "UNAVAILABLE") == "UNAVAILABLE":
+        equity_breakdown["deposit_withdrawal_mismatch"] = _float(equity_breakdown.get("deposit_withdrawal_mismatch")) + unexplained_before_deposit_estimate
+        equity_breakdown["unexplained_before_deposit_withdrawal_estimate"] = unexplained_before_deposit_estimate
+        equity_breakdown["unexplained"] = 0.0
+        equity_breakdown["unexplained_rate"] = 0.0
+        equity_breakdown["deposit_withdrawal_mismatch_reason"] = "Deposit/withdrawal ledger is unavailable; residual is isolated here instead of changing DB balances."
+    equity_breakdown["missing_canonical_live_order_log"] = _float(ledger_summary.get("missing_exchange_fill_value"))
+    equity_breakdown["synthetic_uuid_effect"] = 0.0
+    equity_breakdown["stale_valuation_effect"] = _float(payload.get("stale_valuation_effect"), 0.0)
+    equity_breakdown["valuation_snapshot_timing_diff"] = 0.0
+    equity_breakdown["dust_balance_effect"] = 0.0
     return {
         "initial_equity": initial_equity,
         "current_equity_from_exchange": current_equity,
@@ -469,6 +484,7 @@ def _asset_reconciliation_report(
         "current_coin_market_value": current_coin_value,
         "realized_pnl_from_db": realized_pnl_from_db,
         "unrealized_pnl_from_positions": unrealized_pnl_from_positions,
+        "snapshot_unrealized_pnl_from_positions": snapshot_unrealized_pnl,
         "total_fee": total_fee,
         "gross_realized_pnl_before_fee": reconciliation["gross_realized_pnl_before_fee"],
         "realized_fee": reconciliation["realized_fee"],
@@ -491,14 +507,26 @@ def _asset_reconciliation_report(
         "locked_coin_market_value": reconciliation["locked_coin_market_value"],
         "equity_diff": reconciliation["equity_diff"],
         "equity_diff_rate": reconciliation["equity_diff_rate"],
-        "equity_diff_breakdown": reconciliation["equity_diff_breakdown"],
+        "equity_diff_breakdown": equity_breakdown,
         "exchange_fill_match": reconciliation["exchange_fill_match"],
         "duplicate_exchange_uuid_in_db": reconciliation["duplicate_exchange_uuid_in_db"],
         "duplicate_client_order_id_in_db": reconciliation["duplicate_client_order_id_in_db"],
         "duplicate_db_accounting": reconciliation["duplicate_db_accounting"],
         "valuation_price_diff_detail": reconciliation["valuation_price_diff_detail"],
+        "exchange_fills_ledger_summary": payload.get("exchange_fills_ledger_summary", {}),
+        "exchange_net_realized_pnl_after_fee": (payload.get("exchange_realized_pnl") or {}).get("exchange_net_realized_pnl_after_fee"),
+        "exchange_gross_realized_pnl_before_fee": (payload.get("exchange_realized_pnl") or {}).get("exchange_gross_realized_pnl_before_fee"),
+        "exchange_realized_fee": (payload.get("exchange_realized_pnl") or {}).get("exchange_realized_fee"),
+        "realized_pnl_diff": (
+            _float((payload.get("exchange_realized_pnl") or {}).get("exchange_net_realized_pnl_after_fee")) - realized_pnl_from_db
+            if payload.get("exchange_realized_pnl")
+            else None
+        ),
+        "position_valuation_summary": payload.get("position_valuation_summary", {}),
+        "stale_valuation_effect": _float(payload.get("stale_valuation_effect"), 0.0),
         "exchange_ledger_status": payload.get("exchange_ledger_status", "UNAVAILABLE"),
         "exchange_ledger_unavailable_reason": payload.get("exchange_ledger_unavailable_reason"),
+        "exchange_ledger_errors": payload.get("exchange_ledger_errors", []),
         "deposit_withdrawal_status": payload.get("deposit_withdrawal_status", "UNAVAILABLE"),
         "deposit_withdrawal_unavailable_reason": payload.get("deposit_withdrawal_unavailable_reason", "No read-only deposit/withdrawal broker method is configured."),
         "gate_failed": bool(reconciliation["gate_failed"]),
@@ -538,6 +566,13 @@ def _restart_gate(risk: dict, limits: dict, summary: dict, asset_reconciliation:
         reasons.append({"code": "DUPLICATE_CLIENT_ORDER_ID", "count": asset_reconciliation["duplicate_client_order_id_in_db"]["count"]})
     if abs(_float((asset_reconciliation or {}).get("fee_diff"))) > 100.0:
         reasons.append({"code": "FEE_RECONCILIATION_DIFF", "count": 1})
+    ledger_summary = (asset_reconciliation or {}).get("exchange_fills_ledger_summary") or {}
+    if ledger_summary.get("missing_canonical_log_count"):
+        reasons.append({"code": "MISSING_CANONICAL_LIVE_ORDER_LOG", "count": ledger_summary.get("missing_canonical_log_count")})
+    if ledger_summary.get("duplicate_exchange_uuid_count"):
+        reasons.append({"code": "DUPLICATE_REAL_EXCHANGE_UUID", "count": ledger_summary.get("duplicate_exchange_uuid_count")})
+    if ledger_summary.get("synthetic_uuid_count"):
+        reasons.append({"code": "SYNTHETIC_UUID_PRESENT", "count": ledger_summary.get("synthetic_uuid_count")})
     if _float(summary.get("total_pnl_krw")) < 0:
         reasons.append({"code": "SEVEN_DAY_PNL_NEGATIVE", "count": 1})
     return {

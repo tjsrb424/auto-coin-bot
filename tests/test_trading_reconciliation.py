@@ -142,8 +142,8 @@ class TradingReconciliationTests(unittest.TestCase):
             unrealized_pnl_from_positions=0,
             total_fee_from_db=1,
             db_orders=[
-                db_order(id=1, request_id="req-1", order_uuid="dup", client_order_id="dup-client"),
-                db_order(id=2, request_id="req-2", order_uuid="dup", client_order_id="dup-client"),
+                db_order(id=1, request_id="req-1", order_uuid="C0504000000407836246", client_order_id="dup-client"),
+                db_order(id=2, request_id="req-2", order_uuid="C0504000000407836246", client_order_id="dup-client"),
             ],
             db_positions=[],
         )

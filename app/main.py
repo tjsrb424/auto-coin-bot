@@ -155,6 +155,11 @@ from app.smart_promotion import smart_engine_live_mode
 from app.smart_readiness import build_limited_readiness
 from app.scale_in_repair import repair_scale_in_duplicate
 from app.trading_diagnostics import build_trading_diagnostics_report, restart_block_reason
+from app.exchange_fills_ledger import (
+    build_position_valuation_summary,
+    compute_realized_pnl_from_ledger,
+    load_or_build_ledger_rows,
+)
 from app.live_paper import process_running_live_paper_sessions, run_scheduler_tick
 from app.live_strategy_pilot import (
     AUTO_STRATEGY_CONFIRMATION,
@@ -1991,7 +1996,13 @@ async def repair_scale_in_duplicate_endpoint(
     return {**result, "recent_events": recent_recovery_events()}
 
 
-async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: float | None, *, days: int = 7) -> dict:
+async def _asset_reconciliation_from_exchange(
+    exchange: str,
+    initial_equity: float | None,
+    *,
+    days: int = 7,
+    persist_exchange_ledger: bool = False,
+) -> dict:
     period_start_utc = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     balances, status, error = await _safe_live_balances_for_exchange(exchange)
     if status != "SUCCESS":
@@ -2031,6 +2042,7 @@ async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: flo
             coin_locked_quantities[f"KRW-{symbol}"] = locked
     ledger_markets = _diagnostic_ledger_markets(exchange, days, extra_markets=list(coin_quantities.keys()))
     snapshots = await _market_snapshots(list(coin_quantities.keys()), exchange=exchange)
+    valuation_snapshot_at_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     valuation_prices = {market: float((snapshot or {}).get("price") or 0.0) for market, snapshot in snapshots.items()}
     coin_value = 0.0
     coin_available_value = 0.0
@@ -2055,6 +2067,24 @@ async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: flo
             "value_krw": value,
         })
     ledger = await _read_only_exchange_order_ledger(exchange, ledger_markets, days=days)
+    db_orders = _diagnostic_db_orders(exchange, days)
+    open_positions = _diagnostic_open_positions(exchange)
+    ledger_rows, ledger_summary = load_or_build_ledger_rows(
+        exchange_name=exchange,
+        period_start_utc=period_start_utc,
+        exchange_orders=ledger.get("orders", []),
+        db_orders=db_orders,
+        persist=persist_exchange_ledger,
+    )
+    ledger_pnl = compute_realized_pnl_from_ledger(ledger_rows)
+    position_valuation = build_position_valuation_summary(
+        positions=open_positions,
+        balances=balances,
+        valuation_prices=valuation_prices,
+        balance_snapshot_at_utc=str(balances.get("fetched_at") or ""),
+        valuation_price_snapshot_at_utc=valuation_snapshot_at_utc,
+        valuation_source="bithumb_ticker",
+    )
     return {
         "initial_equity": initial_equity,
         "period_start_utc": period_start_utc,
@@ -2078,6 +2108,12 @@ async def _asset_reconciliation_from_exchange(exchange: str, initial_equity: flo
         "exchange_ledger_errors": ledger.get("errors", []),
         "exchange_ledger_market_count": len(ledger_markets),
         "exchange_ledger_order_count": len(ledger.get("orders", [])),
+        "exchange_fills_ledger_rows": ledger_rows,
+        "exchange_fills_ledger_summary": ledger_summary,
+        "exchange_realized_pnl": ledger_pnl,
+        "position_valuation_summary": position_valuation,
+        "snapshot_unrealized_pnl": position_valuation.get("snapshot_unrealized_pnl"),
+        "stale_valuation_effect": position_valuation.get("stale_valuation_effect"),
         "deposit_withdrawal_status": "UNAVAILABLE",
         "deposit_withdrawal_unavailable_reason": "No read-only deposit/withdrawal broker method is configured.",
     }
@@ -2128,6 +2164,43 @@ def _diagnostic_order_uuids(exchange: str, days: int, *, limit: int) -> list[str
             (exchange, cutoff, max(int(limit), 1)),
         ).fetchall()
     return [str(row["order_uuid"]) for row in rows]
+
+
+def _diagnostic_db_orders(exchange: str, days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(days), 1))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND created_at >= ?
+              AND request_id NOT LIKE '%-submitted%'
+              AND request_id NOT LIKE '%-waiting-%'
+              AND request_id NOT LIKE '%-partial%'
+              AND request_id NOT LIKE '%-canceled-%'
+              AND request_id NOT LIKE '%-filled-%'
+              AND request_id NOT LIKE '%-failed-%'
+            ORDER BY created_at ASC, id ASC
+            """,
+            (exchange, cutoff),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _diagnostic_open_positions(exchange: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM live_positions
+            WHERE exchange = ?
+              AND status IN ('OPEN', 'EXIT_CANDIDATE', 'EXIT_PENDING', 'CLOSING', 'MANUAL_REVIEW_REQUIRED')
+            ORDER BY market ASC, id ASC
+            """,
+            (exchange,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 async def _read_only_exchange_order_ledger(exchange: str, markets: list[str], *, days: int) -> dict:
@@ -2191,8 +2264,14 @@ async def trading_diagnostics(
     exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
     days: int = Query(7, ge=1, le=30),
     starting_asset_krw: float | None = Query(None, gt=0),
+    persist_exchange_ledger: bool = Query(False),
 ) -> dict:
-    asset_reconciliation = await _asset_reconciliation_from_exchange(exchange, starting_asset_krw, days=days)
+    asset_reconciliation = await _asset_reconciliation_from_exchange(
+        exchange,
+        starting_asset_krw,
+        days=days,
+        persist_exchange_ledger=persist_exchange_ledger,
+    )
     return build_trading_diagnostics_report(
         exchange=exchange,
         days=days,
@@ -2206,13 +2285,55 @@ async def trading_reconciliation(
     exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
     days: int = Query(7, ge=1, le=30),
     starting_asset_krw: float | None = Query(None, gt=0),
+    persist_exchange_ledger: bool = Query(False),
 ) -> dict:
-    report = await trading_diagnostics(exchange=exchange, days=days, starting_asset_krw=starting_asset_krw)
+    report = await trading_diagnostics(
+        exchange=exchange,
+        days=days,
+        starting_asset_krw=starting_asset_krw,
+        persist_exchange_ledger=persist_exchange_ledger,
+    )
+    asset = report.get("asset_reconciliation") or {}
+    ledger_summary = asset.get("exchange_fills_ledger_summary") or {}
+    match = asset.get("exchange_fill_match") or {}
+    position_summary = asset.get("position_valuation_summary") or {}
+    restart_gate = report.get("restart_gate") or {}
     return {
         "generated_at_utc": report.get("generated_at_utc"),
         "exchange": report.get("exchange"),
-        "asset_reconciliation": report.get("asset_reconciliation"),
-        "restart_gate": report.get("restart_gate"),
+        "current_equity_from_exchange": asset.get("current_equity_from_exchange"),
+        "corrected_expected_equity": asset.get("expected_equity"),
+        "corrected_equity_diff": asset.get("equity_diff"),
+        "corrected_equity_diff_rate": asset.get("equity_diff_rate"),
+        "exchange_net_realized_pnl_after_fee": asset.get("exchange_net_realized_pnl_after_fee"),
+        "db_net_realized_pnl_after_fee": asset.get("net_realized_pnl_after_fee"),
+        "realized_pnl_diff": asset.get("realized_pnl_diff"),
+        "total_fee_from_exchange": asset.get("total_fee_from_exchange"),
+        "total_fee_from_db": asset.get("total_fee_from_db"),
+        "fee_diff": asset.get("fee_diff"),
+        "stale_valuation_effect": asset.get("stale_valuation_effect"),
+        "missing_exchange_fill_count": ledger_summary.get("missing_canonical_log_count"),
+        "missing_exchange_fill_value": ledger_summary.get("missing_exchange_fill_value"),
+        "missing_canonical_log_count": ledger_summary.get("missing_canonical_log_count"),
+        "synthetic_uuid_count": ledger_summary.get("synthetic_uuid_count"),
+        "residual_unexplained": (asset.get("equity_diff_breakdown") or {}).get("unexplained"),
+        "restart_allowed": restart_gate.get("allowed"),
+        "restart_block_reasons": restart_gate.get("reasons", []),
+        "expected_equity_formula": asset.get("expected_equity_formula"),
+        "equity_diff_breakdown": asset.get("equity_diff_breakdown"),
+        "fills_match_summary": {
+            "ledger": ledger_summary,
+            "exchange_fill_match": {
+                "exchange_fill_count": match.get("exchange_fill_count"),
+                "db_fill_count": match.get("db_fill_count"),
+                "matched_fill_count": match.get("matched_fill_count"),
+                "missing_exchange_fill_in_db": match.get("missing_exchange_fill_in_db"),
+                "db_only_trade": match.get("db_only_trade"),
+            },
+        },
+        "position_valuation_summary": position_summary,
+        "exchange_ledger_status": asset.get("exchange_ledger_status"),
+        "exchange_ledger_errors": asset.get("exchange_ledger_errors", []),
     }
 
 

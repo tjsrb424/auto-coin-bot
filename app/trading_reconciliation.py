@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 
 OPEN_POSITION_STATUSES = {"OPEN", "EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED"}
+REAL_EXCHANGE_UUID_PATTERN = re.compile(r"^[A-Z]\d{10,}$")
 
 
 def build_equity_reconciliation(
@@ -211,7 +213,7 @@ def match_fills(db_fills: list[dict], exchange_fills: list[dict]) -> dict:
 
 
 def duplicate_exchange_order_uuids(db_orders: list[dict]) -> dict:
-    return _duplicate_field(db_orders, "order_uuid")
+    return _duplicate_field(db_orders, "order_uuid", real_exchange_uuid_only=True)
 
 
 def duplicate_client_order_ids(db_orders: list[dict]) -> dict:
@@ -360,11 +362,15 @@ def _fill_group(fills: list[dict]) -> dict:
     }
 
 
-def _duplicate_field(db_orders: list[dict], field: str) -> dict:
+def _duplicate_field(db_orders: list[dict], field: str, *, real_exchange_uuid_only: bool = False) -> dict:
     rows = [
         row for row in db_orders
         if str(row.get(field) or "") and "-filled-" not in str(row.get("request_id") or "") and "-waiting-" not in str(row.get("request_id") or "")
     ]
+    synthetic_rows = []
+    if real_exchange_uuid_only:
+        synthetic_rows = [row for row in rows if not REAL_EXCHANGE_UUID_PATTERN.match(str(row.get(field) or ""))]
+        rows = [row for row in rows if REAL_EXCHANGE_UUID_PATTERN.match(str(row.get(field) or ""))]
     counts = Counter(str(row.get(field) or "") for row in rows)
     duplicate_values = {value for value, count in counts.items() if count > 1}
     items = []
@@ -374,7 +380,16 @@ def _duplicate_field(db_orders: list[dict], field: str) -> dict:
         duplicate_amount = sum(_order_amount(row) for row in group[1:])
         amount += duplicate_amount
         items.append({field: value, "count": len(group), "amount_krw": duplicate_amount, "order_ids": [row.get("id") for row in group[:10]]})
-    return {"count": len(items), "amount_krw": amount, "items": items[:20]}
+    return {
+        "count": len(items),
+        "amount_krw": amount,
+        "items": items[:20],
+        "synthetic_uuid_count": len(synthetic_rows) if real_exchange_uuid_only else 0,
+        "synthetic_uuid_items": [
+            {"order_uuid": row.get(field), "order_id": row.get("id"), "request_id": row.get("request_id")}
+            for row in synthetic_rows[:20]
+        ] if real_exchange_uuid_only else [],
+    }
 
 
 def _order_amount(order: dict) -> float:
