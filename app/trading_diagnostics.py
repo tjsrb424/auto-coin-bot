@@ -273,6 +273,8 @@ def _strategy_pnl(orders: list[dict], positions: list[dict]) -> list[dict]:
         losses = row.pop("_losses")
         holding = row.pop("_holding")
         total = len(wins) + len(losses)
+        row["win_count"] = len(wins)
+        row["loss_count"] = len(losses)
         row["win_rate"] = len(wins) / total if total else 0.0
         row["avg_holding_minutes"] = sum(holding) / len(holding) if holding else 0.0
         row["gross_pnl"] = row["net_pnl"] + row["fee_total"]
