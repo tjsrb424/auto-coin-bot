@@ -13,6 +13,7 @@ from app.accounting_epoch import (
     limited_auto_live_gate,
     split_restart_blockers,
 )
+from app.controlled_auto_live import controlled_auto_live_gate
 from app.trading_reconciliation import build_equity_reconciliation
 
 OPEN_POSITION_STATUSES = ("OPEN", "EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED")
@@ -197,6 +198,7 @@ def build_trading_diagnostics_report(
         open_order_audit=open_order_audit,
     )
     limited_gate = limited_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
+    controlled_gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     blocker_split = split_restart_blockers(restart_gate.get("reasons", []), current_epoch, smoke_preflight)
     return {
         "generated_at_utc": _to_iso(now),
@@ -208,6 +210,11 @@ def build_trading_diagnostics_report(
         "smoke_test_preflight": smoke_preflight,
         "open_order_audit": open_order_audit or smoke_preflight.get("open_order_audit"),
         "limited_auto_live_gate": limited_gate,
+        "controlled_auto_live_gate": controlled_gate,
+        "protected_full_auto_live_allowed": controlled_gate.get("protected_full_auto_live_allowed"),
+        "protected_full_auto_live_blockers": controlled_gate.get("protected_full_auto_live_blockers", []),
+        "protected_full_auto_live_config": controlled_gate.get("protected_full_auto_live_config", {}),
+        "protected_full_auto_next_action": controlled_gate.get("protected_full_auto_next_action"),
         "full_auto_live_allowed": False,
         **blocker_split,
         "pnl_source_of_truth": asset_report.get("pnl_source_of_truth"),

@@ -3389,6 +3389,7 @@ async def trading_reconciliation(
     match = asset.get("exchange_fill_match") or {}
     position_summary = asset.get("position_valuation_summary") or {}
     restart_gate = report.get("restart_gate") or {}
+    controlled_gate = report.get("controlled_auto_live_gate") or {}
     return {
         "generated_at_utc": report.get("generated_at_utc"),
         "exchange": report.get("exchange"),
@@ -3397,11 +3398,17 @@ async def trading_reconciliation(
         "smoke_test_preflight": report.get("smoke_test_preflight"),
         "open_order_audit": report.get("open_order_audit"),
         "limited_auto_live_gate": report.get("limited_auto_live_gate"),
+        "controlled_auto_live_gate": controlled_gate,
         "legacy_blockers": report.get("legacy_blockers", []),
         "current_epoch_blockers": report.get("current_epoch_blockers", []),
         "smoke_test_blockers": report.get("smoke_test_blockers", []),
         "normal_auto_blockers": report.get("normal_auto_blockers", []),
         "limited_auto_live_allowed": (report.get("limited_auto_live_gate") or {}).get("limited_auto_live_allowed"),
+        "protected_full_auto_live_allowed": controlled_gate.get("protected_full_auto_live_allowed"),
+        "protected_full_auto_live_blockers": controlled_gate.get("protected_full_auto_live_blockers", []),
+        "protected_full_auto_live_config": controlled_gate.get("protected_full_auto_live_config", {}),
+        "protected_full_auto_next_action": controlled_gate.get("protected_full_auto_next_action"),
+        "final_controlled_position_loop_result": controlled_gate.get("final_controlled_position_loop_result"),
         "full_auto_live_allowed": report.get("full_auto_live_allowed", False),
         "open_live_order_count_total": ((report.get("open_order_audit") or {}).get("open_order_audit_summary") or {}).get("open_live_order_count_total"),
         "exchange_open_order_count": ((report.get("open_order_audit") or {}).get("open_order_audit_summary") or {}).get("exchange_open_order_count"),

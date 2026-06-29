@@ -47,6 +47,7 @@ REQUIRED_SCHEMA_TABLES = [
     "exchange_fills_ledger",
     "accounting_epochs",
     "live_smoke_test_runs",
+    "controlled_run_reports",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -976,6 +977,20 @@ def init_db() -> None:
                 report_json TEXT NOT NULL DEFAULT '{}',
                 created_at_utc TEXT NOT NULL,
                 updated_at_utc TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS controlled_run_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                run_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                technical_result TEXT NOT NULL DEFAULT '',
+                profitability_result TEXT NOT NULL DEFAULT '',
+                started_at_utc TEXT NOT NULL DEFAULT '',
+                completed_at_utc TEXT NOT NULL DEFAULT '',
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS runtime_locks (

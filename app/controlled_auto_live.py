@@ -89,6 +89,7 @@ def _job_lock() -> asyncio.Lock:
 def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exchange: str = "bithumb") -> dict:
     limited_gate = limited_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     limited_run = latest_limited_auto_live_run()
+    position_loop = latest_controlled_position_loop_run()
     blockers = list(limited_gate.get("limited_auto_live_blockers") or [])
     if not limited_gate.get("limited_auto_live_allowed"):
         blockers.append({"code": "LIMITED_AUTO_GATE_NOT_READY", "count": 1})
@@ -98,11 +99,55 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         blockers.append({"code": "LAST_LIMITED_AUTO_FEE_DIFF", "count": 1})
     if _float(limited_run.get("equity_diff_after")) != 0.0:
         blockers.append({"code": "LAST_LIMITED_AUTO_EQUITY_DIFF", "count": 1})
+    protected_blockers = list(limited_gate.get("limited_auto_live_blockers") or [])
+    protected_allowed_position_results = {
+        "PASS_IDLE",
+        "PASSED_TECHNICAL_POSITION",
+        "PASSED_PROFITABLE_POSITION",
+        "PASSED_POSITION_TRADE",
+    }
+    final_loop_result = str(position_loop.get("status") or "").upper()
+    if final_loop_result not in protected_allowed_position_results:
+        protected_blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
+    current_equity = _float(
+        current_epoch.get("current_epoch_current_equity"),
+        _float(current_epoch.get("current_equity_from_exchange")),
+    )
+    daily_max_loss = min(1000.0, current_equity * 0.005) if current_equity > 0 else 1000.0
+    protected_config = {
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "allowed_symbols": ["BTC", "ETH"],
+        "allowed_strategies": [CONTROLLED_ENTRY_V3_STRATEGY],
+        "blocked_strategies": sorted(CONTROLLED_BLOCKED_STRATEGIES),
+        "blocked_symbols": sorted(BLOCKED_SYMBOLS),
+        "max_notional_per_order_krw": MAX_NOTIONAL_KRW,
+        "max_open_positions": MAX_OPEN_POSITIONS,
+        "max_daily_trades": 10,
+        "max_consecutive_losses": 2,
+        "daily_max_loss_krw": daily_max_loss,
+        "daily_max_loss_rule": "min(1000 KRW, current_equity * 0.005)",
+        "cooldown_after_trade_minutes": {"min": 5, "max": 10},
+        "averaging_down_allowed": False,
+        "reentry_allowed": False,
+        "stop_on_accounting_error": True,
+        "stop_on_missing_fill": True,
+        "stop_on_duplicate_fill": True,
+        "stop_on_fee_diff": True,
+        "stop_on_equity_diff": True,
+        "stop_on_stale_open_order": True,
+        "requires_user_confirmation": True,
+    }
     return {
         "controlled_auto_live_allowed": len(blockers) == 0,
         "full_auto_live_allowed": False,
         "controlled_auto_live_blockers": blockers,
         "last_limited_auto_live_run": limited_run,
+        "final_controlled_position_loop_result": final_loop_result or "MISSING",
+        "last_controlled_position_loop_run": position_loop,
+        "protected_full_auto_live_allowed": len(protected_blockers) == 0,
+        "protected_full_auto_live_blockers": protected_blockers,
+        "protected_full_auto_live_config": protected_config,
+        "protected_full_auto_next_action": "USER_CONFIRM_PROTECTED_FULL_AUTO_START" if len(protected_blockers) == 0 else "RESOLVE_PROTECTED_FULL_AUTO_BLOCKERS",
         "base_limited_auto_live_gate": limited_gate,
         "controlled_auto_constraints": {
             "allowed_symbols": sorted(ALLOWED_SYMBOLS),
@@ -180,6 +225,82 @@ def latest_limited_auto_live_run() -> dict:
         "fee_from_ledger": fee_from_ledger,
         "fee_diff": fee_from_orders - fee_from_ledger,
         "equity_diff_after": 0.0 if passed else None,
+    }
+
+
+def persist_controlled_run_report(report: dict) -> None:
+    run_id = str(report.get("loop_run_id") or report.get("position_run_id") or report.get("controlled_run_id") or "").strip()
+    if not run_id:
+        return
+    now = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO controlled_run_reports (
+                run_id, run_type, status, technical_result, profitability_result,
+                started_at_utc, completed_at_utc, report_json, created_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                run_type = excluded.run_type,
+                status = excluded.status,
+                technical_result = excluded.technical_result,
+                profitability_result = excluded.profitability_result,
+                started_at_utc = excluded.started_at_utc,
+                completed_at_utc = excluded.completed_at_utc,
+                report_json = excluded.report_json,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                run_id,
+                str(report.get("run_type") or ""),
+                str(report.get("controlled_auto_live_status") or report.get("status") or ""),
+                str(report.get("technical_result") or ""),
+                str(report.get("profitability_result") or ""),
+                str(report.get("started_at_utc") or ""),
+                str(report.get("completed_at_utc") or ""),
+                json.dumps(report, ensure_ascii=False, default=str),
+                now,
+                now,
+            ),
+        )
+
+
+def latest_controlled_position_loop_run() -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM controlled_run_reports
+            WHERE run_type = 'CONTROLLED_POSITION_LOOP'
+            ORDER BY completed_at_utc DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return {"present": False, "status": "MISSING"}
+    item = dict(row)
+    report = _safe_json_loads(item.get("report_json"), {})
+    return {
+        "present": True,
+        "run_id": item.get("run_id"),
+        "run_type": item.get("run_type"),
+        "status": item.get("status"),
+        "technical_result": item.get("technical_result"),
+        "profitability_result": item.get("profitability_result"),
+        "started_at_utc": item.get("started_at_utc"),
+        "completed_at_utc": item.get("completed_at_utc"),
+        "trade_count": report.get("trade_count"),
+        "order_count": report.get("order_count"),
+        "net_pnl_after_fee": report.get("net_pnl_after_fee"),
+        "exchange_fill_count": report.get("exchange_fill_count"),
+        "ledger_fill_count": report.get("ledger_fill_count"),
+        "missing_ledger_fill_count": report.get("missing_ledger_fill_count"),
+        "duplicate_fill_count": report.get("duplicate_fill_count"),
+        "fee_diff": report.get("fee_diff"),
+        "equity_diff_after": report.get("equity_diff_after"),
+        "open_order_count_after": report.get("open_order_count_after"),
+        "final_runtime_status": report.get("final_runtime_status"),
+        "report": report,
     }
 
 
@@ -1894,6 +2015,7 @@ def _finalize_position_loop(report: dict, status: str, reasons: list[str], contr
         report["controlled_auto_live_gate"] = controlled_gate
     runtime = load_runtime_lock("auto-trading")
     report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
+    persist_controlled_run_report(report)
     return {key: value for key, value in report.items() if not key.startswith("_")}
 
 
@@ -3208,6 +3330,17 @@ def _decode_json_fields(row: dict) -> dict:
             except json.JSONDecodeError:
                 row[key] = {}
     return row
+
+
+def _safe_json_loads(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(str(raw))
+    except Exception:
+        return default
 
 
 def _normalize_candle(candle: dict) -> dict:

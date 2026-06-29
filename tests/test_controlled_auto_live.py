@@ -26,6 +26,8 @@ from app.controlled_auto_live import (
     _select_best_decision,
     _select_controlled_entry_v3_watch_candidate,
     _threshold_adjustment_report,
+    controlled_auto_live_gate,
+    persist_controlled_run_report,
     run_controlled_entry_v3_watch,
     run_controlled_entry_v3_position_run,
     run_controlled_position_loop,
@@ -1201,6 +1203,86 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "ABORTED")
         final = _controlled_jobs[first["controlled_run_id"]]
         self.assertEqual(final["status"], "PASS_IDLE")
+
+    def test_protected_full_auto_gate_allows_pass_idle_position_loop_but_not_full_auto(self) -> None:
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": "smoke-protected-pass",
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": "PASSED_AFTER_RECALC",
+                "started_at_utc": "2026-06-26T00:00:00Z",
+                "completed_at_utc": "2026-06-26T00:01:00Z",
+                "max_notional_krw": 6000,
+                "report": {
+                    "duplicate_fill_count": 0,
+                    "fee_diff": 0.0,
+                    "equity_diff_after": 0.0,
+                    "current_epoch_accounting_pending_count": 0,
+                    "current_epoch_accounting_failed_count": 0,
+                    "final_runtime_status": "STOPPED",
+                },
+            }
+        )
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-pass-idle",
+                "loop_run_id": "posloop-pass-idle",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "PASS_IDLE",
+                "technical_result": "PASS_IDLE",
+                "profitability_result": "NO_TRADE",
+                "started_at_utc": "2026-06-29T07:37:46Z",
+                "completed_at_utc": "2026-06-29T08:07:48Z",
+                "trade_count": 0,
+                "order_count": 0,
+                "exchange_fill_count": 0,
+                "ledger_fill_count": 0,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        preflight = {
+            "smoke_test_blockers": [],
+            "open_order_audit_summary": {
+                "exchange_open_order_count": 0,
+                "current_epoch_open_order_count": 0,
+                "unknown_open_order_count": 0,
+            },
+        }
+        with patch("app.accounting_epoch.is_emergency_stopped", return_value=False):
+            gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertTrue(gate["protected_full_auto_live_allowed"], gate["protected_full_auto_live_blockers"])
+        self.assertEqual(gate["protected_full_auto_live_blockers"], [])
+        self.assertEqual(gate["final_controlled_position_loop_result"], "PASS_IDLE")
+        self.assertEqual(gate["protected_full_auto_next_action"], "USER_CONFIRM_PROTECTED_FULL_AUTO_START")
+        self.assertFalse(gate["full_auto_live_allowed"])
+        config = gate["protected_full_auto_live_config"]
+        self.assertEqual(config["allowed_symbols"], ["BTC", "ETH"])
+        self.assertEqual(config["allowed_strategies"], ["controlled_entry_v3"])
+        self.assertEqual(config["max_notional_per_order_krw"], 6000)
+        self.assertEqual(config["max_open_positions"], 1)
+        self.assertEqual(config["max_daily_trades"], 10)
+        self.assertEqual(config["max_consecutive_losses"], 2)
+        self.assertEqual(config["daily_max_loss_krw"], 1000.0)
+        self.assertFalse(config["averaging_down_allowed"])
+        self.assertFalse(config["reentry_allowed"])
 
 
 if __name__ == "__main__":
