@@ -147,6 +147,7 @@ from app.controlled_auto_live import (
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
     ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_POSITION_CONFIRMATION,
     ENTRY_V3_WATCH_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION,
+    PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
     TRADE_PROBE_CONFIRMATION_PHRASE as CONTROLLED_TRADE_PROBE_CONFIRMATION,
     build_controlled_signal_diagnostics,
     controlled_auto_live_job_status,
@@ -752,6 +753,17 @@ class ControlledEntryV3PositionStartRequest(BaseModel):
 
 
 class ControlledPositionLoopStartRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    runtime_seconds: int = Field(1800, ge=900, le=1800)
+    scan_interval_seconds: int = Field(60, ge=30, le=120)
+    max_holding_minutes: int = Field(10, ge=10, le=30)
+    max_position_trades: int = Field(3, ge=1, le=3)
+    confirmation: str = ""
+
+
+class ProtectedFullAutoLiveV1StartRequest(BaseModel):
     exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
     symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
     amount_krw: float = Field(6000, gt=0, le=6000)
@@ -3306,6 +3318,63 @@ async def controlled_auto_live_position_loop_start(payload: ControlledPositionLo
     }
 
 
+@app.post("/api/protected-full-auto-live/v1/start")
+async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1StartRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="protected_full_auto_live_v1",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    if payload.confirmation != PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Protected full auto live v1 confirmation phrase is required.",
+            "required_confirmation": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    if not gate.get("protected_full_auto_live_allowed"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Protected full auto live v1 gate is blocked.",
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
+    job = await start_controlled_position_loop_job(
+        exchange=payload.exchange,
+        symbols=symbols or ["BTC", "ETH"],
+        amount_krw=payload.amount_krw,
+        runtime_seconds=payload.runtime_seconds,
+        scan_interval_seconds=payload.scan_interval_seconds,
+        max_holding_minutes=payload.max_holding_minutes,
+        max_position_trades=payload.max_position_trades,
+        confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
+        controlled_gate=gate,
+        current_epoch=current_epoch,
+    )
+    return {
+        **job,
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "required_confirmation": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+        "current_epoch": current_epoch,
+        "controlled_auto_live_gate": gate,
+        "protected_session_baseline_preview": gate.get("protected_session_baseline_preview"),
+    }
+
+
 @app.get("/api/controlled-auto-live/status/{controlled_run_id}")
 async def controlled_auto_live_status(controlled_run_id: str) -> dict:
     return controlled_auto_live_job_status(controlled_run_id)
@@ -3406,8 +3475,20 @@ async def trading_reconciliation(
         "limited_auto_live_allowed": (report.get("limited_auto_live_gate") or {}).get("limited_auto_live_allowed"),
         "protected_full_auto_live_allowed": controlled_gate.get("protected_full_auto_live_allowed"),
         "protected_full_auto_live_blockers": controlled_gate.get("protected_full_auto_live_blockers", []),
+        "protected_full_auto_live_warnings": controlled_gate.get("protected_full_auto_live_warnings", []),
         "protected_full_auto_live_config": controlled_gate.get("protected_full_auto_live_config", {}),
         "protected_full_auto_next_action": controlled_gate.get("protected_full_auto_next_action"),
+        "protected_session_start_allowed": controlled_gate.get("protected_session_start_allowed"),
+        "protected_session_baseline_preview": controlled_gate.get("protected_session_baseline_preview"),
+        "protected_session_hard_blockers": controlled_gate.get("protected_session_hard_blockers", []),
+        "protected_session_warnings": controlled_gate.get("protected_session_warnings", []),
+        "global_daily_loss_status": controlled_gate.get("global_daily_loss_status"),
+        "protected_session_loss_status": controlled_gate.get("protected_session_loss_status"),
+        "pre_existing_daily_realized_pnl": controlled_gate.get("pre_existing_daily_realized_pnl"),
+        "pre_existing_daily_total_pnl": controlled_gate.get("pre_existing_daily_total_pnl"),
+        "protected_session_loss_limit": controlled_gate.get("protected_session_loss_limit"),
+        "protected_session_loss_limit_rate": controlled_gate.get("protected_session_loss_limit_rate"),
+        "protected_session_loss_limit_remaining": controlled_gate.get("protected_session_loss_limit_remaining"),
         "final_controlled_position_loop_result": controlled_gate.get("final_controlled_position_loop_result"),
         "full_auto_live_allowed": report.get("full_auto_live_allowed", False),
         "open_live_order_count_total": ((report.get("open_order_audit") or {}).get("open_order_audit_summary") or {}).get("open_live_order_count_total"),

@@ -40,6 +40,7 @@ from app.live_smoke_test import (
     _orderbook_quote,
     _round_volume,
 )
+from app.risk_manager import compute_risk_state
 from app.smart_decision import record_shadow_decision
 from app.strategies import apply_strategy
 from app.upbit import fetch_minute_candles
@@ -72,6 +73,10 @@ CONTROLLED_ENTRY_V3_MIN_SCORE = 62.0
 CONTROLLED_ENTRY_V3_MIN_EDGE_AFTER_COST = 0.0004
 OBSERVED_CONTROLLED_ROUNDTRIP_COST_RATE_FLOOR = 0.005
 DRY_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED DRY RUN FORCE BUY"
+PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE = "START PROTECTED FULL AUTO LIVE V1"
+PROTECTED_FULL_AUTO_MODE = "PROTECTED_FULL_AUTO_LIVE_V1"
+PROTECTED_SESSION_LOSS_LIMIT_RATE = 0.005
+PROTECTED_SESSION_MAX_DAILY_LOSS_KRW = 1000.0
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -90,6 +95,7 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
     limited_gate = limited_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     limited_run = latest_limited_auto_live_run()
     position_loop = latest_controlled_position_loop_run()
+    protected_status = protected_session_gate_status(current_epoch, smoke_preflight, exchange=exchange)
     blockers = list(limited_gate.get("limited_auto_live_blockers") or [])
     if not limited_gate.get("limited_auto_live_allowed"):
         blockers.append({"code": "LIMITED_AUTO_GATE_NOT_READY", "count": 1})
@@ -109,13 +115,14 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
     final_loop_result = str(position_loop.get("status") or "").upper()
     if final_loop_result not in protected_allowed_position_results:
         protected_blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
+    protected_blockers.extend(protected_status.get("hard_blockers") or [])
     current_equity = _float(
         current_epoch.get("current_epoch_current_equity"),
         _float(current_epoch.get("current_equity_from_exchange")),
     )
-    daily_max_loss = min(1000.0, current_equity * 0.005) if current_equity > 0 else 1000.0
+    daily_max_loss = _protected_session_loss_limit_krw(current_equity)
     protected_config = {
-        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "mode": PROTECTED_FULL_AUTO_MODE,
         "allowed_symbols": ["BTC", "ETH"],
         "allowed_strategies": [CONTROLLED_ENTRY_V3_STRATEGY],
         "blocked_strategies": sorted(CONTROLLED_BLOCKED_STRATEGIES),
@@ -126,6 +133,9 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "max_consecutive_losses": 2,
         "daily_max_loss_krw": daily_max_loss,
         "daily_max_loss_rule": "min(1000 KRW, current_equity * 0.005)",
+        "session_loss_limit_krw": daily_max_loss,
+        "session_loss_limit_rate": PROTECTED_SESSION_LOSS_LIMIT_RATE,
+        "session_loss_basis": "protected session PnL delta after user-confirmed start",
         "cooldown_after_trade_minutes": {"min": 5, "max": 10},
         "averaging_down_allowed": False,
         "reentry_allowed": False,
@@ -136,6 +146,7 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "stop_on_equity_diff": True,
         "stop_on_stale_open_order": True,
         "requires_user_confirmation": True,
+        "confirmation_phrase": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
     }
     return {
         "controlled_auto_live_allowed": len(blockers) == 0,
@@ -146,6 +157,18 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "last_controlled_position_loop_run": position_loop,
         "protected_full_auto_live_allowed": len(protected_blockers) == 0,
         "protected_full_auto_live_blockers": protected_blockers,
+        "protected_full_auto_live_warnings": protected_status.get("warnings", []),
+        "protected_session_start_allowed": len(protected_blockers) == 0,
+        "protected_session_hard_blockers": protected_status.get("hard_blockers", []),
+        "protected_session_warnings": protected_status.get("warnings", []),
+        "protected_session_baseline_preview": protected_status.get("baseline"),
+        "global_daily_loss_status": protected_status.get("global_daily_loss_status"),
+        "protected_session_loss_status": protected_status.get("protected_session_loss_status"),
+        "pre_existing_daily_realized_pnl": protected_status.get("pre_existing_daily_realized_pnl"),
+        "pre_existing_daily_total_pnl": protected_status.get("pre_existing_daily_total_pnl"),
+        "protected_session_loss_limit": protected_status.get("session_loss_limit_krw"),
+        "protected_session_loss_limit_rate": protected_status.get("session_loss_limit_rate"),
+        "protected_session_loss_limit_remaining": protected_status.get("session_loss_limit_remaining"),
         "protected_full_auto_live_config": protected_config,
         "protected_full_auto_next_action": "USER_CONFIRM_PROTECTED_FULL_AUTO_START" if len(protected_blockers) == 0 else "RESOLVE_PROTECTED_FULL_AUTO_BLOCKERS",
         "base_limited_auto_live_gate": limited_gate,
@@ -172,6 +195,146 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         },
         "controlled_auto_next_action": "USER_CONFIRM_CONTROLLED_AUTO_LIVE_START" if len(blockers) == 0 else "RESOLVE_CONTROLLED_AUTO_BLOCKERS",
     }
+
+
+def _protected_session_loss_limit_krw(current_equity: float) -> float:
+    return min(PROTECTED_SESSION_MAX_DAILY_LOSS_KRW, current_equity * PROTECTED_SESSION_LOSS_LIMIT_RATE) if current_equity > 0 else PROTECTED_SESSION_MAX_DAILY_LOSS_KRW
+
+
+def protected_session_gate_status(current_epoch: dict, smoke_preflight: dict | None = None, *, exchange: str = "bithumb") -> dict:
+    current_equity = _float(
+        current_epoch.get("current_epoch_current_equity"),
+        _float(current_epoch.get("current_equity_from_exchange")),
+    )
+    try:
+        risk_state = compute_risk_state(exchange, "KRW-BTC", account_equity_krw=current_equity if current_equity > 0 else None)
+    except Exception as exc:
+        risk_state = {"status": "UNAVAILABLE", "error": f"{exc.__class__.__name__}:{str(exc)[:160]}"}
+    baseline = build_protected_session_baseline(
+        current_epoch=current_epoch,
+        risk_state=risk_state,
+        exchange=exchange,
+        protected_session_id=None,
+    )
+    hard_blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    trust = str(current_epoch.get("current_epoch_trust_level") or "").upper()
+    open_summary = (smoke_preflight or {}).get("open_order_audit_summary") or {}
+    if not current_epoch.get("current_epoch_sanity_passed"):
+        hard_blockers.append({"code": "CURRENT_EPOCH_SANITY_FAILED", "count": 1})
+    if trust == "LOW":
+        hard_blockers.append({"code": "CURRENT_EPOCH_TRUST_LOW", "count": 1})
+    if int(current_epoch.get("current_epoch_accounting_pending_count") or 0) > 0:
+        hard_blockers.append({"code": "CURRENT_EPOCH_ACCOUNTING_PENDING", "count": 1})
+    if int(current_epoch.get("current_epoch_accounting_failed_count") or 0) > 0:
+        hard_blockers.append({"code": "CURRENT_EPOCH_ACCOUNTING_FAILED", "count": 1})
+    if int(open_summary.get("exchange_open_order_count") or 0) > 0:
+        hard_blockers.append({"code": "EXCHANGE_OPEN_ORDER_EXISTS", "count": int(open_summary.get("exchange_open_order_count") or 1)})
+    if int(open_summary.get("current_epoch_open_order_count") or 0) > 0:
+        hard_blockers.append({"code": "CURRENT_EPOCH_OPEN_ORDER_EXISTS", "count": int(open_summary.get("current_epoch_open_order_count") or 1)})
+    if int(open_summary.get("unknown_open_order_count") or 0) > 0:
+        hard_blockers.append({"code": "UNKNOWN_OPEN_ORDER_EXISTS", "count": int(open_summary.get("unknown_open_order_count") or 1)})
+    if is_emergency_stopped():
+        hard_blockers.append({"code": "EMERGENCY_STOP_ON", "count": 1})
+    live_config = LiveTradingConfig.for_exchange(exchange)
+    if not live_config.api_key_loaded or not live_config.live_trading_enabled:
+        hard_blockers.append({"code": "BROKER_NOT_READY", "count": 1})
+    if baseline["global_daily_loss_status"] == "EXCEEDED":
+        warnings.append({"code": "GLOBAL_DAILY_LOSS_ALREADY_EXCEEDED", "count": 1})
+    if _float(baseline.get("pre_existing_daily_realized_pnl")) < -_float(baseline.get("session_loss_limit_krw")):
+        warnings.append({"code": "PRE_EXISTING_DAILY_REALIZED_LOSS_EXCEEDS_PROTECTED_LIMIT", "count": 1})
+    return {
+        "baseline": baseline,
+        "hard_blockers": hard_blockers,
+        "warnings": warnings,
+        "global_daily_loss_status": baseline["global_daily_loss_status"],
+        "protected_session_loss_status": baseline["protected_session_loss_status"],
+        "pre_existing_daily_realized_pnl": baseline["pre_existing_daily_realized_pnl"],
+        "pre_existing_daily_total_pnl": baseline["pre_existing_daily_total_pnl"],
+        "session_loss_limit_krw": baseline["session_loss_limit_krw"],
+        "session_loss_limit_rate": baseline["session_loss_limit_rate"],
+        "session_loss_limit_remaining": baseline["session_loss_limit_remaining"],
+    }
+
+
+def build_protected_session_baseline(
+    *,
+    current_epoch: dict,
+    risk_state: dict | None = None,
+    exchange: str = "bithumb",
+    protected_session_id: str | None = None,
+    started_at_utc: str | None = None,
+) -> dict:
+    started_at = started_at_utc or _utc_now()
+    current_equity = _float(
+        current_epoch.get("current_epoch_current_equity"),
+        _float(current_epoch.get("current_equity_from_exchange")),
+    )
+    if risk_state is None:
+        try:
+            risk_state = compute_risk_state(exchange, "KRW-BTC", account_equity_krw=current_equity if current_equity > 0 else None)
+        except Exception:
+            risk_state = {}
+    start_realized = _float((risk_state or {}).get("daily_realized_pnl"))
+    start_unrealized = _float((risk_state or {}).get("daily_unrealized_pnl"))
+    start_total = _float((risk_state or {}).get("daily_total_pnl"), start_realized + start_unrealized)
+    session_limit = _protected_session_loss_limit_krw(current_equity)
+    global_daily_loss_status = "EXCEEDED" if min(start_realized, start_total) <= -session_limit else "OK"
+    return {
+        "protected_session_id": protected_session_id,
+        "protected_session_started_at_utc": started_at,
+        "session_start_equity": current_equity,
+        "session_start_realized_pnl": start_realized,
+        "session_start_unrealized_pnl": start_unrealized,
+        "session_start_total_pnl": start_total,
+        "pre_existing_daily_realized_pnl": start_realized,
+        "pre_existing_daily_total_pnl": start_total,
+        "pre_existing_daily_loss_limit_status": global_daily_loss_status,
+        "global_daily_loss_status": global_daily_loss_status,
+        "session_loss_limit_krw": session_limit,
+        "session_loss_limit_rate": PROTECTED_SESSION_LOSS_LIMIT_RATE,
+        "session_max_trades": 10,
+        "session_status": "PENDING_USER_CONFIRMATION" if protected_session_id is None else "RUNNING",
+        "protected_session_loss_status": "OK",
+        "session_pnl_delta": 0.0,
+        "session_realized_pnl_delta": 0.0,
+        "session_unrealized_pnl_delta": 0.0,
+        "session_loss_limit_remaining": session_limit,
+        "protected_session_stop_reason": None,
+    }
+
+
+def update_protected_session_loss_status(report: dict, current_epoch: dict | None = None, risk_state: dict | None = None) -> dict:
+    baseline = report.get("protected_session_baseline") or (report.get("controlled_auto_live_gate") or {}).get("active_protected_session_baseline")
+    if not isinstance(baseline, dict):
+        return {}
+    if current_epoch is None:
+        current_epoch = {}
+    if risk_state is None:
+        risk_state = {}
+    current_total = _float((risk_state or {}).get("daily_total_pnl"), _float(current_epoch.get("current_epoch_total_pnl"), _float(baseline.get("session_start_total_pnl"))))
+    current_realized = _float((risk_state or {}).get("daily_realized_pnl"), _float(baseline.get("session_start_realized_pnl")))
+    current_unrealized = _float((risk_state or {}).get("daily_unrealized_pnl"), _float(baseline.get("session_start_unrealized_pnl")))
+    total_delta = current_total - _float(baseline.get("session_start_total_pnl"))
+    realized_delta = current_realized - _float(baseline.get("session_start_realized_pnl"))
+    unrealized_delta = current_unrealized - _float(baseline.get("session_start_unrealized_pnl"))
+    limit = _float(baseline.get("session_loss_limit_krw"), PROTECTED_SESSION_MAX_DAILY_LOSS_KRW)
+    remaining = limit + total_delta if total_delta < 0 else limit
+    status = "EXCEEDED" if total_delta <= -limit else "OK"
+    stop_reason = "PROTECTED_SESSION_LOSS_LIMIT_REACHED" if status == "EXCEEDED" else None
+    updates = {
+        "global_daily_loss_status": baseline.get("global_daily_loss_status") or baseline.get("pre_existing_daily_loss_limit_status"),
+        "protected_session_loss_status": status,
+        "session_pnl_delta": total_delta,
+        "session_realized_pnl_delta": realized_delta,
+        "session_unrealized_pnl_delta": unrealized_delta,
+        "session_loss_limit_remaining": remaining,
+        "protected_session_stop_reason": stop_reason,
+    }
+    baseline.update(updates)
+    report["protected_session_baseline"] = baseline
+    report.update(updates)
+    return updates
 
 
 def latest_limited_auto_live_run() -> dict:
@@ -363,6 +526,14 @@ async def run_controlled_auto_live(
         "run_pnl": 0.0,
         "pnl_explanation": "",
         "report_notes": [],
+        "protected_session_baseline": None,
+        "global_daily_loss_status": None,
+        "protected_session_loss_status": None,
+        "session_pnl_delta": 0.0,
+        "session_realized_pnl_delta": 0.0,
+        "session_unrealized_pnl_delta": 0.0,
+        "session_loss_limit_remaining": None,
+        "protected_session_stop_reason": None,
         "current_epoch_accounting_pending_count": None,
         "current_epoch_accounting_failed_count": None,
         "final_runtime_status": None,
@@ -392,6 +563,10 @@ async def run_controlled_auto_live(
             return _finalize(report, "ABORTED", ["CURRENT_EPOCH_SANITY_FAILED"], controlled_gate=controlled_gate)
         report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
         report["account_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        active_protected_baseline = (controlled_gate or {}).get("active_protected_session_baseline")
+        if isinstance(active_protected_baseline, dict):
+            report["protected_session_baseline"] = dict(active_protected_baseline)
+            update_protected_session_loss_status(report, current_epoch)
 
         broker = get_live_broker(exchange)
         held_position: dict[str, Any] | None = None
@@ -1600,6 +1775,12 @@ async def run_controlled_entry_v3_position_run(
         while asyncio.get_running_loop().time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["CONTROLLED_ENTRY_V3_POSITION_STOP_REQUESTED"], before_equity, controlled_gate)
+            if report.get("protected_session_baseline"):
+                latest_equity = await _current_equity(exchange)
+                latest_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=latest_equity)
+                protected_updates = update_protected_session_loss_status(report, latest_epoch)
+                if protected_updates.get("protected_session_loss_status") == "EXCEEDED":
+                    return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["PROTECTED_SESSION_LOSS_LIMIT_REACHED"], before_equity, controlled_gate)
             open_blocker = await _open_order_blocker(exchange, symbols)
             if open_blocker:
                 return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", [open_blocker], before_equity, controlled_gate)
@@ -1696,6 +1877,13 @@ async def run_controlled_entry_v3_position_run(
                         "unrealized_pnl_after_estimated_fee": unrealized_net,
                     }
                 )
+                if report.get("protected_session_baseline"):
+                    latest_equity = await _current_equity(exchange)
+                    latest_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=latest_equity)
+                    protected_updates = update_protected_session_loss_status(report, latest_epoch)
+                    if protected_updates.get("protected_session_loss_status") == "EXCEEDED":
+                        exit_reason = "ACCOUNTING_STOP"
+                        break
                 move_rate = (mark_price - entry_price) / entry_price if entry_price > 0 else 0.0
                 if elapsed >= POSITION_RUN_MIN_HOLD_SECONDS and move_rate >= _float(report.get("take_profit_rate")):
                     exit_reason = "TAKE_PROFIT"
@@ -1844,6 +2032,14 @@ async def run_controlled_position_loop(
         "current_epoch_accounting_failed_count": None,
         "open_order_count_after": None,
         "final_runtime_status": None,
+        "protected_session_baseline": None,
+        "global_daily_loss_status": None,
+        "protected_session_loss_status": None,
+        "session_pnl_delta": 0.0,
+        "session_realized_pnl_delta": 0.0,
+        "session_unrealized_pnl_delta": 0.0,
+        "session_loss_limit_remaining": None,
+        "protected_session_stop_reason": None,
         "sub_runs": [],
         "pass_fail_reasons": [],
     }
@@ -1869,12 +2065,28 @@ async def run_controlled_position_loop(
             return _finalize_position_loop(report, "ABORTED", ["CURRENT_EPOCH_SANITY_FAILED"], controlled_gate)
         report["account_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
         report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        protected_baseline = None
+        if controlled_gate and controlled_gate.get("protected_full_auto_live_config"):
+            protected_baseline = build_protected_session_baseline(
+                current_epoch=current_epoch,
+                exchange=exchange,
+                protected_session_id=run_id,
+                started_at_utc=started_at,
+            )
+            report["protected_session_baseline"] = protected_baseline
+            update_protected_session_loss_status(report, current_epoch)
 
         deadline = asyncio.get_running_loop().time() + runtime_seconds
         traded_symbols: set[str] = set()
         while asyncio.get_running_loop().time() < deadline and int(report["trade_count"]) < max_position_trades:
             if stop_event is not None and stop_event.is_set():
                 break
+            if protected_baseline:
+                latest_equity = await _current_equity(exchange)
+                latest_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=latest_equity)
+                protected_updates = update_protected_session_loss_status(report, latest_epoch)
+                if protected_updates.get("protected_session_loss_status") == "EXCEEDED":
+                    return _finalize_position_loop(report, "STOPPED", ["PROTECTED_SESSION_LOSS_LIMIT_REACHED"], controlled_gate)
             remaining_symbols = [symbol for symbol in symbols if symbol not in traded_symbols]
             if not remaining_symbols:
                 break
@@ -1883,6 +2095,9 @@ async def run_controlled_position_loop(
                 break
             sub_runtime = min(MAX_RUNTIME_SECONDS, max(900, remaining_seconds))
             sub_run_id = f"{run_id}-trade-{int(report['trade_count']) + 1}"
+            sub_gate = controlled_gate
+            if protected_baseline and controlled_gate is not None:
+                sub_gate = {**controlled_gate, "active_protected_session_baseline": protected_baseline}
             sub = await run_controlled_entry_v3_position_run(
                 exchange=exchange,
                 symbols=remaining_symbols,
@@ -1891,13 +2106,19 @@ async def run_controlled_position_loop(
                 scan_interval_seconds=scan_interval_seconds,
                 max_holding_minutes=max_holding_minutes,
                 confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
-                controlled_gate=controlled_gate,
+                controlled_gate=sub_gate,
                 current_epoch=current_epoch,
                 controlled_run_id=sub_run_id,
                 stop_event=stop_event,
             )
             report["sub_runs"].append(sub)
             _merge_position_loop_subrun(report, sub)
+            if protected_baseline:
+                latest_equity = await _current_equity(exchange)
+                latest_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=latest_equity)
+                protected_updates = update_protected_session_loss_status(report, latest_epoch)
+                if protected_updates.get("protected_session_loss_status") == "EXCEEDED":
+                    return _finalize_position_loop(report, "STOPPED", ["PROTECTED_SESSION_LOSS_LIMIT_REACHED"], controlled_gate)
             status = str(sub.get("controlled_auto_live_status") or "").upper()
             if status == "PASSED_POSITION_TRADE":
                 symbol = str(sub.get("selected_symbol") or "").upper()
@@ -1920,6 +2141,7 @@ async def run_controlled_position_loop(
         report["current_epoch_accounting_pending_count"] = int(after_epoch.get("current_epoch_accounting_pending_count") or 0)
         report["current_epoch_accounting_failed_count"] = int(after_epoch.get("current_epoch_accounting_failed_count") or 0)
         report["open_order_count_after"] = await _open_order_count(exchange, symbols or ["BTC", "ETH"])
+        update_protected_session_loss_status(report, after_epoch)
         reasons = _position_loop_fail_reasons(report)
         if reasons:
             return _finalize_position_loop(report, "STOPPED", reasons, controlled_gate)
@@ -1990,6 +2212,8 @@ def _position_loop_fail_reasons(report: dict) -> list[str]:
         reasons.append("CURRENT_EPOCH_ACCOUNTING_FAILED")
     if int(report.get("open_order_count_after") or 0) != 0:
         reasons.append("OPEN_ORDER_REMAINS_AFTER_RUN")
+    if str(report.get("protected_session_loss_status") or "").upper() == "EXCEEDED":
+        reasons.append(str(report.get("protected_session_stop_reason") or "PROTECTED_SESSION_LOSS_LIMIT_REACHED"))
     runtime = load_runtime_lock("auto-trading")
     report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
     if report["final_runtime_status"] != "STOPPED":
@@ -2903,6 +3127,7 @@ async def _finalize_after_orders(
         logger.info("[controlled-auto-live] zero-order epoch pnl moved: delta=%s note=%s", epoch_delta, note)
     report["current_epoch_accounting_pending_count"] = int(after_epoch.get("current_epoch_accounting_pending_count") or 0)
     report["current_epoch_accounting_failed_count"] = int(after_epoch.get("current_epoch_accounting_failed_count") or 0)
+    update_protected_session_loss_status(report, after_epoch)
     report["runtime_seconds"] = max(0, int((_parse_utc(_utc_now()) - _parse_utc(str(report["started_at_utc"]))).total_seconds()))
     status2, fail_reasons = _pass_fail(report)
     if reasons:
@@ -2978,6 +3203,8 @@ def _pass_fail(report: dict) -> tuple[str, list[str]]:
         reasons.append("CURRENT_EPOCH_ACCOUNTING_FAILED")
     if int(report.get("open_order_count_after") or 0) != 0:
         reasons.append("OPEN_ORDER_REMAINS_AFTER_RUN")
+    if str(report.get("protected_session_loss_status") or "").upper() == "EXCEEDED":
+        reasons.append(str(report.get("protected_session_stop_reason") or "PROTECTED_SESSION_LOSS_LIMIT_REACHED"))
     runtime = load_runtime_lock("auto-trading")
     report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
     if report["final_runtime_status"] != "STOPPED":

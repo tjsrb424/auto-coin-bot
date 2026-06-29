@@ -26,6 +26,7 @@ from app.controlled_auto_live import (
     _select_best_decision,
     _select_controlled_entry_v3_watch_candidate,
     _threshold_adjustment_report,
+    build_protected_session_baseline,
     controlled_auto_live_gate,
     persist_controlled_run_report,
     run_controlled_entry_v3_watch,
@@ -38,6 +39,7 @@ from app.controlled_auto_live import (
     start_controlled_entry_v3_position_run_job,
     start_controlled_position_loop_job,
     start_controlled_auto_live_job,
+    update_protected_session_loss_status,
 )
 
 
@@ -1265,7 +1267,11 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
                 "unknown_open_order_count": 0,
             },
         }
-        with patch("app.accounting_epoch.is_emergency_stopped", return_value=False):
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+        ):
             gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
 
         self.assertTrue(gate["protected_full_auto_live_allowed"], gate["protected_full_auto_live_blockers"])
@@ -1283,6 +1289,120 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["daily_max_loss_krw"], 1000.0)
         self.assertFalse(config["averaging_down_allowed"])
         self.assertFalse(config["reentry_allowed"])
+
+    def test_protected_full_auto_global_daily_loss_is_warning_not_blocker(self) -> None:
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": "smoke-protected-warning",
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": "PASSED_AFTER_RECALC",
+                "started_at_utc": "2026-06-26T00:00:00Z",
+                "completed_at_utc": "2026-06-26T00:01:00Z",
+                "max_notional_krw": 6000,
+                "report": {
+                    "duplicate_fill_count": 0,
+                    "fee_diff": 0.0,
+                    "equity_diff_after": 0.0,
+                    "current_epoch_accounting_pending_count": 0,
+                    "current_epoch_accounting_failed_count": 0,
+                    "final_runtime_status": "STOPPED",
+                },
+            }
+        )
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-warning",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "PASS_IDLE",
+                "technical_result": "PASS_IDLE",
+                "profitability_result": "NO_TRADE",
+                "started_at_utc": "2026-06-29T07:37:46Z",
+                "completed_at_utc": "2026-06-29T08:07:48Z",
+                "trade_count": 0,
+                "order_count": 0,
+                "exchange_fill_count": 0,
+                "ledger_fill_count": 0,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": -5000.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        preflight = {
+            "smoke_test_blockers": [],
+            "open_order_audit_summary": {
+                "exchange_open_order_count": 0,
+                "current_epoch_open_order_count": 0,
+                "unknown_open_order_count": 0,
+            },
+        }
+        risk_state = {
+            "daily_realized_pnl": -1516.7006,
+            "daily_unrealized_pnl": 0.0,
+            "daily_total_pnl": -1516.7006,
+        }
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+            patch("app.controlled_auto_live.compute_risk_state", return_value=risk_state),
+        ):
+            gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertTrue(gate["protected_full_auto_live_allowed"], gate["protected_full_auto_live_blockers"])
+        self.assertEqual(gate["protected_session_hard_blockers"], [])
+        self.assertEqual(gate["global_daily_loss_status"], "EXCEEDED")
+        self.assertEqual(gate["protected_session_loss_status"], "OK")
+        self.assertEqual(gate["pre_existing_daily_realized_pnl"], -1516.7006)
+        self.assertIn("GLOBAL_DAILY_LOSS_ALREADY_EXCEEDED", [item["code"] for item in gate["protected_session_warnings"]])
+        self.assertEqual(gate["protected_session_loss_limit"], 1000.0)
+        self.assertEqual(gate["protected_full_auto_next_action"], "USER_CONFIRM_PROTECTED_FULL_AUTO_START")
+        self.assertFalse(gate["full_auto_live_allowed"])
+
+    def test_protected_session_delta_loss_triggers_session_stop(self) -> None:
+        current_epoch = {
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": -5000.0,
+        }
+        baseline = build_protected_session_baseline(
+            current_epoch=current_epoch,
+            risk_state={
+                "daily_realized_pnl": -1516.7006,
+                "daily_unrealized_pnl": 0.0,
+                "daily_total_pnl": -1516.7006,
+            },
+            protected_session_id="protected-session-test",
+        )
+        report = {"protected_session_baseline": baseline}
+        updates = update_protected_session_loss_status(
+            report,
+            {"current_epoch_total_pnl": -6400.0},
+            {
+                "daily_realized_pnl": -1516.7006,
+                "daily_unrealized_pnl": -1001.0,
+                "daily_total_pnl": -2517.7006,
+            },
+        )
+
+        self.assertEqual(updates["global_daily_loss_status"], "EXCEEDED")
+        self.assertEqual(updates["protected_session_loss_status"], "EXCEEDED")
+        self.assertAlmostEqual(updates["session_pnl_delta"], -1001.0)
+        self.assertLess(updates["session_loss_limit_remaining"], 0)
+        self.assertEqual(updates["protected_session_stop_reason"], "PROTECTED_SESSION_LOSS_LIMIT_REACHED")
 
 
 if __name__ == "__main__":

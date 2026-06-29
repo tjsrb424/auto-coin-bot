@@ -698,6 +698,23 @@ type TradingDiagnostics = {
     daily_loss_limit_reached?: boolean;
     max_trade_count_per_day?: number;
   };
+  controlled_auto_live_gate?: Record<string, any>;
+  protected_full_auto_live_allowed?: boolean;
+  protected_full_auto_live_blockers?: Array<{ code?: string; count?: number }>;
+  protected_full_auto_live_warnings?: Array<{ code?: string; count?: number }>;
+  protected_full_auto_live_config?: Record<string, any>;
+  protected_full_auto_next_action?: string;
+  protected_session_start_allowed?: boolean;
+  protected_session_baseline_preview?: Record<string, any>;
+  protected_session_hard_blockers?: Array<{ code?: string; count?: number }>;
+  protected_session_warnings?: Array<{ code?: string; count?: number }>;
+  global_daily_loss_status?: string;
+  protected_session_loss_status?: string;
+  pre_existing_daily_realized_pnl?: number;
+  pre_existing_daily_total_pnl?: number;
+  protected_session_loss_limit?: number;
+  protected_session_loss_limit_rate?: number;
+  protected_session_loss_limit_remaining?: number;
   asset_reconciliation?: {
     initial_equity?: number;
     current_equity_from_exchange?: number | null;
@@ -4036,6 +4053,17 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const lastSmokeReport = lastSmoke?.report ?? {};
   const lastSmokeStatus = limitedGate?.last_smoke_test_status ?? lastSmoke?.status ?? "-";
   const limitedNextAction = limitedGate?.limited_auto_next_action ?? "-";
+  const protectedGate = diagnostics?.controlled_auto_live_gate ?? {};
+  const protectedBaseline = diagnostics?.protected_session_baseline_preview ?? protectedGate?.protected_session_baseline_preview ?? {};
+  const protectedWarnings = diagnostics?.protected_full_auto_live_warnings ?? protectedGate?.protected_full_auto_live_warnings ?? [];
+  const protectedHardBlockers = diagnostics?.protected_session_hard_blockers ?? protectedGate?.protected_session_hard_blockers ?? [];
+  const protectedConfig = diagnostics?.protected_full_auto_live_config ?? protectedGate?.protected_full_auto_live_config ?? {};
+  const globalDailyLossStatus = diagnostics?.global_daily_loss_status ?? protectedGate?.global_daily_loss_status ?? protectedBaseline?.global_daily_loss_status ?? "-";
+  const protectedSessionLossStatus = diagnostics?.protected_session_loss_status ?? protectedGate?.protected_session_loss_status ?? protectedBaseline?.protected_session_loss_status ?? "-";
+  const protectedSessionLossLimit = diagnostics?.protected_session_loss_limit ?? protectedConfig?.session_loss_limit_krw ?? protectedBaseline?.session_loss_limit_krw;
+  const protectedSessionRemaining = diagnostics?.protected_session_loss_limit_remaining ?? protectedBaseline?.session_loss_limit_remaining;
+  const protectedStartAllowed = diagnostics?.protected_session_start_allowed ?? diagnostics?.protected_full_auto_live_allowed ?? protectedGate?.protected_session_start_allowed ?? false;
+  const protectedNextAction = diagnostics?.protected_full_auto_next_action ?? protectedGate?.protected_full_auto_next_action ?? "-";
   const openOrderAudit = diagnostics?.open_order_audit ?? smokeTest?.open_order_audit;
   const openOrderSummary = openOrderAudit?.open_order_audit_summary ?? smokeTest?.open_order_audit_summary;
   const ledgerPnl = assetRecon?.ledger_pnl_detail;
@@ -4174,6 +4202,38 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: limitedGate?.limited_auto_live_allowed ? "green" : "amber"
     },
     {
+      label: "Global Daily PnL",
+      value: formatSignedKrw(diagnostics?.pre_existing_daily_total_pnl ?? data.risk?.risk_state?.daily_total_pnl),
+      detail: `status ${globalDailyLossStatus} - realized ${formatSignedKrw(diagnostics?.pre_existing_daily_realized_pnl ?? data.risk?.risk_state?.daily_realized_pnl)}`,
+      tone: globalDailyLossStatus === "EXCEEDED" ? "amber" : "green"
+    },
+    {
+      label: "Protected Session PnL",
+      value: formatSignedKrw(protectedBaseline?.session_pnl_delta ?? 0),
+      detail: `status ${protectedSessionLossStatus} - excludes pre-existing validation loss`,
+      tone: protectedSessionLossStatus === "EXCEEDED" ? "red" : "cyan"
+    },
+    {
+      label: "Protected Loss Limit",
+      value: formatKrw(protectedSessionLossLimit),
+      detail: `remaining ${formatKrw(protectedSessionRemaining)} - stop immediately on session limit`,
+      tone: "amber"
+    },
+    {
+      label: "Protected Warning",
+      value: protectedWarnings.length ? "WARNING" : "CLEAR",
+      detail: protectedWarnings.length
+        ? "오늘 전체 손실 한도는 이미 초과했습니다."
+        : "검증 손실 제외 session baseline ready",
+      tone: protectedWarnings.length ? "amber" : "green"
+    },
+    {
+      label: "Start Protected V1",
+      value: protectedStartAllowed ? "USER CONFIRM" : "BLOCKED",
+      detail: protectedHardBlockers.slice(0, 2).map((item: any) => item.code).join(" / ") || String(protectedNextAction),
+      tone: protectedStartAllowed ? "cyan" : "red"
+    },
+    {
       label: "Next Action",
       value: String(limitedNextAction),
       detail: `trust ${currentEpoch?.current_epoch_trust_level ?? "-"} - orders ${limitedGate?.limited_auto_constraints?.max_orders ?? 3}`,
@@ -4207,6 +4267,9 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
         <p>현재 손익 기준은 exchange_fills_ledger입니다.</p>
         <p>Legacy DB PnL은 과거 누락 fill 때문에 debug 참고용입니다.</p>
         <p>Accounting pending 또는 missing fill이 존재하면 실거래 재가동이 차단됩니다.</p>
+        <p>오늘 전체 손실 한도는 이미 초과했을 수 있습니다.</p>
+        <p>검증 과정 손실을 제외하고, 지금부터의 protected session 손실 한도로 시작할 수 있습니다.</p>
+        <p>session 손실 한도 도달 시 즉시 STOP됩니다.</p>
       </div>
     </section>
   );
