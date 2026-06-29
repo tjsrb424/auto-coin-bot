@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app import database
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE,
     DRY_RUN_CONFIRMATION_PHRASE,
+    TRADE_PROBE_CONFIRMATION_PHRASE,
     _controlled_jobs,
     _finalize_after_orders,
     _ma_cross_decision,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
+    run_controlled_trade_probe,
     start_controlled_auto_live_job,
 )
 
@@ -181,7 +185,10 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
             "report_notes": [],
         }
 
-        with patch("app.controlled_auto_live._current_equity", return_value=262_900.0):
+        with (
+            patch("app.controlled_auto_live._current_equity", return_value=262_900.0),
+            patch("app.controlled_auto_live._open_order_count", return_value=0),
+        ):
             result = await _finalize_after_orders(
                 report,
                 "bithumb",
@@ -215,7 +222,10 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
             "report_notes": [],
         }
 
-        with patch("app.controlled_auto_live._current_equity", return_value=263_000.0):
+        with (
+            patch("app.controlled_auto_live._current_equity", return_value=263_000.0),
+            patch("app.controlled_auto_live._open_order_count", return_value=0),
+        ):
             result = await _finalize_after_orders(
                 report,
                 "bithumb",
@@ -228,6 +238,107 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["controlled_auto_live_status"], "PASSED_TRADE")
         self.assertEqual(result["order_count"], 1)
+
+    async def test_trade_probe_places_buy_sell_and_records_risk_decision(self) -> None:
+        broker = AsyncMock()
+        broker.list_open_orders.return_value = {"orders": []}
+        broker.place_order.side_effect = [
+            {"uuid": "C0101000003129835701", "market": "KRW-BTC", "side": "bid"},
+            {"uuid": "C0101000003129835702", "market": "KRW-BTC", "side": "ask"},
+        ]
+
+        async def reconcile(log: dict, source: str) -> SimpleNamespace:
+            side = str(log["side"]).upper()
+            order_uuid = str(log["order_uuid"])
+            volume = 0.00001
+            amount = 6000.0 if side == "BUY" else 5990.0
+            fee = 3.0 if side == "BUY" else 2.995
+            database.update_live_order_log(
+                str(log["request_id"]),
+                {
+                    "status": "FILLED",
+                    "risk_result": "CONTROLLED_TRADE_PROBE_FILLED",
+                    "exchange_response_payload": {
+                        "uuid": order_uuid,
+                        "client_order_id": log["client_order_id"],
+                        "market": "KRW-BTC",
+                        "side": "bid" if side == "BUY" else "ask",
+                        "price": str(amount / volume),
+                        "executed_volume": str(volume),
+                        "executed_funds": str(amount),
+                        "paid_fee": str(fee),
+                        "created_at": "2026-06-26T17:00:00+09:00",
+                        "trades": [
+                            {
+                                "uuid": f"{order_uuid}-fill",
+                                "price": str(amount / volume),
+                                "volume": str(volume),
+                                "funds": str(amount),
+                                "fee": str(fee),
+                                "created_at": "2026-06-26T17:00:00+09:00",
+                            }
+                        ],
+                    },
+                    "executed_volume": volume,
+                    "remaining_volume": 0,
+                    "filled_amount_krw": amount,
+                    "paid_fee": fee,
+                },
+            )
+            return SimpleNamespace(
+                status="FILLED",
+                executed_volume=volume,
+                remaining_volume=0.0,
+                filled_amount_krw=amount,
+                paid_fee=fee,
+                raw={},
+            )
+
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_started_at_utc": "2026-06-26T00:00:00Z",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+        with (
+            patch.dict("os.environ", {"MIN_LIVE_ORDER_KRW": "5000"}, clear=False),
+            patch("app.controlled_auto_live.get_live_broker", return_value=broker),
+            patch("app.controlled_auto_live._full_auto_live_disabled", return_value=True),
+            patch("app.controlled_auto_live._runtime_guards_pass", return_value=True),
+            patch("app.controlled_auto_live._current_equity", side_effect=[263_000.0, 262_990.0]),
+            patch("app.controlled_auto_live._orderbook_quote", side_effect=[{"best_ask": 600_000_000.0, "best_bid": 599_000_000.0}, {"best_ask": 600_000_000.0, "best_bid": 599_000_000.0}]),
+            patch("app.controlled_auto_live.reconcile_order_log", side_effect=reconcile),
+        ):
+            result = await run_controlled_trade_probe(
+                confirmation=TRADE_PROBE_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+
+        self.assertEqual(result["controlled_auto_live_status"], "PASSED_TRADE_PROBE", result.get("pass_fail_reasons"))
+        self.assertEqual(result["run_type"], "CONTROLLED_TRADE_PROBE")
+        self.assertEqual(result["order_count"], 2)
+        self.assertEqual(result["buy_filled_count"], 1)
+        self.assertEqual(result["sell_filled_count"], 1)
+        self.assertEqual(result["exchange_fill_count"], result["ledger_fill_count"])
+        self.assertEqual(result["missing_ledger_fill_count"], 0)
+        self.assertEqual(result["duplicate_fill_count"], 0)
+        self.assertEqual(result["fee_diff"], 0.0)
+        self.assertEqual(result["open_order_count_after"], 0)
+        self.assertEqual(result["risk_decision"]["strategy_source"], "controlled_trade_probe")
+        self.assertTrue(result["risk_decision"]["risk_allowed"])
+        self.assertEqual(broker.place_order.await_count, 2)
+        with database.get_connection() as conn:
+            rows = conn.execute("SELECT order_purpose, strategy_name, order_preview_payload FROM live_order_logs ORDER BY id").fetchall()
+        self.assertEqual([row["order_purpose"] for row in rows], ["CONTROLLED_TRADE_PROBE", "CONTROLLED_TRADE_PROBE"])
+        previews = [json.loads(row["order_preview_payload"]) for row in rows]
+        self.assertEqual(previews[0]["run_type"], "CONTROLLED_TRADE_PROBE")
+        self.assertEqual(previews[0]["risk_decision"]["strategy_source"], "controlled_trade_probe")
 
     async def test_async_controlled_job_blocks_duplicate_active_run(self) -> None:
         async def fake_run(**kwargs):

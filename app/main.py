@@ -144,11 +144,13 @@ from app.accounting_epoch import build_current_epoch_diagnostics, build_open_ord
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE as CONTROLLED_AUTO_LIVE_CONFIRMATION,
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
+    TRADE_PROBE_CONFIRMATION_PHRASE as CONTROLLED_TRADE_PROBE_CONFIRMATION,
     controlled_auto_live_job_status,
     controlled_auto_live_gate,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
     start_controlled_auto_live_job,
+    start_controlled_trade_probe_job,
     stop_controlled_auto_live_job,
 )
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
@@ -713,6 +715,13 @@ class ControlledAutoLiveDryRunForceBuyRequest(BaseModel):
     symbol: str = Field("BTC", pattern=r"^(BTC|ETH)$")
     amount_krw: float = Field(6000, gt=0, le=6000)
     runtime_seconds: int = Field(600, ge=1, le=600)
+    confirmation: str = ""
+
+
+class ControlledTradeProbeStartRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbol: str = Field("BTC", pattern=r"^(BTC|ETH)$")
+    amount_krw: float = Field(6000, gt=0, le=6000)
     confirmation: str = ""
 
 
@@ -3005,6 +3014,56 @@ async def controlled_auto_live_start(payload: ControlledAutoLiveStartRequest) ->
     )
     return {
         **job,
+        "current_epoch": current_epoch,
+        "controlled_auto_live_gate": gate,
+    }
+
+
+@app.post("/api/controlled-auto-live/trade-probe/start")
+async def controlled_auto_live_trade_probe_start(payload: ControlledTradeProbeStartRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, payload.symbol)
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol=payload.symbol,
+        strategy_name="controlled_trade_probe",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    if payload.confirmation != CONTROLLED_TRADE_PROBE_CONFIRMATION:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled trade probe confirmation phrase is required.",
+            "required_confirmation": CONTROLLED_TRADE_PROBE_CONFIRMATION,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    if not gate.get("controlled_auto_live_allowed"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled trade probe gate is blocked.",
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    job = await start_controlled_trade_probe_job(
+        exchange=payload.exchange,
+        symbol=payload.symbol,
+        amount_krw=payload.amount_krw,
+        confirmation=payload.confirmation,
+        controlled_gate=gate,
+        current_epoch=current_epoch,
+    )
+    return {
+        **job,
+        "required_confirmation": CONTROLLED_TRADE_PROBE_CONFIRMATION,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
     }
