@@ -144,12 +144,14 @@ from app.accounting_epoch import build_current_epoch_diagnostics, build_open_ord
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE as CONTROLLED_AUTO_LIVE_CONFIRMATION,
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
+    ENTRY_V3_WATCH_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION,
     TRADE_PROBE_CONFIRMATION_PHRASE as CONTROLLED_TRADE_PROBE_CONFIRMATION,
     build_controlled_signal_diagnostics,
     controlled_auto_live_job_status,
     controlled_auto_live_gate,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
+    start_controlled_entry_v3_watch_job,
     start_controlled_auto_live_job,
     start_controlled_trade_probe_job,
     stop_controlled_auto_live_job,
@@ -723,6 +725,15 @@ class ControlledTradeProbeStartRequest(BaseModel):
     exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
     symbol: str = Field("BTC", pattern=r"^(BTC|ETH)$")
     amount_krw: float = Field(6000, gt=0, le=6000)
+    confirmation: str = ""
+
+
+class ControlledEntryV3WatchStartRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    runtime_seconds: int = Field(900, ge=900, le=1800)
+    scan_interval_seconds: int = Field(60, ge=30, le=120)
     confirmation: str = ""
 
 
@@ -3103,6 +3114,59 @@ async def controlled_auto_live_trade_probe_start(payload: ControlledTradeProbeSt
     return {
         **job,
         "required_confirmation": CONTROLLED_TRADE_PROBE_CONFIRMATION,
+        "current_epoch": current_epoch,
+        "controlled_auto_live_gate": gate,
+    }
+
+
+@app.post("/api/controlled-auto-live/v3-watch/start")
+async def controlled_auto_live_v3_watch_start(payload: ControlledEntryV3WatchStartRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="controlled_entry_v3_watch",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    if payload.confirmation != CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled entry v3 watch confirmation phrase is required.",
+            "required_confirmation": CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    if not gate.get("controlled_auto_live_allowed"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled entry v3 watch gate is blocked.",
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
+    job = await start_controlled_entry_v3_watch_job(
+        exchange=payload.exchange,
+        symbols=symbols or ["BTC", "ETH"],
+        amount_krw=payload.amount_krw,
+        runtime_seconds=payload.runtime_seconds,
+        scan_interval_seconds=payload.scan_interval_seconds,
+        confirmation=payload.confirmation,
+        controlled_gate=gate,
+        current_epoch=current_epoch,
+    )
+    return {
+        **job,
+        "required_confirmation": CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
     }
