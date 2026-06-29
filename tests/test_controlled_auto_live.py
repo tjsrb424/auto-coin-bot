@@ -16,7 +16,9 @@ from app.controlled_auto_live import (
     ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
     ENTRY_V3_WATCH_CONFIRMATION_PHRASE,
     TRADE_PROBE_CONFIRMATION_PHRASE,
+    _controlled_client_order_id,
     _diagnose_signal_decision,
+    _controlled_order_seq_by_run,
     _controlled_entry_v2_decision,
     _controlled_entry_v3_decision,
     _controlled_jobs,
@@ -81,6 +83,7 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         _controlled_jobs.clear()
+        _controlled_order_seq_by_run.clear()
         self.db_patch.stop()
         self.tmp.cleanup()
 
@@ -814,7 +817,136 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["missing_ledger_fill_count"], 0)
         self.assertEqual(result["duplicate_fill_count"], 0)
         self.assertEqual(result["open_order_count_after"], 0)
+        self.assertEqual(result["duplicate_client_order_id_count"], 0)
+        self.assertEqual(result["protected_strategy_realized_pnl"], result["net_pnl_after_fee"])
+        self.assertEqual(result["protected_strategy_unrealized_pnl"], 0.0)
+        self.assertEqual(result["protected_strategy_total_pnl"], result["net_pnl_after_fee"])
+        self.assertEqual(result["run_trade_pnl_after_fee"], result["net_pnl_after_fee"])
+        self.assertEqual(result["account_session_pnl_delta"], result["current_epoch_pnl_delta"])
+        self.assertAlmostEqual(
+            result["legacy_holding_valuation_delta"],
+            result["account_session_pnl_delta"] - result["protected_strategy_total_pnl"],
+            places=6,
+        )
+        order_logs = database.load_trade_history_logs()
+        run_logs = [log for log in order_logs if str(log["request_id"]).startswith(str(result["controlled_run_id"]))]
+        run_logs.sort(key=lambda log: ((log.get("order_preview_payload") or {}).get("order_seq") or 0))
+        client_ids = [log["client_order_id"] for log in run_logs]
+        self.assertEqual(len(client_ids), 2)
+        self.assertEqual(len(set(client_ids)), 2)
+        self.assertTrue(all(len(client_id) <= 36 for client_id in client_ids))
+        self.assertIn("-b-", client_ids[0])
+        self.assertIn("-s-", client_ids[1])
+        seqs = [((log.get("order_preview_payload") or {}).get("order_seq")) for log in run_logs]
+        self.assertEqual(seqs, [1, 2])
         self.assertEqual(broker.place_order.await_count, 2)
+
+    def test_controlled_client_order_id_is_globally_unique_within_exchange_limit(self) -> None:
+        run_id = "posloop-20260629T121326-57c2fc-trade-1"
+        first = _controlled_client_order_id(
+            mode="PROTECTED_FULL_AUTO_LIVE_V1",
+            run_id=run_id,
+            symbol="ETH",
+            side="BUY",
+            order_seq=1,
+        )
+        second = _controlled_client_order_id(
+            mode="PROTECTED_FULL_AUTO_LIVE_V1",
+            run_id=run_id,
+            symbol="ETH",
+            side="SELL",
+            order_seq=2,
+        )
+        third = _controlled_client_order_id(
+            mode="PROTECTED_FULL_AUTO_LIVE_V1",
+            run_id="posloop-20260629T121326-57c2fc-trade-2",
+            symbol="ETH",
+            side="BUY",
+            order_seq=1,
+        )
+        self.assertEqual(len({first, second, third}), 3)
+        self.assertTrue(all(len(item) <= 36 for item in [first, second, third]))
+        self.assertIn("-b-", first)
+        self.assertIn("-s-", second)
+        self.assertIn("-0001-", first)
+        self.assertIn("-0002-", second)
+
+    async def test_entry_v3_position_duplicate_client_order_id_stops_before_exchange(self) -> None:
+        database.insert_live_order_log(
+            {
+                "request_id": "existing-request",
+                "client_order_id": "dup-client-id",
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "price": 90_000_000,
+                "volume": 0.000066,
+                "amount_krw": 6000,
+                "fee_estimate": 3,
+                "risk_result": "ALLOWED",
+                "status": "PREVIEWED",
+                "order_uuid": "",
+                "strategy_name": "controlled_entry_v3",
+            }
+        )
+        broker = AsyncMock()
+        broker.list_open_orders.return_value = {"orders": []}
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+        scan = {
+            "evaluated_at_utc": "2026-06-26T00:00:00Z",
+            "diagnostics": [],
+            "summary": {},
+            "priority": ["ETH:15m", "BTC:15m", "ETH:5m", "BTC:5m"],
+            "selected_candidate": {
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "strategy_name": "controlled_entry_v3",
+                "timeframe": "5m",
+                "signal_side": "BUY",
+                "signal_state": "TRADE_CANDIDATE",
+                "expected_edge_after_cost": 0.007,
+                "estimated_total_cost_rate": 0.005,
+                "signal_score": 82.0,
+                "trade_candidate_reason": "5m_pullback_rebound+positive_edge_after_cost",
+                "entry_price": 90_909_090.9,
+            },
+        }
+        with (
+            patch("app.controlled_auto_live._controlled_client_order_id", return_value="dup-client-id"),
+            patch("app.controlled_auto_live.get_live_broker", return_value=broker),
+            patch("app.controlled_auto_live._full_auto_live_disabled", return_value=True),
+            patch("app.controlled_auto_live._runtime_guards_pass", return_value=True),
+            patch("app.controlled_auto_live._current_equity", side_effect=[263_000.0, 263_000.0]),
+            patch("app.controlled_auto_live._open_order_count", return_value=0),
+            patch("app.controlled_auto_live._scan_controlled_entry_v3_watch", return_value=scan),
+            patch("app.controlled_auto_live._orderbook_quote", return_value={"best_ask": 91_000_000.0, "best_bid": 91_000_000.0}),
+        ):
+            result = await run_controlled_entry_v3_position_run(
+                confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+                runtime_seconds=900,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+            )
+
+        self.assertEqual(result["controlled_auto_live_status"], "STOPPED")
+        self.assertIn("DUPLICATE_CLIENT_ORDER_ID_BLOCKED", result["pass_fail_reasons"])
+        self.assertEqual(result["duplicate_client_order_id_count"], 1)
+        self.assertEqual(result["duplicate_client_order_ids"], ["dup-client-id"])
+        self.assertEqual(result["open_order_count_after"], 0)
+        self.assertEqual(result["final_runtime_status"], "STOPPED")
+        broker.place_order.assert_not_awaited()
 
     async def test_entry_v3_watch_job_blocks_duplicate_active_run(self) -> None:
         async def fake_run(**kwargs):
@@ -1133,7 +1265,7 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.controlled_auto_live._full_auto_live_disabled", return_value=True),
             patch("app.controlled_auto_live._runtime_guards_pass", return_value=True),
-            patch("app.controlled_auto_live._current_equity", side_effect=[263000.0, 262972.0]),
+            patch("app.controlled_auto_live._current_equity", side_effect=[263000.0, 264000.0]),
             patch("app.controlled_auto_live._open_order_count", return_value=0),
             patch("app.controlled_auto_live.run_controlled_entry_v3_position_run", side_effect=fake_position_run),
         ):
@@ -1153,6 +1285,11 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["time_stop_count"], 1)
         self.assertEqual(result["profitable_trade_count"], 0)
         self.assertEqual(result["losing_trade_count"], 1)
+        self.assertEqual(result["protected_strategy_total_pnl"], -28.0)
+        self.assertEqual(result["run_trade_pnl_after_fee"], -28.0)
+        self.assertEqual(result["account_session_pnl_delta"], 1000.0)
+        self.assertEqual(result["current_epoch_pnl_delta"], 1000.0)
+        self.assertEqual(result["legacy_holding_valuation_delta"], 1028.0)
 
     async def test_controlled_position_loop_job_blocks_duplicate_active_run(self) -> None:
         async def fake_run(**kwargs):

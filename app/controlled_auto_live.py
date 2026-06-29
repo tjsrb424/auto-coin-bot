@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import statistics
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -77,11 +78,13 @@ PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE = "START PROTECTED FULL AUTO LIVE V1"
 PROTECTED_FULL_AUTO_MODE = "PROTECTED_FULL_AUTO_LIVE_V1"
 PROTECTED_SESSION_LOSS_LIMIT_RATE = 0.005
 PROTECTED_SESSION_MAX_DAILY_LOSS_KRW = 1000.0
+CONTROLLED_CLIENT_ORDER_ID_MAX_LENGTH = 36
 
 logger = logging.getLogger("uvicorn.error")
 
 _controlled_jobs: dict[str, dict[str, Any]] = {}
 _controlled_job_lock: asyncio.Lock | None = None
+_controlled_order_seq_by_run: dict[str, int] = {}
 
 
 def _job_lock() -> asyncio.Lock:
@@ -89,6 +92,68 @@ def _job_lock() -> asyncio.Lock:
     if _controlled_job_lock is None:
         _controlled_job_lock = asyncio.Lock()
     return _controlled_job_lock
+
+
+def _next_controlled_order_seq(run_id: str) -> int:
+    current = int(_controlled_order_seq_by_run.get(run_id, 0)) + 1
+    _controlled_order_seq_by_run[run_id] = current
+    return current
+
+
+def _base36(value: int) -> str:
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if value <= 0:
+        return "0"
+    chars = []
+    while value:
+        value, remainder = divmod(value, 36)
+        chars.append(alphabet[remainder])
+    return "".join(reversed(chars))
+
+
+def _controlled_client_order_id(*, mode: str, run_id: str, symbol: str, side: str, order_seq: int) -> str:
+    mode_part = "pv1" if mode == PROTECTED_FULL_AUTO_MODE else "ctl"
+    run_hash = uuid.uuid5(uuid.NAMESPACE_URL, run_id).hex[:8]
+    side_part = "b" if str(side).upper() == "BUY" else "s"
+    seq_part = f"{int(order_seq):04d}"
+    timestamp_part = _base36(int(time.time() * 1000))[-8:]
+    nonce = uuid.uuid4().hex[:4]
+    client_order_id = f"{mode_part}-{run_hash}-{symbol.upper()}-{side_part}-{seq_part}-{timestamp_part}-{nonce}"
+    return client_order_id[:CONTROLLED_CLIENT_ORDER_ID_MAX_LENGTH]
+
+
+def _client_order_id_exists(client_order_id: str, request_id: str | None = None) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM live_order_logs
+            WHERE client_order_id = ?
+              AND (? IS NULL OR request_id != ?)
+            LIMIT 1
+            """,
+            (client_order_id, request_id, request_id),
+        ).fetchone()
+    return row is not None
+
+
+def _duplicate_client_order_result(request_id: str, client_order_id: str) -> dict:
+    return {
+        "requested": False,
+        "filled": False,
+        "blocked": True,
+        "request_id": request_id,
+        "client_order_id": client_order_id,
+        "duplicate_client_order_id": client_order_id,
+        "duplicate_client_order_id_count": 1,
+        "stop_reason": "DUPLICATE_CLIENT_ORDER_ID_BLOCKED",
+    }
+
+
+def _order_result_stop_reason(result: dict, fallback: str) -> list[str]:
+    if result.get("stop_reason"):
+        return [str(result["stop_reason"])]
+    return [fallback]
 
 
 def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exchange: str = "bithumb") -> dict:
@@ -575,8 +640,16 @@ async def run_controlled_auto_live(
         "sell_filled_count": 0,
         "exchange_order_uuid_list": [],
         "client_order_id_list": [],
+        "duplicate_client_order_id_count": 0,
+        "duplicate_client_order_ids": [],
         "gross_pnl": 0.0,
         "net_pnl_after_fee": 0.0,
+        "protected_strategy_realized_pnl": 0.0,
+        "protected_strategy_unrealized_pnl": 0.0,
+        "protected_strategy_total_pnl": 0.0,
+        "account_session_pnl_delta": 0.0,
+        "legacy_holding_valuation_delta": 0.0,
+        "run_trade_pnl_after_fee": 0.0,
         "run_realized_pnl": 0.0,
         "run_unrealized_pnl_delta": 0.0,
         "run_mark_to_market_delta": 0.0,
@@ -911,8 +984,16 @@ async def run_controlled_trade_probe(
         "sell_filled_count": 0,
         "exchange_order_uuid_list": [],
         "client_order_id_list": [],
+        "duplicate_client_order_id_count": 0,
+        "duplicate_client_order_ids": [],
         "gross_pnl": 0.0,
         "net_pnl_after_fee": 0.0,
+        "protected_strategy_realized_pnl": 0.0,
+        "protected_strategy_unrealized_pnl": 0.0,
+        "protected_strategy_total_pnl": 0.0,
+        "account_session_pnl_delta": 0.0,
+        "legacy_holding_valuation_delta": 0.0,
+        "run_trade_pnl_after_fee": 0.0,
         "run_realized_pnl": 0.0,
         "run_unrealized_pnl_delta": 0.0,
         "run_mark_to_market_delta": 0.0,
@@ -1531,8 +1612,16 @@ async def run_controlled_entry_v3_watch(
         "sell_filled_count": 0,
         "exchange_order_uuid_list": [],
         "client_order_id_list": [],
+        "duplicate_client_order_id_count": 0,
+        "duplicate_client_order_ids": [],
         "gross_pnl": 0.0,
         "net_pnl_after_fee": 0.0,
+        "protected_strategy_realized_pnl": 0.0,
+        "protected_strategy_unrealized_pnl": 0.0,
+        "protected_strategy_total_pnl": 0.0,
+        "account_session_pnl_delta": 0.0,
+        "legacy_holding_valuation_delta": 0.0,
+        "run_trade_pnl_after_fee": 0.0,
         "run_realized_pnl": 0.0,
         "run_unrealized_pnl_delta": 0.0,
         "run_mark_to_market_delta": 0.0,
@@ -1639,7 +1728,7 @@ async def run_controlled_entry_v3_watch(
                 if buy.get("order_log"):
                     ordered_logs.append(buy["order_log"])
                 if not buy.get("filled"):
-                    return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["BUY_NOT_FILLED"], before_equity, controlled_gate)
+                    return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", _order_result_stop_reason(buy, "BUY_NOT_FILLED"), before_equity, controlled_gate)
                 if stop_event is not None and stop_event.is_set():
                     return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["CONTROLLED_ENTRY_V3_WATCH_STOP_REQUESTED_AFTER_BUY"], before_equity, controlled_gate)
                 sell_quote = await _orderbook_quote(exchange, market)
@@ -1668,7 +1757,7 @@ async def run_controlled_entry_v3_watch(
                 if sell.get("order_log"):
                     ordered_logs.append(sell["order_log"])
                 if not sell.get("filled"):
-                    return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["SELL_NOT_FILLED"], before_equity, controlled_gate)
+                    return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", _order_result_stop_reason(sell, "SELL_NOT_FILLED"), before_equity, controlled_gate)
                 _apply_realized_position_pnl(
                     report,
                     {
@@ -1774,6 +1863,8 @@ async def run_controlled_entry_v3_position_run(
         "sell_filled_count": 0,
         "exchange_order_uuid_list": [],
         "client_order_id_list": [],
+        "duplicate_client_order_id_count": 0,
+        "duplicate_client_order_ids": [],
         "entry_price": None,
         "entry_fee": 0.0,
         "exit_price": None,
@@ -1788,6 +1879,12 @@ async def run_controlled_entry_v3_position_run(
         "min_unrealized_pnl": 0.0,
         "gross_pnl": 0.0,
         "net_pnl_after_fee": 0.0,
+        "protected_strategy_realized_pnl": 0.0,
+        "protected_strategy_unrealized_pnl": 0.0,
+        "protected_strategy_total_pnl": 0.0,
+        "account_session_pnl_delta": 0.0,
+        "legacy_holding_valuation_delta": 0.0,
+        "run_trade_pnl_after_fee": 0.0,
         "run_realized_pnl": 0.0,
         "run_unrealized_pnl_delta": 0.0,
         "run_mark_to_market_delta": 0.0,
@@ -1913,7 +2010,7 @@ async def run_controlled_entry_v3_position_run(
             if buy.get("order_log"):
                 ordered_logs.append(buy["order_log"])
             if not buy.get("filled"):
-                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["BUY_NOT_FILLED"], before_equity, controlled_gate)
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", _order_result_stop_reason(buy, "BUY_NOT_FILLED"), before_equity, controlled_gate)
 
             executed_volume = _round_volume(_float(buy.get("executed_volume")))
             entry_value = _float(buy.get("filled_amount_krw"))
@@ -1997,7 +2094,7 @@ async def run_controlled_entry_v3_position_run(
             if sell.get("order_log"):
                 ordered_logs.append(sell["order_log"])
             if not sell.get("filled"):
-                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["SELL_NOT_FILLED"], before_equity, controlled_gate)
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", _order_result_stop_reason(sell, "SELL_NOT_FILLED"), before_equity, controlled_gate)
             exit_value = _float(sell.get("filled_amount_krw"))
             exit_fee = _float(sell.get("paid_fee"))
             exit_price = exit_value / executed_volume if executed_volume > 0 and exit_value > 0 else sell_price
@@ -2076,8 +2173,16 @@ async def run_controlled_position_loop(
         "order_count": 0,
         "buy_filled_count": 0,
         "sell_filled_count": 0,
+        "duplicate_client_order_id_count": 0,
+        "duplicate_client_order_ids": [],
         "gross_pnl": 0.0,
         "net_pnl_after_fee": 0.0,
+        "protected_strategy_realized_pnl": 0.0,
+        "protected_strategy_unrealized_pnl": 0.0,
+        "protected_strategy_total_pnl": 0.0,
+        "account_session_pnl_delta": 0.0,
+        "legacy_holding_valuation_delta": 0.0,
+        "run_trade_pnl_after_fee": 0.0,
         "run_realized_pnl": 0.0,
         "run_unrealized_pnl_delta": 0.0,
         "run_mark_to_market_delta": 0.0,
@@ -2211,6 +2316,10 @@ async def run_controlled_position_loop(
         epoch_delta = _float(report.get("account_epoch_pnl_after")) - _float(report.get("account_epoch_pnl_before"))
         report["account_epoch_pnl_delta"] = epoch_delta
         report["current_epoch_pnl_delta"] = epoch_delta
+        report["account_session_pnl_delta"] = epoch_delta
+        report["protected_strategy_total_pnl"] = _float(report.get("protected_strategy_realized_pnl")) + _float(report.get("protected_strategy_unrealized_pnl"))
+        report["run_trade_pnl_after_fee"] = report["protected_strategy_total_pnl"]
+        report["legacy_holding_valuation_delta"] = epoch_delta - _float(report.get("protected_strategy_total_pnl"))
         report["current_epoch_accounting_pending_count"] = int(after_epoch.get("current_epoch_accounting_pending_count") or 0)
         report["current_epoch_accounting_failed_count"] = int(after_epoch.get("current_epoch_accounting_failed_count") or 0)
         report["open_order_count_after"] = await _open_order_count(exchange, symbols or ["BTC", "ETH"])
@@ -2221,7 +2330,7 @@ async def run_controlled_position_loop(
         if int(report.get("trade_count") or 0) <= 0:
             return _finalize_position_loop(report, "PASS_IDLE", [], controlled_gate)
         report["technical_result"] = "PASSED"
-        if _float(report.get("net_pnl_after_fee")) > 0:
+        if _float(report.get("protected_strategy_total_pnl"), _float(report.get("net_pnl_after_fee"))) > 0:
             report["profitability_result"] = "PROFITABLE"
             return _finalize_position_loop(report, "PASSED_PROFITABLE_POSITION", [], controlled_gate)
         report["profitability_result"] = "NOT_PROFITABLE"
@@ -2242,11 +2351,21 @@ def _merge_position_loop_subrun(report: dict, sub: dict) -> None:
     report["net_pnl_after_fee"] = _float(report.get("net_pnl_after_fee")) + _float(sub.get("net_pnl_after_fee"))
     report["run_realized_pnl"] = _float(report.get("run_realized_pnl")) + _float(sub.get("run_realized_pnl"))
     report["run_pnl"] = report["run_realized_pnl"]
+    report["protected_strategy_realized_pnl"] = _float(report.get("protected_strategy_realized_pnl")) + _float(sub.get("protected_strategy_realized_pnl"), _float(sub.get("run_realized_pnl")))
+    report["protected_strategy_unrealized_pnl"] = _float(report.get("protected_strategy_unrealized_pnl")) + _float(sub.get("protected_strategy_unrealized_pnl"))
+    report["protected_strategy_total_pnl"] = _float(report.get("protected_strategy_realized_pnl")) + _float(report.get("protected_strategy_unrealized_pnl"))
+    report["run_trade_pnl_after_fee"] = report["protected_strategy_total_pnl"]
     report["total_fee"] = _float(report.get("total_fee")) + _float(sub.get("total_fee"))
     report["exchange_fill_count"] = int(report.get("exchange_fill_count") or 0) + int(sub.get("exchange_fill_count") or 0)
     report["ledger_fill_count"] = int(report.get("ledger_fill_count") or 0) + int(sub.get("ledger_fill_count") or 0)
     report["missing_ledger_fill_count"] = int(report.get("missing_ledger_fill_count") or 0) + int(sub.get("missing_ledger_fill_count") or 0)
     report["duplicate_fill_count"] = int(report.get("duplicate_fill_count") or 0) + int(sub.get("duplicate_fill_count") or 0)
+    report["duplicate_client_order_id_count"] = int(report.get("duplicate_client_order_id_count") or 0) + int(sub.get("duplicate_client_order_id_count") or 0)
+    ids = list(report.get("duplicate_client_order_ids") or [])
+    for item in sub.get("duplicate_client_order_ids") or []:
+        if item not in ids:
+            ids.append(item)
+    report["duplicate_client_order_ids"] = ids
     report["fee_diff"] = _float(report.get("fee_diff")) + _float(sub.get("fee_diff"))
     symbol = str(sub.get("selected_symbol") or "").upper()
     timeframe = str(sub.get("selected_timeframe") or "")
@@ -2275,6 +2394,8 @@ def _position_loop_fail_reasons(report: dict) -> list[str]:
         reasons.append("MISSING_LEDGER_FILL")
     if int(report.get("duplicate_fill_count") or 0) != 0:
         reasons.append("DUPLICATE_FILL")
+    if int(report.get("duplicate_client_order_id_count") or 0) != 0:
+        reasons.append("DUPLICATE_CLIENT_ORDER_ID_BLOCKED")
     if abs(_float(report.get("fee_diff"))) > FEE_TOLERANCE_KRW:
         reasons.append("FEE_DIFF_EXCEEDS_TOLERANCE")
     if report.get("equity_diff_after") is not None and abs(_float(report.get("equity_diff_after"))) > EQUITY_TOLERANCE_KRW:
@@ -2313,6 +2434,7 @@ def _finalize_position_loop(report: dict, status: str, reasons: list[str], contr
     runtime = load_runtime_lock("auto-trading")
     report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
     persist_controlled_run_report(report)
+    _controlled_order_seq_by_run.pop(str(report.get("controlled_run_id") or report.get("loop_run_id") or report.get("position_run_id") or ""), None)
     return {key: value for key, value in report.items() if not key.startswith("_")}
 
 
@@ -3077,9 +3199,13 @@ async def _submit_and_wait_controlled(
     timeout_seconds: int = 300,
 ) -> dict:
     request_id = f"{run_id}-{side.lower()}-{order_index}"
-    client_order_id = f"{run_id[:24]}-{side.lower()}-{order_index}"[:36]
     symbol = market.split("-")[-1]
-    idempotency_key = f"controlled-auto:{exchange}:{symbol}:{run_id}:{side}:{order_index}"
+    order_seq = _next_controlled_order_seq(run_id)
+    mode = PROTECTED_FULL_AUTO_MODE if run_id.startswith("posloop-") else "CONTROLLED_AUTO_LIVE"
+    client_order_id = _controlled_client_order_id(mode=mode, run_id=run_id, symbol=symbol, side=side, order_seq=order_seq)
+    idempotency_key = f"controlled-auto:{exchange}:{symbol}:{run_id}:{side}:{order_seq}"
+    if _client_order_id_exists(client_order_id, request_id):
+        return _duplicate_client_order_result(request_id, client_order_id)
     order = {
         "request_id": request_id,
         "client_order_id": client_order_id,
@@ -3093,25 +3219,30 @@ async def _submit_and_wait_controlled(
         "volume": volume,
         "amount_krw": amount_krw,
     }
-    preview_payload = {"controlled_auto_live_id": run_id, "order_index": order_index, "max_orders": MAX_ORDERS}
+    preview_payload = {"controlled_auto_live_id": run_id, "order_index": order_index, "order_seq": order_seq, "max_orders": MAX_ORDERS}
     if preview_payload_extra:
         preview_payload.update(preview_payload_extra)
-    insert_live_order_log(
-        {
-            **order,
-            "fee_estimate": amount_krw * LiveTradingConfig.for_exchange(exchange).fee_rate,
-            "risk_result": prepared_risk_result,
-            "order_preview_payload": preview_payload,
-            "exchange_request_payload_masked": masked_exchange_request(order),
-            "exchange_response_payload": {},
-            "status": "PREVIEWED",
-            "order_purpose": order_purpose,
-            "strategy_name": strategy_name,
-            "signal_reason": signal_reason,
-            "signal_type": side,
-            "manual_confirmed": True,
-        }
-    )
+    try:
+        insert_live_order_log(
+            {
+                **order,
+                "fee_estimate": amount_krw * LiveTradingConfig.for_exchange(exchange).fee_rate,
+                "risk_result": prepared_risk_result,
+                "order_preview_payload": preview_payload,
+                "exchange_request_payload_masked": masked_exchange_request(order),
+                "exchange_response_payload": {},
+                "status": "PREVIEWED",
+                "order_purpose": order_purpose,
+                "strategy_name": strategy_name,
+                "signal_reason": signal_reason,
+                "signal_type": side,
+                "manual_confirmed": True,
+            }
+        )
+    except ValueError as exc:
+        if "DUPLICATE_CLIENT_ORDER_ID" in str(exc):
+            return _duplicate_client_order_result(request_id, client_order_id)
+        raise
     response = await broker.place_order(order)
     order_uuid = str(response.get("uuid") or response.get("order_id") or response.get("id") or "")
     update_live_order_log(
@@ -3192,6 +3323,15 @@ async def _finalize_after_orders(
     epoch_delta = epoch_after - epoch_before
     report["current_epoch_pnl_delta"] = epoch_delta
     report["account_epoch_pnl_delta"] = epoch_delta
+    report["account_session_pnl_delta"] = epoch_delta
+    protected_total = _float(report.get("protected_strategy_total_pnl"), _float(report.get("net_pnl_after_fee")))
+    protected_realized = _float(report.get("protected_strategy_realized_pnl"), _float(report.get("run_realized_pnl")))
+    protected_unrealized = _float(report.get("protected_strategy_unrealized_pnl"), _float(report.get("run_unrealized_pnl_delta")))
+    report["protected_strategy_realized_pnl"] = protected_realized
+    report["protected_strategy_unrealized_pnl"] = protected_unrealized
+    report["protected_strategy_total_pnl"] = protected_total
+    report["run_trade_pnl_after_fee"] = protected_total
+    report["legacy_holding_valuation_delta"] = epoch_delta - protected_total
     report["run_unrealized_pnl_delta"] = _float(report.get("run_mark_to_market_delta"))
     if int(report.get("order_count") or 0) == 0 and abs(epoch_delta) > 0:
         note = "No orders were executed; account epoch PnL movement is existing-position mark-to-market change, not this run's trading PnL."
@@ -3230,11 +3370,21 @@ def _apply_realized_position_pnl(report: dict, position: dict) -> None:
     report["run_unrealized_pnl_delta"] = 0.0
     report["run_mark_to_market_delta"] = 0.0
     report["run_pnl"] = report["run_realized_pnl"]
+    report["protected_strategy_realized_pnl"] = _float(report.get("protected_strategy_realized_pnl")) + net
+    report["protected_strategy_unrealized_pnl"] = 0.0
+    report["protected_strategy_total_pnl"] = _float(report.get("protected_strategy_realized_pnl")) + _float(report.get("protected_strategy_unrealized_pnl"))
+    report["run_trade_pnl_after_fee"] = report["protected_strategy_total_pnl"]
     report["spread_slippage_estimate"] = _float(report.get("spread_slippage_estimate")) + spread
 
 
 def _merge_order_result(report: dict, result: dict, *, prefix: str) -> None:
     report["order_count"] = int(report.get("order_count") or 0) + (1 if result.get("requested") else 0)
+    if result.get("duplicate_client_order_id"):
+        report["duplicate_client_order_id_count"] = int(report.get("duplicate_client_order_id_count") or 0) + int(result.get("duplicate_client_order_id_count") or 1)
+        ids = list(report.get("duplicate_client_order_ids") or [])
+        if result["duplicate_client_order_id"] not in ids:
+            ids.append(result["duplicate_client_order_id"])
+        report["duplicate_client_order_ids"] = ids
     if prefix == "buy" and result.get("filled"):
         report["buy_filled_count"] = int(report.get("buy_filled_count") or 0) + 1
     if prefix == "sell" and result.get("filled"):
@@ -3302,6 +3452,7 @@ def _finalize(report: dict, status: str, reasons: list[str], *, controlled_gate:
         report["controlled_auto_live_gate"] = controlled_gate
     runtime = load_runtime_lock("auto-trading")
     report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
+    _controlled_order_seq_by_run.pop(str(report.get("controlled_run_id") or report.get("position_run_id") or ""), None)
     return {key: value for key, value in report.items() if not key.startswith("_")}
 
 
