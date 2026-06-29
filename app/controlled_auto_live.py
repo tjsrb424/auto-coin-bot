@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import statistics
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -45,7 +46,8 @@ from app.upbit import fetch_minute_candles
 
 CONFIRMATION_PHRASE = "RUN CONTROLLED AUTO LIVE ONCE"
 TRADE_PROBE_CONFIRMATION_PHRASE = "RUN CONTROLLED TRADE PROBE ONCE"
-CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous"}
+CONTROLLED_ENTRY_V2_STRATEGY = "controlled_entry_v2"
+CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous", CONTROLLED_ENTRY_V2_STRATEGY}
 CONTROLLED_BLOCKED_STRATEGIES = {"rsi"}
 TRADE_PROBE_STRATEGY_SOURCE = "controlled_trade_probe"
 MAX_ORDERS = 5
@@ -55,6 +57,9 @@ DEFAULT_RUNTIME_SECONDS = 600
 MAX_RUNTIME_SECONDS = 1800
 TICK_INTERVAL_SECONDS = 60
 MIN_EXPECTED_EDGE_RATE = 0.006
+CONTROLLED_ENTRY_V2_MIN_SCORE = 60.0
+CONTROLLED_ENTRY_V2_MIN_EDGE_AFTER_COST = 0.0002
+OBSERVED_CONTROLLED_ROUNDTRIP_COST_RATE_FLOOR = 0.005
 DRY_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED DRY RUN FORCE BUY"
 
 logger = logging.getLogger("uvicorn.error")
@@ -977,6 +982,8 @@ async def _build_entry_decisions(exchange: str, symbols: list[str], notional: fl
         decisions.append(ma_decision)
         smart_decision = await _smart_autonomous_decision(symbol, market, candles, quote, notional)
         decisions.append(smart_decision)
+        entry_v2_decision = _controlled_entry_v2_decision(symbol, market, candles, quote, notional)
+        decisions.append(entry_v2_decision)
     decisions.sort(key=lambda item: _float(item.get("expected_edge_rate")), reverse=True)
     return decisions
 
@@ -1099,6 +1106,159 @@ async def _smart_autonomous_decision(symbol: str, market: str, candles: list[dic
         "confidence_score": confidence,
         "notional_krw": notional,
     }
+
+
+def _controlled_entry_v2_decision(symbol: str, market: str, candles: list[dict], quote: dict, notional: float) -> dict:
+    latest = latest_completed_candle(candles, 1) or (candles[-1] if candles else {})
+    costs = _cost_components(quote)
+    total_cost = costs["estimated_round_trip_cost_rate"]
+    metrics = _controlled_entry_v2_metrics(candles, quote)
+    expected_move = metrics["expected_move_rate"]
+    edge_after_cost = expected_move - total_cost
+    block_reasons: list[str] = []
+    if metrics["candle_count"] < 30:
+        block_reasons.append("INSUFFICIENT_CANDLES")
+    if metrics["signal_bias"] != "BUY":
+        block_reasons.append("NO_CONTROLLED_ENTRY_V2_SIGNAL")
+    if edge_after_cost <= CONTROLLED_ENTRY_V2_MIN_EDGE_AFTER_COST:
+        block_reasons.append("EXPECTED_EDGE_BELOW_FEE_COST")
+    if edge_after_cost <= 0:
+        block_reasons.append("EXPECTED_EDGE_BELOW_THRESHOLD")
+    if metrics["signal_score"] < CONTROLLED_ENTRY_V2_MIN_SCORE:
+        block_reasons.append("CONTROLLED_ENTRY_V2_SCORE_TOO_LOW")
+    if metrics["estimated_spread_rate"] > max(0.003, expected_move * 0.7):
+        block_reasons.append("SPREAD_TOO_WIDE")
+    if metrics["volatility_rate"] < 0.00015:
+        block_reasons.append("VOLATILITY_TOO_LOW")
+    if metrics["volume_ratio"] < 0.45:
+        block_reasons.append("VOLUME_TOO_LOW")
+    block_reasons = list(dict.fromkeys(block_reasons))
+    edge_allowed = not block_reasons
+    if edge_allowed:
+        signal_state = "TRADE_CANDIDATE"
+    elif metrics["signal_bias"] == "BUY" and edge_after_cost > 0:
+        signal_state = "WATCH"
+    else:
+        signal_state = "NO_TRADE"
+    return {
+        "symbol": symbol,
+        "market": market,
+        "strategy": CONTROLLED_ENTRY_V2_STRATEGY,
+        "candle_count": metrics["candle_count"],
+        "last_candle_at_utc": latest.get("candle_time_utc"),
+        "signal": "BUY" if signal_state in {"WATCH", "TRADE_CANDIDATE"} else "HOLD",
+        "signal_state": signal_state,
+        "reason": "CONTROLLED_ENTRY_V2_TRADE_CANDIDATE" if edge_allowed else "CONTROLLED_ENTRY_V2_BLOCKED",
+        "trade_candidate_reason": metrics["trade_candidate_reason"] if edge_allowed else "",
+        "entry_price": quote.get("best_ask"),
+        "expected_edge_rate": expected_move,
+        "expected_move_rate": expected_move,
+        "min_expected_edge_rate": CONTROLLED_ENTRY_V2_MIN_EDGE_AFTER_COST,
+        "estimated_round_trip_cost_rate": total_cost,
+        "estimated_total_cost_rate": total_cost,
+        "estimated_roundtrip_fee_rate": costs["estimated_roundtrip_fee_rate"],
+        "estimated_spread_rate": costs["estimated_spread_rate"],
+        "expected_edge_after_cost": edge_after_cost,
+        "edge_allowed": edge_allowed,
+        "blocker": None if edge_allowed else ",".join(block_reasons),
+        "block_reasons": block_reasons,
+        "signal_score": metrics["signal_score"],
+        "confidence_score": metrics["confidence"],
+        "confidence": metrics["confidence"],
+        "metrics": metrics,
+        "notional_krw": notional,
+    }
+
+
+def _controlled_entry_v2_metrics(candles: list[dict], quote: dict) -> dict:
+    normalized = [_normalize_candle(candle) for candle in candles]
+    closes = [_float(candle.get("trade_price")) for candle in normalized if _float(candle.get("trade_price")) > 0]
+    highs = [_float(candle.get("high_price")) for candle in normalized if _float(candle.get("high_price")) > 0]
+    lows = [_float(candle.get("low_price")) for candle in normalized if _float(candle.get("low_price")) > 0]
+    opens = [_float(candle.get("opening_price")) for candle in normalized if _float(candle.get("opening_price")) > 0]
+    volumes = [_float(candle.get("candle_acc_trade_volume")) for candle in normalized]
+    if len(closes) < 6:
+        return {
+            "candle_count": len(closes),
+            "signal_bias": "HOLD",
+            "expected_move_rate": 0.0,
+            "estimated_spread_rate": _cost_components(quote)["estimated_spread_rate"],
+            "volatility_rate": 0.0,
+            "volume_ratio": 0.0,
+            "signal_score": 0.0,
+            "confidence": 0.0,
+            "trade_candidate_reason": "INSUFFICIENT_CANDLES",
+        }
+    last = closes[-1]
+    momentum_3 = _rate(closes[-1], closes[-4]) if len(closes) >= 4 else 0.0
+    momentum_5 = _rate(closes[-1], closes[-6]) if len(closes) >= 6 else 0.0
+    recent_high = max(highs[-11:-1]) if len(highs) >= 11 else max(highs[:-1] or highs)
+    breakout_rate = max(_rate(last, recent_high), 0.0)
+    bullish_body_rate = _rate(closes[-1], opens[-1]) if opens else 0.0
+    returns = [_rate(closes[index], closes[index - 1]) for index in range(max(1, len(closes) - 20), len(closes))]
+    volatility = statistics.pstdev(returns) if len(returns) >= 2 else 0.0
+    ma5_now = sum(closes[-5:]) / 5 if len(closes) >= 5 else last
+    ma5_prev = sum(closes[-8:-3]) / 5 if len(closes) >= 8 else ma5_now
+    short_ma_slope = _rate(ma5_now, ma5_prev)
+    recent_low = min(lows[-10:]) if len(lows) >= 10 else min(lows or [last])
+    rebound_rate = max(_rate(last, recent_low), 0.0)
+    recent_volume = sum(volumes[-3:]) / 3 if len(volumes) >= 3 else (volumes[-1] if volumes else 0.0)
+    base_volume = sum(volumes[-23:-3]) / 20 if len(volumes) >= 23 else (sum(volumes[:-3]) / max(len(volumes[:-3]), 1) if len(volumes) > 3 else recent_volume)
+    volume_ratio = recent_volume / base_volume if base_volume > 0 else 1.0
+    costs = _cost_components(quote)
+    expected_move = max(
+        momentum_3 * 1.1,
+        momentum_5 * 0.85,
+        breakout_rate + volatility * 0.35,
+        rebound_rate * 0.45,
+        short_ma_slope * 1.15,
+        bullish_body_rate * 0.6,
+        0.0,
+    )
+    edge_after_cost = expected_move - costs["estimated_round_trip_cost_rate"]
+    directional = max(momentum_3, momentum_5, breakout_rate, short_ma_slope, bullish_body_rate)
+    signal_bias = "BUY" if directional > 0 and (momentum_3 > 0 or short_ma_slope > 0 or breakout_rate > 0) else "HOLD"
+    edge_component = min(max(edge_after_cost / 0.003, 0.0), 1.0) * 32.0
+    direction_component = min(max(directional / 0.003, 0.0), 1.0) * 22.0
+    volume_component = min(max((volume_ratio - 0.7) / 1.3, 0.0), 1.0) * 16.0
+    volatility_component = min(max(volatility / 0.0015, 0.0), 1.0) * 15.0
+    body_component = 8.0 if bullish_body_rate > 0 else 0.0
+    spread_penalty = 12.0 if costs["estimated_spread_rate"] > max(0.003, expected_move * 0.7) else 0.0
+    score = max(0.0, min(100.0, 22.0 + edge_component + direction_component + volume_component + volatility_component + body_component - spread_penalty))
+    confidence = round(score / 100.0, 4)
+    reason_bits = []
+    if momentum_3 > 0:
+        reason_bits.append("positive_3m_momentum")
+    if breakout_rate > 0:
+        reason_bits.append("recent_high_breakout")
+    if volume_ratio >= 1.0:
+        reason_bits.append("volume_support")
+    if short_ma_slope > 0:
+        reason_bits.append("short_ma_slope_up")
+    if rebound_rate > costs["estimated_round_trip_cost_rate"]:
+        reason_bits.append("rebound_after_drawdown")
+    return {
+        "candle_count": len(closes),
+        "signal_bias": signal_bias,
+        "momentum_3_rate": momentum_3,
+        "momentum_5_rate": momentum_5,
+        "breakout_rate": breakout_rate,
+        "bullish_body_rate": bullish_body_rate,
+        "volume_ratio": volume_ratio,
+        "volatility_rate": volatility,
+        "short_ma_slope_rate": short_ma_slope,
+        "rebound_rate": rebound_rate,
+        "estimated_spread_rate": costs["estimated_spread_rate"],
+        "expected_move_rate": expected_move,
+        "expected_edge_after_cost": edge_after_cost,
+        "signal_score": score,
+        "confidence": confidence,
+        "trade_candidate_reason": "+".join(reason_bits) or "controlled_entry_v2_composite_signal",
+    }
+
+
+def _rate(current: float, previous: float) -> float:
+    return (current - previous) / previous if previous > 0 else 0.0
 
 
 def _latest_ma_signal(candles: list[dict]) -> dict:
@@ -1462,11 +1622,14 @@ def _diagnose_signal_decision(
         block_reasons.append("RISK_BLOCKED")
         if "ACCOUNTING_GATE_BLOCKED" in risk_blockers:
             block_reasons.append("ACCOUNTING_GATE_BLOCKED")
+    block_reasons.extend(str(reason) for reason in (decision.get("block_reasons") or []) if reason)
 
     if strategy == "ma_cross" and signal_side != "BUY":
         block_reasons.append("NO_MA_CROSS_SIGNAL")
     if strategy == "smart_autonomous" and signal_side != "BUY":
         block_reasons.append("SMART_SCORE_TOO_LOW")
+    if strategy == CONTROLLED_ENTRY_V2_STRATEGY and str(decision.get("signal_state") or "") != "TRADE_CANDIDATE" and signal_side != "BUY":
+        block_reasons.append("NO_CONTROLLED_ENTRY_V2_SIGNAL")
     if expected_edge < min_edge:
         block_reasons.append("EXPECTED_EDGE_BELOW_THRESHOLD")
     if expected_edge < total_cost:
@@ -1495,11 +1658,15 @@ def _diagnose_signal_decision(
         "last_candle_at_utc": decision.get("last_candle_at_utc"),
         "signal_generated": signal_side in {"BUY", "SELL"},
         "signal_side": signal_side if signal_side in {"BUY", "SELL", "HOLD"} else "NONE",
-        "signal_score": _float(decision.get("confidence_score"), expected_edge),
+        "signal_state": decision.get("signal_state") or ("TRADE_CANDIDATE" if decision.get("edge_allowed") else "NO_TRADE"),
+        "signal_score": _float(decision.get("signal_score"), _float(decision.get("confidence_score"), expected_edge)),
+        "confidence": _float(decision.get("confidence"), _float(decision.get("confidence_score"))),
         "expected_edge_rate": expected_edge,
+        "expected_move_rate": _float(decision.get("expected_move_rate"), expected_edge),
         "min_expected_edge_rate": min_edge,
         "estimated_roundtrip_fee_rate": fee_rate,
         "estimated_spread_rate": spread_rate,
+        "estimated_total_cost_rate": _float(decision.get("estimated_total_cost_rate"), total_cost),
         "expected_edge_after_cost": expected_after_cost,
         "blocked": bool(block_reasons) or not bool(decision.get("edge_allowed")),
         "block_reasons": block_reasons or ([] if decision.get("edge_allowed") else ["UNKNOWN"]),
@@ -1509,6 +1676,7 @@ def _diagnose_signal_decision(
         "risk_allowed": not risk_blockers,
         "risk_blockers": risk_blockers,
         "raw_reason": decision.get("reason"),
+        "trade_candidate_reason": decision.get("trade_candidate_reason") or "",
     }
 
 
@@ -1616,7 +1784,7 @@ def _cost_components(quote: dict, *, exchange: str = "bithumb") -> dict:
     ask = _float(quote.get("best_ask"))
     mid = (bid + ask) / 2 if bid > 0 and ask > 0 else ask
     spread_rate = ((ask - bid) / mid) if mid > 0 else 0.0
-    fee_rate = 2 * LiveTradingConfig.for_exchange(exchange).fee_rate
+    fee_rate = max(2 * LiveTradingConfig.for_exchange(exchange).fee_rate, OBSERVED_CONTROLLED_ROUNDTRIP_COST_RATE_FLOOR)
     return {
         "estimated_roundtrip_fee_rate": fee_rate,
         "estimated_spread_rate": spread_rate,

@@ -14,6 +14,7 @@ from app.controlled_auto_live import (
     DRY_RUN_CONFIRMATION_PHRASE,
     TRADE_PROBE_CONFIRMATION_PHRASE,
     _diagnose_signal_decision,
+    _controlled_entry_v2_decision,
     _controlled_jobs,
     _finalize_after_orders,
     _ma_cross_decision,
@@ -498,6 +499,69 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(report["operating_threshold_changed"])
         self.assertGreaterEqual(report["safe_min_expected_edge_rate_suggestion"], 0.006)
         self.assertGreaterEqual(report["aggressive_min_expected_edge_rate_suggestion"], report["observed_roundtrip_cost_rate"])
+
+    def test_controlled_entry_v2_marks_cost_positive_setup_as_trade_candidate(self) -> None:
+        candles = []
+        price = 100.0
+        for index in range(40):
+            if index >= 34:
+                price *= 1.0014
+            candle_open = price * 0.999
+            candles.append(
+                {
+                    "candle_time_utc": f"2026-06-26T00:{index:02d}:00Z",
+                    "opening_price": candle_open,
+                    "high_price": price * 1.001,
+                    "low_price": candle_open * 0.999,
+                    "trade_price": price,
+                    "candle_acc_trade_volume": 4 if index >= 37 else 1,
+                }
+            )
+
+        decision = _controlled_entry_v2_decision(
+            "BTC",
+            "KRW-BTC",
+            candles,
+            {"best_bid": 100.10, "best_ask": 100.11},
+            6000,
+        )
+        diagnostic = _diagnose_signal_decision(decision)
+
+        self.assertEqual(decision["strategy"], "controlled_entry_v2")
+        self.assertEqual(decision["signal_state"], "TRADE_CANDIDATE")
+        self.assertEqual(decision["signal"], "BUY")
+        self.assertTrue(decision["edge_allowed"])
+        self.assertGreater(decision["expected_edge_after_cost"], 0)
+        self.assertGreaterEqual(decision["signal_score"], 60)
+        self.assertEqual(diagnostic["signal_state"], "TRADE_CANDIDATE")
+        self.assertEqual(diagnostic["trade_candidate_reason"], decision["trade_candidate_reason"])
+
+    def test_controlled_entry_v2_blocks_when_expected_edge_does_not_cover_cost(self) -> None:
+        candles = []
+        for index in range(40):
+            price = 100.0 + (0.002 if index % 2 == 0 else 0.0)
+            candles.append(
+                {
+                    "candle_time_utc": f"2026-06-26T00:{index:02d}:00Z",
+                    "opening_price": 100.0,
+                    "high_price": 100.01,
+                    "low_price": 99.99,
+                    "trade_price": price,
+                    "candle_acc_trade_volume": 1,
+                }
+            )
+
+        decision = _controlled_entry_v2_decision(
+            "ETH",
+            "KRW-ETH",
+            candles,
+            {"best_bid": 100.0, "best_ask": 100.4},
+            6000,
+        )
+
+        self.assertNotEqual(decision["signal_state"], "TRADE_CANDIDATE")
+        self.assertFalse(decision["edge_allowed"])
+        self.assertIn("EXPECTED_EDGE_BELOW_FEE_COST", decision["block_reasons"])
 
 
 if __name__ == "__main__":
