@@ -1290,6 +1290,161 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(config["averaging_down_allowed"])
         self.assertFalse(config["reentry_allowed"])
 
+    def test_protected_full_auto_uses_report_status_when_persisted_status_is_stale(self) -> None:
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": "smoke-protected-stale-status",
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": "PASSED_AFTER_RECALC",
+                "started_at_utc": "2026-06-26T00:00:00Z",
+                "completed_at_utc": "2026-06-26T00:01:00Z",
+                "max_notional_krw": 6000,
+                "report": {
+                    "duplicate_fill_count": 0,
+                    "fee_diff": 0.0,
+                    "equity_diff_after": 0.0,
+                    "current_epoch_accounting_pending_count": 0,
+                    "current_epoch_accounting_failed_count": 0,
+                    "final_runtime_status": "STOPPED",
+                },
+            }
+        )
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-stale-status",
+                "loop_run_id": "posloop-stale-status",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "PASS_IDLE",
+                "technical_result": "PASS_IDLE",
+                "profitability_result": "NO_TRADE",
+                "started_at_utc": "2026-06-29T07:37:46Z",
+                "completed_at_utc": "2026-06-29T08:07:48Z",
+                "trade_count": 0,
+                "order_count": 0,
+                "exchange_fill_count": 0,
+                "ledger_fill_count": 0,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "current_epoch_accounting_pending_count": 0,
+                "current_epoch_accounting_failed_count": 0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
+        with database.get_connection() as conn:
+            conn.execute("UPDATE controlled_run_reports SET status = 'STOPPED' WHERE run_id = 'posloop-stale-status'")
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        preflight = {
+            "smoke_test_blockers": [],
+            "open_order_audit_summary": {
+                "exchange_open_order_count": 0,
+                "current_epoch_open_order_count": 0,
+                "unknown_open_order_count": 0,
+            },
+        }
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+        ):
+            gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertEqual(gate["final_controlled_position_loop_result"], "PASS_IDLE")
+        self.assertTrue(gate["protected_session_start_allowed"], gate["protected_full_auto_live_blockers"])
+        self.assertTrue(gate["protected_full_auto_live_allowed"], gate["protected_full_auto_live_blockers"])
+        self.assertEqual(gate["protected_full_auto_live_blockers"], [])
+        self.assertEqual(gate["last_controlled_position_loop_run"]["persisted_status"], "STOPPED")
+
+    def test_protected_full_auto_blocks_pass_idle_with_loop_safety_error(self) -> None:
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": "smoke-protected-loop-error",
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": "PASSED_AFTER_RECALC",
+                "started_at_utc": "2026-06-26T00:00:00Z",
+                "completed_at_utc": "2026-06-26T00:01:00Z",
+                "max_notional_krw": 6000,
+                "report": {
+                    "duplicate_fill_count": 0,
+                    "fee_diff": 0.0,
+                    "equity_diff_after": 0.0,
+                    "current_epoch_accounting_pending_count": 0,
+                    "current_epoch_accounting_failed_count": 0,
+                    "final_runtime_status": "STOPPED",
+                },
+            }
+        )
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-pass-idle-missing-fill",
+                "loop_run_id": "posloop-pass-idle-missing-fill",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "PASS_IDLE",
+                "technical_result": "PASS_IDLE",
+                "profitability_result": "NO_TRADE",
+                "started_at_utc": "2026-06-29T07:37:46Z",
+                "completed_at_utc": "2026-06-29T08:07:48Z",
+                "trade_count": 0,
+                "order_count": 0,
+                "exchange_fill_count": 1,
+                "ledger_fill_count": 0,
+                "missing_ledger_fill_count": 1,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "current_epoch_accounting_pending_count": 0,
+                "current_epoch_accounting_failed_count": 0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        preflight = {
+            "smoke_test_blockers": [],
+            "open_order_audit_summary": {
+                "exchange_open_order_count": 0,
+                "current_epoch_open_order_count": 0,
+                "unknown_open_order_count": 0,
+            },
+        }
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+        ):
+            gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertEqual(gate["final_controlled_position_loop_result"], "PASS_IDLE")
+        self.assertFalse(gate["protected_full_auto_live_allowed"])
+        self.assertIn(
+            "CONTROLLED_POSITION_LOOP_MISSING_LEDGER_FILL",
+            [item["code"] for item in gate["protected_full_auto_live_blockers"]],
+        )
+
     def test_protected_full_auto_global_daily_loss_is_warning_not_blocker(self) -> None:
         database.insert_smoke_test_run(
             {

@@ -106,15 +106,8 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
     if _float(limited_run.get("equity_diff_after")) != 0.0:
         blockers.append({"code": "LAST_LIMITED_AUTO_EQUITY_DIFF", "count": 1})
     protected_blockers = list(limited_gate.get("limited_auto_live_blockers") or [])
-    protected_allowed_position_results = {
-        "PASS_IDLE",
-        "PASSED_TECHNICAL_POSITION",
-        "PASSED_PROFITABLE_POSITION",
-        "PASSED_POSITION_TRADE",
-    }
     final_loop_result = str(position_loop.get("status") or "").upper()
-    if final_loop_result not in protected_allowed_position_results:
-        protected_blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
+    protected_blockers.extend(_protected_position_loop_blockers(position_loop))
     protected_blockers.extend(protected_status.get("hard_blockers") or [])
     current_equity = _float(
         current_epoch.get("current_epoch_current_equity"),
@@ -443,15 +436,18 @@ def latest_controlled_position_loop_run() -> dict:
         return {"present": False, "status": "MISSING"}
     item = dict(row)
     report = _safe_json_loads(item.get("report_json"), {})
+    status = str(report.get("controlled_auto_live_status") or item.get("status") or "").upper()
     return {
         "present": True,
         "run_id": item.get("run_id"),
         "run_type": item.get("run_type"),
-        "status": item.get("status"),
+        "status": status,
+        "persisted_status": item.get("status"),
         "technical_result": item.get("technical_result"),
         "profitability_result": item.get("profitability_result"),
         "started_at_utc": item.get("started_at_utc"),
         "completed_at_utc": item.get("completed_at_utc"),
+        "pass_fail_reasons": report.get("pass_fail_reasons") or [],
         "trade_count": report.get("trade_count"),
         "order_count": report.get("order_count"),
         "net_pnl_after_fee": report.get("net_pnl_after_fee"),
@@ -461,10 +457,46 @@ def latest_controlled_position_loop_run() -> dict:
         "duplicate_fill_count": report.get("duplicate_fill_count"),
         "fee_diff": report.get("fee_diff"),
         "equity_diff_after": report.get("equity_diff_after"),
+        "current_epoch_accounting_pending_count": report.get("current_epoch_accounting_pending_count"),
+        "current_epoch_accounting_failed_count": report.get("current_epoch_accounting_failed_count"),
         "open_order_count_after": report.get("open_order_count_after"),
         "final_runtime_status": report.get("final_runtime_status"),
         "report": report,
     }
+
+
+def _protected_position_loop_blockers(position_loop: dict) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if not position_loop.get("present"):
+        return [{"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1}]
+    status = str(position_loop.get("status") or "").upper()
+    allowed_results = {
+        "PASS_IDLE",
+        "PASSED_POSITION_TRADE",
+        "PASSED_TECHNICAL_POSITION",
+        "PASSED_PROFITABLE_POSITION",
+    }
+    if status not in allowed_results:
+        blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
+    metric_checks = [
+        ("missing_ledger_fill_count", "CONTROLLED_POSITION_LOOP_MISSING_LEDGER_FILL"),
+        ("duplicate_fill_count", "CONTROLLED_POSITION_LOOP_DUPLICATE_FILL"),
+        ("current_epoch_accounting_pending_count", "CONTROLLED_POSITION_LOOP_ACCOUNTING_PENDING"),
+        ("current_epoch_accounting_failed_count", "CONTROLLED_POSITION_LOOP_ACCOUNTING_FAILED"),
+        ("open_order_count_after", "CONTROLLED_POSITION_LOOP_OPEN_ORDER_REMAINS"),
+    ]
+    for key, code in metric_checks:
+        count = int(position_loop.get(key) or 0)
+        if count > 0:
+            blockers.append({"code": code, "count": count})
+    if abs(_float(position_loop.get("fee_diff"))) > FEE_TOLERANCE_KRW:
+        blockers.append({"code": "CONTROLLED_POSITION_LOOP_FEE_DIFF", "count": 1})
+    equity_diff = position_loop.get("equity_diff_after")
+    if equity_diff is not None and abs(_float(equity_diff)) > EQUITY_TOLERANCE_KRW:
+        blockers.append({"code": "CONTROLLED_POSITION_LOOP_EQUITY_DIFF", "count": 1})
+    if str(position_loop.get("final_runtime_status") or "").upper() != "STOPPED":
+        blockers.append({"code": "CONTROLLED_POSITION_LOOP_RUNTIME_NOT_STOPPED", "count": 1})
+    return blockers
 
 
 async def run_controlled_auto_live(
