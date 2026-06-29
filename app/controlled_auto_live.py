@@ -16,11 +16,13 @@ from app.database import (
     get_connection,
     get_live_order_log,
     insert_live_order_log,
+    load_resolved_safety_event,
     load_current_accounting_epoch,
     load_exchange_fills_ledger,
     load_global_bot_operation_policy,
     load_runtime_lock,
     load_unresolved_live_order_logs_for_exchange,
+    upsert_resolved_safety_event,
     update_live_order_log,
 )
 from app.exchange_fills_ledger import load_or_build_ledger_rows
@@ -79,6 +81,11 @@ PROTECTED_FULL_AUTO_MODE = "PROTECTED_FULL_AUTO_LIVE_V1"
 PROTECTED_SESSION_LOSS_LIMIT_RATE = 0.005
 PROTECTED_SESSION_MAX_DAILY_LOSS_KRW = 1000.0
 CONTROLLED_CLIENT_ORDER_ID_MAX_LENGTH = 36
+RESOLVED_DUPLICATE_CLIENT_ORDER_RUN_ID = "posloop-20260629T121326-57c2fc"
+RESOLVED_DUPLICATE_CLIENT_ORDER_STOP_REASON = "CONTROLLED_ENTRY_V3_POSITION_EXCEPTION:ValueError:DUPLICATE_CLIENT_ORDER_ID"
+RESOLVED_DUPLICATE_CLIENT_ORDER_ERROR_CODE = "DUPLICATE_CLIENT_ORDER_ID"
+RESOLVED_DUPLICATE_CLIENT_ORDER_FIXED_SHA = "152126b6ba16e033e0c49b8c757625731fa83b8d"
+RESOLVED_DUPLICATE_CLIENT_ORDER_EVENT_ID = "resolved-posloop-20260629T121326-57c2fc-duplicate-client-order-id"
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -172,8 +179,12 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         blockers.append({"code": "LAST_LIMITED_AUTO_EQUITY_DIFF", "count": 1})
     protected_blockers = list(limited_gate.get("limited_auto_live_blockers") or [])
     final_loop_result = str(position_loop.get("status") or "").upper()
+    resolved_position_loop_event = _resolved_duplicate_client_order_position_loop_event(position_loop)
     protected_blockers.extend(_protected_position_loop_blockers(position_loop))
     protected_blockers.extend(protected_status.get("hard_blockers") or [])
+    protected_warnings = list(protected_status.get("warnings", []))
+    if resolved_position_loop_event:
+        protected_warnings.append({"code": "RESOLVED_PREVIOUS_DUPLICATE_CLIENT_ORDER_ID", "count": 1})
     current_equity = _float(
         current_epoch.get("current_epoch_current_equity"),
         _float(current_epoch.get("current_equity_from_exchange")),
@@ -215,10 +226,11 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "last_controlled_position_loop_run": position_loop,
         "protected_full_auto_live_allowed": len(protected_blockers) == 0,
         "protected_full_auto_live_blockers": protected_blockers,
-        "protected_full_auto_live_warnings": protected_status.get("warnings", []),
+        "protected_full_auto_live_warnings": protected_warnings,
         "protected_session_start_allowed": len(protected_blockers) == 0,
         "protected_session_hard_blockers": protected_status.get("hard_blockers", []),
-        "protected_session_warnings": protected_status.get("warnings", []),
+        "protected_session_warnings": protected_warnings,
+        "resolved_position_loop_safety_event": resolved_position_loop_event,
         "protected_session_baseline_preview": protected_status.get("baseline"),
         "global_daily_loss_status": protected_status.get("global_daily_loss_status"),
         "protected_session_loss_status": protected_status.get("protected_session_loss_status"),
@@ -571,6 +583,51 @@ def _position_loop_run_summary(item: dict, report: dict, status: str) -> dict:
     }
 
 
+def record_resolved_duplicate_client_order_safety_event(
+    *,
+    resolution_status: str = "RESOLVED",
+    resolution_reason: str = "client_order_id generation fixed with per-order seq, timestamp, nonce, and DB precheck",
+    admin_confirmed: bool = True,
+) -> dict:
+    return upsert_resolved_safety_event(
+        {
+            "safety_event_id": RESOLVED_DUPLICATE_CLIENT_ORDER_EVENT_ID,
+            "related_run_id": RESOLVED_DUPLICATE_CLIENT_ORDER_RUN_ID,
+            "original_stop_reason": RESOLVED_DUPLICATE_CLIENT_ORDER_STOP_REASON,
+            "original_error_code": RESOLVED_DUPLICATE_CLIENT_ORDER_ERROR_CODE,
+            "fixed_by_commit_sha": RESOLVED_DUPLICATE_CLIENT_ORDER_FIXED_SHA,
+            "fixed_at_utc": _utc_now(),
+            "resolution_status": resolution_status,
+            "resolution_reason": resolution_reason,
+            "admin_confirmed": admin_confirmed,
+        }
+    )
+
+
+def _resolved_duplicate_client_order_position_loop_event(position_loop: dict) -> dict | None:
+    run_id = str(position_loop.get("run_id") or "")
+    if run_id != RESOLVED_DUPLICATE_CLIENT_ORDER_RUN_ID:
+        return None
+    status = str(position_loop.get("status") or "").upper()
+    if status != "STOPPED":
+        return None
+    reasons = [str(reason) for reason in (position_loop.get("pass_fail_reasons") or [])]
+    if not any(RESOLVED_DUPLICATE_CLIENT_ORDER_ERROR_CODE in reason for reason in reasons):
+        return None
+    event = load_resolved_safety_event(run_id, RESOLVED_DUPLICATE_CLIENT_ORDER_ERROR_CODE)
+    if not event:
+        return None
+    if str(event.get("resolution_status") or "").upper() not in {"RESOLVED", "SUPERSEDED"}:
+        return None
+    if not int(event.get("admin_confirmed") or 0):
+        return None
+    if str(event.get("fixed_by_commit_sha") or "") != RESOLVED_DUPLICATE_CLIENT_ORDER_FIXED_SHA:
+        return None
+    if RESOLVED_DUPLICATE_CLIENT_ORDER_ERROR_CODE not in str(event.get("original_stop_reason") or ""):
+        return None
+    return event
+
+
 def _protected_position_loop_blockers(position_loop: dict) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     if not position_loop.get("present"):
@@ -583,7 +640,8 @@ def _protected_position_loop_blockers(position_loop: dict) -> list[dict[str, Any
         "PASSED_PROFITABLE_POSITION",
     }
     if status not in allowed_results:
-        blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
+        if _resolved_duplicate_client_order_position_loop_event(position_loop) is None:
+            blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
     metric_checks = [
         ("missing_ledger_fill_count", "CONTROLLED_POSITION_LOOP_MISSING_LEDGER_FILL"),
         ("duplicate_fill_count", "CONTROLLED_POSITION_LOOP_DUPLICATE_FILL"),

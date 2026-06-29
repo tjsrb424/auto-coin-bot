@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,6 +49,7 @@ REQUIRED_SCHEMA_TABLES = [
     "accounting_epochs",
     "live_smoke_test_runs",
     "controlled_run_reports",
+    "resolved_safety_events",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -991,6 +993,20 @@ def init_db() -> None:
                 report_json TEXT NOT NULL DEFAULT '{}',
                 created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS resolved_safety_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                safety_event_id TEXT NOT NULL UNIQUE,
+                related_run_id TEXT NOT NULL,
+                original_stop_reason TEXT NOT NULL,
+                original_error_code TEXT NOT NULL DEFAULT '',
+                fixed_by_commit_sha TEXT NOT NULL DEFAULT '',
+                fixed_at_utc TEXT NOT NULL DEFAULT '',
+                resolution_status TEXT NOT NULL,
+                resolution_reason TEXT NOT NULL DEFAULT '',
+                admin_confirmed INTEGER NOT NULL DEFAULT 0,
+                created_at_utc TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS runtime_locks (
@@ -3572,6 +3588,77 @@ def insert_live_recovery_event(event: dict) -> int:
             ),
         )
         return int(cursor.lastrowid)
+
+
+def upsert_resolved_safety_event(event: dict) -> dict:
+    now = _utc_now()
+    safety_event_id = str(event.get("safety_event_id") or "").strip()
+    if not safety_event_id:
+        safety_event_id = f"safety-{uuid.uuid4().hex[:12]}"
+    payload = {
+        "safety_event_id": safety_event_id,
+        "related_run_id": str(event.get("related_run_id") or ""),
+        "original_stop_reason": str(event.get("original_stop_reason") or ""),
+        "original_error_code": str(event.get("original_error_code") or ""),
+        "fixed_by_commit_sha": str(event.get("fixed_by_commit_sha") or ""),
+        "fixed_at_utc": str(event.get("fixed_at_utc") or now),
+        "resolution_status": str(event.get("resolution_status") or "RESOLVED").upper(),
+        "resolution_reason": str(event.get("resolution_reason") or ""),
+        "admin_confirmed": 1 if event.get("admin_confirmed") else 0,
+        "created_at_utc": str(event.get("created_at_utc") or now),
+    }
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO resolved_safety_events (
+                safety_event_id, related_run_id, original_stop_reason, original_error_code,
+                fixed_by_commit_sha, fixed_at_utc, resolution_status, resolution_reason,
+                admin_confirmed, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(safety_event_id) DO UPDATE SET
+                related_run_id = excluded.related_run_id,
+                original_stop_reason = excluded.original_stop_reason,
+                original_error_code = excluded.original_error_code,
+                fixed_by_commit_sha = excluded.fixed_by_commit_sha,
+                fixed_at_utc = excluded.fixed_at_utc,
+                resolution_status = excluded.resolution_status,
+                resolution_reason = excluded.resolution_reason,
+                admin_confirmed = excluded.admin_confirmed
+            """,
+            (
+                payload["safety_event_id"],
+                payload["related_run_id"],
+                payload["original_stop_reason"],
+                payload["original_error_code"],
+                payload["fixed_by_commit_sha"],
+                payload["fixed_at_utc"],
+                payload["resolution_status"],
+                payload["resolution_reason"],
+                payload["admin_confirmed"],
+                payload["created_at_utc"],
+            ),
+        )
+    return load_resolved_safety_event(payload["related_run_id"], payload["original_error_code"]) or payload
+
+
+def load_resolved_safety_event(related_run_id: str, original_error_code: str | None = None) -> dict | None:
+    params: list[Any] = [related_run_id]
+    where = "related_run_id = ?"
+    if original_error_code:
+        where += " AND original_error_code = ?"
+        params.append(original_error_code)
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM resolved_safety_events
+            WHERE {where}
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def load_live_recovery_events(limit: int = 100) -> list[dict]:

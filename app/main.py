@@ -152,6 +152,7 @@ from app.controlled_auto_live import (
     build_controlled_signal_diagnostics,
     controlled_auto_live_job_status,
     controlled_auto_live_gate,
+    record_resolved_duplicate_client_order_safety_event,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
     start_controlled_position_loop_job,
@@ -772,6 +773,12 @@ class ProtectedFullAutoLiveV1StartRequest(BaseModel):
     max_holding_minutes: int = Field(10, ge=10, le=30)
     max_position_trades: int = Field(3, ge=1, le=3)
     confirmation: str = ""
+
+
+class ResolvedSafetyEventRequest(BaseModel):
+    confirmation: str = ""
+    resolution_status: str = Field("RESOLVED", pattern=r"^(RESOLVED|SUPERSEDED)$")
+    resolution_reason: str = "DUPLICATE_CLIENT_ORDER_ID fixed by 152126b6ba16e033e0c49b8c757625731fa83b8d"
 
 
 class SmartRehearsalReviewRequest(BaseModel):
@@ -3315,6 +3322,28 @@ async def controlled_auto_live_position_loop_start(payload: ControlledPositionLo
         "required_confirmation": CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
+    }
+
+
+@app.post("/api/protected-full-auto-live/v1/resolve-duplicate-client-order")
+async def protected_full_auto_live_v1_resolve_duplicate_client_order(payload: ResolvedSafetyEventRequest) -> dict:
+    required = "RESOLVE PREVIOUS DUPLICATE CLIENT ORDER ID"
+    if payload.confirmation != required:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Resolved safety event confirmation phrase is required.",
+            "required_confirmation": required,
+        }
+    event = record_resolved_duplicate_client_order_safety_event(
+        resolution_status=payload.resolution_status,
+        resolution_reason=payload.resolution_reason,
+        admin_confirmed=True,
+    )
+    return {
+        "ok": True,
+        "status": "RECORDED",
+        "resolved_safety_event": event,
     }
 
 

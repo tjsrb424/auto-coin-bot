@@ -31,6 +31,7 @@ from app.controlled_auto_live import (
     build_protected_session_baseline,
     controlled_auto_live_gate,
     persist_controlled_run_report,
+    record_resolved_duplicate_client_order_safety_event,
     run_controlled_entry_v3_watch,
     run_controlled_entry_v3_position_run,
     run_controlled_position_loop,
@@ -1607,6 +1608,98 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
             "CONTROLLED_POSITION_LOOP_MISSING_LEDGER_FILL",
             [item["code"] for item in gate["protected_full_auto_live_blockers"]],
         )
+
+    def test_protected_full_auto_allows_resolved_duplicate_client_order_failure_as_warning(self) -> None:
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": "smoke-protected-resolved-duplicate-client-id",
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": "PASSED_AFTER_RECALC",
+                "started_at_utc": "2026-06-26T00:00:00Z",
+                "completed_at_utc": "2026-06-26T00:01:00Z",
+                "max_notional_krw": 6000,
+                "report": {
+                    "duplicate_fill_count": 0,
+                    "fee_diff": 0.0,
+                    "equity_diff_after": 0.0,
+                    "current_epoch_accounting_pending_count": 0,
+                    "current_epoch_accounting_failed_count": 0,
+                    "final_runtime_status": "STOPPED",
+                },
+            }
+        )
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-20260629T121326-57c2fc",
+                "loop_run_id": "posloop-20260629T121326-57c2fc",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "STOPPED",
+                "technical_result": "FAILED",
+                "profitability_result": "NOT_EVALUATED",
+                "started_at_utc": "2026-06-29T12:13:26Z",
+                "completed_at_utc": "2026-06-29T12:23:30Z",
+                "pass_fail_reasons": ["CONTROLLED_ENTRY_V3_POSITION_EXCEPTION:ValueError:DUPLICATE_CLIENT_ORDER_ID"],
+                "trade_count": 1,
+                "order_count": 2,
+                "exchange_fill_count": 2,
+                "ledger_fill_count": 2,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "current_epoch_accounting_pending_count": 0,
+                "current_epoch_accounting_failed_count": 0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        preflight = {
+            "smoke_test_blockers": [],
+            "open_order_audit_summary": {
+                "exchange_open_order_count": 0,
+                "current_epoch_open_order_count": 0,
+                "unknown_open_order_count": 0,
+            },
+        }
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+        ):
+            blocked_gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertFalse(blocked_gate["protected_full_auto_live_allowed"])
+        self.assertIn("FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", [item["code"] for item in blocked_gate["protected_full_auto_live_blockers"]])
+
+        event = record_resolved_duplicate_client_order_safety_event(admin_confirmed=True)
+        self.assertEqual(event["related_run_id"], "posloop-20260629T121326-57c2fc")
+        self.assertEqual(event["resolution_status"], "RESOLVED")
+        self.assertEqual(int(event["admin_confirmed"]), 1)
+
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+        ):
+            resolved_gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertTrue(resolved_gate["protected_session_start_allowed"], resolved_gate["protected_full_auto_live_blockers"])
+        self.assertTrue(resolved_gate["protected_full_auto_live_allowed"], resolved_gate["protected_full_auto_live_blockers"])
+        self.assertEqual(resolved_gate["protected_full_auto_live_blockers"], [])
+        self.assertIn("RESOLVED_PREVIOUS_DUPLICATE_CLIENT_ORDER_ID", [item["code"] for item in resolved_gate["protected_full_auto_live_warnings"]])
+        self.assertEqual(resolved_gate["resolved_position_loop_safety_event"]["safety_event_id"], event["safety_event_id"])
 
     def test_protected_full_auto_global_daily_loss_is_warning_not_blocker(self) -> None:
         database.insert_smoke_test_run(
