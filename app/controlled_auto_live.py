@@ -47,7 +47,8 @@ from app.upbit import fetch_minute_candles
 CONFIRMATION_PHRASE = "RUN CONTROLLED AUTO LIVE ONCE"
 TRADE_PROBE_CONFIRMATION_PHRASE = "RUN CONTROLLED TRADE PROBE ONCE"
 CONTROLLED_ENTRY_V2_STRATEGY = "controlled_entry_v2"
-CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous", CONTROLLED_ENTRY_V2_STRATEGY}
+CONTROLLED_ENTRY_V3_STRATEGY = "controlled_entry_v3"
+CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous", CONTROLLED_ENTRY_V2_STRATEGY, CONTROLLED_ENTRY_V3_STRATEGY}
 CONTROLLED_BLOCKED_STRATEGIES = {"rsi"}
 TRADE_PROBE_STRATEGY_SOURCE = "controlled_trade_probe"
 MAX_ORDERS = 5
@@ -59,6 +60,8 @@ TICK_INTERVAL_SECONDS = 60
 MIN_EXPECTED_EDGE_RATE = 0.006
 CONTROLLED_ENTRY_V2_MIN_SCORE = 60.0
 CONTROLLED_ENTRY_V2_MIN_EDGE_AFTER_COST = 0.0002
+CONTROLLED_ENTRY_V3_MIN_SCORE = 62.0
+CONTROLLED_ENTRY_V3_MIN_EDGE_AFTER_COST = 0.0004
 OBSERVED_CONTROLLED_ROUNDTRIP_COST_RATE_FLOOR = 0.005
 DRY_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED DRY RUN FORCE BUY"
 
@@ -984,6 +987,9 @@ async def _build_entry_decisions(exchange: str, symbols: list[str], notional: fl
         decisions.append(smart_decision)
         entry_v2_decision = _controlled_entry_v2_decision(symbol, market, candles, quote, notional)
         decisions.append(entry_v2_decision)
+        for timeframe in (5, 15):
+            timeframe_candles = await _load_strategy_candles(exchange, market, timeframe)
+            decisions.append(_controlled_entry_v3_decision(symbol, market, timeframe, timeframe_candles, quote, notional))
     decisions.sort(key=lambda item: _float(item.get("expected_edge_rate")), reverse=True)
     return decisions
 
@@ -993,6 +999,20 @@ async def _select_entry_decision(exchange: str, symbols: list[str], notional: fl
 
 
 def _select_best_decision(decisions: list[dict]) -> dict:
+    allowed_buys = [
+        item for item in decisions
+        if str(item.get("signal") or "").upper() == "BUY" and item.get("edge_allowed")
+    ]
+    if allowed_buys:
+        allowed_buys.sort(
+            key=lambda item: (
+                _float(item.get("expected_edge_after_cost")),
+                _float(item.get("expected_edge_rate")),
+                _float(item.get("signal_score")),
+            ),
+            reverse=True,
+        )
+        return allowed_buys[0]
     decisions = sorted(decisions, key=lambda item: _float(item.get("expected_edge_rate")), reverse=True)
     return decisions[0] if decisions else {"signal": "HOLD", "reason": "NO_DECISION"}
 
@@ -1255,6 +1275,198 @@ def _controlled_entry_v2_metrics(candles: list[dict], quote: dict) -> dict:
         "confidence": confidence,
         "trade_candidate_reason": "+".join(reason_bits) or "controlled_entry_v2_composite_signal",
     }
+
+
+def _controlled_entry_v3_decision(symbol: str, market: str, timeframe: int, candles: list[dict], quote: dict, notional: float) -> dict:
+    latest = latest_completed_candle(candles, timeframe) or (candles[-1] if candles else {})
+    costs = _cost_components(quote)
+    metrics = _controlled_entry_v3_metrics(candles, quote, timeframe=timeframe)
+    expected_move = metrics["expected_move_rate"]
+    total_cost = costs["estimated_round_trip_cost_rate"]
+    edge_after_cost = expected_move - total_cost
+    block_reasons: list[str] = []
+    if symbol not in {"BTC", "ETH"}:
+        block_reasons.append("SYMBOL_NOT_ALLOWED")
+    if metrics["candle_count"] < 36:
+        block_reasons.append("INSUFFICIENT_CANDLES")
+    if metrics["signal_bias"] != "BUY":
+        block_reasons.append("NO_CONTROLLED_ENTRY_V3_SIGNAL")
+    if edge_after_cost <= CONTROLLED_ENTRY_V3_MIN_EDGE_AFTER_COST:
+        block_reasons.append("EXPECTED_EDGE_BELOW_FEE_COST")
+    if edge_after_cost <= 0:
+        block_reasons.append("EXPECTED_EDGE_BELOW_THRESHOLD")
+    if metrics["signal_score"] < CONTROLLED_ENTRY_V3_MIN_SCORE:
+        block_reasons.append("CONTROLLED_ENTRY_V3_SCORE_TOO_LOW")
+    if metrics["estimated_spread_rate"] > max(0.003, expected_move * 0.55):
+        block_reasons.append("SPREAD_TOO_WIDE")
+    if metrics["volatility_rate"] < (0.00055 if timeframe == 5 else 0.0008):
+        block_reasons.append("VOLATILITY_TOO_LOW")
+    if metrics["volume_ratio"] < 0.55:
+        block_reasons.append("VOLUME_TOO_LOW")
+    if not metrics["trend_passed"]:
+        block_reasons.append("TREND_FILTER_BLOCKED")
+    if not (metrics["breakout_passed"] or metrics["pullback_rebound_passed"]):
+        block_reasons.append("NO_BREAKOUT_OR_REBOUND")
+    block_reasons = list(dict.fromkeys(block_reasons))
+    edge_allowed = not block_reasons
+    if edge_allowed:
+        signal_state = "TRADE_CANDIDATE"
+    elif metrics["signal_bias"] == "BUY" and edge_after_cost > 0:
+        signal_state = "WATCH"
+    else:
+        signal_state = "NO_TRADE"
+    return {
+        "symbol": symbol,
+        "market": market,
+        "strategy": CONTROLLED_ENTRY_V3_STRATEGY,
+        "timeframe": f"{timeframe}m",
+        "timeframe_minutes": timeframe,
+        "candle_count": metrics["candle_count"],
+        "last_candle_at_utc": latest.get("candle_time_utc"),
+        "signal": "BUY" if signal_state in {"WATCH", "TRADE_CANDIDATE"} else "HOLD",
+        "signal_state": signal_state,
+        "reason": "CONTROLLED_ENTRY_V3_TRADE_CANDIDATE" if edge_allowed else "CONTROLLED_ENTRY_V3_BLOCKED",
+        "trade_candidate_reason": metrics["trade_candidate_reason"] if edge_allowed else "",
+        "entry_price": quote.get("best_ask"),
+        "expected_edge_rate": expected_move,
+        "expected_move_rate": expected_move,
+        "min_expected_edge_rate": CONTROLLED_ENTRY_V3_MIN_EDGE_AFTER_COST,
+        "estimated_round_trip_cost_rate": total_cost,
+        "estimated_total_cost_rate": total_cost,
+        "estimated_roundtrip_fee_rate": costs["estimated_roundtrip_fee_rate"],
+        "estimated_spread_rate": costs["estimated_spread_rate"],
+        "expected_edge_after_cost": edge_after_cost,
+        "edge_allowed": edge_allowed,
+        "blocker": None if edge_allowed else ",".join(block_reasons),
+        "block_reasons": block_reasons,
+        "signal_score": metrics["signal_score"],
+        "confidence_score": metrics["confidence"],
+        "confidence": metrics["confidence"],
+        "recommended_next_action": _controlled_entry_v3_next_action(block_reasons, edge_after_cost),
+        "metrics": metrics,
+        "notional_krw": notional,
+    }
+
+
+def _controlled_entry_v3_metrics(candles: list[dict], quote: dict, *, timeframe: int) -> dict:
+    normalized = [_normalize_candle(candle) for candle in candles]
+    closes = [_float(candle.get("trade_price")) for candle in normalized if _float(candle.get("trade_price")) > 0]
+    highs = [_float(candle.get("high_price")) for candle in normalized if _float(candle.get("high_price")) > 0]
+    lows = [_float(candle.get("low_price")) for candle in normalized if _float(candle.get("low_price")) > 0]
+    opens = [_float(candle.get("opening_price")) for candle in normalized if _float(candle.get("opening_price")) > 0]
+    volumes = [_float(candle.get("candle_acc_trade_volume")) for candle in normalized]
+    costs = _cost_components(quote)
+    if len(closes) < 10:
+        return {
+            "candle_count": len(closes),
+            "signal_bias": "HOLD",
+            "expected_move_rate": 0.0,
+            "estimated_spread_rate": costs["estimated_spread_rate"],
+            "volatility_rate": 0.0,
+            "volume_ratio": 0.0,
+            "signal_score": 0.0,
+            "confidence": 0.0,
+            "trend_passed": False,
+            "breakout_passed": False,
+            "pullback_rebound_passed": False,
+            "trade_candidate_reason": "INSUFFICIENT_CANDLES",
+        }
+    last = closes[-1]
+    momentum_2 = _rate(closes[-1], closes[-3]) if len(closes) >= 3 else 0.0
+    momentum_4 = _rate(closes[-1], closes[-5]) if len(closes) >= 5 else 0.0
+    momentum_8 = _rate(closes[-1], closes[-9]) if len(closes) >= 9 else 0.0
+    returns = [_rate(closes[index], closes[index - 1]) for index in range(max(1, len(closes) - 30), len(closes))]
+    volatility = statistics.pstdev(returns) if len(returns) >= 2 else 0.0
+    ma_fast_len = 4 if timeframe == 5 else 3
+    ma_slow_len = 12 if timeframe == 5 else 8
+    ma_fast = sum(closes[-ma_fast_len:]) / ma_fast_len if len(closes) >= ma_fast_len else last
+    ma_slow = sum(closes[-ma_slow_len:]) / ma_slow_len if len(closes) >= ma_slow_len else ma_fast
+    prev_fast = sum(closes[-(ma_fast_len + 3):-3]) / ma_fast_len if len(closes) >= ma_fast_len + 3 else ma_fast
+    trend_rate = _rate(ma_fast, ma_slow)
+    slope_rate = _rate(ma_fast, prev_fast)
+    recent_high = max(highs[-13:-1]) if len(highs) >= 13 else max(highs[:-1] or highs)
+    breakout_rate = max(_rate(last, recent_high), 0.0)
+    recent_low = min(lows[-10:]) if len(lows) >= 10 else min(lows or [last])
+    drawdown_from_high = min(_rate(last, recent_high), 0.0)
+    rebound_rate = max(_rate(last, recent_low), 0.0)
+    body_rate = _rate(closes[-1], opens[-1]) if opens else 0.0
+    recent_volume = sum(volumes[-3:]) / 3 if len(volumes) >= 3 else (volumes[-1] if volumes else 0.0)
+    base_volume = sum(volumes[-27:-3]) / 24 if len(volumes) >= 27 else (sum(volumes[:-3]) / max(len(volumes[:-3]), 1) if len(volumes) > 3 else recent_volume)
+    volume_ratio = recent_volume / base_volume if base_volume > 0 else 1.0
+    trend_passed = trend_rate > 0 or slope_rate > 0
+    breakout_passed = breakout_rate > max(costs["estimated_round_trip_cost_rate"] * 0.35, volatility * 0.4)
+    pullback_rebound_passed = drawdown_from_high < -volatility and rebound_rate > max(costs["estimated_round_trip_cost_rate"] * 0.45, volatility * 0.55)
+    directional = max(momentum_2, momentum_4 * 0.9, momentum_8 * 0.65, breakout_rate, rebound_rate * 0.75, slope_rate)
+    expected_move = max(
+        momentum_4 * 1.2,
+        momentum_8 * 0.95,
+        breakout_rate + volatility * 0.8,
+        rebound_rate * 0.85,
+        trend_rate + max(slope_rate, 0.0) * 0.8,
+        body_rate * 0.7,
+        0.0,
+    )
+    edge_after_cost = expected_move - costs["estimated_round_trip_cost_rate"]
+    signal_bias = "BUY" if directional > 0 and trend_passed and (breakout_passed or pullback_rebound_passed or momentum_4 > costs["estimated_round_trip_cost_rate"] * 0.55) else "HOLD"
+    edge_component = min(max(edge_after_cost / 0.006, 0.0), 1.0) * 34.0
+    direction_component = min(max(directional / 0.006, 0.0), 1.0) * 20.0
+    volume_component = min(max((volume_ratio - 0.65) / 1.5, 0.0), 1.0) * 14.0
+    volatility_component = min(max(volatility / (0.003 if timeframe == 5 else 0.0045), 0.0), 1.0) * 14.0
+    trend_component = 10.0 if trend_passed else 0.0
+    pattern_component = 8.0 if breakout_passed or pullback_rebound_passed else 0.0
+    spread_penalty = 15.0 if costs["estimated_spread_rate"] > max(0.003, expected_move * 0.55) else 0.0
+    score = max(0.0, min(100.0, 14.0 + edge_component + direction_component + volume_component + volatility_component + trend_component + pattern_component - spread_penalty))
+    reason_bits = []
+    if breakout_passed:
+        reason_bits.append(f"{timeframe}m_breakout")
+    if pullback_rebound_passed:
+        reason_bits.append(f"{timeframe}m_pullback_rebound")
+    if trend_passed:
+        reason_bits.append("trend_filter_passed")
+    if volume_ratio >= 1.0:
+        reason_bits.append("volume_support")
+    if edge_after_cost > 0:
+        reason_bits.append("positive_edge_after_cost")
+    return {
+        "candle_count": len(closes),
+        "signal_bias": signal_bias,
+        "momentum_2_rate": momentum_2,
+        "momentum_4_rate": momentum_4,
+        "momentum_8_rate": momentum_8,
+        "breakout_rate": breakout_rate,
+        "pullback_rebound_rate": rebound_rate,
+        "drawdown_from_recent_high_rate": drawdown_from_high,
+        "bullish_body_rate": body_rate,
+        "volume_ratio": volume_ratio,
+        "volatility_rate": volatility,
+        "trend_rate": trend_rate,
+        "short_ma_slope_rate": slope_rate,
+        "estimated_spread_rate": costs["estimated_spread_rate"],
+        "expected_move_rate": expected_move,
+        "expected_edge_after_cost": edge_after_cost,
+        "trend_passed": trend_passed,
+        "breakout_passed": breakout_passed,
+        "pullback_rebound_passed": pullback_rebound_passed,
+        "signal_score": score,
+        "confidence": round(score / 100.0, 4),
+        "trade_candidate_reason": "+".join(reason_bits) or f"controlled_entry_v3_{timeframe}m_composite_signal",
+    }
+
+
+def _controlled_entry_v3_next_action(block_reasons: list[str], edge_after_cost: float) -> str:
+    if not block_reasons:
+        return "CONTROLLED_RUN_REQUIRES_USER_APPROVAL"
+    if "EXPECTED_EDGE_BELOW_FEE_COST" in block_reasons or "EXPECTED_EDGE_BELOW_THRESHOLD" in block_reasons:
+        return "WAIT_FOR_LARGER_5M_15M_MOVE"
+    if "VOLATILITY_TOO_LOW" in block_reasons:
+        return "WAIT_FOR_VOLATILITY"
+    if "VOLUME_TOO_LOW" in block_reasons:
+        return "WAIT_FOR_VOLUME"
+    if "TREND_FILTER_BLOCKED" in block_reasons:
+        return "WAIT_FOR_TREND_CONFIRMATION"
+    if edge_after_cost > 0:
+        return "WATCH"
+    return "NO_TRADE"
 
 
 def _rate(current: float, previous: float) -> float:
@@ -1630,6 +1842,8 @@ def _diagnose_signal_decision(
         block_reasons.append("SMART_SCORE_TOO_LOW")
     if strategy == CONTROLLED_ENTRY_V2_STRATEGY and str(decision.get("signal_state") or "") != "TRADE_CANDIDATE" and signal_side != "BUY":
         block_reasons.append("NO_CONTROLLED_ENTRY_V2_SIGNAL")
+    if strategy == CONTROLLED_ENTRY_V3_STRATEGY and str(decision.get("signal_state") or "") != "TRADE_CANDIDATE" and signal_side != "BUY":
+        block_reasons.append("NO_CONTROLLED_ENTRY_V3_SIGNAL")
     if expected_edge < min_edge:
         block_reasons.append("EXPECTED_EDGE_BELOW_THRESHOLD")
     if expected_edge < total_cost:
@@ -1654,6 +1868,7 @@ def _diagnose_signal_decision(
     return {
         "symbol": symbol,
         "strategy_name": strategy,
+        "timeframe": decision.get("timeframe"),
         "candle_count": int(decision.get("candle_count") or 0),
         "last_candle_at_utc": decision.get("last_candle_at_utc"),
         "signal_generated": signal_side in {"BUY", "SELL"},
@@ -1677,6 +1892,7 @@ def _diagnose_signal_decision(
         "risk_blockers": risk_blockers,
         "raw_reason": decision.get("reason"),
         "trade_candidate_reason": decision.get("trade_candidate_reason") or "",
+        "recommended_next_action": decision.get("recommended_next_action") or ("CONTROLLED_RUN_REQUIRES_USER_APPROVAL" if decision.get("edge_allowed") else "NO_TRADE"),
     }
 
 

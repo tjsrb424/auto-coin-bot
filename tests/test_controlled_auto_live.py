@@ -15,10 +15,12 @@ from app.controlled_auto_live import (
     TRADE_PROBE_CONFIRMATION_PHRASE,
     _diagnose_signal_decision,
     _controlled_entry_v2_decision,
+    _controlled_entry_v3_decision,
     _controlled_jobs,
     _finalize_after_orders,
     _ma_cross_decision,
     _summarize_signal_diagnostics,
+    _select_best_decision,
     _threshold_adjustment_report,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
@@ -562,6 +564,95 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(decision["signal_state"], "TRADE_CANDIDATE")
         self.assertFalse(decision["edge_allowed"])
         self.assertIn("EXPECTED_EDGE_BELOW_FEE_COST", decision["block_reasons"])
+
+    def test_controlled_entry_v3_marks_5m_cost_positive_breakout_as_trade_candidate(self) -> None:
+        candles = []
+        price = 100.0
+        for index in range(60):
+            if index >= 50:
+                price *= 1.007
+            candle_open = price * 0.996
+            candles.append(
+                {
+                    "candle_time_utc": f"2026-06-26T{index // 12:02d}:{(index % 12) * 5:02d}:00Z",
+                    "opening_price": candle_open,
+                    "high_price": price * 1.003,
+                    "low_price": candle_open * 0.997,
+                    "trade_price": price,
+                    "candle_acc_trade_volume": 5 if index >= 52 else 1,
+                }
+            )
+
+        decision = _controlled_entry_v3_decision(
+            "BTC",
+            "KRW-BTC",
+            5,
+            candles,
+            {"best_bid": 100.10, "best_ask": 100.11},
+            6000,
+        )
+        diagnostic = _diagnose_signal_decision(decision)
+
+        self.assertEqual(decision["strategy"], "controlled_entry_v3")
+        self.assertEqual(decision["timeframe"], "5m")
+        self.assertEqual(decision["signal_state"], "TRADE_CANDIDATE")
+        self.assertEqual(decision["signal"], "BUY")
+        self.assertTrue(decision["edge_allowed"])
+        self.assertGreater(decision["expected_edge_after_cost"], 0)
+        self.assertGreaterEqual(decision["signal_score"], 62)
+        self.assertEqual(diagnostic["timeframe"], "5m")
+        self.assertEqual(diagnostic["signal_state"], "TRADE_CANDIDATE")
+        self.assertEqual(diagnostic["recommended_next_action"], "CONTROLLED_RUN_REQUIRES_USER_APPROVAL")
+
+    def test_controlled_entry_v3_blocks_low_volatility_low_volume_15m_setup(self) -> None:
+        candles = []
+        for index in range(60):
+            price = 100.0 + (0.01 if index % 2 == 0 else 0.0)
+            candles.append(
+                {
+                    "candle_time_utc": f"2026-06-26T{index // 4:02d}:{(index % 4) * 15:02d}:00Z",
+                    "opening_price": 100.0,
+                    "high_price": 100.02,
+                    "low_price": 99.99,
+                    "trade_price": price,
+                    "candle_acc_trade_volume": 0.1,
+                }
+            )
+
+        decision = _controlled_entry_v3_decision(
+            "ETH",
+            "KRW-ETH",
+            15,
+            candles,
+            {"best_bid": 100.0, "best_ask": 100.5},
+            6000,
+        )
+
+        self.assertEqual(decision["timeframe"], "15m")
+        self.assertNotEqual(decision["signal_state"], "TRADE_CANDIDATE")
+        self.assertFalse(decision["edge_allowed"])
+        self.assertIn("EXPECTED_EDGE_BELOW_FEE_COST", decision["block_reasons"])
+        self.assertIn("VOLATILITY_TOO_LOW", decision["block_reasons"])
+
+    def test_best_decision_prefers_allowed_buy_over_higher_hold_edge(self) -> None:
+        selected = _select_best_decision(
+            [
+                {"symbol": "BTC", "strategy": "smart_autonomous", "signal": "HOLD", "expected_edge_rate": 0.02, "edge_allowed": False},
+                {
+                    "symbol": "ETH",
+                    "strategy": "controlled_entry_v3",
+                    "timeframe": "15m",
+                    "signal": "BUY",
+                    "expected_edge_rate": 0.01,
+                    "expected_edge_after_cost": 0.003,
+                    "signal_score": 80,
+                    "edge_allowed": True,
+                },
+            ]
+        )
+
+        self.assertEqual(selected["strategy"], "controlled_entry_v3")
+        self.assertEqual(selected["symbol"], "ETH")
 
 
 if __name__ == "__main__":
