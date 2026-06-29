@@ -48,6 +48,7 @@ CONFIRMATION_PHRASE = "RUN CONTROLLED AUTO LIVE ONCE"
 TRADE_PROBE_CONFIRMATION_PHRASE = "RUN CONTROLLED TRADE PROBE ONCE"
 ENTRY_V3_WATCH_CONFIRMATION_PHRASE = "RUN CONTROLLED ENTRY V3 WATCH ONCE"
 ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED ENTRY V3 POSITION ONCE"
+CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE = "RUN CONTROLLED POSITION LOOP ONCE"
 CONTROLLED_ENTRY_V2_STRATEGY = "controlled_entry_v2"
 CONTROLLED_ENTRY_V3_STRATEGY = "controlled_entry_v3"
 CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous", CONTROLLED_ENTRY_V2_STRATEGY, CONTROLLED_ENTRY_V3_STRATEGY}
@@ -63,6 +64,7 @@ POSITION_RUN_MIN_HOLD_SECONDS = 60
 POSITION_RUN_PRICE_CHECK_SECONDS = 30
 POSITION_RUN_MIN_NET_PROFIT_MARGIN_RATE = 0.001
 POSITION_RUN_STOP_LOSS_RATE = 0.003
+POSITION_LOOP_MAX_TRADES = 3
 MIN_EXPECTED_EDGE_RATE = 0.006
 CONTROLLED_ENTRY_V2_MIN_SCORE = 60.0
 CONTROLLED_ENTRY_V2_MIN_EDGE_AFTER_COST = 0.0002
@@ -1004,6 +1006,113 @@ async def _run_controlled_entry_v3_position_run_job(
         job["completed_at_utc"] = _utc_now()
 
 
+async def start_controlled_position_loop_job(
+    *,
+    exchange: str = "bithumb",
+    symbols: list[str] | None = None,
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    runtime_seconds: int = MAX_RUNTIME_SECONDS,
+    scan_interval_seconds: int = 60,
+    max_holding_minutes: int = 10,
+    max_position_trades: int = POSITION_LOOP_MAX_TRADES,
+    confirmation: str,
+    controlled_gate: dict,
+    current_epoch: dict,
+) -> dict:
+    async with _job_lock():
+        active = _active_controlled_job_locked()
+        if active is not None:
+            return {
+                "ok": False,
+                "status": "ABORTED",
+                "message": "A controlled auto live run is already active.",
+                "active_controlled_run_id": active["controlled_run_id"],
+                "active_status": active["status"],
+            }
+        started_at = _utc_now()
+        run_id = f"posloop-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+        stop_event = asyncio.Event()
+        job = {
+            "controlled_run_id": run_id,
+            "loop_run_id": run_id,
+            "run_type": "CONTROLLED_POSITION_LOOP",
+            "status": "STARTING",
+            "started_at_utc": started_at,
+            "completed_at_utc": None,
+            "runtime_limit_seconds": min(max(int(runtime_seconds), 900), MAX_RUNTIME_SECONDS),
+            "scan_interval_seconds": max(30, int(scan_interval_seconds)),
+            "max_holding_minutes": min(max(int(max_holding_minutes), 10), 30),
+            "max_position_trades": min(max(int(max_position_trades), 1), POSITION_LOOP_MAX_TRADES),
+            "exchange": exchange,
+            "symbols": [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])],
+            "amount_krw": min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW),
+            "report": None,
+            "error": None,
+            "_stop_event": stop_event,
+        }
+        _controlled_jobs[run_id] = job
+        task = asyncio.create_task(
+            _run_controlled_position_loop_job(
+                run_id=run_id,
+                exchange=exchange,
+                symbols=symbols or ["BTC", "ETH"],
+                amount_krw=amount_krw,
+                runtime_seconds=runtime_seconds,
+                scan_interval_seconds=scan_interval_seconds,
+                max_holding_minutes=max_holding_minutes,
+                max_position_trades=max_position_trades,
+                confirmation=confirmation,
+                controlled_gate=controlled_gate,
+                current_epoch=current_epoch,
+                stop_event=stop_event,
+            )
+        )
+        job["_task"] = task
+        return _public_job(job)
+
+
+async def _run_controlled_position_loop_job(
+    *,
+    run_id: str,
+    exchange: str,
+    symbols: list[str],
+    amount_krw: float,
+    runtime_seconds: int,
+    scan_interval_seconds: int,
+    max_holding_minutes: int,
+    max_position_trades: int,
+    confirmation: str,
+    controlled_gate: dict,
+    current_epoch: dict,
+    stop_event: asyncio.Event,
+) -> None:
+    job = _controlled_jobs[run_id]
+    job["status"] = "RUNNING"
+    try:
+        report = await run_controlled_position_loop(
+            exchange=exchange,
+            symbols=symbols,
+            amount_krw=amount_krw,
+            runtime_seconds=runtime_seconds,
+            scan_interval_seconds=scan_interval_seconds,
+            max_holding_minutes=max_holding_minutes,
+            max_position_trades=max_position_trades,
+            confirmation=confirmation,
+            controlled_gate=controlled_gate,
+            current_epoch=current_epoch,
+            loop_run_id=run_id,
+            stop_event=stop_event,
+        )
+        job["report"] = report
+        job["status"] = str(report.get("controlled_auto_live_status") or "FAILED")
+        job["completed_at_utc"] = report.get("completed_at_utc") or _utc_now()
+    except Exception as exc:
+        logger.exception("[controlled-position-loop] job failed run_id=%s", run_id)
+        job["status"] = "FAILED"
+        job["error"] = f"{exc.__class__.__name__}:{str(exc)[:240]}"
+        job["completed_at_utc"] = _utc_now()
+
+
 async def run_controlled_entry_v3_watch(
     *,
     exchange: str = "bithumb",
@@ -1533,6 +1642,259 @@ async def run_controlled_entry_v3_position_run(
         return await _finalize_after_orders(report, exchange, ordered_logs, "PASSED", [], before_equity, controlled_gate)
     except Exception as exc:
         return _finalize(report, "FAILED", [f"CONTROLLED_ENTRY_V3_POSITION_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"], controlled_gate=controlled_gate)
+
+
+async def run_controlled_position_loop(
+    *,
+    exchange: str = "bithumb",
+    symbols: list[str] | None = None,
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    runtime_seconds: int = MAX_RUNTIME_SECONDS,
+    scan_interval_seconds: int = 60,
+    max_holding_minutes: int = 10,
+    max_position_trades: int = POSITION_LOOP_MAX_TRADES,
+    confirmation: str,
+    controlled_gate: dict | None = None,
+    current_epoch: dict | None = None,
+    loop_run_id: str | None = None,
+    stop_event: asyncio.Event | None = None,
+) -> dict:
+    exchange = (exchange or "bithumb").lower()
+    symbols = [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])]
+    symbols = [symbol for symbol in symbols if symbol in {"BTC", "ETH"}]
+    runtime_seconds = min(max(int(runtime_seconds), 900), MAX_RUNTIME_SECONDS)
+    scan_interval_seconds = max(30, int(scan_interval_seconds))
+    max_holding_minutes = min(max(int(max_holding_minutes), 10), 30)
+    max_position_trades = min(max(int(max_position_trades), 1), POSITION_LOOP_MAX_TRADES)
+    notional = min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW)
+    started_at = _utc_now()
+    run_id = loop_run_id or f"posloop-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+    report: dict[str, Any] = {
+        "controlled_run_id": run_id,
+        "loop_run_id": run_id,
+        "run_type": "CONTROLLED_POSITION_LOOP",
+        "controlled_auto_live_status": "FAILED",
+        "technical_result": "NOT_EVALUATED",
+        "profitability_result": "NOT_EVALUATED",
+        "started_at_utc": started_at,
+        "completed_at_utc": None,
+        "runtime_limit_seconds": runtime_seconds,
+        "runtime_seconds": 0,
+        "scan_interval_seconds": scan_interval_seconds,
+        "max_holding_minutes": max_holding_minutes,
+        "max_position_trades": max_position_trades,
+        "symbols": symbols,
+        "strategies": [CONTROLLED_ENTRY_V3_STRATEGY],
+        "selected_symbols": [],
+        "selected_timeframes": [],
+        "selected_symbol": None,
+        "selected_timeframe": None,
+        "trade_count": 0,
+        "position_trade_count": 0,
+        "order_count": 0,
+        "buy_filled_count": 0,
+        "sell_filled_count": 0,
+        "gross_pnl": 0.0,
+        "net_pnl_after_fee": 0.0,
+        "run_realized_pnl": 0.0,
+        "run_unrealized_pnl_delta": 0.0,
+        "run_mark_to_market_delta": 0.0,
+        "run_pnl": 0.0,
+        "total_fee": 0.0,
+        "exit_reason_counts": {},
+        "time_stop_count": 0,
+        "profitable_trade_count": 0,
+        "losing_trade_count": 0,
+        "exchange_fill_count": 0,
+        "ledger_fill_count": 0,
+        "missing_ledger_fill_count": 0,
+        "duplicate_fill_count": 0,
+        "fee_diff": 0.0,
+        "equity_before": None,
+        "equity_after": None,
+        "equity_diff_after": 0.0,
+        "account_epoch_pnl_before": None,
+        "account_epoch_pnl_after": None,
+        "account_epoch_pnl_delta": None,
+        "current_epoch_pnl_before": None,
+        "current_epoch_pnl_after": None,
+        "current_epoch_pnl_delta": None,
+        "current_epoch_accounting_pending_count": None,
+        "current_epoch_accounting_failed_count": None,
+        "open_order_count_after": None,
+        "final_runtime_status": None,
+        "sub_runs": [],
+        "pass_fail_reasons": [],
+    }
+    try:
+        if confirmation != CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE:
+            return _finalize_position_loop(report, "ABORTED", ["CONTROLLED_POSITION_LOOP_CONFIRMATION_REQUIRED"], controlled_gate)
+        if not _full_auto_live_disabled():
+            return _finalize_position_loop(report, "ABORTED", ["FULL_AUTO_LIVE_MUST_REMAIN_FALSE"], controlled_gate)
+        if not symbols:
+            return _finalize_position_loop(report, "ABORTED", ["CONTROLLED_POSITION_LOOP_SYMBOLS_NOT_ALLOWED"], controlled_gate)
+        if controlled_gate is not None and not controlled_gate.get("controlled_auto_live_allowed"):
+            reasons = [str(item.get("code")) for item in (controlled_gate.get("controlled_auto_live_blockers") or [])]
+            return _finalize_position_loop(report, "ABORTED", reasons or ["CONTROLLED_AUTO_GATE_BLOCKED"], controlled_gate)
+        if not _runtime_guards_pass(exchange):
+            return _finalize_position_loop(report, "ABORTED", ["RUNTIME_GUARD_FAILED"], controlled_gate)
+        if notional <= 0 or notional > MAX_NOTIONAL_KRW:
+            return _finalize_position_loop(report, "ABORTED", ["CONTROLLED_POSITION_LOOP_AMOUNT_EXCEEDS_LIMIT"], controlled_gate)
+
+        before_equity = await _current_equity(exchange)
+        report["equity_before"] = before_equity
+        current_epoch = current_epoch or build_current_epoch_diagnostics(exchange=exchange, current_equity=before_equity)
+        if not current_epoch.get("current_epoch_sanity_passed"):
+            return _finalize_position_loop(report, "ABORTED", ["CURRENT_EPOCH_SANITY_FAILED"], controlled_gate)
+        report["account_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+
+        deadline = asyncio.get_running_loop().time() + runtime_seconds
+        traded_symbols: set[str] = set()
+        while asyncio.get_running_loop().time() < deadline and int(report["trade_count"]) < max_position_trades:
+            if stop_event is not None and stop_event.is_set():
+                break
+            remaining_symbols = [symbol for symbol in symbols if symbol not in traded_symbols]
+            if not remaining_symbols:
+                break
+            remaining_seconds = int(max(deadline - asyncio.get_running_loop().time(), 0))
+            if remaining_seconds <= 0:
+                break
+            sub_runtime = min(MAX_RUNTIME_SECONDS, max(900, remaining_seconds))
+            sub_run_id = f"{run_id}-trade-{int(report['trade_count']) + 1}"
+            sub = await run_controlled_entry_v3_position_run(
+                exchange=exchange,
+                symbols=remaining_symbols,
+                amount_krw=notional,
+                runtime_seconds=sub_runtime,
+                scan_interval_seconds=scan_interval_seconds,
+                max_holding_minutes=max_holding_minutes,
+                confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
+                controlled_gate=controlled_gate,
+                current_epoch=current_epoch,
+                controlled_run_id=sub_run_id,
+                stop_event=stop_event,
+            )
+            report["sub_runs"].append(sub)
+            _merge_position_loop_subrun(report, sub)
+            status = str(sub.get("controlled_auto_live_status") or "").upper()
+            if status == "PASSED_POSITION_TRADE":
+                symbol = str(sub.get("selected_symbol") or "").upper()
+                if symbol:
+                    traded_symbols.add(symbol)
+                current_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=sub.get("equity_after"))
+                continue
+            if status == "PASS_IDLE":
+                break
+            return _finalize_position_loop(report, "STOPPED", list(sub.get("pass_fail_reasons") or [status]), controlled_gate)
+
+        after_equity = await _current_equity(exchange)
+        report["equity_after"] = after_equity
+        after_epoch = build_current_epoch_diagnostics(exchange=exchange, current_equity=after_equity)
+        report["account_epoch_pnl_after"] = after_epoch.get("current_epoch_total_pnl")
+        report["current_epoch_pnl_after"] = after_epoch.get("current_epoch_total_pnl")
+        epoch_delta = _float(report.get("account_epoch_pnl_after")) - _float(report.get("account_epoch_pnl_before"))
+        report["account_epoch_pnl_delta"] = epoch_delta
+        report["current_epoch_pnl_delta"] = epoch_delta
+        report["current_epoch_accounting_pending_count"] = int(after_epoch.get("current_epoch_accounting_pending_count") or 0)
+        report["current_epoch_accounting_failed_count"] = int(after_epoch.get("current_epoch_accounting_failed_count") or 0)
+        report["open_order_count_after"] = await _open_order_count(exchange, symbols or ["BTC", "ETH"])
+        reasons = _position_loop_fail_reasons(report)
+        if reasons:
+            return _finalize_position_loop(report, "STOPPED", reasons, controlled_gate)
+        if int(report.get("trade_count") or 0) <= 0:
+            return _finalize_position_loop(report, "PASS_IDLE", [], controlled_gate)
+        report["technical_result"] = "PASSED"
+        if _float(report.get("net_pnl_after_fee")) > 0:
+            report["profitability_result"] = "PROFITABLE"
+            return _finalize_position_loop(report, "PASSED_PROFITABLE_POSITION", [], controlled_gate)
+        report["profitability_result"] = "NOT_PROFITABLE"
+        return _finalize_position_loop(report, "PASSED_TECHNICAL_POSITION", [], controlled_gate)
+    except Exception as exc:
+        return _finalize_position_loop(report, "FAILED", [f"CONTROLLED_POSITION_LOOP_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"], controlled_gate)
+
+
+def _merge_position_loop_subrun(report: dict, sub: dict) -> None:
+    if str(sub.get("controlled_auto_live_status") or "").upper() != "PASSED_POSITION_TRADE":
+        return
+    report["trade_count"] = int(report.get("trade_count") or 0) + 1
+    report["position_trade_count"] = int(report.get("position_trade_count") or 0) + 1
+    report["order_count"] = int(report.get("order_count") or 0) + int(sub.get("order_count") or 0)
+    report["buy_filled_count"] = int(report.get("buy_filled_count") or 0) + int(sub.get("buy_filled_count") or 0)
+    report["sell_filled_count"] = int(report.get("sell_filled_count") or 0) + int(sub.get("sell_filled_count") or 0)
+    report["gross_pnl"] = _float(report.get("gross_pnl")) + _float(sub.get("gross_pnl"))
+    report["net_pnl_after_fee"] = _float(report.get("net_pnl_after_fee")) + _float(sub.get("net_pnl_after_fee"))
+    report["run_realized_pnl"] = _float(report.get("run_realized_pnl")) + _float(sub.get("run_realized_pnl"))
+    report["run_pnl"] = report["run_realized_pnl"]
+    report["total_fee"] = _float(report.get("total_fee")) + _float(sub.get("total_fee"))
+    report["exchange_fill_count"] = int(report.get("exchange_fill_count") or 0) + int(sub.get("exchange_fill_count") or 0)
+    report["ledger_fill_count"] = int(report.get("ledger_fill_count") or 0) + int(sub.get("ledger_fill_count") or 0)
+    report["missing_ledger_fill_count"] = int(report.get("missing_ledger_fill_count") or 0) + int(sub.get("missing_ledger_fill_count") or 0)
+    report["duplicate_fill_count"] = int(report.get("duplicate_fill_count") or 0) + int(sub.get("duplicate_fill_count") or 0)
+    report["fee_diff"] = _float(report.get("fee_diff")) + _float(sub.get("fee_diff"))
+    symbol = str(sub.get("selected_symbol") or "").upper()
+    timeframe = str(sub.get("selected_timeframe") or "")
+    if symbol and symbol not in report["selected_symbols"]:
+        report["selected_symbols"].append(symbol)
+    if timeframe and timeframe not in report["selected_timeframes"]:
+        report["selected_timeframes"].append(timeframe)
+    report["selected_symbol"] = symbol or report.get("selected_symbol")
+    report["selected_timeframe"] = timeframe or report.get("selected_timeframe")
+    reason = str(sub.get("exit_reason") or "UNKNOWN")
+    counts = dict(report.get("exit_reason_counts") or {})
+    counts[reason] = int(counts.get(reason) or 0) + 1
+    report["exit_reason_counts"] = counts
+    report["time_stop_count"] = int(report.get("time_stop_count") or 0) + (1 if reason == "TIME_STOP" else 0)
+    if _float(sub.get("net_pnl_after_fee")) > 0:
+        report["profitable_trade_count"] = int(report.get("profitable_trade_count") or 0) + 1
+    else:
+        report["losing_trade_count"] = int(report.get("losing_trade_count") or 0) + 1
+
+
+def _position_loop_fail_reasons(report: dict) -> list[str]:
+    reasons = []
+    if int(report.get("exchange_fill_count") or 0) != int(report.get("ledger_fill_count") or 0):
+        reasons.append("EXCHANGE_LEDGER_FILL_COUNT_MISMATCH")
+    if int(report.get("missing_ledger_fill_count") or 0) != 0:
+        reasons.append("MISSING_LEDGER_FILL")
+    if int(report.get("duplicate_fill_count") or 0) != 0:
+        reasons.append("DUPLICATE_FILL")
+    if abs(_float(report.get("fee_diff"))) > FEE_TOLERANCE_KRW:
+        reasons.append("FEE_DIFF_EXCEEDS_TOLERANCE")
+    if report.get("equity_diff_after") is not None and abs(_float(report.get("equity_diff_after"))) > EQUITY_TOLERANCE_KRW:
+        reasons.append("EQUITY_DIFF_EXCEEDS_TOLERANCE")
+    if int(report.get("current_epoch_accounting_pending_count") or 0) != 0:
+        reasons.append("CURRENT_EPOCH_ACCOUNTING_PENDING")
+    if int(report.get("current_epoch_accounting_failed_count") or 0) != 0:
+        reasons.append("CURRENT_EPOCH_ACCOUNTING_FAILED")
+    if int(report.get("open_order_count_after") or 0) != 0:
+        reasons.append("OPEN_ORDER_REMAINS_AFTER_RUN")
+    runtime = load_runtime_lock("auto-trading")
+    report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
+    if report["final_runtime_status"] != "STOPPED":
+        reasons.append("RUNTIME_NOT_STOPPED")
+    return reasons
+
+
+def _finalize_position_loop(report: dict, status: str, reasons: list[str], controlled_gate: dict | None = None) -> dict:
+    if status in {"PASSED_PROFITABLE_POSITION", "PASSED_TECHNICAL_POSITION"}:
+        report["technical_result"] = "PASSED"
+    elif status == "PASS_IDLE":
+        report["technical_result"] = "PASS_IDLE"
+        report["profitability_result"] = "NO_TRADE"
+    else:
+        report["technical_result"] = "FAILED" if status in {"FAILED", "STOPPED"} else status
+        if report.get("profitability_result") == "NOT_EVALUATED":
+            report["profitability_result"] = "NOT_EVALUATED"
+    report["controlled_auto_live_status"] = status
+    report["completed_at_utc"] = _utc_now()
+    report["runtime_seconds"] = max(0, int((_parse_utc(report["completed_at_utc"]) - _parse_utc(str(report["started_at_utc"]))).total_seconds()))
+    report["pass_fail_reasons"] = reasons
+    if controlled_gate is not None:
+        report["controlled_auto_live_gate"] = controlled_gate
+    runtime = load_runtime_lock("auto-trading")
+    report["final_runtime_status"] = str((runtime or {}).get("status") or "UNKNOWN").upper()
+    return {key: value for key, value in report.items() if not key.startswith("_")}
 
 
 def _select_controlled_entry_v3_watch_candidate(decisions: list[dict]) -> dict | None:

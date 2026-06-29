@@ -143,6 +143,7 @@ from app.live_recovery import (
 from app.accounting_epoch import build_current_epoch_diagnostics, build_open_order_audit, build_smoke_test_preflight, limited_auto_live_gate
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE as CONTROLLED_AUTO_LIVE_CONFIRMATION,
+    CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
     ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_POSITION_CONFIRMATION,
     ENTRY_V3_WATCH_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION,
@@ -152,6 +153,7 @@ from app.controlled_auto_live import (
     controlled_auto_live_gate,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
+    start_controlled_position_loop_job,
     start_controlled_entry_v3_position_run_job,
     start_controlled_entry_v3_watch_job,
     start_controlled_auto_live_job,
@@ -746,6 +748,17 @@ class ControlledEntryV3PositionStartRequest(BaseModel):
     runtime_seconds: int = Field(900, ge=900, le=1800)
     scan_interval_seconds: int = Field(60, ge=30, le=120)
     max_holding_minutes: int = Field(10, ge=10, le=30)
+    confirmation: str = ""
+
+
+class ControlledPositionLoopStartRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    runtime_seconds: int = Field(1800, ge=900, le=1800)
+    scan_interval_seconds: int = Field(60, ge=30, le=120)
+    max_holding_minutes: int = Field(10, ge=10, le=30)
+    max_position_trades: int = Field(3, ge=1, le=3)
     confirmation: str = ""
 
 
@@ -3233,6 +3246,61 @@ async def controlled_auto_live_v3_position_start(payload: ControlledEntryV3Posit
     return {
         **job,
         "required_confirmation": CONTROLLED_ENTRY_V3_POSITION_CONFIRMATION,
+        "current_epoch": current_epoch,
+        "controlled_auto_live_gate": gate,
+    }
+
+
+@app.post("/api/controlled-auto-live/position-loop/start")
+async def controlled_auto_live_position_loop_start(payload: ControlledPositionLoopStartRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="controlled_position_loop",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    if payload.confirmation != CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled position loop confirmation phrase is required.",
+            "required_confirmation": CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    if not gate.get("controlled_auto_live_allowed"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled position loop gate is blocked.",
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
+    job = await start_controlled_position_loop_job(
+        exchange=payload.exchange,
+        symbols=symbols or ["BTC", "ETH"],
+        amount_krw=payload.amount_krw,
+        runtime_seconds=payload.runtime_seconds,
+        scan_interval_seconds=payload.scan_interval_seconds,
+        max_holding_minutes=payload.max_holding_minutes,
+        max_position_trades=payload.max_position_trades,
+        confirmation=payload.confirmation,
+        controlled_gate=gate,
+        current_epoch=current_epoch,
+    )
+    return {
+        **job,
+        "required_confirmation": CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
     }

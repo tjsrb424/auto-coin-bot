@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 from app import database
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE,
+    CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
     DRY_RUN_CONFIRMATION_PHRASE,
     ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
     ENTRY_V3_WATCH_CONFIRMATION_PHRASE,
@@ -27,11 +28,13 @@ from app.controlled_auto_live import (
     _threshold_adjustment_report,
     run_controlled_entry_v3_watch,
     run_controlled_entry_v3_position_run,
+    run_controlled_position_loop,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
     run_controlled_trade_probe,
     start_controlled_entry_v3_watch_job,
     start_controlled_entry_v3_position_run_job,
+    start_controlled_position_loop_job,
     start_controlled_auto_live_job,
 )
 
@@ -1017,6 +1020,177 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
                 scan_interval_seconds=60,
                 max_holding_minutes=10,
                 confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+            await asyncio.sleep(0.1)
+
+        self.assertEqual(first["status"], "STARTING")
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["status"], "ABORTED")
+        final = _controlled_jobs[first["controlled_run_id"]]
+        self.assertEqual(final["status"], "PASS_IDLE")
+
+    async def test_controlled_position_loop_reports_profitable_and_technical_results_separately(self) -> None:
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+
+        async def fake_position_run(**kwargs):
+            return {
+                "controlled_auto_live_status": "PASSED_POSITION_TRADE",
+                "selected_symbol": "BTC",
+                "selected_timeframe": "15m",
+                "order_count": 2,
+                "buy_filled_count": 1,
+                "sell_filled_count": 1,
+                "gross_pnl": 40.0,
+                "net_pnl_after_fee": 10.0,
+                "run_realized_pnl": 10.0,
+                "total_fee": 30.0,
+                "exit_reason": "TAKE_PROFIT",
+                "exchange_fill_count": 2,
+                "ledger_fill_count": 2,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_after": 263010.0,
+                "pass_fail_reasons": [],
+            }
+
+        with (
+            patch("app.controlled_auto_live._full_auto_live_disabled", return_value=True),
+            patch("app.controlled_auto_live._runtime_guards_pass", return_value=True),
+            patch("app.controlled_auto_live._current_equity", side_effect=[263000.0, 263010.0]),
+            patch("app.controlled_auto_live._open_order_count", return_value=0),
+            patch("app.controlled_auto_live.run_controlled_entry_v3_position_run", side_effect=fake_position_run),
+        ):
+            result = await run_controlled_position_loop(
+                confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+                runtime_seconds=900,
+                scan_interval_seconds=60,
+                max_position_trades=1,
+            )
+
+        self.assertEqual(result["controlled_auto_live_status"], "PASSED_PROFITABLE_POSITION")
+        self.assertEqual(result["technical_result"], "PASSED")
+        self.assertEqual(result["profitability_result"], "PROFITABLE")
+        self.assertEqual(result["trade_count"], 1)
+        self.assertEqual(result["net_pnl_after_fee"], 10.0)
+        self.assertEqual(result["exit_reason_counts"], {"TAKE_PROFIT": 1})
+        self.assertEqual(result["profitable_trade_count"], 1)
+        self.assertEqual(result["losing_trade_count"], 0)
+        self.assertEqual(result["exchange_fill_count"], result["ledger_fill_count"])
+        self.assertEqual(result["open_order_count_after"], 0)
+
+    async def test_controlled_position_loop_passes_technical_when_pnl_is_not_positive(self) -> None:
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+
+        async def fake_position_run(**kwargs):
+            return {
+                "controlled_auto_live_status": "PASSED_POSITION_TRADE",
+                "selected_symbol": "ETH",
+                "selected_timeframe": "15m",
+                "order_count": 2,
+                "buy_filled_count": 1,
+                "sell_filled_count": 1,
+                "gross_pnl": 2.0,
+                "net_pnl_after_fee": -28.0,
+                "run_realized_pnl": -28.0,
+                "total_fee": 30.0,
+                "exit_reason": "TIME_STOP",
+                "exchange_fill_count": 2,
+                "ledger_fill_count": 2,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_after": 262972.0,
+                "pass_fail_reasons": [],
+            }
+
+        with (
+            patch("app.controlled_auto_live._full_auto_live_disabled", return_value=True),
+            patch("app.controlled_auto_live._runtime_guards_pass", return_value=True),
+            patch("app.controlled_auto_live._current_equity", side_effect=[263000.0, 262972.0]),
+            patch("app.controlled_auto_live._open_order_count", return_value=0),
+            patch("app.controlled_auto_live.run_controlled_entry_v3_position_run", side_effect=fake_position_run),
+        ):
+            result = await run_controlled_position_loop(
+                confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+                runtime_seconds=900,
+                scan_interval_seconds=60,
+                max_position_trades=1,
+            )
+
+        self.assertEqual(result["controlled_auto_live_status"], "PASSED_TECHNICAL_POSITION")
+        self.assertEqual(result["technical_result"], "PASSED")
+        self.assertEqual(result["profitability_result"], "NOT_PROFITABLE")
+        self.assertEqual(result["exit_reason_counts"], {"TIME_STOP": 1})
+        self.assertEqual(result["time_stop_count"], 1)
+        self.assertEqual(result["profitable_trade_count"], 0)
+        self.assertEqual(result["losing_trade_count"], 1)
+
+    async def test_controlled_position_loop_job_blocks_duplicate_active_run(self) -> None:
+        async def fake_run(**kwargs):
+            await asyncio.sleep(0.05)
+            return {
+                "controlled_run_id": kwargs["loop_run_id"],
+                "controlled_auto_live_status": "PASS_IDLE",
+                "completed_at_utc": "2026-06-26T00:30:00Z",
+                "trade_count": 0,
+                "final_runtime_status": "STOPPED",
+            }
+
+        current_epoch = {
+            "current_epoch_sanity_passed": True,
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+            "current_epoch_total_pnl": 0.0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+        with patch("app.controlled_auto_live.run_controlled_position_loop", side_effect=fake_run):
+            first = await start_controlled_position_loop_job(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                runtime_seconds=1800,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+                max_position_trades=3,
+                confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+            second = await start_controlled_position_loop_job(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                runtime_seconds=1800,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+                max_position_trades=3,
+                confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
                 controlled_gate=gate,
                 current_epoch=current_epoch,
             )
