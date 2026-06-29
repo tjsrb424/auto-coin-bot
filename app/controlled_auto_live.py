@@ -47,6 +47,7 @@ from app.upbit import fetch_minute_candles
 CONFIRMATION_PHRASE = "RUN CONTROLLED AUTO LIVE ONCE"
 TRADE_PROBE_CONFIRMATION_PHRASE = "RUN CONTROLLED TRADE PROBE ONCE"
 ENTRY_V3_WATCH_CONFIRMATION_PHRASE = "RUN CONTROLLED ENTRY V3 WATCH ONCE"
+ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED ENTRY V3 POSITION ONCE"
 CONTROLLED_ENTRY_V2_STRATEGY = "controlled_entry_v2"
 CONTROLLED_ENTRY_V3_STRATEGY = "controlled_entry_v3"
 CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous", CONTROLLED_ENTRY_V2_STRATEGY, CONTROLLED_ENTRY_V3_STRATEGY}
@@ -58,6 +59,10 @@ MAX_OPEN_POSITIONS = 1
 DEFAULT_RUNTIME_SECONDS = 600
 MAX_RUNTIME_SECONDS = 1800
 TICK_INTERVAL_SECONDS = 60
+POSITION_RUN_MIN_HOLD_SECONDS = 60
+POSITION_RUN_PRICE_CHECK_SECONDS = 30
+POSITION_RUN_MIN_NET_PROFIT_MARGIN_RATE = 0.001
+POSITION_RUN_STOP_LOSS_RATE = 0.003
 MIN_EXPECTED_EDGE_RATE = 0.006
 CONTROLLED_ENTRY_V2_MIN_SCORE = 60.0
 CONTROLLED_ENTRY_V2_MIN_EDGE_AFTER_COST = 0.0002
@@ -897,6 +902,108 @@ async def _run_controlled_entry_v3_watch_job(
         job["completed_at_utc"] = _utc_now()
 
 
+async def start_controlled_entry_v3_position_run_job(
+    *,
+    exchange: str = "bithumb",
+    symbols: list[str] | None = None,
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    runtime_seconds: int = 900,
+    scan_interval_seconds: int = 60,
+    max_holding_minutes: int = 10,
+    confirmation: str,
+    controlled_gate: dict,
+    current_epoch: dict,
+) -> dict:
+    async with _job_lock():
+        active = _active_controlled_job_locked()
+        if active is not None:
+            return {
+                "ok": False,
+                "status": "ABORTED",
+                "message": "A controlled auto live run is already active.",
+                "active_controlled_run_id": active["controlled_run_id"],
+                "active_status": active["status"],
+            }
+        started_at = _utc_now()
+        run_id = f"v3pos-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+        stop_event = asyncio.Event()
+        job = {
+            "controlled_run_id": run_id,
+            "position_run_id": run_id,
+            "run_type": "CONTROLLED_ENTRY_V3_POSITION_RUN",
+            "status": "STARTING",
+            "started_at_utc": started_at,
+            "completed_at_utc": None,
+            "runtime_limit_seconds": min(max(int(runtime_seconds), 900), MAX_RUNTIME_SECONDS),
+            "scan_interval_seconds": max(30, int(scan_interval_seconds)),
+            "max_holding_minutes": min(max(int(max_holding_minutes), 10), 30),
+            "exchange": exchange,
+            "symbols": [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])],
+            "amount_krw": min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW),
+            "report": None,
+            "error": None,
+            "_stop_event": stop_event,
+        }
+        _controlled_jobs[run_id] = job
+        task = asyncio.create_task(
+            _run_controlled_entry_v3_position_run_job(
+                run_id=run_id,
+                exchange=exchange,
+                symbols=symbols or ["BTC", "ETH"],
+                amount_krw=amount_krw,
+                runtime_seconds=runtime_seconds,
+                scan_interval_seconds=scan_interval_seconds,
+                max_holding_minutes=max_holding_minutes,
+                confirmation=confirmation,
+                controlled_gate=controlled_gate,
+                current_epoch=current_epoch,
+                stop_event=stop_event,
+            )
+        )
+        job["_task"] = task
+        return _public_job(job)
+
+
+async def _run_controlled_entry_v3_position_run_job(
+    *,
+    run_id: str,
+    exchange: str,
+    symbols: list[str],
+    amount_krw: float,
+    runtime_seconds: int,
+    scan_interval_seconds: int,
+    max_holding_minutes: int,
+    confirmation: str,
+    controlled_gate: dict,
+    current_epoch: dict,
+    stop_event: asyncio.Event,
+) -> None:
+    job = _controlled_jobs[run_id]
+    job["status"] = "RUNNING"
+    try:
+        report = await run_controlled_entry_v3_position_run(
+            exchange=exchange,
+            symbols=symbols,
+            amount_krw=amount_krw,
+            runtime_seconds=runtime_seconds,
+            scan_interval_seconds=scan_interval_seconds,
+            max_holding_minutes=max_holding_minutes,
+            confirmation=confirmation,
+            controlled_gate=controlled_gate,
+            current_epoch=current_epoch,
+            controlled_run_id=run_id,
+            stop_event=stop_event,
+        )
+        job["report"] = report
+        job["status"] = str(report.get("controlled_auto_live_status") or "FAILED")
+        job["completed_at_utc"] = report.get("completed_at_utc") or _utc_now()
+    except Exception as exc:
+        logger.exception("[controlled-entry-v3-position] job failed run_id=%s", run_id)
+        job["status"] = "FAILED"
+        job["error"] = f"{exc.__class__.__name__}:{str(exc)[:240]}"
+        job["completed_at_utc"] = _utc_now()
+
+
 async def run_controlled_entry_v3_watch(
     *,
     exchange: str = "bithumb",
@@ -1133,6 +1240,299 @@ async def _scan_controlled_entry_v3_watch(
         "selected_candidate": selected_diag,
         "priority": ["ETH:15m", "BTC:15m", "ETH:5m", "BTC:5m"],
     }
+
+
+async def run_controlled_entry_v3_position_run(
+    *,
+    exchange: str = "bithumb",
+    symbols: list[str] | None = None,
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    runtime_seconds: int = 900,
+    scan_interval_seconds: int = 60,
+    max_holding_minutes: int = 10,
+    confirmation: str,
+    controlled_gate: dict | None = None,
+    current_epoch: dict | None = None,
+    controlled_run_id: str | None = None,
+    stop_event: asyncio.Event | None = None,
+) -> dict:
+    exchange = (exchange or "bithumb").lower()
+    symbols = [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])]
+    symbols = [symbol for symbol in symbols if symbol in {"BTC", "ETH"}]
+    runtime_seconds = min(max(int(runtime_seconds), 900), MAX_RUNTIME_SECONDS)
+    scan_interval_seconds = max(30, int(scan_interval_seconds))
+    max_holding_minutes = min(max(int(max_holding_minutes), 10), 30)
+    max_holding_seconds = max_holding_minutes * 60
+    notional = min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW)
+    started_at = _utc_now()
+    run_id = controlled_run_id or f"v3pos-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+    report: dict[str, Any] = {
+        "controlled_run_id": run_id,
+        "position_run_id": run_id,
+        "run_type": "CONTROLLED_ENTRY_V3_POSITION_RUN",
+        "controlled_auto_live_status": "FAILED",
+        "started_at_utc": started_at,
+        "completed_at_utc": None,
+        "runtime_limit_seconds": runtime_seconds,
+        "runtime_seconds": 0,
+        "scan_interval_seconds": scan_interval_seconds,
+        "scan_count": 0,
+        "max_holding_minutes": max_holding_minutes,
+        "min_holding_seconds": POSITION_RUN_MIN_HOLD_SECONDS,
+        "trade_candidate_detected": False,
+        "selected_candidate": None,
+        "selected_symbol": None,
+        "selected_timeframe": None,
+        "selected_edge_after_cost": None,
+        "selected_signal_score": None,
+        "selected_trigger_reason": None,
+        "symbols": symbols,
+        "strategies": [CONTROLLED_ENTRY_V3_STRATEGY],
+        "used_symbols": [],
+        "used_strategies": [],
+        "order_count": 0,
+        "max_orders": 2,
+        "buy_filled_count": 0,
+        "sell_filled_count": 0,
+        "exchange_order_uuid_list": [],
+        "client_order_id_list": [],
+        "entry_price": None,
+        "entry_fee": 0.0,
+        "exit_price": None,
+        "exit_fee": 0.0,
+        "holding_minutes": 0.0,
+        "exit_reason": None,
+        "take_profit_rate": None,
+        "stop_loss_rate": POSITION_RUN_STOP_LOSS_RATE,
+        "estimated_total_cost_rate": None,
+        "realized_edge_after_cost": None,
+        "max_unrealized_pnl": 0.0,
+        "min_unrealized_pnl": 0.0,
+        "gross_pnl": 0.0,
+        "net_pnl_after_fee": 0.0,
+        "run_realized_pnl": 0.0,
+        "run_unrealized_pnl_delta": 0.0,
+        "run_mark_to_market_delta": 0.0,
+        "total_fee": 0.0,
+        "spread_slippage_estimate": 0.0,
+        "exchange_fill_count": 0,
+        "ledger_fill_count": 0,
+        "missing_ledger_fill_count": 0,
+        "duplicate_fill_count": 0,
+        "fee_diff": 0.0,
+        "open_order_count_after": None,
+        "equity_before": None,
+        "equity_after": None,
+        "equity_diff_after": None,
+        "current_epoch_pnl_before": None,
+        "current_epoch_pnl_after": None,
+        "current_epoch_pnl_delta": None,
+        "account_epoch_pnl_before": None,
+        "account_epoch_pnl_after": None,
+        "account_epoch_pnl_delta": None,
+        "run_pnl": 0.0,
+        "pnl_explanation": "",
+        "report_notes": [],
+        "current_epoch_accounting_pending_count": None,
+        "current_epoch_accounting_failed_count": None,
+        "final_runtime_status": None,
+        "watch_scans": [],
+        "tick_reports": [],
+        "position_ticks": [],
+        "pass_fail_reasons": [],
+    }
+    try:
+        if confirmation != ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE:
+            return _finalize(report, "ABORTED", ["CONTROLLED_ENTRY_V3_POSITION_CONFIRMATION_REQUIRED"], controlled_gate=controlled_gate)
+        if not _full_auto_live_disabled():
+            return _finalize(report, "ABORTED", ["FULL_AUTO_LIVE_MUST_REMAIN_FALSE"], controlled_gate=controlled_gate)
+        if not symbols:
+            return _finalize(report, "ABORTED", ["CONTROLLED_ENTRY_V3_POSITION_SYMBOLS_NOT_ALLOWED"], controlled_gate=controlled_gate)
+        if controlled_gate is not None and not controlled_gate.get("controlled_auto_live_allowed"):
+            reasons = [str(item.get("code")) for item in (controlled_gate.get("controlled_auto_live_blockers") or [])]
+            return _finalize(report, "ABORTED", reasons or ["CONTROLLED_AUTO_GATE_BLOCKED"], controlled_gate=controlled_gate)
+        if not _runtime_guards_pass(exchange):
+            return _finalize(report, "ABORTED", ["RUNTIME_GUARD_FAILED"], controlled_gate=controlled_gate)
+        if notional <= 0 or notional > MAX_NOTIONAL_KRW:
+            return _finalize(report, "ABORTED", ["CONTROLLED_ENTRY_V3_POSITION_AMOUNT_EXCEEDS_LIMIT"], controlled_gate=controlled_gate)
+
+        before_equity = await _current_equity(exchange)
+        report["equity_before"] = before_equity
+        current_epoch = current_epoch or build_current_epoch_diagnostics(exchange=exchange, current_equity=before_equity)
+        if not current_epoch.get("current_epoch_sanity_passed"):
+            return _finalize(report, "ABORTED", ["CURRENT_EPOCH_SANITY_FAILED"], controlled_gate=controlled_gate)
+        report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+        report["account_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
+
+        broker = get_live_broker(exchange)
+        ordered_logs: list[dict] = []
+        deadline = asyncio.get_running_loop().time() + runtime_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["CONTROLLED_ENTRY_V3_POSITION_STOP_REQUESTED"], before_equity, controlled_gate)
+            open_blocker = await _open_order_blocker(exchange, symbols)
+            if open_blocker:
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", [open_blocker], before_equity, controlled_gate)
+            scan = await _scan_controlled_entry_v3_watch(exchange=exchange, symbols=symbols, notional=notional, current_epoch=current_epoch, controlled_gate=controlled_gate)
+            report["scan_count"] = int(report.get("scan_count") or 0) + 1
+            report["watch_scans"].append(scan)
+            report["tick_reports"].append(scan)
+            selected = scan.get("selected_candidate")
+            if not selected:
+                await asyncio.sleep(min(scan_interval_seconds, max(deadline - asyncio.get_running_loop().time(), 0)))
+                continue
+
+            report["trade_candidate_detected"] = True
+            report["selected_candidate"] = selected
+            report["selected_symbol"] = selected.get("symbol")
+            report["selected_timeframe"] = selected.get("timeframe")
+            report["selected_edge_after_cost"] = selected.get("expected_edge_after_cost")
+            report["selected_signal_score"] = selected.get("signal_score")
+            report["selected_trigger_reason"] = selected.get("trade_candidate_reason")
+            report["estimated_total_cost_rate"] = _float(selected.get("estimated_total_cost_rate"))
+            report["take_profit_rate"] = report["estimated_total_cost_rate"] + POSITION_RUN_MIN_NET_PROFIT_MARGIN_RATE
+            market = str(selected.get("market") or f"KRW-{selected.get('symbol')}")
+            buy_price = _float(selected.get("entry_price"))
+            if buy_price <= 0:
+                quote = await _orderbook_quote(exchange, market)
+                buy_price = _float(quote.get("best_ask"))
+            volume = _round_volume(notional / buy_price) if buy_price > 0 else 0.0
+            if volume <= 0:
+                return await _finalize_after_orders(report, exchange, ordered_logs, "FAILED", ["CONTROLLED_ENTRY_V3_POSITION_VOLUME_INVALID"], before_equity, controlled_gate)
+
+            buy = await _submit_and_wait_controlled(
+                broker=broker,
+                run_id=run_id,
+                exchange=exchange,
+                market=market,
+                side="BUY",
+                price=buy_price,
+                volume=volume,
+                amount_krw=notional,
+                order_index=1,
+                strategy_name=CONTROLLED_ENTRY_V3_STRATEGY,
+                signal_reason=str(selected.get("trade_candidate_reason") or "CONTROLLED_ENTRY_V3_POSITION_BUY"),
+                order_purpose="CONTROLLED_ENTRY_V3_POSITION_RUN",
+                preview_payload_extra={
+                    "run_type": "CONTROLLED_ENTRY_V3_POSITION_RUN",
+                    "selected_candidate": selected,
+                    "take_profit_rate": report["take_profit_rate"],
+                    "stop_loss_rate": report["stop_loss_rate"],
+                    "max_holding_minutes": max_holding_minutes,
+                },
+                prepared_risk_result="CONTROLLED_ENTRY_V3_POSITION_PREPARED",
+                submitted_risk_result="CONTROLLED_ENTRY_V3_POSITION_SUBMITTED",
+                status_recheck_source="CONTROLLED_ENTRY_V3_POSITION_STATUS_RECHECK",
+                timeout_seconds=300,
+            )
+            _merge_order_result(report, buy, prefix="buy")
+            if buy.get("order_log"):
+                ordered_logs.append(buy["order_log"])
+            if not buy.get("filled"):
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["BUY_NOT_FILLED"], before_equity, controlled_gate)
+
+            executed_volume = _round_volume(_float(buy.get("executed_volume")))
+            entry_value = _float(buy.get("filled_amount_krw"))
+            entry_fee = _float(buy.get("paid_fee"))
+            entry_price = entry_value / executed_volume if executed_volume > 0 and entry_value > 0 else buy_price
+            report["entry_price"] = entry_price
+            report["entry_fee"] = entry_fee
+            report["max_unrealized_pnl"] = -entry_fee
+            report["min_unrealized_pnl"] = -entry_fee
+
+            buy_time = asyncio.get_running_loop().time()
+            hold_deadline = buy_time + max_holding_seconds
+            exit_reason = "TIME_STOP"
+            while asyncio.get_running_loop().time() < hold_deadline:
+                elapsed = asyncio.get_running_loop().time() - buy_time
+                if stop_event is not None and stop_event.is_set():
+                    exit_reason = "MANUAL_STOP"
+                    break
+                quote = await _orderbook_quote(exchange, market)
+                mark_price = _float(quote.get("best_bid"))
+                if mark_price <= 0:
+                    await asyncio.sleep(POSITION_RUN_PRICE_CHECK_SECONDS)
+                    continue
+                mark_value = mark_price * executed_volume
+                estimated_exit_fee = mark_value * LiveTradingConfig.for_exchange(exchange).fee_rate
+                unrealized_net = mark_value - entry_value - entry_fee - estimated_exit_fee
+                report["max_unrealized_pnl"] = max(_float(report.get("max_unrealized_pnl")), unrealized_net)
+                report["min_unrealized_pnl"] = min(_float(report.get("min_unrealized_pnl")), unrealized_net)
+                report["position_ticks"].append(
+                    {
+                        "checked_at_utc": _utc_now(),
+                        "holding_seconds": int(elapsed),
+                        "mark_price": mark_price,
+                        "unrealized_pnl_after_estimated_fee": unrealized_net,
+                    }
+                )
+                move_rate = (mark_price - entry_price) / entry_price if entry_price > 0 else 0.0
+                if elapsed >= POSITION_RUN_MIN_HOLD_SECONDS and move_rate >= _float(report.get("take_profit_rate")):
+                    exit_reason = "TAKE_PROFIT"
+                    break
+                if elapsed >= POSITION_RUN_MIN_HOLD_SECONDS and move_rate <= -_float(report.get("stop_loss_rate")):
+                    exit_reason = "STOP_LOSS"
+                    break
+                await asyncio.sleep(min(POSITION_RUN_PRICE_CHECK_SECONDS, max(hold_deadline - asyncio.get_running_loop().time(), 0)))
+
+            sell_quote = await _orderbook_quote(exchange, market)
+            sell_price = _float(sell_quote.get("best_bid"))
+            if sell_price <= 0:
+                return await _finalize_after_orders(report, exchange, ordered_logs, "FAILED", ["CONTROLLED_ENTRY_V3_POSITION_EXIT_PRICE_INVALID"], before_equity, controlled_gate)
+            sell = await _submit_and_wait_controlled(
+                broker=broker,
+                run_id=run_id,
+                exchange=exchange,
+                market=market,
+                side="SELL",
+                price=sell_price,
+                volume=executed_volume,
+                amount_krw=sell_price * executed_volume,
+                order_index=2,
+                strategy_name=CONTROLLED_ENTRY_V3_STRATEGY,
+                signal_reason=f"CONTROLLED_ENTRY_V3_POSITION_{exit_reason}",
+                order_purpose="CONTROLLED_ENTRY_V3_POSITION_RUN",
+                preview_payload_extra={
+                    "run_type": "CONTROLLED_ENTRY_V3_POSITION_RUN",
+                    "selected_candidate": selected,
+                    "exit_reason": exit_reason,
+                },
+                prepared_risk_result="CONTROLLED_ENTRY_V3_POSITION_PREPARED",
+                submitted_risk_result="CONTROLLED_ENTRY_V3_POSITION_SUBMITTED",
+                status_recheck_source="CONTROLLED_ENTRY_V3_POSITION_STATUS_RECHECK",
+                timeout_seconds=300,
+            )
+            _merge_order_result(report, sell, prefix="sell")
+            if sell.get("order_log"):
+                ordered_logs.append(sell["order_log"])
+            if not sell.get("filled"):
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["SELL_NOT_FILLED"], before_equity, controlled_gate)
+            exit_value = _float(sell.get("filled_amount_krw"))
+            exit_fee = _float(sell.get("paid_fee"))
+            exit_price = exit_value / executed_volume if executed_volume > 0 and exit_value > 0 else sell_price
+            report["exit_price"] = exit_price
+            report["exit_fee"] = exit_fee
+            report["exit_reason"] = exit_reason
+            report["holding_minutes"] = round((asyncio.get_running_loop().time() - buy_time) / 60.0, 4)
+            _apply_realized_position_pnl(
+                report,
+                {
+                    "quantity": executed_volume,
+                    "buy_value": entry_value,
+                    "buy_fee": entry_fee,
+                    "buy_price": entry_price,
+                    "sell_value": exit_value,
+                    "sell_fee": exit_fee,
+                    "sell_price": exit_price,
+                },
+            )
+            if entry_value > 0:
+                report["realized_edge_after_cost"] = _float(report.get("net_pnl_after_fee")) / entry_value
+            return await _finalize_after_orders(report, exchange, ordered_logs, "PASSED", [], before_equity, controlled_gate)
+
+        return await _finalize_after_orders(report, exchange, ordered_logs, "PASSED", [], before_equity, controlled_gate)
+    except Exception as exc:
+        return _finalize(report, "FAILED", [f"CONTROLLED_ENTRY_V3_POSITION_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"], controlled_gate=controlled_gate)
 
 
 def _select_controlled_entry_v3_watch_candidate(decisions: list[dict]) -> dict | None:
@@ -2072,7 +2472,10 @@ def _merge_order_result(report: dict, result: dict, *, prefix: str) -> None:
 
 def _pass_fail(report: dict) -> tuple[str, list[str]]:
     reasons = []
-    max_orders = TRADE_PROBE_MAX_ORDERS if str(report.get("run_type") or "") == "CONTROLLED_TRADE_PROBE" else MAX_ORDERS
+    run_type = str(report.get("run_type") or "")
+    max_orders = TRADE_PROBE_MAX_ORDERS if run_type == "CONTROLLED_TRADE_PROBE" else MAX_ORDERS
+    if run_type == "CONTROLLED_ENTRY_V3_POSITION_RUN":
+        max_orders = 2
     if int(report.get("order_count") or 0) > max_orders:
         reasons.append("CONTROLLED_AUTO_MAX_ORDERS_EXCEEDED")
     if int(report.get("exchange_fill_count") or 0) != int(report.get("ledger_fill_count") or 0):
@@ -2102,6 +2505,8 @@ def _controlled_result_status(report: dict, status: str) -> str:
     normalized = str(status or "").upper()
     if normalized != "PASSED":
         return normalized
+    if str(report.get("run_type") or "") == "CONTROLLED_ENTRY_V3_POSITION_RUN" and int(report.get("order_count") or 0) > 0:
+        return "PASSED_POSITION_TRADE"
     return "PASSED_TRADE" if int(report.get("order_count") or 0) > 0 else "PASS_IDLE"
 
 

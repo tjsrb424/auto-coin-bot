@@ -12,6 +12,7 @@ from app import database
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE,
     DRY_RUN_CONFIRMATION_PHRASE,
+    ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
     ENTRY_V3_WATCH_CONFIRMATION_PHRASE,
     TRADE_PROBE_CONFIRMATION_PHRASE,
     _diagnose_signal_decision,
@@ -25,10 +26,12 @@ from app.controlled_auto_live import (
     _select_controlled_entry_v3_watch_candidate,
     _threshold_adjustment_report,
     run_controlled_entry_v3_watch,
+    run_controlled_entry_v3_position_run,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
     run_controlled_trade_probe,
     start_controlled_entry_v3_watch_job,
+    start_controlled_entry_v3_position_run_job,
     start_controlled_auto_live_job,
 )
 
@@ -843,6 +846,177 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
                 runtime_seconds=900,
                 scan_interval_seconds=60,
                 confirmation=ENTRY_V3_WATCH_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+            await asyncio.sleep(0.1)
+
+        self.assertEqual(first["status"], "STARTING")
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["status"], "ABORTED")
+        final = _controlled_jobs[first["controlled_run_id"]]
+        self.assertEqual(final["status"], "PASS_IDLE")
+
+    async def test_entry_v3_position_run_buys_holds_and_exits_on_take_profit(self) -> None:
+        broker = AsyncMock()
+        broker.list_open_orders.return_value = {"orders": []}
+        broker.place_order.side_effect = [
+            {"uuid": "C0101000003129835901", "market": "KRW-BTC", "side": "bid"},
+            {"uuid": "C0101000003129835902", "market": "KRW-BTC", "side": "ask"},
+        ]
+
+        async def reconcile(log: dict, source: str) -> SimpleNamespace:
+            side = str(log["side"]).upper()
+            order_uuid = str(log["order_uuid"])
+            volume = 0.000066
+            amount = 6000.0 if side == "BUY" else 6050.0
+            fee = 3.0 if side == "BUY" else 3.025
+            database.update_live_order_log(
+                str(log["request_id"]),
+                {
+                    "status": "FILLED",
+                    "risk_result": "CONTROLLED_ENTRY_V3_POSITION_FILLED",
+                    "exchange_response_payload": {
+                        "uuid": order_uuid,
+                        "client_order_id": log["client_order_id"],
+                        "market": "KRW-BTC",
+                        "side": "bid" if side == "BUY" else "ask",
+                        "price": str(amount / volume),
+                        "executed_volume": str(volume),
+                        "executed_funds": str(amount),
+                        "paid_fee": str(fee),
+                        "created_at": "2026-06-26T17:00:00+09:00",
+                        "trades": [
+                            {
+                                "uuid": f"{order_uuid}-fill",
+                                "price": str(amount / volume),
+                                "volume": str(volume),
+                                "funds": str(amount),
+                                "fee": str(fee),
+                                "created_at": "2026-06-26T17:00:00+09:00",
+                            }
+                        ],
+                    },
+                    "executed_volume": volume,
+                    "remaining_volume": 0,
+                    "filled_amount_krw": amount,
+                    "paid_fee": fee,
+                },
+            )
+            return SimpleNamespace(
+                status="FILLED",
+                executed_volume=volume,
+                remaining_volume=0.0,
+                filled_amount_krw=amount,
+                paid_fee=fee,
+                raw={},
+            )
+
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+        scan = {
+            "evaluated_at_utc": "2026-06-26T00:00:00Z",
+            "diagnostics": [],
+            "summary": {},
+            "priority": ["ETH:15m", "BTC:15m", "ETH:5m", "BTC:5m"],
+            "selected_candidate": {
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "strategy_name": "controlled_entry_v3",
+                "timeframe": "5m",
+                "signal_side": "BUY",
+                "signal_state": "TRADE_CANDIDATE",
+                "expected_edge_after_cost": 0.007,
+                "estimated_total_cost_rate": 0.005,
+                "signal_score": 82.0,
+                "trade_candidate_reason": "5m_pullback_rebound+positive_edge_after_cost",
+                "entry_price": 90_909_090.9,
+            },
+        }
+        with (
+            patch.dict("os.environ", {"MIN_LIVE_ORDER_KRW": "5000"}, clear=False),
+            patch("app.controlled_auto_live.POSITION_RUN_MIN_HOLD_SECONDS", 0),
+            patch("app.controlled_auto_live.get_live_broker", return_value=broker),
+            patch("app.controlled_auto_live._full_auto_live_disabled", return_value=True),
+            patch("app.controlled_auto_live._runtime_guards_pass", return_value=True),
+            patch("app.controlled_auto_live._current_equity", side_effect=[263_000.0, 263_044.975]),
+            patch("app.controlled_auto_live._open_order_count", return_value=0),
+            patch("app.controlled_auto_live._scan_controlled_entry_v3_watch", return_value=scan),
+            patch("app.controlled_auto_live._orderbook_quote", return_value={"best_ask": 91_000_000.0, "best_bid": 91_666_666.7}),
+            patch("app.controlled_auto_live.reconcile_order_log", side_effect=reconcile),
+        ):
+            result = await run_controlled_entry_v3_position_run(
+                confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+                runtime_seconds=900,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+            )
+
+        self.assertEqual(result["controlled_auto_live_status"], "PASSED_POSITION_TRADE", result.get("pass_fail_reasons"))
+        self.assertEqual(result["run_type"], "CONTROLLED_ENTRY_V3_POSITION_RUN")
+        self.assertEqual(result["selected_symbol"], "BTC")
+        self.assertEqual(result["selected_timeframe"], "5m")
+        self.assertEqual(result["order_count"], 2)
+        self.assertEqual(result["buy_filled_count"], 1)
+        self.assertEqual(result["sell_filled_count"], 1)
+        self.assertEqual(result["exit_reason"], "TAKE_PROFIT")
+        self.assertGreater(result["entry_price"], 0)
+        self.assertGreater(result["exit_price"], 0)
+        self.assertEqual(result["exchange_fill_count"], result["ledger_fill_count"])
+        self.assertEqual(result["missing_ledger_fill_count"], 0)
+        self.assertEqual(result["duplicate_fill_count"], 0)
+        self.assertEqual(result["open_order_count_after"], 0)
+        self.assertEqual(broker.place_order.await_count, 2)
+
+    async def test_entry_v3_position_run_job_blocks_duplicate_active_run(self) -> None:
+        async def fake_run(**kwargs):
+            await asyncio.sleep(0.05)
+            return {
+                "controlled_run_id": kwargs["controlled_run_id"],
+                "controlled_auto_live_status": "PASS_IDLE",
+                "completed_at_utc": "2026-06-26T00:15:00Z",
+                "order_count": 0,
+                "final_runtime_status": "STOPPED",
+            }
+
+        current_epoch = {
+            "current_epoch_sanity_passed": True,
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+            "current_epoch_total_pnl": 0.0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+        with patch("app.controlled_auto_live.run_controlled_entry_v3_position_run", side_effect=fake_run):
+            first = await start_controlled_entry_v3_position_run_job(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                runtime_seconds=900,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+                confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+            second = await start_controlled_entry_v3_position_run_job(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                runtime_seconds=900,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+                confirmation=ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE,
                 controlled_gate=gate,
                 current_epoch=current_epoch,
             )
