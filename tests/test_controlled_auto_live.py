@@ -1337,6 +1337,31 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         )
         with database.get_connection() as conn:
             conn.execute("UPDATE controlled_run_reports SET status = 'STOPPED' WHERE run_id = 'posloop-stale-status'")
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-stop-requested",
+                "loop_run_id": "posloop-stop-requested",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "STOPPED",
+                "technical_result": "FAILED",
+                "profitability_result": "NOT_EVALUATED",
+                "started_at_utc": "2026-06-29T09:18:46Z",
+                "completed_at_utc": "2026-06-29T09:22:48Z",
+                "pass_fail_reasons": ["CONTROLLED_ENTRY_V3_POSITION_STOP_REQUESTED"],
+                "trade_count": 0,
+                "order_count": 0,
+                "exchange_fill_count": 0,
+                "ledger_fill_count": 0,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "current_epoch_accounting_pending_count": 0,
+                "current_epoch_accounting_failed_count": 0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
         current_epoch = {
             "current_epoch_exists": True,
             "current_epoch_id": "epoch-controlled",
@@ -1366,6 +1391,7 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(gate["protected_session_start_allowed"], gate["protected_full_auto_live_blockers"])
         self.assertTrue(gate["protected_full_auto_live_allowed"], gate["protected_full_auto_live_blockers"])
         self.assertEqual(gate["protected_full_auto_live_blockers"], [])
+        self.assertEqual(gate["last_controlled_position_loop_run"]["run_id"], "posloop-stale-status")
         self.assertEqual(gate["last_controlled_position_loop_run"]["persisted_status"], "STOPPED")
 
     def test_protected_full_auto_blocks_pass_idle_with_loop_safety_error(self) -> None:

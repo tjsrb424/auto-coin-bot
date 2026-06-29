@@ -423,20 +423,61 @@ def persist_controlled_run_report(report: dict) -> None:
 
 def latest_controlled_position_loop_run() -> dict:
     with get_connection() as conn:
-        row = conn.execute(
+        rows = conn.execute(
             """
             SELECT *
             FROM controlled_run_reports
             WHERE run_type = 'CONTROLLED_POSITION_LOOP'
             ORDER BY completed_at_utc DESC, id DESC
-            LIMIT 1
+            LIMIT 20
             """
-        ).fetchone()
-    if not row:
+        ).fetchall()
+    if not rows:
         return {"present": False, "status": "MISSING"}
-    item = dict(row)
-    report = _safe_json_loads(item.get("report_json"), {})
+
+    selected: dict[str, Any] | None = None
+    selected_report: dict[str, Any] = {}
+    for row in rows:
+        item = dict(row)
+        report = _safe_json_loads(item.get("report_json"), {})
+        status = str(report.get("controlled_auto_live_status") or item.get("status") or "").upper()
+        if _is_ignorable_position_loop_stop_request(status, report):
+            continue
+        selected = item
+        selected_report = report
+        break
+    if selected is None:
+        selected = dict(rows[0])
+        selected_report = _safe_json_loads(selected.get("report_json"), {})
+
+    item = selected
+    report = selected_report
     status = str(report.get("controlled_auto_live_status") or item.get("status") or "").upper()
+    return _position_loop_run_summary(item, report, status)
+
+
+def _is_ignorable_position_loop_stop_request(status: str, report: dict) -> bool:
+    if status != "STOPPED":
+        return False
+    reasons = {str(reason) for reason in (report.get("pass_fail_reasons") or [])}
+    if reasons != {"CONTROLLED_ENTRY_V3_POSITION_STOP_REQUESTED"}:
+        return False
+    return (
+        int(report.get("trade_count") or 0) == 0
+        and int(report.get("order_count") or 0) == 0
+        and int(report.get("exchange_fill_count") or 0) == 0
+        and int(report.get("ledger_fill_count") or 0) == 0
+        and int(report.get("missing_ledger_fill_count") or 0) == 0
+        and int(report.get("duplicate_fill_count") or 0) == 0
+        and abs(_float(report.get("fee_diff"))) <= FEE_TOLERANCE_KRW
+        and (report.get("equity_diff_after") is None or abs(_float(report.get("equity_diff_after"))) <= EQUITY_TOLERANCE_KRW)
+        and int(report.get("current_epoch_accounting_pending_count") or 0) == 0
+        and int(report.get("current_epoch_accounting_failed_count") or 0) == 0
+        and int(report.get("open_order_count_after") or 0) == 0
+    )
+
+
+def _position_loop_run_summary(item: dict, report: dict, status: str) -> dict:
     return {
         "present": True,
         "run_id": item.get("run_id"),
