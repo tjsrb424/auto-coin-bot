@@ -13,9 +13,12 @@ from app.controlled_auto_live import (
     CONFIRMATION_PHRASE,
     DRY_RUN_CONFIRMATION_PHRASE,
     TRADE_PROBE_CONFIRMATION_PHRASE,
+    _diagnose_signal_decision,
     _controlled_jobs,
     _finalize_after_orders,
     _ma_cross_decision,
+    _summarize_signal_diagnostics,
+    _threshold_adjustment_report,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
     run_controlled_trade_probe,
@@ -385,6 +388,116 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "ABORTED")
         final = _controlled_jobs[first["controlled_run_id"]]
         self.assertEqual(final["status"], "PASS_IDLE")
+
+    def test_signal_diagnostics_records_no_signal_blockers(self) -> None:
+        ma = _diagnose_signal_decision(
+            {
+                "symbol": "BTC",
+                "strategy": "ma_cross",
+                "signal": "HOLD",
+                "expected_edge_rate": 0.001,
+                "min_expected_edge_rate": 0.006,
+                "estimated_roundtrip_fee_rate": 0.005,
+                "estimated_spread_rate": 0.0001,
+                "estimated_round_trip_cost_rate": 0.0051,
+                "edge_allowed": False,
+                "candle_count": 30,
+            }
+        )
+        smart = _diagnose_signal_decision(
+            {
+                "symbol": "ETH",
+                "strategy": "smart_autonomous",
+                "signal": "HOLD",
+                "expected_edge_rate": 0.001,
+                "min_expected_edge_rate": 0.006,
+                "estimated_roundtrip_fee_rate": 0.005,
+                "estimated_spread_rate": 0.0001,
+                "estimated_round_trip_cost_rate": 0.0051,
+                "edge_allowed": False,
+                "candle_count": 30,
+            }
+        )
+
+        self.assertIn("NO_MA_CROSS_SIGNAL", ma["block_reasons"])
+        self.assertIn("SMART_SCORE_TOO_LOW", smart["block_reasons"])
+        self.assertTrue(ma["blocked"])
+        self.assertTrue(smart["blocked"])
+
+    def test_signal_diagnostics_records_threshold_and_fee_cost_blockers(self) -> None:
+        below_threshold = _diagnose_signal_decision(
+            {
+                "symbol": "BTC",
+                "strategy": "ma_cross",
+                "signal": "BUY",
+                "expected_edge_rate": 0.0055,
+                "min_expected_edge_rate": 0.006,
+                "estimated_roundtrip_fee_rate": 0.004,
+                "estimated_spread_rate": 0.001,
+                "estimated_round_trip_cost_rate": 0.005,
+                "edge_allowed": False,
+            }
+        )
+        below_cost = _diagnose_signal_decision(
+            {
+                "symbol": "BTC",
+                "strategy": "ma_cross",
+                "signal": "BUY",
+                "expected_edge_rate": 0.004,
+                "min_expected_edge_rate": 0.006,
+                "estimated_roundtrip_fee_rate": 0.004,
+                "estimated_spread_rate": 0.001,
+                "estimated_round_trip_cost_rate": 0.005,
+                "edge_allowed": False,
+            }
+        )
+
+        self.assertIn("EXPECTED_EDGE_BELOW_THRESHOLD", below_threshold["block_reasons"])
+        self.assertNotIn("EXPECTED_EDGE_BELOW_FEE_COST", below_threshold["block_reasons"])
+        self.assertIn("EXPECTED_EDGE_BELOW_THRESHOLD", below_cost["block_reasons"])
+        self.assertIn("EXPECTED_EDGE_BELOW_FEE_COST", below_cost["block_reasons"])
+
+    def test_pass_idle_signal_summary_contains_counts_and_block_reasons(self) -> None:
+        diagnostics = [
+            _diagnose_signal_decision(
+                {
+                    "symbol": "BTC",
+                    "strategy": "ma_cross",
+                    "signal": "HOLD",
+                    "expected_edge_rate": 0.001,
+                    "min_expected_edge_rate": 0.006,
+                    "estimated_roundtrip_fee_rate": 0.005,
+                    "estimated_spread_rate": 0.0001,
+                    "estimated_round_trip_cost_rate": 0.0051,
+                    "edge_allowed": False,
+                }
+            )
+        ]
+
+        summary = _summarize_signal_diagnostics(diagnostics)
+
+        self.assertEqual(summary["candidate_signal_count"], 0)
+        self.assertEqual(summary["blocked_signal_count"], 1)
+        self.assertTrue(summary["top_block_reasons"])
+        reason_codes = {item["code"] for item in summary["top_block_reasons"]}
+        self.assertIn("NO_MA_CROSS_SIGNAL", reason_codes)
+        self.assertIn("EXPECTED_EDGE_BELOW_THRESHOLD", reason_codes)
+
+    def test_threshold_adjustment_report_does_not_mutate_operating_threshold(self) -> None:
+        diagnostics = [
+            {
+                "estimated_roundtrip_fee_rate": 0.005,
+                "estimated_spread_rate": 0.0002,
+                "expected_edge_rate": 0.0055,
+                "current_threshold": 0.006,
+            }
+        ]
+
+        report = _threshold_adjustment_report(diagnostics)
+
+        self.assertFalse(report["operating_threshold_changed"])
+        self.assertGreaterEqual(report["safe_min_expected_edge_rate_suggestion"], 0.006)
+        self.assertGreaterEqual(report["aggressive_min_expected_edge_rate_suggestion"], report["observed_roundtrip_cost_rate"])
 
 
 if __name__ == "__main__":

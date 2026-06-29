@@ -231,6 +231,9 @@ async def run_controlled_auto_live(
         "final_runtime_status": None,
         "pass_fail_reasons": [],
         "tick_reports": [],
+        "signal_diagnostics": [],
+        "signal_summary": {},
+        "threshold_analysis": {},
     }
     try:
         if confirmation != CONFIRMATION_PHRASE:
@@ -267,7 +270,18 @@ async def run_controlled_auto_live(
                 break
 
             if held_position is None:
-                decision = await _select_entry_decision(exchange, symbols, notional)
+                decisions = await _build_entry_decisions(exchange, symbols, notional)
+                diagnostics = _signal_diagnostics_from_decisions(decisions, current_epoch=current_epoch, controlled_gate=controlled_gate)
+                report["signal_diagnostics"].append(
+                    {
+                        "evaluated_at_utc": _utc_now(),
+                        "diagnostics": diagnostics,
+                        "summary": _summarize_signal_diagnostics(diagnostics),
+                    }
+                )
+                report["signal_summary"] = _summarize_signal_diagnostics(diagnostics)
+                report["threshold_analysis"] = _threshold_adjustment_report(diagnostics)
+                decision = _select_best_decision(decisions)
                 report["tick_reports"].append(decision)
                 if decision.get("signal") == "BUY" and decision.get("edge_allowed"):
                     buy = await _submit_and_wait_controlled(
@@ -924,7 +938,36 @@ async def run_controlled_auto_live_dry_run_force_buy(
         return _finalize(report, "FAILED", [f"CONTROLLED_DRY_RUN_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"])
 
 
-async def _select_entry_decision(exchange: str, symbols: list[str], notional: float) -> dict:
+async def build_controlled_signal_diagnostics(
+    *,
+    exchange: str = "bithumb",
+    symbols: list[str] | None = None,
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    current_epoch: dict | None = None,
+    controlled_gate: dict | None = None,
+) -> dict:
+    exchange = (exchange or "bithumb").lower()
+    symbols = [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])]
+    symbols = [symbol for symbol in symbols if symbol in ALLOWED_SYMBOLS and symbol not in BLOCKED_SYMBOLS]
+    notional = min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW)
+    decisions = await _build_entry_decisions(exchange, symbols, notional)
+    diagnostics = _signal_diagnostics_from_decisions(decisions, current_epoch=current_epoch, controlled_gate=controlled_gate)
+    summary = _summarize_signal_diagnostics(diagnostics)
+    threshold_analysis = _threshold_adjustment_report(diagnostics)
+    return {
+        "ok": True,
+        "exchange": exchange,
+        "symbols": symbols,
+        "amount_krw": notional,
+        "generated_at_utc": _utc_now(),
+        "diagnostics": diagnostics,
+        "signal_summary": summary,
+        "threshold_analysis": threshold_analysis,
+        "recommended_next_plan": _recommended_next_plan(summary, threshold_analysis),
+    }
+
+
+async def _build_entry_decisions(exchange: str, symbols: list[str], notional: float) -> list[dict]:
     decisions = []
     for symbol in symbols:
         market = f"KRW-{symbol}"
@@ -935,6 +978,15 @@ async def _select_entry_decision(exchange: str, symbols: list[str], notional: fl
         smart_decision = await _smart_autonomous_decision(symbol, market, candles, quote, notional)
         decisions.append(smart_decision)
     decisions.sort(key=lambda item: _float(item.get("expected_edge_rate")), reverse=True)
+    return decisions
+
+
+async def _select_entry_decision(exchange: str, symbols: list[str], notional: float) -> dict:
+    return _select_best_decision(await _build_entry_decisions(exchange, symbols, notional))
+
+
+def _select_best_decision(decisions: list[dict]) -> dict:
+    decisions = sorted(decisions, key=lambda item: _float(item.get("expected_edge_rate")), reverse=True)
     return decisions[0] if decisions else {"signal": "HOLD", "reason": "NO_DECISION"}
 
 
@@ -986,18 +1038,23 @@ def _ma_cross_decision(symbol: str, market: str, candles: list[dict], quote: dic
     ma_gap_rate = ((float(ma5) - float(ma20)) / last) if ma5 and ma20 and last > 0 else 0.0
     recent_return_rate = ((float(close.iloc[-1]) - float(close.iloc[-6])) / float(close.iloc[-6])) if close is not None and len(close) >= 6 and float(close.iloc[-6]) > 0 else 0.0
     expected_edge = max(ma_gap_rate, recent_return_rate)
-    cost = _round_trip_cost_rate(quote)
+    costs = _cost_components(quote)
+    cost = costs["estimated_round_trip_cost_rate"]
     edge_allowed = latest.get("signal") == "BUY" and expected_edge >= max(MIN_EXPECTED_EDGE_RATE, cost * 1.25)
     return {
         "symbol": symbol,
         "market": market,
         "strategy": "ma_cross",
+        "candle_count": len(candles),
+        "last_candle_at_utc": (latest_completed_candle(candles, 1) or (candles[-1] if candles else {})).get("candle_time_utc"),
         "signal": latest.get("signal"),
         "reason": latest.get("reason") or "MA_CROSS_HOLD",
         "entry_price": quote.get("best_ask"),
         "expected_edge_rate": expected_edge,
         "min_expected_edge_rate": MIN_EXPECTED_EDGE_RATE,
         "estimated_round_trip_cost_rate": cost,
+        "estimated_roundtrip_fee_rate": costs["estimated_roundtrip_fee_rate"],
+        "estimated_spread_rate": costs["estimated_spread_rate"],
         "edge_allowed": edge_allowed,
         "blocker": None if edge_allowed else "BLOCKED_EXPECTED_EDGE_BELOW_COST",
         "notional_krw": notional,
@@ -1020,18 +1077,23 @@ async def _smart_autonomous_decision(symbol: str, market: str, candles: list[dic
     confidence = _float((snapshot or {}).get("confidence_score"))
     action_hint = str((snapshot or {}).get("action_hint") or "WAIT")
     expected_edge = max(recent_return_rate, confidence / 10000.0)
-    cost = _round_trip_cost_rate(quote)
+    costs = _cost_components(quote)
+    cost = costs["estimated_round_trip_cost_rate"]
     edge_allowed = action_hint in {"BUY_MORE", "ENTER", "INCREASE"} and expected_edge >= max(MIN_EXPECTED_EDGE_RATE, cost * 1.25)
     return {
         "symbol": symbol,
         "market": market,
         "strategy": "smart_autonomous",
+        "candle_count": len(candles),
+        "last_candle_at_utc": latest.get("candle_time_utc"),
         "signal": "BUY" if action_hint in {"BUY_MORE", "ENTER", "INCREASE"} else "HOLD",
         "reason": f"smart_action={action_hint}",
         "entry_price": quote.get("best_ask"),
         "expected_edge_rate": expected_edge,
         "min_expected_edge_rate": MIN_EXPECTED_EDGE_RATE,
         "estimated_round_trip_cost_rate": cost,
+        "estimated_roundtrip_fee_rate": costs["estimated_roundtrip_fee_rate"],
+        "estimated_spread_rate": costs["estimated_spread_rate"],
         "edge_allowed": edge_allowed,
         "blocker": None if edge_allowed else "BLOCKED_EXPECTED_EDGE_BELOW_COST",
         "confidence_score": confidence,
@@ -1348,12 +1410,222 @@ def _full_auto_live_disabled() -> bool:
     return True
 
 
-def _round_trip_cost_rate(quote: dict) -> float:
+def _signal_diagnostics_from_decisions(
+    decisions: list[dict],
+    *,
+    current_epoch: dict | None = None,
+    controlled_gate: dict | None = None,
+) -> list[dict]:
+    return [
+        _diagnose_signal_decision(decision, current_epoch=current_epoch, controlled_gate=controlled_gate)
+        for decision in decisions
+    ]
+
+
+def _diagnose_signal_decision(
+    decision: dict,
+    *,
+    current_epoch: dict | None = None,
+    controlled_gate: dict | None = None,
+) -> dict:
+    symbol = str(decision.get("symbol") or "").upper()
+    strategy = str(decision.get("strategy") or "")
+    signal_side = str(decision.get("signal") or "NONE").upper()
+    expected_edge = _float(decision.get("expected_edge_rate"))
+    min_edge = _float(decision.get("min_expected_edge_rate"), MIN_EXPECTED_EDGE_RATE)
+    fee_rate = _float(decision.get("estimated_roundtrip_fee_rate"))
+    spread_rate = _float(decision.get("estimated_spread_rate"))
+    total_cost = _float(decision.get("estimated_round_trip_cost_rate"), fee_rate + spread_rate)
+    expected_after_cost = expected_edge - total_cost
+    risk_blockers: list[str] = []
+    block_reasons: list[str] = []
+
+    if symbol not in ALLOWED_SYMBOLS:
+        block_reasons.append("SYMBOL_NOT_ALLOWED")
+    if symbol in BLOCKED_SYMBOLS:
+        block_reasons.append("SYMBOL_NOT_ALLOWED")
+    if strategy in CONTROLLED_BLOCKED_STRATEGIES or strategy not in CONTROLLED_ALLOWED_STRATEGIES:
+        block_reasons.append("STRATEGY_BLOCKED")
+    if current_epoch is not None:
+        if not current_epoch.get("current_epoch_sanity_passed", True):
+            risk_blockers.append("ACCOUNTING_GATE_BLOCKED")
+        if int(current_epoch.get("current_epoch_accounting_pending_count") or 0) > 0:
+            risk_blockers.append("ACCOUNTING_GATE_BLOCKED")
+        if int(current_epoch.get("current_epoch_accounting_failed_count") or 0) > 0:
+            risk_blockers.append("ACCOUNTING_GATE_BLOCKED")
+    if controlled_gate is not None and not controlled_gate.get("controlled_auto_live_allowed", True):
+        risk_blockers.extend(
+            str(item.get("code") or "RISK_BLOCKED")
+            for item in (controlled_gate.get("controlled_auto_live_blockers") or [])
+        )
+    if risk_blockers:
+        block_reasons.append("RISK_BLOCKED")
+        if "ACCOUNTING_GATE_BLOCKED" in risk_blockers:
+            block_reasons.append("ACCOUNTING_GATE_BLOCKED")
+
+    if strategy == "ma_cross" and signal_side != "BUY":
+        block_reasons.append("NO_MA_CROSS_SIGNAL")
+    if strategy == "smart_autonomous" and signal_side != "BUY":
+        block_reasons.append("SMART_SCORE_TOO_LOW")
+    if expected_edge < min_edge:
+        block_reasons.append("EXPECTED_EDGE_BELOW_THRESHOLD")
+    if expected_edge < total_cost:
+        block_reasons.append("EXPECTED_EDGE_BELOW_FEE_COST")
+    if spread_rate > max(0.003, expected_edge):
+        block_reasons.append("SPREAD_TOO_WIDE")
+    if signal_side == "BUY" and not block_reasons and not decision.get("edge_allowed"):
+        block_reasons.append("UNKNOWN")
+
+    block_reasons = list(dict.fromkeys(block_reasons))
+    risk_blockers = list(dict.fromkeys(risk_blockers))
+    recommended_threshold = max(min_edge, total_cost * 1.25)
+    would_order_if_threshold_relaxed = (
+        signal_side == "BUY"
+        and not risk_blockers
+        and symbol in ALLOWED_SYMBOLS
+        and symbol not in BLOCKED_SYMBOLS
+        and strategy in CONTROLLED_ALLOWED_STRATEGIES
+        and expected_edge >= total_cost
+        and expected_edge < min_edge
+    )
+    return {
+        "symbol": symbol,
+        "strategy_name": strategy,
+        "candle_count": int(decision.get("candle_count") or 0),
+        "last_candle_at_utc": decision.get("last_candle_at_utc"),
+        "signal_generated": signal_side in {"BUY", "SELL"},
+        "signal_side": signal_side if signal_side in {"BUY", "SELL", "HOLD"} else "NONE",
+        "signal_score": _float(decision.get("confidence_score"), expected_edge),
+        "expected_edge_rate": expected_edge,
+        "min_expected_edge_rate": min_edge,
+        "estimated_roundtrip_fee_rate": fee_rate,
+        "estimated_spread_rate": spread_rate,
+        "expected_edge_after_cost": expected_after_cost,
+        "blocked": bool(block_reasons) or not bool(decision.get("edge_allowed")),
+        "block_reasons": block_reasons or ([] if decision.get("edge_allowed") else ["UNKNOWN"]),
+        "would_order_if_threshold_relaxed": would_order_if_threshold_relaxed,
+        "recommended_threshold": recommended_threshold,
+        "current_threshold": min_edge,
+        "risk_allowed": not risk_blockers,
+        "risk_blockers": risk_blockers,
+        "raw_reason": decision.get("reason"),
+    }
+
+
+def _summarize_signal_diagnostics(diagnostics: list[dict]) -> dict:
+    symbols = {str(item.get("symbol") or "") for item in diagnostics if item.get("symbol")}
+    strategies = {str(item.get("strategy_name") or "") for item in diagnostics if item.get("strategy_name")}
+    candidate_signals = [item for item in diagnostics if item.get("signal_generated")]
+    blocked_signals = [item for item in diagnostics if item.get("blocked")]
+    near_misses = [item for item in diagnostics if item.get("would_order_if_threshold_relaxed")]
+    reason_counts: dict[str, int] = {}
+    for item in diagnostics:
+        for reason in item.get("block_reasons") or []:
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+    closest = None
+    for item in diagnostics:
+        gap = _float(item.get("current_threshold")) - _float(item.get("expected_edge_rate"))
+        score = abs(gap)
+        if closest is None or score < closest["_score"]:
+            closest = {**item, "_gap": gap, "_score": score}
+    summary = {
+        "evaluated_symbol_count": len(symbols),
+        "evaluated_strategy_count": len(strategies),
+        "candidate_signal_count": len(candidate_signals),
+        "blocked_signal_count": len(blocked_signals),
+        "near_miss_signal_count": len(near_misses),
+        "top_block_reasons": [
+            {"code": code, "count": count}
+            for code, count in sorted(reason_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:10]
+        ],
+        "closest_candidate": None,
+        "closest_candidate_expected_edge_rate": None,
+        "closest_candidate_threshold": None,
+        "closest_candidate_gap": None,
+        "recommended_next_action": "WAIT_FOR_SIGNAL",
+    }
+    if closest is not None:
+        summary.update(
+            {
+                "closest_candidate": {
+                    "symbol": closest.get("symbol"),
+                    "strategy_name": closest.get("strategy_name"),
+                    "signal_side": closest.get("signal_side"),
+                    "block_reasons": closest.get("block_reasons"),
+                },
+                "closest_candidate_expected_edge_rate": closest.get("expected_edge_rate"),
+                "closest_candidate_threshold": closest.get("current_threshold"),
+                "closest_candidate_gap": closest["_gap"],
+            }
+        )
+    if any("RISK_BLOCKED" in (item.get("block_reasons") or []) or "ACCOUNTING_GATE_BLOCKED" in (item.get("block_reasons") or []) for item in diagnostics):
+        summary["recommended_next_action"] = "RISK_BLOCKER_FIX_REQUIRED"
+    elif near_misses:
+        summary["recommended_next_action"] = "LOWER_THRESHOLD_SLIGHTLY"
+    elif diagnostics and all(_float(item.get("expected_edge_after_cost")) < 0 for item in diagnostics):
+        summary["recommended_next_action"] = "COST_TOO_HIGH_FOR_CURRENT_TIMEFRAME"
+    elif not candidate_signals:
+        summary["recommended_next_action"] = "STRATEGY_TOO_INACTIVE"
+    else:
+        summary["recommended_next_action"] = "KEEP_THRESHOLDS"
+    return summary
+
+
+def _threshold_adjustment_report(diagnostics: list[dict]) -> dict:
+    current = MIN_EXPECTED_EDGE_RATE
+    costs = [_float(item.get("estimated_roundtrip_fee_rate")) + _float(item.get("estimated_spread_rate")) for item in diagnostics]
+    observed_cost = max(costs) if costs else 0.0
+    return {
+        "current_min_expected_edge_rate": current,
+        "observed_roundtrip_cost_rate": observed_cost,
+        "safe_min_expected_edge_rate_suggestion": max(current, observed_cost * 1.25),
+        "aggressive_min_expected_edge_rate_suggestion": max(observed_cost * 1.05, observed_cost, 0.005),
+        "risk_note": "Do not lower live thresholds below observed round-trip fee plus spread cost; for 6000 KRW probes this cost has been about 0.5%.",
+        "operating_threshold_changed": False,
+    }
+
+
+def _recommended_next_plan(summary: dict, threshold_analysis: dict) -> dict:
+    action = str(summary.get("recommended_next_action") or "WAIT_FOR_SIGNAL")
+    if action == "LOWER_THRESHOLD_SLIGHTLY":
+        plan = "B"
+        reason = "Near-miss BUY signal exists and expected edge remains above observed cost."
+    elif action == "STRATEGY_TOO_INACTIVE":
+        plan = "C"
+        reason = "No candidate BUY signal was generated by the allowed strategies."
+    elif action == "COST_TOO_HIGH_FOR_CURRENT_TIMEFRAME":
+        plan = "D"
+        reason = "Expected edge is below fee and spread cost."
+    elif action == "RISK_BLOCKER_FIX_REQUIRED":
+        plan = "D"
+        reason = "Risk or accounting gate blocks controlled execution."
+    else:
+        plan = "A"
+        reason = "Thresholds are appropriate; wait for a natural signal."
+    return {
+        "plan": plan,
+        "reason": reason,
+        "recommended_next_action": action,
+        "threshold_change_required": False,
+        "suggested_threshold": threshold_analysis.get("safe_min_expected_edge_rate_suggestion"),
+    }
+
+
+def _cost_components(quote: dict, *, exchange: str = "bithumb") -> dict:
     bid = _float(quote.get("best_bid"))
     ask = _float(quote.get("best_ask"))
     mid = (bid + ask) / 2 if bid > 0 and ask > 0 else ask
     spread_rate = ((ask - bid) / mid) if mid > 0 else 0.0
-    return spread_rate + (2 * LiveTradingConfig.for_exchange("bithumb").fee_rate)
+    fee_rate = 2 * LiveTradingConfig.for_exchange(exchange).fee_rate
+    return {
+        "estimated_roundtrip_fee_rate": fee_rate,
+        "estimated_spread_rate": spread_rate,
+        "estimated_round_trip_cost_rate": spread_rate + fee_rate,
+    }
+
+
+def _round_trip_cost_rate(quote: dict) -> float:
+    return _cost_components(quote)["estimated_round_trip_cost_rate"]
 
 
 def _ledger_rows_for_order_uuids(order_uuids: list[str]) -> list[dict]:

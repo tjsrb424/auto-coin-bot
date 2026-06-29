@@ -145,6 +145,7 @@ from app.controlled_auto_live import (
     CONFIRMATION_PHRASE as CONTROLLED_AUTO_LIVE_CONFIRMATION,
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
     TRADE_PROBE_CONFIRMATION_PHRASE as CONTROLLED_TRADE_PROBE_CONFIRMATION,
+    build_controlled_signal_diagnostics,
     controlled_auto_live_job_status,
     controlled_auto_live_gate,
     run_controlled_auto_live,
@@ -2918,6 +2919,44 @@ async def controlled_auto_live_preflight(
         "open_order_audit": open_order_audit,
         "controlled_auto_live_gate": gate,
         "required_confirmation": CONTROLLED_AUTO_LIVE_CONFIRMATION,
+    }
+
+
+@app.get("/api/controlled-auto-live/signal-diagnostics")
+async def controlled_auto_live_signal_diagnostics(
+    exchange: str = Query("bithumb", pattern=r"^(bithumb)$"),
+    amount_krw: float = Query(6000, gt=0, le=6000),
+    symbols: str = Query("BTC,ETH"),
+) -> dict:
+    requested_symbols = [item.strip().upper() for item in str(symbols or "").split(",") if item.strip()]
+    requested_symbols = [symbol for symbol in requested_symbols if symbol in {"BTC", "ETH"}]
+    asset = await _asset_reconciliation_from_exchange(exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=exchange,
+        symbol="BTC",
+        strategy_name="controlled_auto_live_signal_diagnostics",
+        amount_krw=amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
+    report = await build_controlled_signal_diagnostics(
+        exchange=exchange,
+        symbols=requested_symbols or ["BTC", "ETH"],
+        amount_krw=amount_krw,
+        current_epoch=current_epoch,
+        controlled_gate=gate,
+    )
+    return {
+        **report,
+        "current_epoch": current_epoch,
+        "controlled_auto_live_gate": gate,
+        "open_order_audit": open_order_audit,
     }
 
 
