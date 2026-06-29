@@ -49,12 +49,22 @@ CONTROLLED_BLOCKED_STRATEGIES = {"rsi"}
 MAX_ORDERS = 5
 MAX_OPEN_POSITIONS = 1
 DEFAULT_RUNTIME_SECONDS = 600
-MAX_RUNTIME_SECONDS = 900
+MAX_RUNTIME_SECONDS = 1800
 TICK_INTERVAL_SECONDS = 60
 MIN_EXPECTED_EDGE_RATE = 0.006
 DRY_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED DRY RUN FORCE BUY"
 
 logger = logging.getLogger("uvicorn.error")
+
+_controlled_jobs: dict[str, dict[str, Any]] = {}
+_controlled_job_lock: asyncio.Lock | None = None
+
+
+def _job_lock() -> asyncio.Lock:
+    global _controlled_job_lock
+    if _controlled_job_lock is None:
+        _controlled_job_lock = asyncio.Lock()
+    return _controlled_job_lock
 
 
 def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exchange: str = "bithumb") -> dict:
@@ -163,6 +173,8 @@ async def run_controlled_auto_live(
     confirmation: str,
     controlled_gate: dict | None = None,
     current_epoch: dict | None = None,
+    controlled_run_id: str | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> dict:
     exchange = (exchange or "bithumb").lower()
     symbols = [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])]
@@ -170,7 +182,7 @@ async def run_controlled_auto_live(
     runtime_seconds = min(max(int(runtime_seconds), 600), MAX_RUNTIME_SECONDS)
     notional = min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW)
     started_at = _utc_now()
-    run_id = f"controlled-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+    run_id = controlled_run_id or f"controlled-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
     report: dict[str, Any] = {
         "controlled_run_id": run_id,
         "controlled_auto_live_status": "FAILED",
@@ -243,6 +255,8 @@ async def run_controlled_auto_live(
         ordered_logs: list[dict] = []
         deadline = asyncio.get_running_loop().time() + runtime_seconds
         while asyncio.get_running_loop().time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["CONTROLLED_AUTO_STOP_REQUESTED"], before_equity, controlled_gate)
             open_blocker = await _open_order_blocker(exchange, symbols)
             if open_blocker:
                 return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", [open_blocker], before_equity, controlled_gate)
@@ -313,6 +327,8 @@ async def run_controlled_auto_live(
                     held_position = None
                     break
             await asyncio.sleep(min(TICK_INTERVAL_SECONDS, max(deadline - asyncio.get_running_loop().time(), 0)))
+            if stop_event is not None and stop_event.is_set():
+                return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", ["CONTROLLED_AUTO_STOP_REQUESTED"], before_equity, controlled_gate)
         if held_position is not None and int(report["order_count"]) < MAX_ORDERS:
             quote = await _orderbook_quote(exchange, held_position["market"])
             sell = await _submit_and_wait_controlled(
@@ -341,6 +357,133 @@ async def run_controlled_auto_live(
         return await _finalize_after_orders(report, exchange, ordered_logs, "PASSED", [], before_equity, controlled_gate)
     except Exception as exc:
         return _finalize(report, "FAILED", [f"CONTROLLED_AUTO_EXCEPTION:{exc.__class__.__name__}:{str(exc)[:160]}"], controlled_gate=controlled_gate)
+
+
+async def start_controlled_auto_live_job(
+    *,
+    exchange: str = "bithumb",
+    symbols: list[str] | None = None,
+    amount_krw: float = MAX_NOTIONAL_KRW,
+    runtime_seconds: int = DEFAULT_RUNTIME_SECONDS,
+    confirmation: str,
+    controlled_gate: dict,
+    current_epoch: dict,
+) -> dict:
+    async with _job_lock():
+        active = _active_controlled_job_locked()
+        if active is not None:
+            return {
+                "ok": False,
+                "status": "ABORTED",
+                "message": "A controlled auto live run is already active.",
+                "active_controlled_run_id": active["controlled_run_id"],
+                "active_status": active["status"],
+            }
+        started_at = _utc_now()
+        run_id = f"controlled-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
+        stop_event = asyncio.Event()
+        job = {
+            "controlled_run_id": run_id,
+            "status": "STARTING",
+            "started_at_utc": started_at,
+            "completed_at_utc": None,
+            "runtime_limit_seconds": min(max(int(runtime_seconds), 600), MAX_RUNTIME_SECONDS),
+            "exchange": exchange,
+            "symbols": [str(symbol).upper() for symbol in (symbols or ["BTC", "ETH"])],
+            "amount_krw": min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW),
+            "report": None,
+            "error": None,
+            "_stop_event": stop_event,
+        }
+        _controlled_jobs[run_id] = job
+        task = asyncio.create_task(
+            _run_controlled_job(
+                run_id=run_id,
+                exchange=exchange,
+                symbols=symbols or ["BTC", "ETH"],
+                amount_krw=amount_krw,
+                runtime_seconds=runtime_seconds,
+                confirmation=confirmation,
+                controlled_gate=controlled_gate,
+                current_epoch=current_epoch,
+                stop_event=stop_event,
+            )
+        )
+        job["_task"] = task
+        return _public_job(job)
+
+
+def controlled_auto_live_job_status(controlled_run_id: str | None = None) -> dict:
+    if controlled_run_id:
+        job = _controlled_jobs.get(controlled_run_id)
+        if job is None:
+            return {"ok": False, "status": "NOT_FOUND", "controlled_run_id": controlled_run_id}
+        return {"ok": True, **_public_job(job)}
+    jobs = [_public_job(job) for job in sorted(_controlled_jobs.values(), key=lambda item: str(item.get("started_at_utc") or ""), reverse=True)]
+    return {"ok": True, "jobs": jobs, "active_job": _public_job(_active_controlled_job_locked()) if _active_controlled_job_locked() else None}
+
+
+async def stop_controlled_auto_live_job(controlled_run_id: str) -> dict:
+    async with _job_lock():
+        job = _controlled_jobs.get(controlled_run_id)
+        if job is None:
+            return {"ok": False, "status": "NOT_FOUND", "controlled_run_id": controlled_run_id}
+        if str(job.get("status") or "").upper() not in {"STARTING", "RUNNING"}:
+            return {"ok": True, **_public_job(job)}
+        stop_event = job.get("_stop_event")
+        if stop_event is not None:
+            stop_event.set()
+        job["stop_requested_at_utc"] = _utc_now()
+        return {"ok": True, **_public_job(job)}
+
+
+async def _run_controlled_job(
+    *,
+    run_id: str,
+    exchange: str,
+    symbols: list[str],
+    amount_krw: float,
+    runtime_seconds: int,
+    confirmation: str,
+    controlled_gate: dict,
+    current_epoch: dict,
+    stop_event: asyncio.Event,
+) -> None:
+    job = _controlled_jobs[run_id]
+    job["status"] = "RUNNING"
+    try:
+        report = await run_controlled_auto_live(
+            exchange=exchange,
+            symbols=symbols,
+            amount_krw=amount_krw,
+            runtime_seconds=runtime_seconds,
+            confirmation=confirmation,
+            controlled_gate=controlled_gate,
+            current_epoch=current_epoch,
+            controlled_run_id=run_id,
+            stop_event=stop_event,
+        )
+        job["report"] = report
+        job["status"] = str(report.get("controlled_auto_live_status") or "FAILED")
+        job["completed_at_utc"] = report.get("completed_at_utc") or _utc_now()
+    except Exception as exc:
+        logger.exception("[controlled-auto-live] job failed run_id=%s", run_id)
+        job["status"] = "FAILED"
+        job["error"] = f"{exc.__class__.__name__}:{str(exc)[:240]}"
+        job["completed_at_utc"] = _utc_now()
+
+
+def _active_controlled_job_locked() -> dict | None:
+    for job in _controlled_jobs.values():
+        if str(job.get("status") or "").upper() in {"STARTING", "RUNNING"}:
+            return job
+    return None
+
+
+def _public_job(job: dict | None) -> dict | None:
+    if job is None:
+        return None
+    return {key: value for key, value in job.items() if not key.startswith("_")}
 
 
 async def run_controlled_auto_live_dry_run_force_buy(
@@ -741,6 +884,7 @@ async def _finalize_after_orders(
     report["runtime_seconds"] = max(0, int((_parse_utc(_utc_now()) - _parse_utc(str(report["started_at_utc"]))).total_seconds()))
     status2, fail_reasons = _pass_fail(report)
     final_status = status if reasons else status2
+    final_status = _controlled_result_status(report, final_status)
     return _finalize(report, final_status, [*reasons, *fail_reasons], controlled_gate=controlled_gate)
 
 
@@ -804,6 +948,13 @@ def _pass_fail(report: dict) -> tuple[str, list[str]]:
     if report["final_runtime_status"] != "STOPPED":
         reasons.append("RUNTIME_NOT_STOPPED")
     return ("PASSED" if not reasons else "STOPPED", reasons)
+
+
+def _controlled_result_status(report: dict, status: str) -> str:
+    normalized = str(status or "").upper()
+    if normalized != "PASSED":
+        return normalized
+    return "PASSED_TRADE" if int(report.get("order_count") or 0) > 0 else "PASS_IDLE"
 
 
 def _finalize(report: dict, status: str, reasons: list[str], *, controlled_gate: dict | None = None) -> dict:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +10,12 @@ from app import database
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE,
     DRY_RUN_CONFIRMATION_PHRASE,
+    _controlled_jobs,
     _finalize_after_orders,
     _ma_cross_decision,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
+    start_controlled_auto_live_job,
 )
 
 
@@ -53,6 +56,7 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def tearDown(self) -> None:
+        _controlled_jobs.clear()
         self.db_patch.stop()
         self.tmp.cleanup()
 
@@ -188,12 +192,88 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
                 None,
             )
 
-        self.assertEqual(result["controlled_auto_live_status"], "PASSED")
+        self.assertEqual(result["controlled_auto_live_status"], "PASS_IDLE")
         self.assertEqual(result["order_count"], 0)
         self.assertEqual(result["run_pnl"], 0.0)
         self.assertEqual(result["account_epoch_pnl_delta"], -100.0)
         self.assertIn("기존 보유자산 평가손익 변화", result["pnl_explanation"])
         self.assertTrue(result["report_notes"])
+
+    async def test_trade_run_is_reported_as_passed_trade(self) -> None:
+        report = {
+            "controlled_run_id": "controlled-test-trade",
+            "controlled_auto_live_status": "FAILED",
+            "started_at_utc": "2026-06-26T00:00:00Z",
+            "order_count": 1,
+            "run_pnl": 0.0,
+            "run_realized_pnl": 0.0,
+            "run_mark_to_market_delta": 0.0,
+            "missing_ledger_fill_count": 0,
+            "duplicate_fill_count": 0,
+            "fee_diff": 0.0,
+            "account_epoch_pnl_before": 0.0,
+            "report_notes": [],
+        }
+
+        with patch("app.controlled_auto_live._current_equity", return_value=263_000.0):
+            result = await _finalize_after_orders(
+                report,
+                "bithumb",
+                [],
+                "PASSED",
+                [],
+                263_000.0,
+                None,
+            )
+
+        self.assertEqual(result["controlled_auto_live_status"], "PASSED_TRADE")
+        self.assertEqual(result["order_count"], 1)
+
+    async def test_async_controlled_job_blocks_duplicate_active_run(self) -> None:
+        async def fake_run(**kwargs):
+            await asyncio.sleep(0.05)
+            return {
+                "controlled_run_id": kwargs["controlled_run_id"],
+                "controlled_auto_live_status": "PASS_IDLE",
+                "completed_at_utc": "2026-06-26T00:10:00Z",
+                "order_count": 0,
+                "final_runtime_status": "STOPPED",
+            }
+
+        current_epoch = {
+            "current_epoch_sanity_passed": True,
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+            "current_epoch_total_pnl": 0.0,
+        }
+        gate = {"controlled_auto_live_allowed": True, "controlled_auto_live_blockers": []}
+        with patch("app.controlled_auto_live.run_controlled_auto_live", side_effect=fake_run):
+            first = await start_controlled_auto_live_job(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                runtime_seconds=600,
+                confirmation=CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+            second = await start_controlled_auto_live_job(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                runtime_seconds=600,
+                confirmation=CONFIRMATION_PHRASE,
+                controlled_gate=gate,
+                current_epoch=current_epoch,
+            )
+            await asyncio.sleep(0.1)
+
+        self.assertEqual(first["status"], "STARTING")
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["status"], "ABORTED")
+        final = _controlled_jobs[first["controlled_run_id"]]
+        self.assertEqual(final["status"], "PASS_IDLE")
 
 
 if __name__ == "__main__":

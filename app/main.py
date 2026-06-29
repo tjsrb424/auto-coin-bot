@@ -144,9 +144,12 @@ from app.accounting_epoch import build_current_epoch_diagnostics, build_open_ord
 from app.controlled_auto_live import (
     CONFIRMATION_PHRASE as CONTROLLED_AUTO_LIVE_CONFIRMATION,
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
+    controlled_auto_live_job_status,
     controlled_auto_live_gate,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
+    start_controlled_auto_live_job,
+    stop_controlled_auto_live_job,
 )
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
 from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
@@ -694,6 +697,14 @@ class ControlledAutoLiveRunRequest(BaseModel):
     symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
     amount_krw: float = Field(6000, gt=0, le=6000)
     runtime_seconds: int = Field(600, ge=600, le=900)
+    confirmation: str = ""
+
+
+class ControlledAutoLiveStartRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    symbols: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    runtime_seconds: int = Field(900, ge=600, le=1800)
     confirmation: str = ""
 
 
@@ -2945,7 +2956,73 @@ async def controlled_auto_live_run_once(payload: ControlledAutoLiveRunRequest) -
         controlled_gate=gate,
         current_epoch=current_epoch,
     )
-    return {"ok": report.get("controlled_auto_live_status") == "PASSED", "report": report}
+    return {"ok": report.get("controlled_auto_live_status") in {"PASS_IDLE", "PASSED_TRADE"}, "report": report}
+
+
+@app.post("/api/controlled-auto-live/start")
+async def controlled_auto_live_start(payload: ControlledAutoLiveStartRequest) -> dict:
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, "BTC")
+    smoke_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="limited_auto_live",
+        amount_krw=payload.amount_krw,
+        current_epoch=current_epoch,
+        open_order_audit=open_order_audit,
+    )
+    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    if payload.confirmation != CONTROLLED_AUTO_LIVE_CONFIRMATION:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled auto live confirmation phrase is required.",
+            "required_confirmation": CONTROLLED_AUTO_LIVE_CONFIRMATION,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    if not gate.get("controlled_auto_live_allowed"):
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Controlled auto live gate is blocked.",
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
+    symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
+    job = await start_controlled_auto_live_job(
+        exchange=payload.exchange,
+        symbols=symbols or ["BTC", "ETH"],
+        amount_krw=payload.amount_krw,
+        runtime_seconds=payload.runtime_seconds,
+        confirmation=payload.confirmation,
+        controlled_gate=gate,
+        current_epoch=current_epoch,
+    )
+    return {
+        **job,
+        "current_epoch": current_epoch,
+        "controlled_auto_live_gate": gate,
+    }
+
+
+@app.get("/api/controlled-auto-live/status/{controlled_run_id}")
+async def controlled_auto_live_status(controlled_run_id: str) -> dict:
+    return controlled_auto_live_job_status(controlled_run_id)
+
+
+@app.get("/api/controlled-auto-live/status")
+async def controlled_auto_live_status_list() -> dict:
+    return controlled_auto_live_job_status()
+
+
+@app.post("/api/controlled-auto-live/stop/{controlled_run_id}")
+async def controlled_auto_live_stop(controlled_run_id: str) -> dict:
+    return await stop_controlled_auto_live_job(controlled_run_id)
 
 
 @app.post("/api/controlled-auto-live/dry-run-force-buy")
