@@ -705,6 +705,16 @@ type TradingDiagnostics = {
   protected_full_auto_live_config?: Record<string, any>;
   protected_full_auto_next_action?: string;
   protected_session_start_allowed?: boolean;
+  protected_full_auto_session_status?: Record<string, any>;
+  runtime_lock_separation?: Record<string, any>;
+  total_open_position_count?: number;
+  legacy_open_position_count?: number;
+  protected_open_position_count?: number;
+  protected_empty_slot_count?: number;
+  allocator_blocked_by_legacy_positions?: boolean;
+  allocator_blocked_by_protected_positions?: boolean;
+  position_classification_counts?: Record<string, number>;
+  open_position_classifications?: Array<Record<string, any>>;
   protected_session_baseline_preview?: Record<string, any>;
   protected_session_hard_blockers?: Array<{ code?: string; count?: number }>;
   protected_session_warnings?: Array<{ code?: string; count?: number }>;
@@ -4064,6 +4074,12 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const protectedSessionRemaining = diagnostics?.protected_session_loss_limit_remaining ?? protectedBaseline?.session_loss_limit_remaining;
   const protectedStartAllowed = diagnostics?.protected_session_start_allowed ?? diagnostics?.protected_full_auto_live_allowed ?? protectedGate?.protected_session_start_allowed ?? false;
   const protectedNextAction = diagnostics?.protected_full_auto_next_action ?? protectedGate?.protected_full_auto_next_action ?? "-";
+  const protectedSessionStatus = diagnostics?.protected_full_auto_session_status ?? protectedGate?.protected_full_auto_session_status ?? {};
+  const runtimeLockSeparation = diagnostics?.runtime_lock_separation ?? protectedGate?.runtime_lock_separation ?? {};
+  const legacyOpenPositionCount = diagnostics?.legacy_open_position_count ?? protectedGate?.legacy_open_position_count ?? 0;
+  const protectedOpenPositionCount = diagnostics?.protected_open_position_count ?? protectedGate?.protected_open_position_count ?? 0;
+  const protectedEmptySlotCount = diagnostics?.protected_empty_slot_count ?? protectedGate?.protected_empty_slot_count ?? 0;
+  const allocatorBlockedByLegacy = diagnostics?.allocator_blocked_by_legacy_positions ?? protectedGate?.allocator_blocked_by_legacy_positions ?? false;
   const openOrderAudit = diagnostics?.open_order_audit ?? smokeTest?.open_order_audit;
   const openOrderSummary = openOrderAudit?.open_order_audit_summary ?? smokeTest?.open_order_audit_summary;
   const ledgerPnl = assetRecon?.ledger_pnl_detail;
@@ -4226,6 +4242,24 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
         ? "오늘 전체 손실 한도는 이미 초과했습니다."
         : "검증 손실 제외 session baseline ready",
       tone: protectedWarnings.length ? "amber" : "green"
+    },
+    {
+      label: "Protected Runtime",
+      value: String(protectedSessionStatus?.status ?? "STOPPED"),
+      detail: `${runtimeLockSeparation?.protected_lock_id ?? "protected-full-auto-live-v1"} - ${runtimeLockSeparation?.protected_runtime_lock_status ?? "STOPPED"}`,
+      tone: protectedSessionStatus?.status === "RUNNING" ? "green" : "amber"
+    },
+    {
+      label: "Protected Slots",
+      value: `${protectedOpenPositionCount}/${protectedConfig?.max_open_positions ?? 1}`,
+      detail: `legacy ${legacyOpenPositionCount} - empty ${protectedEmptySlotCount}`,
+      tone: protectedEmptySlotCount > 0 ? "green" : "red"
+    },
+    {
+      label: "Legacy Slot Block",
+      value: allocatorBlockedByLegacy ? "BLOCKED" : "IGNORED",
+      detail: "legacy holdings count in equity, not protected slot limit",
+      tone: allocatorBlockedByLegacy ? "red" : "green"
     },
     {
       label: "Start Protected V1",

@@ -31,6 +31,7 @@ from app.controlled_auto_live import (
     build_protected_session_baseline,
     controlled_auto_live_gate,
     persist_controlled_run_report,
+    protected_position_scope_status,
     record_resolved_duplicate_client_order_safety_event,
     run_controlled_entry_v3_watch,
     run_controlled_entry_v3_position_run,
@@ -44,6 +45,27 @@ from app.controlled_auto_live import (
     start_controlled_auto_live_job,
     update_protected_session_loss_status,
 )
+
+
+def candidate_payload(market: str = "KRW-BTC", status: str = "LIVE_ACTIVE", strategy: str = "controlled_entry_v3") -> dict:
+    return {
+        "name": f"{market} controlled test",
+        "description": "",
+        "strategy": strategy,
+        "parameters": {},
+        "unit": 5,
+        "market": market,
+        "backtest_period": "30d",
+        "score": 95.0,
+        "backtest_total_return": 0.04,
+        "backtest_mdd": 0.04,
+        "backtest_win_rate": 0.55,
+        "backtest_profit_factor": 1.4,
+        "backtest_trade_count": 12,
+        "backtest_average_trade_pnl": 0.002,
+        "warning": "",
+        "status": status,
+    }
 
 
 class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
@@ -1427,6 +1449,198 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["daily_max_loss_krw"], 1000.0)
         self.assertFalse(config["averaging_down_allowed"])
         self.assertFalse(config["reentry_allowed"])
+
+    def test_protected_full_auto_ignores_legacy_holdings_for_slot_count(self) -> None:
+        database.insert_smoke_test_run(
+            {
+                "smoke_test_id": "smoke-protected-legacy-slots",
+                "exchange_name": "bithumb",
+                "symbol": "BTC",
+                "market": "KRW-BTC",
+                "status": "PASSED_AFTER_RECALC",
+                "started_at_utc": "2026-06-26T00:00:00Z",
+                "completed_at_utc": "2026-06-26T00:01:00Z",
+                "max_notional_krw": 6000,
+                "report": {
+                    "duplicate_fill_count": 0,
+                    "fee_diff": 0.0,
+                    "equity_diff_after": 0.0,
+                    "current_epoch_accounting_pending_count": 0,
+                    "current_epoch_accounting_failed_count": 0,
+                    "final_runtime_status": "STOPPED",
+                },
+            }
+        )
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": "posloop-legacy-pass",
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "controlled_auto_live_status": "PASS_IDLE",
+                "technical_result": "PASS_IDLE",
+                "profitability_result": "NO_TRADE",
+                "started_at_utc": "2026-06-29T07:37:46Z",
+                "completed_at_utc": "2026-06-29T08:07:48Z",
+                "trade_count": 0,
+                "order_count": 0,
+                "exchange_fill_count": 0,
+                "ledger_fill_count": 0,
+                "missing_ledger_fill_count": 0,
+                "duplicate_fill_count": 0,
+                "fee_diff": 0.0,
+                "equity_diff_after": 0.0,
+                "open_order_count_after": 0,
+                "final_runtime_status": "STOPPED",
+            }
+        )
+        for market in ["KRW-RE", "KRW-STRAX", "KRW-ETH", "KRW-ID", "KRW-XLM"]:
+            candidate_id = database.save_candidate_strategy(candidate_payload(market=market, strategy="ma_cross"))
+            session_id = database.create_live_strategy_session(
+                {
+                    "exchange": "bithumb",
+                    "market": market,
+                    "candidate_strategy_id": candidate_id,
+                    "strategy_name": "ma_cross",
+                    "strategy_parameters": {},
+                    "status": "STOPPED",
+                    "auto_enabled": False,
+                    "initial_balance_krw": 0,
+                    "max_order_krw": 100000,
+                    "max_orders_per_day": 1,
+                }
+            )
+            database.create_live_position(
+                {
+                    "session_id": session_id,
+                    "exchange": "bithumb",
+                    "market": market,
+                    "candidate_strategy_id": candidate_id,
+                    "strategy_name": "ma_cross",
+                    "status": "OPEN",
+                    "entry_order_uuid": f"legacy-{market}",
+                    "entry_price": 1000,
+                    "entry_volume": 1,
+                    "entry_amount_krw": 1000,
+                    "current_price": 1000,
+                    "unrealized_pnl": 0,
+                    "realized_pnl": 0,
+                    "stop_loss_price": 0,
+                    "take_profit_price": 0,
+                    "opened_at": "2026-06-25T00:00:00Z",
+                }
+            )
+
+        current_epoch = {
+            "current_epoch_exists": True,
+            "current_epoch_id": "epoch-controlled",
+            "current_epoch_trust_level": "MEDIUM",
+            "current_epoch_sanity_passed": True,
+            "current_epoch_current_equity": 260_000.0,
+            "current_epoch_total_pnl": 0.0,
+            "current_epoch_accounting_pending_count": 0,
+            "current_epoch_accounting_failed_count": 0,
+        }
+        preflight = {
+            "smoke_test_blockers": [],
+            "open_order_audit_summary": {
+                "exchange_open_order_count": 0,
+                "current_epoch_open_order_count": 0,
+                "unknown_open_order_count": 0,
+            },
+        }
+        with (
+            patch("app.accounting_epoch.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.is_emergency_stopped", return_value=False),
+            patch("app.controlled_auto_live.LiveTradingConfig.for_exchange", return_value=SimpleNamespace(api_key_loaded=True, live_trading_enabled=True)),
+        ):
+            gate = controlled_auto_live_gate(current_epoch, preflight, exchange="bithumb")
+
+        self.assertTrue(gate["protected_full_auto_live_allowed"], gate["protected_full_auto_live_blockers"])
+        self.assertEqual(gate["total_open_position_count"], 5)
+        self.assertEqual(gate["legacy_open_position_count"], 5)
+        self.assertEqual(gate["protected_open_position_count"], 0)
+        self.assertEqual(gate["protected_empty_slot_count"], 1)
+        self.assertFalse(gate["allocator_blocked_by_legacy_positions"])
+        self.assertFalse(gate["allocator_blocked_by_protected_positions"])
+        classifications = {row["market"]: row["classification"] for row in gate["open_position_classifications"]}
+        self.assertEqual(classifications["KRW-RE"], "LEGACY_HOLDING")
+        self.assertEqual(classifications["KRW-STRAX"], "LEGACY_HOLDING")
+        self.assertEqual(classifications["KRW-ID"], "LEGACY_HOLDING")
+        self.assertEqual(classifications["KRW-XLM"], "LEGACY_HOLDING")
+        self.assertEqual(classifications["KRW-ETH"], "LEGACY_HOLDING")
+
+    def test_protected_position_scope_counts_current_session_position_only(self) -> None:
+        candidate_id = database.save_candidate_strategy(candidate_payload(market="KRW-BTC"))
+        session_id = database.create_live_strategy_session(
+            {
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": candidate_id,
+                "strategy_name": "controlled_entry_v3",
+                "strategy_parameters": {},
+                "status": "RUNNING",
+                "auto_enabled": True,
+                "initial_balance_krw": 0,
+                "max_order_krw": 6000,
+                "max_orders_per_day": 1,
+            }
+        )
+        position_id = database.create_live_position(
+            {
+                "session_id": session_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "candidate_strategy_id": candidate_id,
+                "strategy_name": "controlled_entry_v3",
+                "status": "OPEN",
+                "entry_order_uuid": "protected-entry-uuid",
+                "entry_price": 100000000,
+                "entry_volume": 0.00006,
+                "entry_amount_krw": 6000,
+                "current_price": 100000000,
+                "unrealized_pnl": 0,
+                "realized_pnl": 0,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "opened_at": "2026-06-29T12:01:00Z",
+            }
+        )
+        database.insert_live_order_log(
+            {
+                "request_id": "posloop-current-trade-1-buy-1",
+                "session_id": session_id,
+                "candidate_strategy_id": candidate_id,
+                "exchange": "bithumb",
+                "market": "KRW-BTC",
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "price": 100000000,
+                "volume": 0.00006,
+                "amount_krw": 6000,
+                "fee_estimate": 15,
+                "risk_result": "CONTROLLED_ENTRY_V3_POSITION_SUBMITTED",
+                "order_preview_payload": {},
+                "exchange_request_payload_masked": {},
+                "exchange_response_payload": {},
+                "status": "FILLED",
+                "order_uuid": "protected-entry-uuid",
+                "position_id": position_id,
+                "order_purpose": "CONTROLLED_ENTRY_V3_POSITION_RUN",
+                "strategy_name": "controlled_entry_v3",
+                "signal_reason": "test",
+            }
+        )
+
+        status = protected_position_scope_status(
+            exchange="bithumb",
+            protected_session_id="posloop-current",
+            protected_session_started_at_utc="2026-06-29T12:00:00Z",
+        )
+
+        self.assertEqual(status["total_open_position_count"], 1)
+        self.assertEqual(status["legacy_open_position_count"], 0)
+        self.assertEqual(status["protected_open_position_count"], 1)
+        self.assertEqual(status["protected_empty_slot_count"], 0)
+        self.assertTrue(status["allocator_blocked_by_protected_positions"])
 
     def test_protected_full_auto_uses_report_status_when_persisted_status_is_stale(self) -> None:
         database.insert_smoke_test_run(

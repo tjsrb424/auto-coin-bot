@@ -147,7 +147,9 @@ from app.controlled_auto_live import (
     DRY_RUN_CONFIRMATION_PHRASE as CONTROLLED_DRY_RUN_CONFIRMATION,
     ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_POSITION_CONFIRMATION,
     ENTRY_V3_WATCH_CONFIRMATION_PHRASE as CONTROLLED_ENTRY_V3_WATCH_CONFIRMATION,
+    PROTECTED_FULL_AUTO_MODE,
     PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+    PROTECTED_RUNTIME_LOCK_ID,
     TRADE_PROBE_CONFIRMATION_PHRASE as CONTROLLED_TRADE_PROBE_CONFIRMATION,
     build_controlled_signal_diagnostics,
     controlled_auto_live_job_status,
@@ -160,6 +162,7 @@ from app.controlled_auto_live import (
     start_controlled_entry_v3_watch_job,
     start_controlled_auto_live_job,
     start_controlled_trade_probe_job,
+    stop_stale_protected_full_auto_sessions_on_startup,
     stop_controlled_auto_live_job,
 )
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
@@ -901,6 +904,18 @@ async def lifespan(_: FastAPI):
         logger.info(
             "[paper-forward] stopped %s RUNNING sessions on server startup; auto-resume is disabled",
             stopped_forward_sessions,
+        )
+    stopped_protected_sessions = stop_stale_protected_full_auto_sessions_on_startup()
+    if stopped_protected_sessions:
+        stale_protected_lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID)
+        release_runtime_lock(
+            lock_id=PROTECTED_RUNTIME_LOCK_ID,
+            instance_id=str((stale_protected_lock or {}).get("instance_id") or _instance_id()),
+            status="STOPPED",
+        )
+        logger.info(
+            "[protected-full-auto-v1] safe-stopped %s stale RUNNING sessions on server startup; auto-resume is disabled",
+            stopped_protected_sessions,
         )
     scheduler = BackgroundScheduler(timezone="Asia/Seoul")
     scheduler.add_job(
@@ -3381,6 +3396,23 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
             "current_epoch": current_epoch,
             "controlled_auto_live_gate": gate,
         }
+    acquired, protected_lock = acquire_runtime_lock(
+        lock_id=PROTECTED_RUNTIME_LOCK_ID,
+        instance_id=_instance_id(),
+        hostname=_hostname(),
+        app_env=os.getenv("APP_ENV", "development"),
+        runtime_owner="protected-full-auto-live-v1",
+        ttl_seconds=max(int(payload.runtime_seconds), int(os.getenv("PROTECTED_RUNTIME_LOCK_TTL_SECONDS", "3600"))),
+    )
+    if not acquired:
+        return {
+            "ok": False,
+            "status": "ABORTED",
+            "message": "Protected full auto live v1 runtime lock is already active.",
+            "protected_runtime_lock": protected_lock,
+            "current_epoch": current_epoch,
+            "controlled_auto_live_gate": gate,
+        }
     symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
     job = await start_controlled_position_loop_job(
         exchange=payload.exchange,
@@ -3393,11 +3425,16 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
         confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
         controlled_gate=gate,
         current_epoch=current_epoch,
+        mode=PROTECTED_FULL_AUTO_MODE,
+        protected_runtime_instance_id=_instance_id(),
     )
+    if job.get("ok") is False:
+        release_runtime_lock(lock_id=PROTECTED_RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
     return {
         **job,
         "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
         "required_confirmation": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+        "protected_runtime_lock": protected_lock,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
         "protected_session_baseline_preview": gate.get("protected_session_baseline_preview"),
@@ -3508,6 +3545,16 @@ async def trading_reconciliation(
         "protected_full_auto_live_config": controlled_gate.get("protected_full_auto_live_config", {}),
         "protected_full_auto_next_action": controlled_gate.get("protected_full_auto_next_action"),
         "protected_session_start_allowed": controlled_gate.get("protected_session_start_allowed"),
+        "protected_full_auto_session_status": controlled_gate.get("protected_full_auto_session_status"),
+        "runtime_lock_separation": controlled_gate.get("runtime_lock_separation"),
+        "total_open_position_count": controlled_gate.get("total_open_position_count"),
+        "legacy_open_position_count": controlled_gate.get("legacy_open_position_count"),
+        "protected_open_position_count": controlled_gate.get("protected_open_position_count"),
+        "protected_empty_slot_count": controlled_gate.get("protected_empty_slot_count"),
+        "allocator_blocked_by_legacy_positions": controlled_gate.get("allocator_blocked_by_legacy_positions"),
+        "allocator_blocked_by_protected_positions": controlled_gate.get("allocator_blocked_by_protected_positions"),
+        "position_classification_counts": controlled_gate.get("position_classification_counts"),
+        "open_position_classifications": controlled_gate.get("open_position_classifications", []),
         "protected_session_baseline_preview": controlled_gate.get("protected_session_baseline_preview"),
         "protected_session_hard_blockers": controlled_gate.get("protected_session_hard_blockers", []),
         "protected_session_warnings": controlled_gate.get("protected_session_warnings", []),

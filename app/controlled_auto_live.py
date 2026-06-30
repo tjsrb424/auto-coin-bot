@@ -13,15 +13,18 @@ from typing import Any
 from app.accounting_epoch import build_current_epoch_diagnostics, limited_auto_live_gate
 from app.backtest import candles_to_frame
 from app.database import (
+    acquire_runtime_lock,
     get_connection,
     get_live_order_log,
     insert_live_order_log,
     load_resolved_safety_event,
     load_current_accounting_epoch,
     load_exchange_fills_ledger,
+    load_open_live_positions_for_exchange,
     load_global_bot_operation_policy,
     load_runtime_lock,
     load_unresolved_live_order_logs_for_exchange,
+    release_runtime_lock,
     upsert_resolved_safety_event,
     update_live_order_log,
 )
@@ -78,8 +81,19 @@ OBSERVED_CONTROLLED_ROUNDTRIP_COST_RATE_FLOOR = 0.005
 DRY_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED DRY RUN FORCE BUY"
 PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE = "START PROTECTED FULL AUTO LIVE V1"
 PROTECTED_FULL_AUTO_MODE = "PROTECTED_FULL_AUTO_LIVE_V1"
+PROTECTED_RUNTIME_LOCK_ID = "protected-full-auto-live-v1"
 PROTECTED_SESSION_LOSS_LIMIT_RATE = 0.005
 PROTECTED_SESSION_MAX_DAILY_LOSS_KRW = 1000.0
+POSITION_CLASSIFICATIONS = {
+    "PROTECTED_AUTO_POSITION",
+    "LEGACY_HOLDING",
+    "LEGACY_EXIT_ONLY",
+    "MANUAL_OR_EXTERNAL",
+    "UNKNOWN",
+}
+PROTECTED_ALLOWED_SYMBOLS = {"BTC", "ETH"}
+PROTECTED_ALLOWED_MARKETS = {f"KRW-{symbol}" for symbol in PROTECTED_ALLOWED_SYMBOLS}
+KNOWN_LEGACY_HOLDING_MARKETS = {"KRW-RE", "KRW-STRAX", "KRW-ID", "KRW-XLM"}
 CONTROLLED_CLIENT_ORDER_ID_MAX_LENGTH = 36
 RESOLVED_DUPLICATE_CLIENT_ORDER_RUN_ID = "posloop-20260629T121326-57c2fc"
 RESOLVED_DUPLICATE_CLIENT_ORDER_STOP_REASON = "CONTROLLED_ENTRY_V3_POSITION_EXCEPTION:ValueError:DUPLICATE_CLIENT_ORDER_ID"
@@ -163,11 +177,229 @@ def _order_result_stop_reason(result: dict, fallback: str) -> list[str]:
     return [fallback]
 
 
+def _normalize_utc_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return str(value).replace(" ", "T").replace("+00:00", "Z")
+
+
+def _protected_position_session_marker(position: dict, protected_session_id: str | None) -> bool:
+    if not protected_session_id:
+        return False
+    entry_uuid = str(position.get("entry_order_uuid") or "")
+    position_id = int(position.get("id") or 0)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM live_order_logs
+            WHERE exchange = ?
+              AND market = ?
+              AND order_purpose IN ('CONTROLLED_ENTRY_V3_POSITION_RUN', 'PROTECTED_FULL_AUTO_LIVE_V1')
+              AND (
+                    request_id LIKE ?
+                 OR order_uuid = ?
+                 OR position_id = ?
+              )
+            LIMIT 1
+            """,
+            (
+                str(position.get("exchange") or "bithumb"),
+                str(position.get("market") or ""),
+                f"{protected_session_id}%",
+                entry_uuid,
+                position_id,
+            ),
+        ).fetchone()
+    return row is not None
+
+
+def classify_live_position_for_protected_auto(
+    position: dict,
+    *,
+    protected_session_id: str | None = None,
+    protected_session_started_at_utc: str | None = None,
+) -> str:
+    market = str(position.get("market") or "")
+    status = str(position.get("status") or "").upper()
+    strategy = str(position.get("strategy_name") or "").lower()
+    opened_at = _normalize_utc_text(str(position.get("opened_at") or position.get("created_at") or ""))
+    protected_started = _normalize_utc_text(protected_session_started_at_utc)
+
+    if market in PROTECTED_ALLOWED_MARKETS:
+        if _protected_position_session_marker(position, protected_session_id):
+            return "PROTECTED_AUTO_POSITION"
+        if (
+            protected_session_id
+            and protected_started
+            and opened_at >= protected_started
+            and strategy == CONTROLLED_ENTRY_V3_STRATEGY
+        ):
+            return "PROTECTED_AUTO_POSITION"
+
+    if status in {"EXIT_CANDIDATE", "EXIT_PENDING", "CLOSING", "MANUAL_REVIEW_REQUIRED"}:
+        return "LEGACY_EXIT_ONLY"
+    if market in KNOWN_LEGACY_HOLDING_MARKETS:
+        return "LEGACY_HOLDING"
+    if market in PROTECTED_ALLOWED_MARKETS and not protected_session_id:
+        return "LEGACY_HOLDING"
+    if market in PROTECTED_ALLOWED_MARKETS and protected_started and opened_at < protected_started:
+        return "LEGACY_HOLDING"
+    if str(position.get("entry_order_uuid") or "").upper() == "IMPORTED_EXCHANGE_BALANCE":
+        return "MANUAL_OR_EXTERNAL"
+    if not position.get("session_id") or not position.get("candidate_strategy_id"):
+        return "MANUAL_OR_EXTERNAL"
+    return "UNKNOWN"
+
+
+def protected_position_scope_status(
+    *,
+    exchange: str = "bithumb",
+    protected_session_id: str | None = None,
+    protected_session_started_at_utc: str | None = None,
+) -> dict:
+    positions = load_open_live_positions_for_exchange(exchange)
+    classified = []
+    counts = {classification: 0 for classification in POSITION_CLASSIFICATIONS}
+    for position in positions:
+        classification = classify_live_position_for_protected_auto(
+            position,
+            protected_session_id=protected_session_id,
+            protected_session_started_at_utc=protected_session_started_at_utc,
+        )
+        counts[classification] = counts.get(classification, 0) + 1
+        classified.append(
+            {
+                "id": position.get("id"),
+                "exchange": position.get("exchange"),
+                "market": position.get("market"),
+                "status": position.get("status"),
+                "session_id": position.get("session_id"),
+                "candidate_strategy_id": position.get("candidate_strategy_id"),
+                "strategy_name": position.get("strategy_name"),
+                "opened_at": position.get("opened_at"),
+                "entry_order_uuid": position.get("entry_order_uuid"),
+                "classification": classification,
+            }
+        )
+    protected_count = counts.get("PROTECTED_AUTO_POSITION", 0)
+    legacy_count = counts.get("LEGACY_HOLDING", 0) + counts.get("LEGACY_EXIT_ONLY", 0)
+    protected_empty = max(MAX_OPEN_POSITIONS - protected_count, 0)
+    return {
+        "total_open_position_count": len(positions),
+        "legacy_open_position_count": legacy_count,
+        "protected_open_position_count": protected_count,
+        "protected_empty_slot_count": protected_empty,
+        "allocator_blocked_by_legacy_positions": False,
+        "allocator_blocked_by_protected_positions": protected_empty <= 0,
+        "position_classification_counts": counts,
+        "open_position_classifications": classified,
+        "protected_allowed_markets": sorted(PROTECTED_ALLOWED_MARKETS),
+        "protected_session_id": protected_session_id,
+        "protected_session_started_at_utc": protected_session_started_at_utc,
+    }
+
+
+def _active_protected_job_locked() -> dict | None:
+    for job in _controlled_jobs.values():
+        if str(job.get("mode") or "") != PROTECTED_FULL_AUTO_MODE:
+            continue
+        if str(job.get("status") or "").upper() in {"STARTING", "RUNNING"}:
+            return job
+    return None
+
+
+def latest_protected_full_auto_session_status() -> dict:
+    active = _active_protected_job_locked()
+    if active is not None:
+        return {
+            "status": str(active.get("status") or "RUNNING").upper(),
+            "protected_session_id": active.get("controlled_run_id"),
+            "started_at_utc": active.get("started_at_utc"),
+            "runtime_persistence": "IN_MEMORY_AND_DB_RUNNING",
+            "active_job": _public_job(active),
+        }
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM controlled_run_reports
+            WHERE run_type = 'CONTROLLED_POSITION_LOOP'
+            ORDER BY updated_at_utc DESC, id DESC
+            LIMIT 50
+            """
+        ).fetchall()
+    for row in rows:
+        item = dict(row)
+        report = _safe_json_loads(item.get("report_json"), {})
+        if str(report.get("mode") or "") != PROTECTED_FULL_AUTO_MODE:
+            continue
+        status = str(report.get("controlled_auto_live_status") or item.get("status") or "STOPPED").upper()
+        return {
+            "status": status,
+            "protected_session_id": report.get("protected_session_id") or report.get("loop_run_id") or item.get("run_id"),
+            "started_at_utc": report.get("started_at_utc") or item.get("started_at_utc"),
+            "completed_at_utc": report.get("completed_at_utc") or item.get("completed_at_utc"),
+            "runtime_persistence": "DB_REPORT_ONLY",
+            "report": report,
+        }
+    return {
+        "status": "STOPPED",
+        "protected_session_id": None,
+        "runtime_persistence": "NONE",
+    }
+
+
+def stop_stale_protected_full_auto_sessions_on_startup() -> int:
+    stopped = 0
+    now = _utc_now()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM controlled_run_reports
+            WHERE run_type = 'CONTROLLED_POSITION_LOOP'
+              AND status IN ('STARTING', 'RUNNING')
+            ORDER BY id DESC
+            """
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            report = _safe_json_loads(item.get("report_json"), {})
+            if str(report.get("mode") or "") != PROTECTED_FULL_AUTO_MODE:
+                continue
+            report["controlled_auto_live_status"] = "STOPPED"
+            report["completed_at_utc"] = report.get("completed_at_utc") or now
+            report["safe_stop_reason"] = "SERVER_RESTART_SAFE_STOP"
+            report.setdefault("pass_fail_reasons", []).append("SERVER_RESTART_SAFE_STOP")
+            conn.execute(
+                """
+                UPDATE controlled_run_reports
+                SET status = 'STOPPED',
+                    completed_at_utc = ?,
+                    report_json = ?,
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (report["completed_at_utc"], json.dumps(report, ensure_ascii=False, default=str), now, int(item["id"])),
+            )
+            stopped += 1
+    return stopped
+
+
 def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exchange: str = "bithumb") -> dict:
     limited_gate = limited_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     limited_run = latest_limited_auto_live_run()
     position_loop = latest_controlled_position_loop_run()
     protected_status = protected_session_gate_status(current_epoch, smoke_preflight, exchange=exchange)
+    protected_session_status = latest_protected_full_auto_session_status()
+    active_session_id = protected_session_status.get("protected_session_id") if protected_session_status.get("status") in {"STARTING", "RUNNING"} else None
+    active_started_at = protected_session_status.get("started_at_utc") if active_session_id else None
+    position_scope = protected_position_scope_status(
+        exchange=exchange,
+        protected_session_id=str(active_session_id) if active_session_id else None,
+        protected_session_started_at_utc=str(active_started_at) if active_started_at else None,
+    )
     blockers = list(limited_gate.get("limited_auto_live_blockers") or [])
     if not limited_gate.get("limited_auto_live_allowed"):
         blockers.append({"code": "LIMITED_AUTO_GATE_NOT_READY", "count": 1})
@@ -182,7 +414,13 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
     resolved_position_loop_event = _resolved_duplicate_client_order_position_loop_event(position_loop)
     protected_blockers.extend(_protected_position_loop_blockers(position_loop))
     protected_blockers.extend(protected_status.get("hard_blockers") or [])
+    if position_scope["allocator_blocked_by_protected_positions"]:
+        protected_blockers.append({"code": "PROTECTED_MAX_OPEN_POSITIONS_REACHED", "count": position_scope["protected_open_position_count"]})
     protected_warnings = list(protected_status.get("warnings", []))
+    general_lock = load_runtime_lock("auto-trading") or {}
+    protected_lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
+    if str(general_lock.get("runtime_owner") or "") == "operator-drawdown-stop":
+        protected_warnings.append({"code": "GENERAL_RUNTIME_PREVIOUS_DRAWDOWN_STOP_WARNING", "count": 1})
     if resolved_position_loop_event:
         protected_warnings.append({"code": "RESOLVED_PREVIOUS_DUPLICATE_CLIENT_ORDER_ID", "count": 1})
     current_equity = _float(
@@ -216,6 +454,7 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "stop_on_stale_open_order": True,
         "requires_user_confirmation": True,
         "confirmation_phrase": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+        "position_slot_scope": "protected session BTC/ETH positions only",
     }
     return {
         "controlled_auto_live_allowed": len(blockers) == 0,
@@ -230,6 +469,20 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "protected_session_start_allowed": len(protected_blockers) == 0,
         "protected_session_hard_blockers": protected_status.get("hard_blockers", []),
         "protected_session_warnings": protected_warnings,
+        "protected_full_auto_session_status": protected_session_status,
+        "protected_runtime_lock": protected_lock,
+        "general_runtime_lock": general_lock,
+        "runtime_lock_separation": {
+            "general_lock_id": "auto-trading",
+            "protected_lock_id": PROTECTED_RUNTIME_LOCK_ID,
+            "general_runtime_lock_status": str(general_lock.get("status") or "STOPPED"),
+            "general_runtime_lock_owner": general_lock.get("runtime_owner"),
+            "protected_runtime_lock_status": str(protected_lock.get("status") or "STOPPED"),
+            "protected_runtime_lock_owner": protected_lock.get("runtime_owner"),
+            "separated": True,
+            "general_drawdown_stop_blocks_protected_session": False,
+        },
+        **position_scope,
         "resolved_position_loop_safety_event": resolved_position_loop_event,
         "protected_session_baseline_preview": protected_status.get("baseline"),
         "global_daily_loss_status": protected_status.get("global_daily_loss_status"),
@@ -954,7 +1207,12 @@ def controlled_auto_live_job_status(controlled_run_id: str | None = None) -> dic
             return {"ok": False, "status": "NOT_FOUND", "controlled_run_id": controlled_run_id}
         return {"ok": True, **_public_job(job)}
     jobs = [_public_job(job) for job in sorted(_controlled_jobs.values(), key=lambda item: str(item.get("started_at_utc") or ""), reverse=True)]
-    return {"ok": True, "jobs": jobs, "active_job": _public_job(_active_controlled_job_locked()) if _active_controlled_job_locked() else None}
+    return {
+        "ok": True,
+        "jobs": jobs,
+        "active_job": _public_job(_active_controlled_job_locked()) if _active_controlled_job_locked() else None,
+        "protected_full_auto_live_v1": latest_protected_full_auto_session_status(),
+    }
 
 
 async def stop_controlled_auto_live_job(controlled_run_id: str) -> dict:
@@ -1526,6 +1784,8 @@ async def start_controlled_position_loop_job(
     confirmation: str,
     controlled_gate: dict,
     current_epoch: dict,
+    mode: str = "CONTROLLED_POSITION_LOOP",
+    protected_runtime_instance_id: str | None = None,
 ) -> dict:
     async with _job_lock():
         active = _active_controlled_job_locked()
@@ -1544,6 +1804,7 @@ async def start_controlled_position_loop_job(
             "controlled_run_id": run_id,
             "loop_run_id": run_id,
             "run_type": "CONTROLLED_POSITION_LOOP",
+            "mode": mode,
             "status": "STARTING",
             "started_at_utc": started_at,
             "completed_at_utc": None,
@@ -1556,9 +1817,27 @@ async def start_controlled_position_loop_job(
             "amount_krw": min(_float(amount_krw, MAX_NOTIONAL_KRW), MAX_NOTIONAL_KRW),
             "report": None,
             "error": None,
+            "protected_runtime_lock_id": PROTECTED_RUNTIME_LOCK_ID if mode == PROTECTED_FULL_AUTO_MODE else None,
+            "protected_runtime_instance_id": protected_runtime_instance_id,
             "_stop_event": stop_event,
         }
         _controlled_jobs[run_id] = job
+        if mode == PROTECTED_FULL_AUTO_MODE:
+            persist_controlled_run_report(
+                {
+                    "controlled_run_id": run_id,
+                    "loop_run_id": run_id,
+                    "run_type": "CONTROLLED_POSITION_LOOP",
+                    "mode": PROTECTED_FULL_AUTO_MODE,
+                    "protected_session_id": run_id,
+                    "controlled_auto_live_status": "STARTING",
+                    "technical_result": "RUNNING",
+                    "profitability_result": "NOT_EVALUATED",
+                    "started_at_utc": started_at,
+                    "completed_at_utc": "",
+                    "controlled_auto_live_gate": controlled_gate,
+                }
+            )
         task = asyncio.create_task(
             _run_controlled_position_loop_job(
                 run_id=run_id,
@@ -1596,6 +1875,22 @@ async def _run_controlled_position_loop_job(
 ) -> None:
     job = _controlled_jobs[run_id]
     job["status"] = "RUNNING"
+    if job.get("mode") == PROTECTED_FULL_AUTO_MODE:
+        persist_controlled_run_report(
+            {
+                "controlled_run_id": run_id,
+                "loop_run_id": run_id,
+                "run_type": "CONTROLLED_POSITION_LOOP",
+                "mode": PROTECTED_FULL_AUTO_MODE,
+                "protected_session_id": run_id,
+                "controlled_auto_live_status": "RUNNING",
+                "technical_result": "RUNNING",
+                "profitability_result": "NOT_EVALUATED",
+                "started_at_utc": job.get("started_at_utc"),
+                "completed_at_utc": "",
+                "controlled_auto_live_gate": controlled_gate,
+            }
+        )
     try:
         report = await run_controlled_position_loop(
             exchange=exchange,
@@ -1619,6 +1914,13 @@ async def _run_controlled_position_loop_job(
         job["status"] = "FAILED"
         job["error"] = f"{exc.__class__.__name__}:{str(exc)[:240]}"
         job["completed_at_utc"] = _utc_now()
+    finally:
+        if job.get("mode") == PROTECTED_FULL_AUTO_MODE and job.get("protected_runtime_instance_id"):
+            release_runtime_lock(
+                lock_id=PROTECTED_RUNTIME_LOCK_ID,
+                instance_id=str(job["protected_runtime_instance_id"]),
+                status="STOPPED",
+            )
 
 
 async def run_controlled_entry_v3_watch(
@@ -2210,6 +2512,8 @@ async def run_controlled_position_loop(
         "controlled_run_id": run_id,
         "loop_run_id": run_id,
         "run_type": "CONTROLLED_POSITION_LOOP",
+        "mode": PROTECTED_FULL_AUTO_MODE if (controlled_gate or {}).get("protected_full_auto_live_config") else "CONTROLLED_POSITION_LOOP",
+        "protected_session_id": run_id if (controlled_gate or {}).get("protected_full_auto_live_config") else None,
         "controlled_auto_live_status": "FAILED",
         "technical_result": "NOT_EVALUATED",
         "profitability_result": "NOT_EVALUATED",
