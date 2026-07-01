@@ -52,6 +52,7 @@ REQUIRED_SCHEMA_TABLES = [
     "resolved_safety_events",
     "protected_auto_runtime",
     "protected_auto_notifications",
+    "notification_logs",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -1075,6 +1076,23 @@ def init_db() -> None:
                 delivery_error TEXT NOT NULL DEFAULT '',
                 sent_at_utc TEXT,
                 created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'discord',
+                status TEXT NOT NULL DEFAULT 'SKIPPED',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                related_session_id TEXT,
+                related_run_id TEXT,
+                related_order_uuid TEXT,
+                created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at_utc TEXT
             );
 
             CREATE TABLE IF NOT EXISTS risk_states (
@@ -3787,6 +3805,121 @@ def insert_protected_auto_notification(event: dict) -> dict:
             ),
         )
     return load_protected_auto_notification(event_id) or payload
+
+
+def insert_notification_log(event: dict) -> dict:
+    now = _utc_now()
+    event_id = str(event.get("event_id") or f"notification-{uuid.uuid4().hex[:12]}")
+    payload = {
+        "event_id": event_id,
+        "event_type": str(event.get("event_type") or "NOTIFICATION"),
+        "provider": str(event.get("provider") or "discord").lower(),
+        "status": str(event.get("status") or "SKIPPED").upper(),
+        "title": str(event.get("title") or ""),
+        "summary": str(event.get("summary") or ""),
+        "payload": event.get("payload") or {},
+        "error_message": str(event.get("error_message") or ""),
+        "related_session_id": event.get("related_session_id"),
+        "related_run_id": event.get("related_run_id"),
+        "related_order_uuid": event.get("related_order_uuid"),
+        "created_at_utc": str(event.get("created_at_utc") or now),
+        "sent_at_utc": event.get("sent_at_utc"),
+    }
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO notification_logs (
+                event_id, event_type, provider, status, title, summary,
+                payload_json, error_message, related_session_id, related_run_id,
+                related_order_uuid, created_at_utc, sent_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (
+                payload["event_id"],
+                payload["event_type"],
+                payload["provider"],
+                payload["status"],
+                payload["title"],
+                payload["summary"],
+                json.dumps(payload["payload"], ensure_ascii=False, default=str),
+                payload["error_message"],
+                payload["related_session_id"],
+                payload["related_run_id"],
+                payload["related_order_uuid"],
+                payload["created_at_utc"],
+                payload["sent_at_utc"],
+            ),
+        )
+    return load_notification_log(event_id) or payload
+
+
+def update_notification_log(event_id: str, updates: dict) -> dict | None:
+    allowed = {
+        "provider",
+        "status",
+        "title",
+        "summary",
+        "payload_json",
+        "error_message",
+        "related_session_id",
+        "related_run_id",
+        "related_order_uuid",
+        "sent_at_utc",
+    }
+    normalized = dict(updates)
+    if "payload" in normalized:
+        normalized["payload_json"] = json.dumps(normalized.pop("payload") or {}, ensure_ascii=False, default=str)
+    fields = [key for key in normalized if key in allowed]
+    if not fields:
+        return load_notification_log(event_id)
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    values = [normalized[key] for key in fields]
+    values.append(event_id)
+    with get_connection() as conn:
+        conn.execute(f"UPDATE notification_logs SET {assignments} WHERE event_id = ?", values)
+    return load_notification_log(event_id)
+
+
+def load_notification_log(event_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM notification_logs WHERE event_id = ?", (event_id,)).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["payload"] = json.loads(item.pop("payload_json") or "{}")
+    return item
+
+
+def load_notification_logs(limit: int = 50, event_type: str | None = None, provider: str | None = None) -> list[dict]:
+    limit = min(max(int(limit or 50), 1), 200)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if event_type:
+        clauses.append("event_type = ?")
+        params.append(event_type)
+    if provider:
+        clauses.append("provider = ?")
+        params.append(str(provider).lower())
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM notification_logs
+            {where}
+            ORDER BY created_at_utc DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        items.append(item)
+    return items
 
 
 def update_protected_auto_notification_delivery(event_id: str, updates: dict) -> dict | None:

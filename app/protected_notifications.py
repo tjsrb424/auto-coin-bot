@@ -12,6 +12,7 @@ from app.database import (
     load_protected_auto_notifications,
     update_protected_auto_notification_delivery,
 )
+from app.notifications import notification_config_status, send_notification
 
 PROTECTED_ALERT_EVENTS = {
     "PROTECTED_AUTO_STARTED",
@@ -117,12 +118,17 @@ def notify_protected_auto_event(
         **(payload or {}),
         "protected_session_id": protected_session_id,
         "controlled_run_id": controlled_run_id,
+        "message": message,
     }
-    url = _webhook_url()
-    channel = _channel_for_url(url) if url else "DB_ONLY"
+    notification_event_id = event_id or f"{protected_session_id or 'no-session'}:{controlled_run_id or 'no-run'}:{event_type}:{payload.get('dedupe_key') or ''}"
+    notification = send_notification(event_type, payload, event_id=notification_event_id)
+    configured = bool(notification_config_status().get("discord", {}).get("configured"))
+    delivery_status = str(notification.get("status") or "SKIPPED").upper()
+    legacy_status = "DB_ONLY" if delivery_status == "SKIPPED" and not configured else delivery_status
+    channel = str(notification.get("provider") or "discord").upper() if configured else "DB_ONLY"
     created = insert_protected_auto_notification(
         {
-            "event_id": event_id or f"{protected_session_id or 'no-session'}:{controlled_run_id or 'no-run'}:{event_type}:{payload.get('dedupe_key') or ''}",
+            "event_id": notification_event_id,
             "event_type": event_type,
             "severity": severity,
             "exchange": exchange,
@@ -131,35 +137,22 @@ def notify_protected_auto_event(
             "message": message,
             "payload": payload,
             "channel": channel,
-            "webhook_configured": bool(url),
-            "delivery_status": "PENDING" if url else "DB_ONLY",
+            "webhook_configured": configured,
+            "delivery_status": legacy_status,
+            "delivery_error": str(notification.get("error_message") or ""),
+            "sent_at_utc": notification.get("sent_at_utc"),
         }
     )
-    if created.get("delivery_status") != "PENDING" or not url:
-        return created
-    text = _message(event_type, severity, message, payload)
-    try:
-        _post_webhook(url, channel, text)
-        return update_protected_auto_notification_delivery(
-            str(created["event_id"]),
-            {
-                "channel": channel,
-                "webhook_configured": 1,
-                "delivery_status": "SENT",
-                "delivery_error": "",
-                "sent_at_utc": _utc_now(),
-            },
-        ) or created
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        return update_protected_auto_notification_delivery(
-            str(created["event_id"]),
-            {
-                "channel": channel,
-                "webhook_configured": 1,
-                "delivery_status": "FAILED",
-                "delivery_error": f"{exc.__class__.__name__}:{str(exc)[:240]}",
-            },
-        ) or created
+    return update_protected_auto_notification_delivery(
+        str(created["event_id"]),
+        {
+            "channel": channel,
+            "webhook_configured": 1 if configured else 0,
+            "delivery_status": legacy_status,
+            "delivery_error": str(notification.get("error_message") or ""),
+            "sent_at_utc": notification.get("sent_at_utc"),
+        },
+    ) or created
 
 
 def latest_protected_auto_notification() -> dict | None:

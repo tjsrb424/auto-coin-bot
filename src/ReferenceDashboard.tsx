@@ -345,6 +345,8 @@ type RuntimeStatus = {
   protected_next_scan_at_utc?: string | null;
   protected_lock_expires_at_utc?: string | null;
   protected_last_alert?: Record<string, any> | null;
+  notification_config?: Record<string, any> | null;
+  last_notification?: Record<string, any> | null;
   protected_auto?: Record<string, any>;
 };
 
@@ -4116,6 +4118,13 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const protectedLastAlertDetail = protectedLastAlert
     ? `${protectedLastAlert?.delivery_status ?? "LOGGED"} - ${protectedLastAlert?.message ?? "-"}`
     : "notification log clear";
+  const notificationConfig = data.runtimeStatus?.notification_config ?? {};
+  const lastNotification = data.runtimeStatus?.last_notification ?? protectedLastAlert ?? null;
+  const notificationProvider = notificationConfig?.provider ?? "discord";
+  const notificationStatus = notificationConfig?.status ?? (notificationConfig?.enabled ? "Enabled" : "Disabled");
+  const notificationWebhook = notificationConfig?.webhook_url ?? notificationConfig?.discord?.webhook_url ?? "미설정";
+  const lastNotificationStatus = lastNotification?.status ?? lastNotification?.delivery_status ?? "-";
+  const lastNotificationError = lastNotification?.error_message ?? lastNotification?.delivery_error ?? "";
   const protectedLossRemaining = protectedDaemon?.session_loss_remaining ?? protectedSessionRemaining;
   const protectedStatusTone = protectedRuntimeStatus === "RUNNING" && protectedWorkerStatus !== "STALE"
     ? "green"
@@ -4319,6 +4328,24 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       value: String(protectedLastAlertValue),
       detail: String(protectedLastAlertDetail),
       tone: protectedLastAlertValue === "CLEAR" ? "green" : (String(protectedLastAlert?.severity ?? "").toUpperCase() === "ERROR" ? "red" : "amber")
+    },
+    {
+      label: "Notification Provider",
+      value: String(notificationProvider).toUpperCase(),
+      detail: `status ${notificationStatus} - webhook ${notificationWebhook}`,
+      tone: notificationStatus === "Enabled" ? "green" : "amber"
+    },
+    {
+      label: "Last Notification",
+      value: String(lastNotification?.event_type ?? "CLEAR"),
+      detail: `${lastNotificationStatus} - ${lastNotification?.created_at_utc ?? lastNotification?.sent_at_utc ?? "-"}`,
+      tone: lastNotificationStatus === "SENT" ? "green" : (lastNotificationStatus === "FAILED" ? "red" : "amber")
+    },
+    {
+      label: "Notification Error",
+      value: lastNotificationError ? "CHECK" : "CLEAR",
+      detail: lastNotificationError || "webhook URL is masked",
+      tone: lastNotificationError ? "red" : "green"
     },
     {
       label: "Protected Trades",

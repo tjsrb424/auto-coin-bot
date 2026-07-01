@@ -58,6 +58,7 @@ from app.database import (
     load_candidate_strategy,
     load_bot_operation_policy,
     load_global_bot_operation_policy,
+    load_notification_logs,
     load_protected_auto_notifications,
     load_latest_live_paper_session,
     load_decision_snapshot,
@@ -175,6 +176,7 @@ from app.protected_auto_worker import (
     run_protected_auto_tick,
     start_protected_auto_daemon,
 )
+from app.notifications import notification_config_status, send_discord_notification
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
 from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
 from app.live_state_reconciler import live_state_warnings, reconcile_live_state
@@ -413,6 +415,8 @@ def _runtime_status_payload(request: Request) -> dict:
         runtime_status = "OFF"
     lock = load_runtime_lock(RUNTIME_LOCK_ID)
     protected = protected_auto_status()
+    notification_logs = load_notification_logs(limit=1)
+    notification_config = notification_config_status()
     live_config = LiveTradingConfig.for_exchange(strategy.get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb"))
     return {
         "app_env": os.getenv("APP_ENV", "development"),
@@ -445,6 +449,8 @@ def _runtime_status_payload(request: Request) -> dict:
         "protected_next_scan_at_utc": protected.get("protected_next_scan_at_utc"),
         "protected_lock_expires_at_utc": protected.get("protected_lock_expires_at_utc"),
         "protected_last_alert": protected.get("last_alert"),
+        "notification_config": notification_config,
+        "last_notification": notification_logs[0] if notification_logs else None,
     }
 
 
@@ -839,6 +845,10 @@ class ImportExchangePositionRequest(BaseModel):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class NotificationTestRequest(BaseModel):
+    event_type: str = "DAILY_SUMMARY"
 
 
 class ExitCandidateActionRequest(BaseModel):
@@ -3659,6 +3669,41 @@ async def protected_full_auto_live_v1_notifications(
     return {
         "ok": True,
         "notifications": load_protected_auto_notifications(limit=limit, event_type=event_type),
+    }
+
+
+@app.get("/api/notifications/logs")
+async def notification_logs_endpoint(
+    limit: int = Query(50, ge=1, le=200),
+    event_type: str | None = None,
+    provider: str | None = None,
+) -> dict:
+    return {
+        "ok": True,
+        "notification_config": notification_config_status(),
+        "notifications": load_notification_logs(limit=limit, event_type=event_type, provider=provider),
+    }
+
+
+@app.post("/api/notifications/test-discord")
+async def notification_test_discord_endpoint(payload: NotificationTestRequest | None = None) -> dict:
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    result = send_discord_notification(
+        "DAILY_SUMMARY",
+        {
+            "title": "✅ Discord 알림 테스트",
+            "summary": "Coin Bot 알림 연동이 정상적으로 설정되었습니다.",
+            "provider": "Discord",
+            "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+            "status": "OK",
+            "created_at_utc": now,
+            "dedupe_key": f"manual-test-{uuid.uuid4().hex[:8]}",
+        },
+    )
+    return {
+        "ok": result.get("status") == "SENT",
+        "notification": result,
+        "notification_config": notification_config_status(),
     }
 
 
