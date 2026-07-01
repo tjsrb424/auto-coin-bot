@@ -285,13 +285,62 @@ def _effective_auto_trading_status(exchange: str, runtime: dict | None = None) -
     }
 
 
+def _light_protected_health_status() -> dict:
+    try:
+        with get_connection() as conn:
+            state = conn.execute(
+                """
+                SELECT runtime_id, worker_status, session_status, protected_session_id,
+                       last_heartbeat_at_utc, last_tick_at_utc, next_tick_at_utc,
+                       lock_expires_at_utc, stop_reason, trade_count,
+                       startup_recovery_action, startup_recovery_reason
+                FROM protected_auto_runtime
+                WHERE runtime_id = ?
+                """,
+                ("protected-full-auto-live-v1",),
+            ).fetchone()
+            lock = conn.execute(
+                "SELECT status, expires_at FROM runtime_locks WHERE lock_id = ?",
+                ("protected-full-auto-live-v1",),
+            ).fetchone()
+    except Exception as exc:
+        return {
+            "protected_auto_runtime_status": "UNKNOWN",
+            "protected_worker_status": "UNKNOWN",
+            "protected_session_status": "UNKNOWN",
+            "protected_runtime_lock_status": "UNKNOWN",
+            "protected_health_error": exc.__class__.__name__,
+        }
+    state_dict = dict(state) if state else {}
+    lock_dict = dict(lock) if lock else {}
+    now = datetime.now(timezone.utc)
+    last_heartbeat = _parse_utc(state_dict.get("last_heartbeat_at_utc"))
+    lock_expires = _parse_utc(state_dict.get("lock_expires_at_utc") or lock_dict.get("expires_at"))
+    stale = bool(last_heartbeat and (now - last_heartbeat).total_seconds() > 180)
+    stale_lock = bool(lock_expires and lock_expires <= now)
+    return {
+        "protected_auto_runtime_status": str(state_dict.get("session_status") or "STOPPED").upper(),
+        "protected_worker_status": "STALE" if stale else str(state_dict.get("worker_status") or "STOPPED").upper(),
+        "protected_session_status": str(state_dict.get("session_status") or "STOPPED").upper(),
+        "protected_runtime_lock_status": "STALE" if stale_lock else str(lock_dict.get("status") or "STOPPED").upper(),
+        "protected_session_id": state_dict.get("protected_session_id"),
+        "protected_last_heartbeat_at_utc": state_dict.get("last_heartbeat_at_utc"),
+        "protected_last_tick_at_utc": state_dict.get("last_tick_at_utc"),
+        "protected_next_scan_at_utc": state_dict.get("next_tick_at_utc"),
+        "protected_lock_expires_at_utc": state_dict.get("lock_expires_at_utc") or lock_dict.get("expires_at"),
+        "protected_trade_count": int(state_dict.get("trade_count") or 0),
+        "protected_stop_reason": state_dict.get("stop_reason") or "",
+        "protected_stale": stale,
+        "protected_stale_lock": stale_lock,
+        "startup_recovery_action": state_dict.get("startup_recovery_action"),
+        "startup_recovery_reason": state_dict.get("startup_recovery_reason"),
+    }
+
+
 def _health_payload(request: Request) -> dict:
-    runtime = _runtime_status_payload(request)
-    protected = runtime.get("protected_auto") or protected_auto_status()
     selected_exchange = os.getenv("AUTO_ALLOWED_EXCHANGE", os.getenv("EXCHANGE", "bithumb")).strip().lower()
     if selected_exchange not in {"upbit", "bithumb"}:
         selected_exchange = "bithumb"
-    effective = _effective_auto_trading_status(selected_exchange, runtime)
     database_status = "UNKNOWN"
     try:
         with get_connection() as conn:
@@ -300,32 +349,12 @@ def _health_payload(request: Request) -> dict:
     except Exception as exc:
         database_status = f"ERROR:{exc.__class__.__name__}"
     db_schema = get_db_schema_status()
-
-    risk_state = compute_risk_state(selected_exchange, os.getenv("AUTO_ALLOWED_MARKET", DEFAULT_MARKET))
-    try:
-        state_warnings = live_state_warnings()
-    except Exception as exc:
-        state_warnings = {
-            "warnings": [f"LIVE_STATE_WARNING_CHECK_FAILED:{exc.__class__.__name__}"],
-            "orphan_live_active_candidates_count": 0,
-            "stale_session_position_pointer_count": 0,
-            "mismatched_position_slot_session_count": 0,
-            "expired_order_reservation_count": 0,
-            "reserved_slot_session_pointer_mismatch_count": 0,
-            "reserved_entry_blocked_slot_count": 0,
-            "allocator_last_run_status": "",
-            "allocator_last_error": "",
-            "next_entry_queue_conflict_count": 0,
-            "orphan_live_active_candidates": [],
-            "stale_session_position_pointers": [],
-            "mismatched_position_slot_sessions": [],
-            "expired_order_reservations": [],
-            "reserved_slot_session_pointer_mismatches": [],
-            "reserved_entry_blocked_slots": [],
-        }
+    protected = _light_protected_health_status()
+    lock = load_runtime_lock(RUNTIME_LOCK_ID) or {}
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_running = bool(scheduler and getattr(scheduler, "running", False))
     scheduler_jobs = [job.id for job in scheduler.get_jobs()] if scheduler else []
+    live_config = LiveTradingConfig.for_exchange(selected_exchange)
     return {
         "server_status": "OK",
         "database_status": database_status,
@@ -333,53 +362,27 @@ def _health_payload(request: Request) -> dict:
         "schema_status": db_schema.get("schema_status"),
         "missing_tables": db_schema.get("missing_tables", []),
         "db_schema": db_schema,
-        "broker_status": _live_status(selected_exchange)["broker_status"],
+        "broker_status": "NOT_CHECKED",
         "selected_exchange": selected_exchange,
         "scheduler_status": "RUNNING" if scheduler_running else "STOPPED",
         "scheduler_jobs": scheduler_jobs,
-        "risk_manager_status": risk_state.get("status", "UNKNOWN"),
         "emergency_stop_status": "ON" if is_emergency_stopped() else "OFF",
-        "live_trading_enabled": runtime["live_trading_enabled"],
-        "auto_trading_enabled": effective["effective_auto_trading_enabled"],
-        "env_live_trading_enabled": effective["env_live_trading_enabled"],
-        "db_auto_trading_enabled": effective["db_auto_trading_enabled"],
-        "runtime_lock_status": effective["runtime_lock_status"],
-        "general_auto_runtime_status": effective["general_auto_runtime_status"],
-        "diagnostic_gate_passed": effective["diagnostic_gate_passed"],
-        "diagnostic_gate_reasons": effective["diagnostic_gate_reasons"],
-        "effective_auto_trading_enabled": effective["effective_auto_trading_enabled"],
-        "auto_strategy_enabled": runtime["auto_strategy_pilot_enabled"],
-        "auto_runtime_status": runtime["runtime_status"],
-        "auto_strategy_status": runtime["strategy_status"],
-        "live_session_status": effective["live_session_status"] if effective["live_session_status"] != "STOPPED" else "PAUSED",
-        "latest_order_sync_time": runtime["last_order_time_utc"],
-        "latest_balance_sync_time": _latest_balance_sync_time_utc,
+        "live_trading_enabled": live_config.live_trading_enabled,
+        "runtime_lock_status": str(lock.get("status") or "STOPPED"),
+        "general_auto_runtime_status": str(lock.get("status") or "STOPPED"),
+        "auto_runtime_status": str(lock.get("status") or "STOPPED"),
         "protected_auto_runtime_status": protected.get("protected_auto_runtime_status"),
         "protected_worker_status": protected.get("protected_worker_status"),
         "protected_session_status": protected.get("protected_session_status"),
         "protected_runtime_lock_status": protected.get("protected_runtime_lock_status"),
+        "protected_session_id": protected.get("protected_session_id"),
         "protected_last_heartbeat_at_utc": protected.get("protected_last_heartbeat_at_utc"),
         "protected_last_tick_at_utc": protected.get("protected_last_tick_at_utc"),
         "protected_next_scan_at_utc": protected.get("protected_next_scan_at_utc"),
         "protected_lock_expires_at_utc": protected.get("protected_lock_expires_at_utc"),
-        "warnings": state_warnings.get("warnings", []),
-        "orphan_live_active_candidates_count": state_warnings.get("orphan_live_active_candidates_count", 0),
-        "stale_session_position_pointer_count": state_warnings.get("stale_session_position_pointer_count", 0),
-        "mismatched_position_slot_session_count": state_warnings.get("mismatched_position_slot_session_count", 0),
-        "expired_order_reservation_count": state_warnings.get("expired_order_reservation_count", 0),
-        "reserved_slot_session_pointer_mismatch_count": state_warnings.get(
-            "reserved_slot_session_pointer_mismatch_count", 0
-        ),
-        "reserved_entry_blocked_slot_count": state_warnings.get("reserved_entry_blocked_slot_count", 0),
-        "allocator_last_run_status": state_warnings.get("allocator_last_run_status", ""),
-        "allocator_last_error": state_warnings.get("allocator_last_error", ""),
-        "next_entry_queue_conflict_count": state_warnings.get("next_entry_queue_conflict_count", 0),
-        "orphan_live_active_candidates": state_warnings.get("orphan_live_active_candidates", []),
-        "stale_session_position_pointers": state_warnings.get("stale_session_position_pointers", []),
-        "mismatched_position_slot_sessions": state_warnings.get("mismatched_position_slot_sessions", []),
-        "expired_order_reservations": state_warnings.get("expired_order_reservations", []),
-        "reserved_slot_session_pointer_mismatches": state_warnings.get("reserved_slot_session_pointer_mismatches", []),
-        "reserved_entry_blocked_slots": state_warnings.get("reserved_entry_blocked_slots", []),
+        "protected_trade_count": protected.get("protected_trade_count"),
+        "protected_stop_reason": protected.get("protected_stop_reason"),
+        "health_detail": "LIGHTWEIGHT",
     }
 
 
