@@ -513,6 +513,39 @@ def _compact_notification(event: dict | None) -> dict | None:
     }
 
 
+def _startup_recovery_status(state: dict | None = None, lock: dict | None = None) -> dict:
+    """Return a startup-safe status summary without exchange/accounting scans."""
+    current = dict(state or load_protected_auto_state() or {})
+    runtime_lock = dict(lock or load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {})
+    stale = _is_stale(current)
+    stale_lock = (
+        str(runtime_lock.get("status") or "").upper() == "RUNNING"
+        and str(runtime_lock.get("expires_at") or "") <= _utc_now()
+    )
+    return {
+        "runtime_id": current.get("runtime_id") or PROTECTED_AUTO_RUNTIME_ID,
+        "protected_session_id": current.get("protected_session_id"),
+        "protected_auto_runtime_status": str(current.get("session_status") or "STOPPED").upper(),
+        "protected_worker_status": "STALE" if stale else str(current.get("worker_status") or "STOPPED").upper(),
+        "protected_session_status": str(current.get("session_status") or "STOPPED").upper(),
+        "protected_runtime_lock_status": "STALE" if stale_lock else str(runtime_lock.get("status") or "STOPPED").upper(),
+        "protected_last_heartbeat_at_utc": current.get("last_heartbeat_at_utc"),
+        "protected_last_tick_at_utc": current.get("last_tick_at_utc"),
+        "protected_next_scan_at_utc": current.get("next_tick_at_utc"),
+        "protected_lock_expires_at_utc": current.get("lock_expires_at_utc") or runtime_lock.get("expires_at"),
+        "last_heartbeat_at_utc": current.get("last_heartbeat_at_utc"),
+        "last_tick_at_utc": current.get("last_tick_at_utc"),
+        "next_tick_at_utc": current.get("next_tick_at_utc"),
+        "lock_expires_at_utc": current.get("lock_expires_at_utc") or runtime_lock.get("expires_at"),
+        "trade_count": int(current.get("trade_count") or 0),
+        "stop_reason": current.get("stop_reason"),
+        "startup_recovery_action": current.get("startup_recovery_action"),
+        "startup_recovery_reason": current.get("startup_recovery_reason"),
+        "stale": stale,
+        "stale_lock": stale or stale_lock,
+    }
+
+
 def protected_auto_status() -> dict:
     state = _sync_latest_report_into_state(load_protected_auto_state())
     stale = _is_stale(state)
@@ -761,7 +794,7 @@ async def run_protected_auto_startup_recovery_async() -> dict:
                     "startup_recovery_reason": "NO_ACTIVE_PROTECTED_DAEMON_LOCK_EXPIRED",
                 }
             )
-        return {"action": "NO_ACTIVE_PROTECTED_DAEMON", "protected_auto": protected_auto_status()}
+        return {"action": "NO_ACTIVE_PROTECTED_DAEMON", "protected_auto": _startup_recovery_status()}
     exchange = str(state.get("exchange") or "bithumb")
     try:
         current_epoch = await _current_epoch_with_exchange_equity(exchange)
@@ -799,7 +832,7 @@ async def run_protected_auto_startup_recovery_async() -> dict:
             payload={"recovery_action": "RESUMED", "recovery_reason": "OPEN_ORDER_0_ACCOUNTING_CLEAN_BROKER_READY"},
             event_id=_event_id(resumed.get("protected_session_id"), "PROTECTED_AUTO_STARTED", "RESUMED", resumed.get("last_heartbeat_at_utc")),
         )
-        return {"action": "RESUMED", "protected_auto": protected_auto_status()}
+        return {"action": "RESUMED", "protected_auto": _startup_recovery_status(resumed, lock)}
     except Exception as exc:
         result = await protected_auto_safe_stop_async(f"STARTUP_RECOVERY_EXCEPTION:{exc.__class__.__name__}", failed=True)
         _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": f"{exc.__class__.__name__}:{str(exc)[:160]}"})
