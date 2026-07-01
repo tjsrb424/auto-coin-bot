@@ -1604,6 +1604,34 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            UPDATE notification_logs
+            SET event_dedupe_key = event_type || ':' || related_session_id,
+                dedupe_status = CASE WHEN dedupe_status = '' THEN status ELSE dedupe_status END
+            WHERE event_dedupe_key IS NULL
+              AND event_type IN (
+                'PROTECTED_AUTO_STARTED',
+                'PROTECTED_AUTO_STALE',
+                'SESSION_LOSS_LIMIT_REACHED',
+                'FEE_DIFF_ERROR',
+                'EQUITY_DIFF_ERROR'
+              )
+              AND related_session_id IS NOT NULL
+              AND related_session_id <> ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE notification_logs
+            SET event_dedupe_key = event_type || ':' || COALESCE(related_order_uuid, ''),
+                dedupe_status = CASE WHEN dedupe_status = '' THEN status ELSE dedupe_status END
+            WHERE event_dedupe_key IS NULL
+              AND event_type IN ('TRADE_OPENED', 'TRADE_CLOSED')
+              AND related_order_uuid IS NOT NULL
+              AND related_order_uuid <> ''
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS rebalance_delta_accumulators (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
