@@ -37,6 +37,8 @@ def _utc_now() -> str:
 def _webhook_url() -> str:
     for key in (
         "PROTECTED_AUTO_WEBHOOK_URL",
+        "PROTECTED_AUTO_DISCORD_WEBHOOK_URL",
+        "DISCORD_WEBHOOK_URL",
         "PROTECTED_AUTO_GOOGLE_CHAT_WEBHOOK_URL",
         "GOOGLE_CHAT_WEBHOOK_URL",
         "PROTECTED_AUTO_TELEGRAM_WEBHOOK_URL",
@@ -50,6 +52,8 @@ def _webhook_url() -> str:
 
 def _channel_for_url(url: str) -> str:
     lowered = url.lower()
+    if "discord.com/api/webhooks" in lowered or "discordapp.com/api/webhooks" in lowered:
+        return "DISCORD"
     if "chat.googleapis.com" in lowered:
         return "GOOGLE_CHAT"
     if "api.telegram.org" in lowered or "telegram" in lowered:
@@ -70,6 +74,8 @@ def _message(event_type: str, severity: str, message: str, payload: dict[str, An
 
 
 def _webhook_payload(channel: str, text: str) -> dict[str, Any]:
+    if channel == "DISCORD":
+        return {"content": text[:2000]}
     if channel == "TELEGRAM":
         chat_id = os.getenv("PROTECTED_AUTO_TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
         payload: dict[str, Any] = {"text": text}
