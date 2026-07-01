@@ -1055,7 +1055,7 @@ function useDashboardData(chartUnit: number, selectedExchange: DashboardExchange
     };
 
     void guardedRefresh();
-    const intervalId = window.setInterval(() => void guardedRefresh(), 10_000);
+    const intervalId = window.setInterval(() => void guardedRefresh(), 30_000);
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
@@ -4126,6 +4126,10 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const notificationWebhook = notificationConfig?.webhook_url ?? notificationConfig?.discord?.webhook_url ?? "미설정";
   const lastNotificationStatus = lastNotification?.status ?? lastNotification?.delivery_status ?? "-";
   const lastNotificationError = lastNotification?.error_message ?? lastNotification?.delivery_error ?? "";
+  const notificationQueueDepth = notificationConfig?.queue_depth ?? 0;
+  const protectedLoopDurationMs = protectedDaemon?.protected_worker_loop_duration_ms ?? protectedDaemon?.worker_loop_duration_ms ?? 0;
+  const protectedScanError = protectedDaemon?.protected_last_scan_error ?? protectedDaemon?.last_scan_error ?? "";
+  const protectedScanFailures = protectedDaemon?.protected_consecutive_scan_failures ?? protectedDaemon?.consecutive_scan_failures ?? 0;
   const protectedLossRemaining = protectedDaemon?.session_loss_remaining ?? protectedSessionRemaining;
   const protectedStatusTone = protectedRuntimeStatus === "RUNNING" && protectedWorkerStatus !== "STALE"
     ? "green"
@@ -4319,6 +4323,18 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: protectedDaemon?.stale ? "red" : "cyan"
     },
     {
+      label: "Worker Loop",
+      value: `${protectedLoopDurationMs}ms`,
+      detail: `started ${protectedDaemon?.protected_last_tick_started_at_utc ?? "-"} - finished ${protectedDaemon?.protected_last_tick_finished_at_utc ?? "-"}`,
+      tone: Number(protectedLoopDurationMs) > 20_000 ? "red" : "cyan"
+    },
+    {
+      label: "Scan Error",
+      value: protectedScanError ? "CHECK" : "CLEAR",
+      detail: protectedScanError ? `${protectedScanError} - failures ${protectedScanFailures}` : "last scan completed without error",
+      tone: protectedScanError ? "red" : "green"
+    },
+    {
       label: "Protected Signals",
       value: protectedCandidateDetail,
       detail: protectedSignalDetail,
@@ -4345,7 +4361,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     {
       label: "Notification 1h",
       value: String(notificationStats?.total_count ?? 0),
-      detail: `sent ${notificationStats?.sent_count ?? 0} - dup ${notificationStats?.skipped_duplicate_count ?? 0} - rate ${notificationStats?.rate_limited_count ?? 0}`,
+      detail: `sent ${notificationStats?.sent_count ?? 0} - dup ${notificationStats?.skipped_duplicate_count ?? 0} - rate ${notificationStats?.rate_limited_count ?? 0} - queue ${notificationQueueDepth}`,
       tone: Number(notificationStats?.failed_count ?? 0) > 0 ? "red" : "cyan"
     },
     {

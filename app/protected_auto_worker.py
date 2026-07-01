@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import socket
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -46,6 +48,10 @@ PROTECTED_SESSION_LOSS_LIMIT_KRW = 1000.0
 PROTECTED_SCAN_INTERVAL_SECONDS = 60
 PROTECTED_LOCK_TTL_SECONDS = 180
 PROTECTED_STALE_AFTER_SECONDS = 180
+PROTECTED_SCAN_TIMEOUT_SECONDS = float(os.getenv("PROTECTED_AUTO_SCAN_TIMEOUT_SECONDS", "25"))
+PROTECTED_EXCHANGE_TIMEOUT_SECONDS = float(os.getenv("PROTECTED_AUTO_EXCHANGE_TIMEOUT_SECONDS", "8"))
+
+_WORKER_TICK_LOCK = threading.Lock()
 
 
 def _utc_now() -> str:
@@ -112,6 +118,9 @@ def _row_to_state(row: dict | None) -> dict:
             "legacy_open_position_count": 0,
             "protected_strategy_pnl": 0.0,
             "account_session_pnl_delta": 0.0,
+            "last_scan_error": "",
+            "consecutive_scan_failures": 0,
+            "worker_loop_duration_ms": 0,
             "last_scan_result": {},
             "latest_report": {},
             "baseline": {},
@@ -147,13 +156,15 @@ def _upsert_state(values: dict) -> dict:
                 exchange, symbols_json, amount_krw, scan_interval_seconds,
                 max_holding_minutes, max_position_trades, session_loss_limit_krw,
                 started_at_utc, stopped_at_utc, last_heartbeat_at_utc, last_tick_at_utc,
-                next_tick_at_utc, lock_expires_at_utc, last_scan_result_json,
+                last_tick_started_at_utc, last_tick_finished_at_utc, next_tick_at_utc,
+                lock_expires_at_utc, last_scan_error, consecutive_scan_failures,
+                worker_loop_duration_ms, last_scan_result_json,
                 latest_report_json, baseline_json, stop_reason, trade_count,
                 protected_open_position_count, legacy_open_position_count,
                 protected_strategy_pnl, account_session_pnl_delta,
                 startup_recovery_action, startup_recovery_reason,
                 created_at_utc, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(runtime_id) DO UPDATE SET
                 worker_status = excluded.worker_status,
                 session_status = excluded.session_status,
@@ -169,8 +180,13 @@ def _upsert_state(values: dict) -> dict:
                 stopped_at_utc = excluded.stopped_at_utc,
                 last_heartbeat_at_utc = excluded.last_heartbeat_at_utc,
                 last_tick_at_utc = excluded.last_tick_at_utc,
+                last_tick_started_at_utc = excluded.last_tick_started_at_utc,
+                last_tick_finished_at_utc = excluded.last_tick_finished_at_utc,
                 next_tick_at_utc = excluded.next_tick_at_utc,
                 lock_expires_at_utc = excluded.lock_expires_at_utc,
+                last_scan_error = excluded.last_scan_error,
+                consecutive_scan_failures = excluded.consecutive_scan_failures,
+                worker_loop_duration_ms = excluded.worker_loop_duration_ms,
                 last_scan_result_json = excluded.last_scan_result_json,
                 latest_report_json = excluded.latest_report_json,
                 baseline_json = excluded.baseline_json,
@@ -200,8 +216,13 @@ def _upsert_state(values: dict) -> dict:
                 merged.get("stopped_at_utc"),
                 merged.get("last_heartbeat_at_utc"),
                 merged.get("last_tick_at_utc"),
+                merged.get("last_tick_started_at_utc"),
+                merged.get("last_tick_finished_at_utc"),
                 merged.get("next_tick_at_utc"),
                 merged.get("lock_expires_at_utc"),
+                str(merged.get("last_scan_error") or ""),
+                int(merged.get("consecutive_scan_failures") or 0),
+                int(merged.get("worker_loop_duration_ms") or 0),
                 _json_dumps(merged.get("last_scan_result") or {}),
                 _json_dumps(merged.get("latest_report") or {}),
                 _json_dumps(merged.get("baseline") or {}),
@@ -575,8 +596,13 @@ def protected_auto_status() -> dict:
         "protected_runtime_lock": lock,
         "protected_last_heartbeat_at_utc": state.get("last_heartbeat_at_utc"),
         "protected_last_tick_at_utc": state.get("last_tick_at_utc"),
+        "protected_last_tick_started_at_utc": state.get("last_tick_started_at_utc"),
+        "protected_last_tick_finished_at_utc": state.get("last_tick_finished_at_utc"),
         "protected_next_scan_at_utc": state.get("next_tick_at_utc"),
         "protected_lock_expires_at_utc": state.get("lock_expires_at_utc") or lock.get("expires_at"),
+        "protected_last_scan_error": state.get("last_scan_error") or "",
+        "protected_consecutive_scan_failures": int(state.get("consecutive_scan_failures") or 0),
+        "protected_worker_loop_duration_ms": int(state.get("worker_loop_duration_ms") or 0),
         "stale": stale,
         "stale_lock": stale or stale_lock,
         "active_controlled_job": active,
@@ -795,44 +821,11 @@ async def run_protected_auto_startup_recovery_async() -> dict:
                 }
             )
         return {"action": "NO_ACTIVE_PROTECTED_DAEMON", "protected_auto": _startup_recovery_status()}
-    exchange = str(state.get("exchange") or "bithumb")
     try:
-        current_epoch = await _current_epoch_with_exchange_equity(exchange)
-        blockers = _hard_stop_reasons(exchange, current_epoch)
-        open_blocker = await _open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS))
-        if open_blocker:
-            blockers.append(str(open_blocker))
-        if blockers:
-            result = await protected_auto_safe_stop_async("STARTUP_RECOVERY_SAFE_STOP:" + ",".join(blockers), failed=False)
-            _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": ",".join(blockers)})
-            return {"action": "SAFE_STOP", "reasons": blockers, "protected_auto": result}
-        acquired, lock = _acquire_protected_lock()
-        if not acquired:
-            result = await protected_auto_safe_stop_async("STARTUP_RECOVERY_LOCK_CONFLICT", failed=True)
-            _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": "LOCK_CONFLICT"})
-            return {"action": "SAFE_STOP", "reasons": ["LOCK_CONFLICT"], "protected_auto": result}
-        now = _utc_now()
-        resumed = _upsert_state(
-            {
-                "worker_status": "RUNNING",
-                "session_status": "RUNNING",
-                "last_heartbeat_at_utc": now,
-                "next_tick_at_utc": now,
-                "lock_expires_at_utc": (lock or {}).get("expires_at") or _plus_seconds(PROTECTED_LOCK_TTL_SECONDS),
-                "startup_recovery_action": "RESUMED",
-                "startup_recovery_reason": "OPEN_ORDER_0_ACCOUNTING_CLEAN_BROKER_READY",
-            }
-        )
-        logger.info("[protected-auto] startup recovery resumed protected daemon session=%s", resumed.get("protected_session_id"))
-        _notify_protected_event(
-            "PROTECTED_AUTO_STARTED",
-            state=resumed,
-            severity="INFO",
-            message="Protected auto daemon resumed after startup recovery.",
-            payload={"recovery_action": "RESUMED", "recovery_reason": "OPEN_ORDER_0_ACCOUNTING_CLEAN_BROKER_READY"},
-            event_id=_event_id(resumed.get("protected_session_id"), "PROTECTED_AUTO_STARTED", "RESUMED", resumed.get("last_heartbeat_at_utc")),
-        )
-        return {"action": "RESUMED", "protected_auto": _startup_recovery_status(resumed, lock)}
+        result = await protected_auto_safe_stop_async("BACKEND_RESTART_SAFE_STOP", failed=False)
+        _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": "BACKEND_RESTART_SAFE_STOP"})
+        logger.warning("[protected-auto] startup recovery safe-stopped active protected daemon; manual restart approval required")
+        return {"action": "SAFE_STOP", "reasons": ["BACKEND_RESTART_SAFE_STOP"], "protected_auto": result}
     except Exception as exc:
         result = await protected_auto_safe_stop_async(f"STARTUP_RECOVERY_EXCEPTION:{exc.__class__.__name__}", failed=True)
         _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": f"{exc.__class__.__name__}:{str(exc)[:160]}"})
@@ -849,21 +842,45 @@ async def _open_order_blocker(exchange: str, symbols: list[str]) -> str | None:
     return await controlled_open_order_blocker(exchange, [symbol for symbol in symbols if symbol in PROTECTED_ALLOWED_SYMBOLS])
 
 
+def _duration_ms(started_monotonic: float) -> int:
+    return max(0, int((time.monotonic() - started_monotonic) * 1000))
+
+
+def _finish_tick(started_monotonic: float, updates: dict | None = None) -> dict:
+    return _upsert_state(
+        {
+            "last_tick_finished_at_utc": _utc_now(),
+            "worker_loop_duration_ms": _duration_ms(started_monotonic),
+            **(updates or {}),
+        }
+    )
+
+
+def _record_scan_error(state: dict, started_monotonic: float, error_code: str, *, hard_stop: bool = False) -> dict:
+    failures = int(state.get("consecutive_scan_failures") or 0) + 1
+    now = _utc_now()
+    result = {
+        "result": "SCAN_ERROR",
+        "error": error_code,
+        "hard_stop": hard_stop,
+        "at_utc": now,
+    }
+    return _finish_tick(
+        started_monotonic,
+        {
+            "last_scan_error": error_code,
+            "consecutive_scan_failures": failures,
+            "last_scan_result": result,
+        },
+    )
+
+
 async def protected_auto_tick_async() -> dict:
+    started_monotonic = time.monotonic()
     state = _sync_latest_report_into_state(load_protected_auto_state())
     if str(state.get("worker_status") or "").upper() != "RUNNING":
         return protected_auto_status()
-    if _is_stale(state):
-        return await protected_auto_safe_stop_async("PROTECTED_HEARTBEAT_STALE")
-    active = _active_protected_job()
     exchange = str(state.get("exchange") or "bithumb")
-    try:
-        current_epoch = await _current_epoch_with_exchange_equity(exchange)
-    except Exception as exc:
-        return await protected_auto_safe_stop_async(f"EXCHANGE_API_CRITICAL_FAILURE:{exc.__class__.__name__}", failed=True)
-    hard_stops = _hard_stop_reasons(exchange, current_epoch)
-    if hard_stops:
-        return await protected_auto_safe_stop_async(",".join(hard_stops), failed="DB_WRITE_FAILURE" in hard_stops)
     acquired, lock = _acquire_protected_lock()
     if not acquired:
         return await protected_auto_safe_stop_async("PROTECTED_RUNTIME_LOCK_CONFLICT", failed=True)
@@ -874,13 +891,29 @@ async def protected_auto_tick_async() -> dict:
         {
             "last_heartbeat_at_utc": now,
             "last_tick_at_utc": now,
+            "last_tick_started_at_utc": now,
             "next_tick_at_utc": next_tick,
             "lock_expires_at_utc": (lock or {}).get("expires_at") or _plus_seconds(PROTECTED_LOCK_TTL_SECONDS),
             "protected_open_position_count": scope.get("protected_open_position_count", 0),
             "legacy_open_position_count": scope.get("legacy_open_position_count", 0),
+            "last_scan_error": "",
         }
     )
+    active = _active_protected_job()
     _notify_daily_summary_if_due(heartbeat)
+    try:
+        current_epoch = await asyncio.wait_for(
+            _current_epoch_with_exchange_equity(exchange),
+            timeout=max(0.1, PROTECTED_EXCHANGE_TIMEOUT_SECONDS),
+        )
+    except asyncio.TimeoutError:
+        _record_scan_error(heartbeat, started_monotonic, "EXCHANGE_EQUITY_TIMEOUT")
+        return protected_auto_status()
+    except Exception as exc:
+        return await protected_auto_safe_stop_async(f"EXCHANGE_API_CRITICAL_FAILURE:{exc.__class__.__name__}", failed=True)
+    hard_stops = _hard_stop_reasons(exchange, current_epoch)
+    if hard_stops:
+        return await protected_auto_safe_stop_async(",".join(hard_stops), failed="DB_WRITE_FAILURE" in hard_stops)
     if active:
         active_scan = {
             "result": "ACTIVE_CONTROLLED_ENTRY_V3_POSITION_JOB",
@@ -891,18 +924,29 @@ async def protected_auto_tick_async() -> dict:
             "trade_candidate_count_by_timeframe": active.get("trade_candidate_count_by_timeframe") or {},
             "at_utc": now,
         }
+        _finish_tick(started_monotonic, {"last_scan_result": active_scan, "consecutive_scan_failures": 0, "last_scan_error": ""})
         return {
             **protected_auto_status(),
             "latest_scan_result": active_scan,
         }
-    open_blocker = await _open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS))
+    try:
+        open_blocker = await asyncio.wait_for(
+            _open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS)),
+            timeout=max(0.1, PROTECTED_EXCHANGE_TIMEOUT_SECONDS),
+        )
+    except asyncio.TimeoutError:
+        _record_scan_error(heartbeat, started_monotonic, "OPEN_ORDER_AUDIT_TIMEOUT")
+        return protected_auto_status()
     if open_blocker:
         return await protected_auto_safe_stop_async(str(open_blocker))
     open_positions = int(scope.get("protected_open_position_count") or 0)
     if open_positions >= PROTECTED_MAX_OPEN_POSITIONS:
-        return _upsert_state(
+        return _finish_tick(
+            started_monotonic,
             {
                 "last_scan_result": {"result": "PROTECTED_MAX_OPEN_POSITIONS_REACHED", "protected_open_position_count": open_positions, "at_utc": now},
+                "last_scan_error": "",
+                "consecutive_scan_failures": 0,
             }
         )
     smoke_preflight = build_smoke_test_preflight(
@@ -916,9 +960,12 @@ async def protected_auto_tick_async() -> dict:
     gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     if not gate.get("protected_full_auto_live_allowed"):
         blockers = [str(item.get("code")) for item in gate.get("protected_full_auto_live_blockers") or []]
-        return _upsert_state(
+        return _finish_tick(
+            started_monotonic,
             {
                 "last_scan_result": {"result": "GATE_BLOCKED", "blockers": blockers, "at_utc": now},
+                "last_scan_error": "",
+                "consecutive_scan_failures": 0,
             }
         )
     gate = {
@@ -940,19 +987,31 @@ async def protected_auto_tick_async() -> dict:
         mode=PROTECTED_FULL_AUTO_MODE,
         protected_runtime_instance_id=None,
     )
-    _upsert_state(
+    _finish_tick(
+        started_monotonic,
         {
             "last_scan_result": {
                 "result": "STARTED_CONTROLLED_ENTRY_V3_POSITION_JOB" if job.get("ok", True) is not False else "JOB_START_BLOCKED",
                 "job": {key: value for key, value in job.items() if key not in {"controlled_auto_live_gate"}},
                 "at_utc": now,
-            }
+            },
+            "last_scan_error": "",
+            "consecutive_scan_failures": 0,
         }
     )
     return protected_auto_status()
 
 
 def run_protected_auto_tick() -> dict:
+    if not _WORKER_TICK_LOCK.acquire(blocking=False):
+        logger.warning("[protected-auto] skipped overlapping worker tick")
+        _upsert_state(
+            {
+                "last_scan_error": "WORKER_TICK_OVERLAP_SKIPPED",
+                "last_scan_result": {"result": "SKIPPED", "reason": "WORKER_TICK_OVERLAP_SKIPPED", "at_utc": _utc_now()},
+            }
+        )
+        return protected_auto_status()
     try:
         return asyncio.run(protected_auto_tick_async())
     except Exception as exc:
@@ -961,3 +1020,5 @@ def run_protected_auto_tick() -> dict:
             return protected_auto_safe_stop(f"PROTECTED_WORKER_TICK_EXCEPTION:{exc.__class__.__name__}", failed=True)
         except Exception:
             raise
+    finally:
+        _WORKER_TICK_LOCK.release()

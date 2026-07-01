@@ -1043,8 +1043,13 @@ def init_db() -> None:
                 stopped_at_utc TEXT,
                 last_heartbeat_at_utc TEXT,
                 last_tick_at_utc TEXT,
+                last_tick_started_at_utc TEXT,
+                last_tick_finished_at_utc TEXT,
                 next_tick_at_utc TEXT,
                 lock_expires_at_utc TEXT,
+                last_scan_error TEXT NOT NULL DEFAULT '',
+                consecutive_scan_failures INTEGER NOT NULL DEFAULT 0,
+                worker_loop_duration_ms INTEGER NOT NULL DEFAULT 0,
                 last_scan_result_json TEXT NOT NULL DEFAULT '{}',
                 latest_report_json TEXT NOT NULL DEFAULT '{}',
                 baseline_json TEXT NOT NULL DEFAULT '{}',
@@ -1518,6 +1523,11 @@ def init_db() -> None:
         _ensure_column(conn, "notification_logs", "dedupe_status", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "notification_logs", "rate_limit_until_utc", "TEXT")
         _ensure_column(conn, "notification_logs", "related_position_id", "TEXT")
+        _ensure_column(conn, "protected_auto_runtime", "last_tick_started_at_utc", "TEXT")
+        _ensure_column(conn, "protected_auto_runtime", "last_tick_finished_at_utc", "TEXT")
+        _ensure_column(conn, "protected_auto_runtime", "last_scan_error", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "protected_auto_runtime", "consecutive_scan_failures", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "protected_auto_runtime", "worker_loop_duration_ms", "INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_smart_rehearsal_reviews_latest

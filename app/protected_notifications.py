@@ -121,7 +121,7 @@ def notify_protected_auto_event(
         "message": message,
     }
     notification_event_id = event_id or f"{protected_session_id or 'no-session'}:{controlled_run_id or 'no-run'}:{event_type}:{payload.get('dedupe_key') or ''}"
-    notification = send_notification(event_type, payload, event_id=notification_event_id)
+    notification = send_notification(event_type, payload, event_id=notification_event_id, dispatch_async=True)
     configured = bool(notification_config_status().get("discord", {}).get("configured"))
     delivery_status = str(notification.get("status") or "SKIPPED").upper()
     legacy_status = "DB_ONLY" if delivery_status == "SKIPPED" and not configured else delivery_status

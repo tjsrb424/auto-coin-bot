@@ -27,12 +27,11 @@ def discord_config_status() -> dict[str, Any]:
     return {
         "provider": "discord",
         "configured": bool(url),
-        "webhook_url": "설정됨" if url else "미설정",
+        "webhook_url": "configured" if url else "not configured",
         "alerts_enabled": os.getenv("PROTECTED_AUTO_ALERTS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         "language": os.getenv("PROTECTED_AUTO_ALERT_LANGUAGE", "ko").strip().lower() or "ko",
         "style": os.getenv("PROTECTED_AUTO_ALERT_STYLE", "embed").strip().lower() or "embed",
     }
-
 
 def build_discord_embed(event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
@@ -47,7 +46,7 @@ def build_discord_embed(event_type: str, payload: dict[str, Any] | None = None) 
         "description": summary[:4096],
         "color": event_color(event_type),
         "fields": fields[:10],
-        "footer": {"text": "auto-coin-bot · PROTECTED_FULL_AUTO_LIVE_V1"},
+        "footer": {"text": "auto-coin-bot - PROTECTED_FULL_AUTO_LIVE_V1"},
         "timestamp": format_utc(payload.get("created_at_utc") or now),
     }
 

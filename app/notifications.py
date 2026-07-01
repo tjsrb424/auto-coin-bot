@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -16,6 +18,10 @@ from app.database import (
 )
 from app.discord_notifier import discord_config_status, send_discord_embed
 from app.notification_events import event_summary, event_title, utc_now
+
+_DELIVERY_QUEUE: queue.Queue[tuple[str, str, dict[str, Any]]] = queue.Queue()
+_DELIVERY_THREAD: threading.Thread | None = None
+_DELIVERY_THREAD_LOCK = threading.Lock()
 
 
 def _utc_now_dt() -> datetime:
@@ -48,18 +54,70 @@ def notification_config_status() -> dict[str, Any]:
     provider = os.getenv("NOTIFICATION_PROVIDER", "discord").strip().lower() or "discord"
     discord = discord_config_status()
     since = _utc_iso(_utc_now_dt() - timedelta(hours=1))
+    webhook_label = discord["webhook_url"] if provider == "discord" else "not configured"
     return {
         "provider": provider,
         "enabled": discord["alerts_enabled"] if provider == "discord" else False,
         "status": "Enabled" if provider == "discord" and discord["alerts_enabled"] and discord["configured"] else "Disabled",
-        "webhook_url": discord["webhook_url"] if provider == "discord" else "미설정",
+        "webhook_url": webhook_label,
         "discord": discord,
+        "queue_depth": queued_notification_count(),
         "stats": notification_log_stats_since(since),
     }
 
-
 def send_discord_notification(event_type: str, payload: dict[str, Any] | None = None) -> dict:
     return send_notification(event_type, payload or {}, provider="discord")
+
+
+def _deliver_notification_log(event_id: str, event_type: str, payload: dict[str, Any]) -> dict | None:
+    result = send_discord_embed(event_type, payload)
+    if not result.get("ok"):
+        time.sleep(0.2)
+        result = send_discord_embed(event_type, payload)
+    status = "SENT" if result.get("ok") else "FAILED"
+    return update_notification_log(
+        event_id,
+        {
+            "status": status,
+            "dedupe_status": status,
+            "error_message": "" if status == "SENT" else result.get("error_message", "DISCORD_SEND_FAILED"),
+            "sent_at_utc": utc_now() if status == "SENT" else None,
+        },
+    )
+
+
+def _notification_sender_loop() -> None:
+    while True:
+        event_id, event_type, payload = _DELIVERY_QUEUE.get()
+        try:
+            try:
+                _deliver_notification_log(event_id, event_type, payload)
+            except Exception:
+                # Notification delivery must never take down the sender thread or trading worker.
+                pass
+        finally:
+            _DELIVERY_QUEUE.task_done()
+
+
+def _ensure_notification_sender() -> None:
+    global _DELIVERY_THREAD
+    if _DELIVERY_THREAD and _DELIVERY_THREAD.is_alive():
+        return
+    with _DELIVERY_THREAD_LOCK:
+        if _DELIVERY_THREAD and _DELIVERY_THREAD.is_alive():
+            return
+        _DELIVERY_THREAD = threading.Thread(target=_notification_sender_loop, name="notification-discord-sender", daemon=True)
+        _DELIVERY_THREAD.start()
+
+
+def queued_notification_count() -> int:
+    return _DELIVERY_QUEUE.qsize()
+
+
+def drain_notification_queue_for_tests(timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while getattr(_DELIVERY_QUEUE, "unfinished_tasks", 0) > 0 and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def _event_identity(event_type: str, payload: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -145,7 +203,14 @@ def _skip_notification(
     )
 
 
-def send_notification(event_type: str, payload: dict[str, Any] | None = None, *, provider: str | None = None, event_id: str | None = None) -> dict:
+def send_notification(
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    provider: str | None = None,
+    event_id: str | None = None,
+    dispatch_async: bool = False,
+) -> dict:
     event_type = str(event_type or "NOTIFICATION").upper()
     payload = dict(payload or {})
     provider = (provider or os.getenv("NOTIFICATION_PROVIDER", "discord") or "discord").strip().lower()
@@ -161,6 +226,23 @@ def send_notification(event_type: str, payload: dict[str, Any] | None = None, *,
     payload = {**payload, "created_at_utc": created_at}
 
     if event_dedupe_key:
+        latest_for_dedupe = load_latest_notification_by_dedupe_key(event_dedupe_key)
+        if latest_for_dedupe and rate_limit_minutes is None and str(latest_for_dedupe.get("status") or "").upper() in {"PENDING", "QUEUED"}:
+            return _skip_notification(
+                event_type=event_type,
+                provider=provider,
+                event_id=event_id,
+                status="SKIPPED_DUPLICATE",
+                title=title,
+                summary=summary,
+                payload=payload,
+                event_dedupe_key=event_dedupe_key,
+                error_message="DUPLICATE_NOTIFICATION_SUPPRESSED",
+                related_session_id=related_session_id,
+                related_run_id=related_run_id,
+                related_order_uuid=related_order_uuid,
+                related_position_id=related_position_id,
+            )
         sent = load_sent_notification_by_dedupe_key(event_dedupe_key)
         if sent and rate_limit_minutes is None:
             return _skip_notification(
@@ -226,20 +308,13 @@ def send_notification(event_type: str, payload: dict[str, Any] | None = None, *,
     if not config["configured"]:
         return update_notification_log(event_id, {"status": "SKIPPED", "dedupe_status": "SKIPPED", "error_message": "DISCORD_WEBHOOK_URL_NOT_CONFIGURED"}) or log
 
-    result = send_discord_embed(event_type, payload)
-    if not result.get("ok"):
-        time.sleep(0.2)
-        result = send_discord_embed(event_type, payload)
-    status = "SENT" if result.get("ok") else "FAILED"
-    return update_notification_log(
-        event_id,
-        {
-            "status": status,
-            "dedupe_status": status,
-            "error_message": "" if status == "SENT" else result.get("error_message", "DISCORD_SEND_FAILED"),
-            "sent_at_utc": utc_now() if status == "SENT" else None,
-        },
-    ) or log
+    if dispatch_async:
+        queued = update_notification_log(event_id, {"status": "QUEUED", "dedupe_status": "QUEUED", "error_message": ""}) or log
+        _ensure_notification_sender()
+        _DELIVERY_QUEUE.put((event_id, event_type, payload))
+        return queued
+
+    return _deliver_notification_log(event_id, event_type, payload) or log
 
 
 def load_recent_notification_logs(limit: int = 50, event_type: str | None = None, provider: str | None = None) -> list[dict]:

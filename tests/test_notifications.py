@@ -10,11 +10,12 @@ from fastapi.testclient import TestClient
 from app import database
 from app.discord_notifier import build_discord_embed
 from app.main import app
-from app.notifications import notification_config_status, send_notification
+from app.notifications import drain_notification_queue_for_tests, notification_config_status, send_notification
 
 
 class NotificationTests(unittest.TestCase):
     def setUp(self) -> None:
+        drain_notification_queue_for_tests(timeout_seconds=1.0)
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
@@ -140,14 +141,14 @@ class NotificationTests(unittest.TestCase):
             )
             self.assertTrue(embed["title"])
             self.assertLessEqual(len(embed["fields"]), 10)
-            self.assertEqual(embed["footer"]["text"], "auto-coin-bot · PROTECTED_FULL_AUTO_LIVE_V1")
+            self.assertEqual(embed["footer"]["text"], "auto-coin-bot - PROTECTED_FULL_AUTO_LIVE_V1")
 
     def test_config_masks_webhook_url(self) -> None:
         url = "https://discord.com/api/webhooks/123/token"
         with patch.dict("os.environ", {"DISCORD_WEBHOOK_URL": url}, clear=False):
             config = notification_config_status()
 
-        self.assertEqual(config["webhook_url"], "설정됨")
+        self.assertEqual(config["webhook_url"], "configured")
         self.assertNotIn(url, str(config))
         self.assertIn("stats", config)
 

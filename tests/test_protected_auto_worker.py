@@ -161,8 +161,7 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
 
         self.assertEqual(stopped["protected_auto_runtime_status"], "FAILED")
         notifications = database.load_protected_auto_notifications()
-        failed_delivery = [item for item in notifications if item["delivery_status"] == "FAILED"]
-        self.assertTrue(failed_delivery)
+        self.assertTrue([item for item in notifications if item["delivery_status"] in {"QUEUED", "FAILED"}])
         self.assertIn("ACCOUNTING_ERROR", [item["event_type"] for item in notifications])
 
     def test_startup_recovery_clears_expired_lock_without_active_daemon(self) -> None:
@@ -204,7 +203,7 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         self.assertTrue(report["current_epoch_sanity_passed"])
         self.assertEqual(report["current_epoch_current_equity"], 300_000)
 
-    def test_async_startup_recovery_resumes_without_nested_asyncio_run(self) -> None:
+    def test_async_startup_recovery_safe_stops_active_session(self) -> None:
         start_protected_auto_daemon(
             exchange="bithumb",
             symbols=["BTC"],
@@ -240,8 +239,10 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         ):
             recovery = asyncio.run(recover_inside_running_loop())
 
-        self.assertEqual(recovery["action"], "RESUMED")
-        self.assertEqual(protected_auto_status()["protected_auto_runtime_status"], "RUNNING")
+        self.assertEqual(recovery["action"], "SAFE_STOP")
+        status = protected_auto_status()
+        self.assertEqual(status["protected_auto_runtime_status"], "STOPPED")
+        self.assertEqual(status["stop_reason"], "BACKEND_RESTART_SAFE_STOP")
 
     def test_worker_tick_does_not_reemit_started_notification(self) -> None:
         start_protected_auto_daemon(
@@ -281,3 +282,33 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
             if item["event_type"] == "PROTECTED_AUTO_STARTED"
         ]
         self.assertEqual(len(after), len(before))
+
+    def test_worker_tick_records_heartbeat_before_exchange_timeout(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+
+        async def slow_epoch(exchange: str) -> dict:
+            await asyncio.sleep(0.2)
+            return current_epoch()
+
+        with (
+            patch("app.protected_auto_worker.PROTECTED_EXCHANGE_TIMEOUT_SECONDS", 0.01),
+            patch("app.protected_auto_worker._current_epoch_with_exchange_equity", side_effect=slow_epoch),
+            patch("app.protected_auto_worker._position_scope", return_value={"protected_open_position_count": 0, "legacy_open_position_count": 5}),
+        ):
+            asyncio.run(protected_auto_tick_async())
+
+        status = protected_auto_status()
+        self.assertEqual(status["protected_auto_runtime_status"], "RUNNING")
+        self.assertTrue(status["last_heartbeat_at_utc"])
+        self.assertEqual(status["last_scan_error"], "EXCHANGE_EQUITY_TIMEOUT")
+        self.assertEqual(status["consecutive_scan_failures"], 1)
+        self.assertGreaterEqual(status["worker_loop_duration_ms"], 0)
