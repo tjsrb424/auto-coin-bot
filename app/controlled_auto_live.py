@@ -2607,11 +2607,11 @@ async def run_controlled_position_loop(
         report["current_epoch_pnl_before"] = current_epoch.get("current_epoch_total_pnl")
         protected_baseline = None
         if controlled_gate and controlled_gate.get("protected_full_auto_live_config"):
-            protected_baseline = build_protected_session_baseline(
+            protected_baseline = controlled_gate.get("active_protected_session_baseline") or build_protected_session_baseline(
                 current_epoch=current_epoch,
                 exchange=exchange,
-                protected_session_id=run_id,
-                started_at_utc=started_at,
+                protected_session_id=str(controlled_gate.get("protected_daemon_session_id") or run_id),
+                started_at_utc=str((controlled_gate.get("active_protected_session_baseline") or {}).get("started_at_utc") or started_at),
             )
             report["protected_session_baseline"] = protected_baseline
             update_protected_session_loss_status(report, current_epoch)

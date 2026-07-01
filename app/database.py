@@ -50,6 +50,7 @@ REQUIRED_SCHEMA_TABLES = [
     "live_smoke_test_runs",
     "controlled_run_reports",
     "resolved_safety_events",
+    "protected_auto_runtime",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -1019,6 +1020,39 @@ def init_db() -> None:
                 acquired_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS protected_auto_runtime (
+                runtime_id TEXT PRIMARY KEY,
+                worker_status TEXT NOT NULL,
+                session_status TEXT NOT NULL,
+                protected_session_id TEXT,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                symbols_json TEXT NOT NULL DEFAULT '["BTC","ETH"]',
+                amount_krw REAL NOT NULL DEFAULT 6000,
+                scan_interval_seconds INTEGER NOT NULL DEFAULT 60,
+                max_holding_minutes INTEGER NOT NULL DEFAULT 10,
+                max_position_trades INTEGER NOT NULL DEFAULT 1,
+                session_loss_limit_krw REAL NOT NULL DEFAULT 1000,
+                started_at_utc TEXT,
+                stopped_at_utc TEXT,
+                last_heartbeat_at_utc TEXT,
+                last_tick_at_utc TEXT,
+                next_tick_at_utc TEXT,
+                lock_expires_at_utc TEXT,
+                last_scan_result_json TEXT NOT NULL DEFAULT '{}',
+                latest_report_json TEXT NOT NULL DEFAULT '{}',
+                baseline_json TEXT NOT NULL DEFAULT '{}',
+                stop_reason TEXT NOT NULL DEFAULT '',
+                trade_count INTEGER NOT NULL DEFAULT 0,
+                protected_open_position_count INTEGER NOT NULL DEFAULT 0,
+                legacy_open_position_count INTEGER NOT NULL DEFAULT 0,
+                protected_strategy_pnl REAL NOT NULL DEFAULT 0,
+                account_session_pnl_delta REAL NOT NULL DEFAULT 0,
+                startup_recovery_action TEXT NOT NULL DEFAULT '',
+                startup_recovery_reason TEXT NOT NULL DEFAULT '',
+                created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS risk_states (

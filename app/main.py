@@ -165,6 +165,13 @@ from app.controlled_auto_live import (
     stop_stale_protected_full_auto_sessions_on_startup,
     stop_controlled_auto_live_job,
 )
+from app.protected_auto_worker import (
+    protected_auto_safe_stop_async,
+    protected_auto_status,
+    run_protected_auto_startup_recovery,
+    run_protected_auto_tick,
+    start_protected_auto_daemon,
+)
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
 from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
 from app.live_state_reconciler import live_state_warnings, reconcile_live_state
@@ -265,6 +272,7 @@ def _effective_auto_trading_status(exchange: str, runtime: dict | None = None) -
         "env_live_trading_enabled": env_enabled,
         "db_auto_trading_enabled": db_enabled,
         "runtime_lock_status": str((lock or {}).get("status") or "STOPPED"),
+        "general_auto_runtime_status": str((lock or {}).get("status") or "STOPPED"),
         "live_session_status": str(runtime.get("strategy_status") or "STOPPED"),
         "diagnostic_gate_passed": diagnostic_passed,
         "diagnostic_gate_reasons": diagnostic_gate.get("reasons", []),
@@ -274,6 +282,7 @@ def _effective_auto_trading_status(exchange: str, runtime: dict | None = None) -
 
 def _health_payload(request: Request) -> dict:
     runtime = _runtime_status_payload(request)
+    protected = runtime.get("protected_auto") or protected_auto_status()
     selected_exchange = os.getenv("AUTO_ALLOWED_EXCHANGE", os.getenv("EXCHANGE", "bithumb")).strip().lower()
     if selected_exchange not in {"upbit", "bithumb"}:
         selected_exchange = "bithumb"
@@ -330,6 +339,7 @@ def _health_payload(request: Request) -> dict:
         "env_live_trading_enabled": effective["env_live_trading_enabled"],
         "db_auto_trading_enabled": effective["db_auto_trading_enabled"],
         "runtime_lock_status": effective["runtime_lock_status"],
+        "general_auto_runtime_status": effective["general_auto_runtime_status"],
         "diagnostic_gate_passed": effective["diagnostic_gate_passed"],
         "diagnostic_gate_reasons": effective["diagnostic_gate_reasons"],
         "effective_auto_trading_enabled": effective["effective_auto_trading_enabled"],
@@ -339,6 +349,14 @@ def _health_payload(request: Request) -> dict:
         "live_session_status": effective["live_session_status"] if effective["live_session_status"] != "STOPPED" else "PAUSED",
         "latest_order_sync_time": runtime["last_order_time_utc"],
         "latest_balance_sync_time": _latest_balance_sync_time_utc,
+        "protected_auto_runtime_status": protected.get("protected_auto_runtime_status"),
+        "protected_worker_status": protected.get("protected_worker_status"),
+        "protected_session_status": protected.get("protected_session_status"),
+        "protected_runtime_lock_status": protected.get("protected_runtime_lock_status"),
+        "protected_last_heartbeat_at_utc": protected.get("protected_last_heartbeat_at_utc"),
+        "protected_last_tick_at_utc": protected.get("protected_last_tick_at_utc"),
+        "protected_next_scan_at_utc": protected.get("protected_next_scan_at_utc"),
+        "protected_lock_expires_at_utc": protected.get("protected_lock_expires_at_utc"),
         "warnings": state_warnings.get("warnings", []),
         "orphan_live_active_candidates_count": state_warnings.get("orphan_live_active_candidates_count", 0),
         "stale_session_position_pointer_count": state_warnings.get("stale_session_position_pointer_count", 0),
@@ -391,6 +409,7 @@ def _runtime_status_payload(request: Request) -> dict:
     else:
         runtime_status = "OFF"
     lock = load_runtime_lock(RUNTIME_LOCK_ID)
+    protected = protected_auto_status()
     live_config = LiveTradingConfig.for_exchange(strategy.get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb"))
     return {
         "app_env": os.getenv("APP_ENV", "development"),
@@ -400,6 +419,7 @@ def _runtime_status_payload(request: Request) -> dict:
         "auto_strategy_pilot_enabled": bool(strategy.get("auto_strategy_pilot_enabled")),
         "smart_autonomous_trading_enabled": bool(strategy.get("smart_autonomous_trading_enabled")),
         "runtime_status": runtime_status,
+        "general_auto_runtime_status": runtime_status,
         "strategy_status": raw_status or "STOPPED",
         "emergency_stop": is_emergency_stopped(),
         "selected_strategy_id": session.get("candidate_strategy_id"),
@@ -412,6 +432,15 @@ def _runtime_status_payload(request: Request) -> dict:
         "server_ip": _server_ip(),
         "runtime_owner": lock.get("runtime_owner") if lock else None,
         "runtime_lock": lock,
+        "protected_auto": protected,
+        "protected_auto_runtime_status": protected.get("protected_auto_runtime_status"),
+        "protected_worker_status": protected.get("protected_worker_status"),
+        "protected_session_status": protected.get("protected_session_status"),
+        "protected_runtime_lock_status": protected.get("protected_runtime_lock_status"),
+        "protected_last_heartbeat_at_utc": protected.get("protected_last_heartbeat_at_utc"),
+        "protected_last_tick_at_utc": protected.get("protected_last_tick_at_utc"),
+        "protected_next_scan_at_utc": protected.get("protected_next_scan_at_utc"),
+        "protected_lock_expires_at_utc": protected.get("protected_lock_expires_at_utc"),
     }
 
 
@@ -917,6 +946,8 @@ async def lifespan(_: FastAPI):
             "[protected-full-auto-v1] safe-stopped %s stale RUNNING sessions on server startup; auto-resume is disabled",
             stopped_protected_sessions,
         )
+    protected_recovery_result = run_protected_auto_startup_recovery()
+    logger.info("[protected-auto] startup recovery result=%s", protected_recovery_result)
     scheduler = BackgroundScheduler(timezone="Asia/Seoul")
     scheduler.add_job(
         run_scheduler_tick,
@@ -954,6 +985,15 @@ async def lifespan(_: FastAPI):
         coalesce=True,
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_protected_auto_tick,
+        "interval",
+        seconds=60,
+        id="protected_auto_worker_tick",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     discovery_config = discovery_scheduler_config()
     orchestrator_config = autonomous_orchestrator_config()
     scheduler.add_job(
@@ -983,6 +1023,7 @@ async def lifespan(_: FastAPI):
     logger.info("[paper-forward] scheduler started interval_seconds=60")
     logger.info("[auto-live] pilot scheduler started interval_seconds=10")
     logger.info("[live-strategy] pilot scheduler started interval_seconds=10")
+    logger.info("[protected-auto] worker scheduler started interval_seconds=60")
     logger.info("[autonomous-orchestrator] scheduler started interval_minutes=%s", orchestrator_config["interval_minutes"])
     logger.info("[autonomous-orchestrator] bootstrap_enabled=%s discovery_exchange=%s", orchestrator_config["bootstrap_enabled"], discovery_config["exchange"])
     try:
@@ -3396,49 +3437,36 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
             "current_epoch": current_epoch,
             "controlled_auto_live_gate": gate,
         }
-    acquired, protected_lock = acquire_runtime_lock(
-        lock_id=PROTECTED_RUNTIME_LOCK_ID,
-        instance_id=_instance_id(),
-        hostname=_hostname(),
-        app_env=os.getenv("APP_ENV", "development"),
-        runtime_owner="protected-full-auto-live-v1",
-        ttl_seconds=max(int(payload.runtime_seconds), int(os.getenv("PROTECTED_RUNTIME_LOCK_TTL_SECONDS", "3600"))),
-    )
-    if not acquired:
-        return {
-            "ok": False,
-            "status": "ABORTED",
-            "message": "Protected full auto live v1 runtime lock is already active.",
-            "protected_runtime_lock": protected_lock,
-            "current_epoch": current_epoch,
-            "controlled_auto_live_gate": gate,
-        }
     symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
-    job = await start_controlled_position_loop_job(
+    daemon = start_protected_auto_daemon(
         exchange=payload.exchange,
         symbols=symbols or ["BTC", "ETH"],
         amount_krw=payload.amount_krw,
-        runtime_seconds=payload.runtime_seconds,
         scan_interval_seconds=payload.scan_interval_seconds,
         max_holding_minutes=payload.max_holding_minutes,
         max_position_trades=payload.max_position_trades,
-        confirmation=CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE,
-        controlled_gate=gate,
         current_epoch=current_epoch,
-        mode=PROTECTED_FULL_AUTO_MODE,
-        protected_runtime_instance_id=_instance_id(),
+        gate=gate,
     )
-    if job.get("ok") is False:
-        release_runtime_lock(lock_id=PROTECTED_RUNTIME_LOCK_ID, instance_id=_instance_id(), status="STOPPED")
     return {
-        **job,
+        **daemon,
         "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
         "required_confirmation": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
-        "protected_runtime_lock": protected_lock,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
         "protected_session_baseline_preview": gate.get("protected_session_baseline_preview"),
     }
+
+
+@app.get("/api/protected-full-auto-live/v1/status")
+async def protected_full_auto_live_v1_status() -> dict:
+    return {"ok": True, "protected_auto": protected_auto_status()}
+
+
+@app.post("/api/protected-full-auto-live/v1/stop")
+async def protected_full_auto_live_v1_stop() -> dict:
+    stopped = await protected_auto_safe_stop_async("USER_REQUESTED_STOP")
+    return {"ok": True, "protected_auto": stopped}
 
 
 @app.get("/api/controlled-auto-live/status/{controlled_run_id}")
@@ -3497,13 +3525,24 @@ async def trading_diagnostics(
         current_equity=asset_reconciliation.get("current_equity_from_exchange"),
     )
     open_order_audit = await _build_smoke_open_order_audit(exchange, current_epoch)
-    return build_trading_diagnostics_report(
+    report = build_trading_diagnostics_report(
         exchange=exchange,
         days=days,
         starting_asset_krw=starting_asset_krw,
         asset_reconciliation=asset_reconciliation,
         open_order_audit=open_order_audit,
     )
+    protected = protected_auto_status()
+    report["protected_auto"] = protected
+    report["protected_auto_runtime_status"] = protected.get("protected_auto_runtime_status")
+    report["protected_worker_status"] = protected.get("protected_worker_status")
+    report["protected_session_status"] = protected.get("protected_session_status")
+    report["protected_runtime_lock_status"] = protected.get("protected_runtime_lock_status")
+    report["protected_last_heartbeat_at_utc"] = protected.get("protected_last_heartbeat_at_utc")
+    report["protected_last_tick_at_utc"] = protected.get("protected_last_tick_at_utc")
+    report["protected_next_scan_at_utc"] = protected.get("protected_next_scan_at_utc")
+    report["protected_lock_expires_at_utc"] = protected.get("protected_lock_expires_at_utc")
+    return report
 
 
 @app.get("/api/trading-reconciliation")

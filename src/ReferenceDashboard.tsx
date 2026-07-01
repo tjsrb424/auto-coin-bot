@@ -324,6 +324,7 @@ type RuntimeStatus = {
   auto_strategy_pilot_enabled?: boolean;
   smart_autonomous_trading_enabled?: boolean;
   runtime_status?: "OFF" | "RUNNING" | "PAUSED" | "STOPPED" | "EMERGENCY_STOPPED" | string;
+  general_auto_runtime_status?: string;
   strategy_status?: string;
   emergency_stop?: boolean;
   selected_strategy_id?: number | null;
@@ -335,6 +336,15 @@ type RuntimeStatus = {
   hostname?: string;
   server_ip?: string;
   runtime_owner?: string | null;
+  protected_auto_runtime_status?: string;
+  protected_worker_status?: string;
+  protected_session_status?: string;
+  protected_runtime_lock_status?: string;
+  protected_last_heartbeat_at_utc?: string | null;
+  protected_last_tick_at_utc?: string | null;
+  protected_next_scan_at_utc?: string | null;
+  protected_lock_expires_at_utc?: string | null;
+  protected_auto?: Record<string, any>;
 };
 
 type OrderIntent = {
@@ -4075,10 +4085,11 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const protectedStartAllowed = diagnostics?.protected_session_start_allowed ?? diagnostics?.protected_full_auto_live_allowed ?? protectedGate?.protected_session_start_allowed ?? false;
   const protectedNextAction = diagnostics?.protected_full_auto_next_action ?? protectedGate?.protected_full_auto_next_action ?? "-";
   const protectedSessionStatus = diagnostics?.protected_full_auto_session_status ?? protectedGate?.protected_full_auto_session_status ?? {};
+  const protectedDaemon = data.runtimeStatus?.protected_auto ?? {};
   const runtimeLockSeparation = diagnostics?.runtime_lock_separation ?? protectedGate?.runtime_lock_separation ?? {};
-  const legacyOpenPositionCount = diagnostics?.legacy_open_position_count ?? protectedGate?.legacy_open_position_count ?? 0;
-  const protectedOpenPositionCount = diagnostics?.protected_open_position_count ?? protectedGate?.protected_open_position_count ?? 0;
-  const protectedEmptySlotCount = diagnostics?.protected_empty_slot_count ?? protectedGate?.protected_empty_slot_count ?? 0;
+  const legacyOpenPositionCount = protectedDaemon?.legacy_open_position_count ?? diagnostics?.legacy_open_position_count ?? protectedGate?.legacy_open_position_count ?? 0;
+  const protectedOpenPositionCount = protectedDaemon?.protected_open_position_count ?? diagnostics?.protected_open_position_count ?? protectedGate?.protected_open_position_count ?? 0;
+  const protectedEmptySlotCount = protectedDaemon?.protected_empty_slot_count ?? diagnostics?.protected_empty_slot_count ?? protectedGate?.protected_empty_slot_count ?? 0;
   const allocatorBlockedByLegacy = diagnostics?.allocator_blocked_by_legacy_positions ?? protectedGate?.allocator_blocked_by_legacy_positions ?? false;
   const openOrderAudit = diagnostics?.open_order_audit ?? smokeTest?.open_order_audit;
   const openOrderSummary = openOrderAudit?.open_order_audit_summary ?? smokeTest?.open_order_audit_summary;
@@ -4245,9 +4256,33 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     },
     {
       label: "Protected Runtime",
-      value: String(protectedSessionStatus?.status ?? "STOPPED"),
-      detail: `${runtimeLockSeparation?.protected_lock_id ?? "protected-full-auto-live-v1"} - ${runtimeLockSeparation?.protected_runtime_lock_status ?? "STOPPED"}`,
-      tone: protectedSessionStatus?.status === "RUNNING" ? "green" : "amber"
+      value: String(data.runtimeStatus?.protected_auto_runtime_status ?? protectedDaemon?.protected_auto_runtime_status ?? protectedSessionStatus?.status ?? "STOPPED"),
+      detail: `${runtimeLockSeparation?.protected_lock_id ?? "protected-full-auto-live-v1"} - ${data.runtimeStatus?.protected_runtime_lock_status ?? protectedDaemon?.protected_runtime_lock_status ?? runtimeLockSeparation?.protected_runtime_lock_status ?? "STOPPED"}`,
+      tone: (data.runtimeStatus?.protected_auto_runtime_status ?? protectedDaemon?.protected_auto_runtime_status) === "RUNNING" ? "green" : "amber"
+    },
+    {
+      label: "Protected Worker",
+      value: String(data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status ?? "STOPPED"),
+      detail: `session ${data.runtimeStatus?.protected_session_status ?? protectedDaemon?.protected_session_status ?? "-"} - stale ${protectedDaemon?.stale || protectedDaemon?.stale_lock ? "YES" : "NO"}`,
+      tone: (data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status) === "RUNNING" ? "green" : ((data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status) === "STALE" ? "red" : "amber")
+    },
+    {
+      label: "Protected Heartbeat",
+      value: String(data.runtimeStatus?.protected_last_heartbeat_at_utc ?? protectedDaemon?.protected_last_heartbeat_at_utc ?? "-"),
+      detail: `last scan ${data.runtimeStatus?.protected_last_tick_at_utc ?? protectedDaemon?.protected_last_tick_at_utc ?? "-"} - next ${data.runtimeStatus?.protected_next_scan_at_utc ?? protectedDaemon?.protected_next_scan_at_utc ?? "-"}`,
+      tone: protectedDaemon?.stale ? "red" : "cyan"
+    },
+    {
+      label: "Protected Trades",
+      value: String(protectedDaemon?.trade_count ?? 0),
+      detail: `strategy ${formatSignedKrw(protectedDaemon?.protected_strategy_pnl)} - account ${formatSignedKrw(protectedDaemon?.account_session_pnl_delta)}`,
+      tone: Number(protectedDaemon?.protected_strategy_pnl ?? 0) < 0 ? "red" : "green"
+    },
+    {
+      label: "Protected Stop",
+      value: String(protectedDaemon?.stop_reason || "CLEAR"),
+      detail: String(protectedDaemon?.last_scan_result?.result ?? protectedDaemon?.startup_recovery_action ?? "-"),
+      tone: protectedDaemon?.stop_reason ? "red" : "green"
     },
     {
       label: "Protected Slots",
