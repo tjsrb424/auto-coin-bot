@@ -25,6 +25,7 @@ from app.controlled_auto_live import (
 from app.database import (
     acquire_runtime_lock,
     get_connection,
+    load_protected_auto_notifications,
     load_global_bot_operation_policy,
     load_runtime_lock,
     release_runtime_lock,
@@ -32,6 +33,7 @@ from app.database import (
 from app.live_broker import LiveTradingConfig, is_emergency_stopped
 from app.live_recovery import log_recovery_event
 from app.live_smoke_test import _current_equity
+from app.protected_notifications import latest_protected_auto_notification, notify_protected_auto_event
 
 logger = logging.getLogger("uvicorn.error")
 _WORKER_INSTANCE_ID = os.getenv("RUNTIME_INSTANCE_ID", f"{socket.gethostname()}-{uuid.uuid4().hex[:12]}")
@@ -52,6 +54,10 @@ def _utc_now() -> str:
 
 def _plus_seconds(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _kst_date_text() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=9)).date().isoformat()
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -238,6 +244,182 @@ def _latest_protected_job() -> dict | None:
     return jobs[0] if jobs else None
 
 
+def _event_id(*parts: Any) -> str:
+    return ":".join(str(part).replace(":", "-") for part in parts if part not in (None, ""))
+
+
+def _notify_protected_event(
+    event_type: str,
+    *,
+    state: dict | None = None,
+    severity: str = "INFO",
+    message: str = "",
+    payload: dict | None = None,
+    controlled_run_id: str | None = None,
+    event_id: str | None = None,
+) -> dict | None:
+    state = state or load_protected_auto_state()
+    event_payload = {
+        "runtime_id": PROTECTED_AUTO_RUNTIME_ID,
+        "worker_status": state.get("worker_status"),
+        "session_status": state.get("session_status"),
+        "status": state.get("session_status") or state.get("worker_status"),
+        "protected_session_id": state.get("protected_session_id"),
+        "last_heartbeat_at_utc": state.get("last_heartbeat_at_utc"),
+        "last_tick_at_utc": state.get("last_tick_at_utc"),
+        "next_tick_at_utc": state.get("next_tick_at_utc"),
+        "lock_expires_at_utc": state.get("lock_expires_at_utc"),
+        "trade_count": state.get("trade_count"),
+        "protected_strategy_pnl": state.get("protected_strategy_pnl"),
+        "account_session_pnl_delta": state.get("account_session_pnl_delta"),
+        "stop_reason": state.get("stop_reason"),
+        **(payload or {}),
+    }
+    try:
+        return notify_protected_auto_event(
+            event_type,
+            severity=severity,
+            exchange=str(state.get("exchange") or "bithumb"),
+            protected_session_id=str(state.get("protected_session_id") or "") or None,
+            controlled_run_id=controlled_run_id,
+            message=message,
+            payload=event_payload,
+            event_id=event_id,
+        )
+    except Exception as exc:
+        logger.warning("[protected-auto] notification failed event=%s error=%s", event_type, exc)
+        return None
+
+
+def _mapped_stop_events(reason: str) -> list[str]:
+    upper = str(reason or "").upper()
+    events: list[str] = []
+    if "PROTECTED_HEARTBEAT_STALE" in upper or "STALE" in upper:
+        events.append("PROTECTED_AUTO_STALE")
+    if "SESSION_LOSS_LIMIT" in upper or "PROTECTED_SESSION_LOSS_LIMIT_REACHED" in upper:
+        events.append("SESSION_LOSS_LIMIT_REACHED")
+    if "ACCOUNTING" in upper:
+        events.append("ACCOUNTING_ERROR")
+    if "MISSING_LEDGER" in upper or "MISSING LEDGER" in upper:
+        events.append("MISSING_LEDGER_FILL")
+    if "DUPLICATE_FILL" in upper or "DUPLICATE FILL" in upper:
+        events.append("DUPLICATE_FILL")
+    if "FEE_DIFF" in upper or "FEE DIFF" in upper:
+        events.append("FEE_DIFF_ERROR")
+    if "EQUITY_DIFF" in upper or "EQUITY DIFF" in upper:
+        events.append("EQUITY_DIFF_ERROR")
+    if "OPEN_ORDER" in upper or "OPEN ORDER" in upper:
+        events.append("OPEN_ORDER_STALE")
+    return list(dict.fromkeys(events))
+
+
+def _notify_stop_events(state: dict, reason: str, worker_status: str, failed: bool) -> None:
+    severity = "ERROR" if failed or worker_status == "FAILED" else "WARNING"
+    for event_type in _mapped_stop_events(reason):
+        _notify_protected_event(
+            event_type,
+            state=state,
+            severity=severity,
+            message=f"Protected auto stop condition observed: {reason}",
+            payload={"reason": reason, "worker_status": worker_status},
+            event_id=_event_id(state.get("protected_session_id"), event_type, worker_status, reason),
+        )
+    _notify_protected_event(
+        "PROTECTED_AUTO_STOPPED",
+        state=state,
+        severity=severity,
+        message=f"Protected auto daemon stopped: {reason}",
+        payload={"reason": reason, "worker_status": worker_status},
+        event_id=_event_id(state.get("protected_session_id"), "PROTECTED_AUTO_STOPPED", worker_status, reason),
+    )
+
+
+def _notify_report_events(state: dict, report: dict, status: str, stop_reasons: list[str]) -> None:
+    run_id = str(report.get("controlled_run_id") or report.get("loop_run_id") or report.get("position_run_id") or "")
+    trade_payload = {
+        "controlled_run_id": run_id,
+        "controlled_auto_live_status": status,
+        "trade_count": report.get("trade_count"),
+        "buy_filled_count": report.get("buy_filled_count"),
+        "sell_filled_count": report.get("sell_filled_count"),
+        "protected_strategy_pnl": report.get("protected_strategy_total_pnl"),
+        "account_session_pnl_delta": report.get("account_session_pnl_delta"),
+        "session_loss_remaining": report.get("session_loss_limit_remaining"),
+    }
+    if int(report.get("buy_filled_count") or 0) > 0:
+        _notify_protected_event(
+            "TRADE_OPENED",
+            state=state,
+            severity="INFO",
+            message="Protected controlled_entry_v3 trade opened.",
+            payload=trade_payload,
+            controlled_run_id=run_id or None,
+            event_id=_event_id(state.get("protected_session_id"), run_id, "TRADE_OPENED"),
+        )
+    if int(report.get("sell_filled_count") or 0) > 0:
+        _notify_protected_event(
+            "TRADE_CLOSED",
+            state=state,
+            severity="INFO",
+            message="Protected controlled_entry_v3 trade closed.",
+            payload=trade_payload,
+            controlled_run_id=run_id or None,
+            event_id=_event_id(state.get("protected_session_id"), run_id, "TRADE_CLOSED"),
+        )
+    for reason in stop_reasons:
+        for event_type in _mapped_stop_events(reason):
+            _notify_protected_event(
+                event_type,
+                state=state,
+                severity="ERROR",
+                message=f"Protected controlled_entry_v3 report stop condition: {reason}",
+                payload={**trade_payload, "reason": reason},
+                controlled_run_id=run_id or None,
+                event_id=_event_id(state.get("protected_session_id"), run_id, event_type, reason),
+            )
+
+
+def _notify_daily_summary_if_due(state: dict) -> None:
+    _notify_protected_event(
+        "DAILY_SUMMARY",
+        state=state,
+        severity="INFO",
+        message="Protected auto daily summary.",
+        payload={
+            "summary_date_kst": _kst_date_text(),
+            "trade_count": state.get("trade_count"),
+            "protected_open_position_count": state.get("protected_open_position_count"),
+            "legacy_open_position_count": state.get("legacy_open_position_count"),
+            "protected_strategy_pnl": state.get("protected_strategy_pnl"),
+            "account_session_pnl_delta": state.get("account_session_pnl_delta"),
+            "session_loss_remaining": _session_loss_remaining(state),
+        },
+        event_id=_event_id(state.get("protected_session_id"), "DAILY_SUMMARY", _kst_date_text()),
+    )
+
+
+def _session_loss_remaining(state: dict) -> Any:
+    active = _active_protected_job() or {}
+    active_report = active.get("report") or {}
+    latest_report = state.get("latest_report") or {}
+    baseline = state.get("baseline") or {}
+    return (
+        active_report.get("session_loss_limit_remaining")
+        if active_report.get("session_loss_limit_remaining") is not None
+        else latest_report.get("session_loss_limit_remaining")
+        if latest_report.get("session_loss_limit_remaining") is not None
+        else baseline.get("session_loss_limit_remaining")
+    )
+
+
+def _latest_signal_summary(signals: dict) -> dict:
+    for timeframe in ("3m", "5m", "15m"):
+        signal = signals.get(timeframe)
+        if isinstance(signal, dict) and signal:
+            return {"timeframe": timeframe, **signal}
+    return {}
+
+
 def _sync_latest_report_into_state(state: dict) -> dict:
     latest = _latest_protected_job()
     if not latest or str(latest.get("status") or "").upper() in {"STARTING", "RUNNING"}:
@@ -268,6 +450,7 @@ def _sync_latest_report_into_state(state: dict) -> dict:
         },
     }
     state = _upsert_state(updates)
+    _notify_report_events(state, report, status, stop_reasons)
     hard_status = status in {"FAILED", "STOPPED", "ABORTED"}
     hard_reason = next((reason for reason in stop_reasons if reason), "")
     if hard_status and hard_reason:
@@ -293,6 +476,8 @@ def protected_auto_status() -> dict:
     latest_report = state.get("latest_report") or {}
     scope = _position_scope(state)
     lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
+    recent_notifications = load_protected_auto_notifications(20)
+    signal_by_timeframe = active_signal_by_timeframe or last_scan.get("latest_signal_by_timeframe") or latest_report.get("latest_signal_by_timeframe") or {}
     stale_lock = (
         str(lock.get("status") or "").upper() == "RUNNING"
         and str(lock.get("expires_at") or "") <= _utc_now()
@@ -314,8 +499,12 @@ def protected_auto_status() -> dict:
         "stale": stale,
         "stale_lock": stale or stale_lock,
         "active_controlled_job": active,
-        "latest_signal_by_timeframe": active_signal_by_timeframe or last_scan.get("latest_signal_by_timeframe") or latest_report.get("latest_signal_by_timeframe") or {},
+        "latest_signal": _latest_signal_summary(signal_by_timeframe),
+        "latest_signal_by_timeframe": signal_by_timeframe,
         "trade_candidate_count_by_timeframe": active_candidate_counts or last_scan.get("trade_candidate_count_by_timeframe") or latest_report.get("trade_candidate_count_by_timeframe") or {},
+        "session_loss_remaining": _session_loss_remaining(state),
+        "last_alert": recent_notifications[0] if recent_notifications else latest_protected_auto_notification(),
+        "recent_notifications": recent_notifications,
         "allowed_symbols": list(PROTECTED_ALLOWED_SYMBOLS),
         "allowed_strategy": CONTROLLED_ENTRY_V3_STRATEGY,
         "max_notional_krw": PROTECTED_MAX_NOTIONAL_KRW,
@@ -374,6 +563,7 @@ def protected_auto_safe_stop(reason: str, *, failed: bool = False) -> dict:
         message=f"Protected auto daemon safe-stopped: {reason}",
         payload={"reason": reason, "worker_status": worker_status},
     )
+    _notify_stop_events(state, reason, worker_status, failed)
     return protected_auto_status()
 
 
@@ -403,6 +593,7 @@ async def protected_auto_safe_stop_async(reason: str, *, failed: bool = False) -
         message=f"Protected auto daemon safe-stopped: {reason}",
         payload={"reason": reason, "worker_status": worker_status},
     )
+    _notify_stop_events(state, reason, worker_status, failed)
     return protected_auto_status()
 
 
@@ -499,6 +690,14 @@ def start_protected_auto_daemon(
             "account_session_pnl_delta": 0.0,
         }
     )
+    _notify_protected_event(
+        "PROTECTED_AUTO_STARTED",
+        state=state,
+        severity="INFO",
+        message="Protected auto daemon started.",
+        payload={"started_at_utc": started, "symbols": symbols, "amount_krw": amount},
+        event_id=_event_id(protected_session_id, "PROTECTED_AUTO_STARTED", started),
+    )
     return {"ok": True, "status": "RUNNING", "protected_auto": {**protected_auto_status(), **state}}
 
 
@@ -544,6 +743,14 @@ async def run_protected_auto_startup_recovery_async() -> dict:
             }
         )
         logger.info("[protected-auto] startup recovery resumed protected daemon session=%s", resumed.get("protected_session_id"))
+        _notify_protected_event(
+            "PROTECTED_AUTO_STARTED",
+            state=resumed,
+            severity="INFO",
+            message="Protected auto daemon resumed after startup recovery.",
+            payload={"recovery_action": "RESUMED", "recovery_reason": "OPEN_ORDER_0_ACCOUNTING_CLEAN_BROKER_READY"},
+            event_id=_event_id(resumed.get("protected_session_id"), "PROTECTED_AUTO_STARTED", "RESUMED", resumed.get("last_heartbeat_at_utc")),
+        )
         return {"action": "RESUMED", "protected_auto": protected_auto_status()}
     except Exception as exc:
         result = await protected_auto_safe_stop_async(f"STARTUP_RECOVERY_EXCEPTION:{exc.__class__.__name__}", failed=True)
@@ -592,6 +799,7 @@ async def protected_auto_tick_async() -> dict:
             "legacy_open_position_count": scope.get("legacy_open_position_count", 0),
         }
     )
+    _notify_daily_summary_if_due(heartbeat)
     if active:
         active_scan = {
             "result": "ACTIVE_CONTROLLED_ENTRY_V3_POSITION_JOB",

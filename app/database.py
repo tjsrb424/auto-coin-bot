@@ -51,6 +51,7 @@ REQUIRED_SCHEMA_TABLES = [
     "controlled_run_reports",
     "resolved_safety_events",
     "protected_auto_runtime",
+    "protected_auto_notifications",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
               AND request_id NOT LIKE '%-submitted%'
@@ -1056,6 +1057,24 @@ def init_db() -> None:
                 startup_recovery_reason TEXT NOT NULL DEFAULT '',
                 created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS protected_auto_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'INFO',
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                protected_session_id TEXT,
+                controlled_run_id TEXT,
+                message TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                channel TEXT NOT NULL DEFAULT 'DB_ONLY',
+                webhook_configured INTEGER NOT NULL DEFAULT 0,
+                delivery_status TEXT NOT NULL DEFAULT 'DB_ONLY',
+                delivery_error TEXT NOT NULL DEFAULT '',
+                sent_at_utc TEXT,
+                created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS risk_states (
@@ -3718,6 +3737,118 @@ def load_live_recovery_events(limit: int = 100) -> list[dict]:
         item["payload"] = json.loads(item.pop("payload_json") or "{}")
         events.append(item)
     return events
+
+
+def insert_protected_auto_notification(event: dict) -> dict:
+    now = _utc_now()
+    event_id = str(event.get("event_id") or f"protected-alert-{uuid.uuid4().hex[:12]}")
+    payload = {
+        "event_id": event_id,
+        "event_type": str(event.get("event_type") or "PROTECTED_AUTO_EVENT"),
+        "severity": str(event.get("severity") or "INFO").upper(),
+        "exchange": str(event.get("exchange") or "bithumb"),
+        "protected_session_id": event.get("protected_session_id"),
+        "controlled_run_id": event.get("controlled_run_id"),
+        "message": str(event.get("message") or ""),
+        "payload": event.get("payload") or {},
+        "channel": str(event.get("channel") or "DB_ONLY"),
+        "webhook_configured": 1 if event.get("webhook_configured") else 0,
+        "delivery_status": str(event.get("delivery_status") or "DB_ONLY"),
+        "delivery_error": str(event.get("delivery_error") or ""),
+        "sent_at_utc": event.get("sent_at_utc"),
+        "created_at_utc": str(event.get("created_at_utc") or now),
+    }
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO protected_auto_notifications (
+                event_id, event_type, severity, exchange, protected_session_id,
+                controlled_run_id, message, payload_json, channel,
+                webhook_configured, delivery_status, delivery_error,
+                sent_at_utc, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (
+                payload["event_id"],
+                payload["event_type"],
+                payload["severity"],
+                payload["exchange"],
+                payload["protected_session_id"],
+                payload["controlled_run_id"],
+                payload["message"],
+                json.dumps(payload["payload"], ensure_ascii=False, default=str),
+                payload["channel"],
+                payload["webhook_configured"],
+                payload["delivery_status"],
+                payload["delivery_error"],
+                payload["sent_at_utc"],
+                payload["created_at_utc"],
+            ),
+        )
+    return load_protected_auto_notification(event_id) or payload
+
+
+def update_protected_auto_notification_delivery(event_id: str, updates: dict) -> dict | None:
+    allowed = {
+        "channel",
+        "webhook_configured",
+        "delivery_status",
+        "delivery_error",
+        "sent_at_utc",
+    }
+    fields = [key for key in updates if key in allowed]
+    if not fields:
+        return load_protected_auto_notification(event_id)
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    values = [updates[key] for key in fields]
+    values.append(event_id)
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE protected_auto_notifications SET {assignments} WHERE event_id = ?",
+            values,
+        )
+    return load_protected_auto_notification(event_id)
+
+
+def load_protected_auto_notification(event_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM protected_auto_notifications WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["payload"] = json.loads(item.pop("payload_json") or "{}")
+    return item
+
+
+def load_protected_auto_notifications(limit: int = 50, event_type: str | None = None) -> list[dict]:
+    limit = min(max(int(limit or 50), 1), 200)
+    params: list[Any] = []
+    where = ""
+    if event_type:
+        where = "WHERE event_type = ?"
+        params.append(event_type)
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM protected_auto_notifications
+            {where}
+            ORDER BY created_at_utc DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        items.append(item)
+    return items
 
 
 def load_runtime_lock(lock_id: str = "auto-trading") -> dict | None:

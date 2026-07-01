@@ -344,6 +344,7 @@ type RuntimeStatus = {
   protected_last_tick_at_utc?: string | null;
   protected_next_scan_at_utc?: string | null;
   protected_lock_expires_at_utc?: string | null;
+  protected_last_alert?: Record<string, any> | null;
   protected_auto?: Record<string, any>;
 };
 
@@ -4108,6 +4109,19 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const protectedLegacyValuationDelta = protectedDaemon?.latest_report?.legacy_holding_valuation_delta
     ?? protectedDaemon?.last_scan_result?.legacy_holding_valuation_delta
     ?? 0;
+  const protectedRuntimeStatus = String(data.runtimeStatus?.protected_auto_runtime_status ?? protectedDaemon?.protected_auto_runtime_status ?? protectedSessionStatus?.status ?? "STOPPED");
+  const protectedWorkerStatus = String(data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status ?? "STOPPED");
+  const protectedLastAlert = protectedDaemon?.last_alert ?? data.runtimeStatus?.protected_last_alert ?? protectedDaemon?.recent_notifications?.[0] ?? null;
+  const protectedLastAlertValue = protectedLastAlert?.event_type ?? "CLEAR";
+  const protectedLastAlertDetail = protectedLastAlert
+    ? `${protectedLastAlert?.delivery_status ?? "LOGGED"} - ${protectedLastAlert?.message ?? "-"}`
+    : "notification log clear";
+  const protectedLossRemaining = protectedDaemon?.session_loss_remaining ?? protectedSessionRemaining;
+  const protectedStatusTone = protectedRuntimeStatus === "RUNNING" && protectedWorkerStatus !== "STALE"
+    ? "green"
+    : protectedWorkerStatus === "STALE" || protectedRuntimeStatus === "FAILED"
+      ? "red"
+      : "amber";
   const runtimeLockSeparation = diagnostics?.runtime_lock_separation ?? protectedGate?.runtime_lock_separation ?? {};
   const legacyOpenPositionCount = protectedDaemon?.legacy_open_position_count ?? diagnostics?.legacy_open_position_count ?? protectedGate?.legacy_open_position_count ?? 0;
   const protectedOpenPositionCount = protectedDaemon?.protected_open_position_count ?? diagnostics?.protected_open_position_count ?? protectedGate?.protected_open_position_count ?? 0;
@@ -4265,7 +4279,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     {
       label: "Protected Loss Limit",
       value: formatKrw(protectedSessionLossLimit),
-      detail: `remaining ${formatKrw(protectedSessionRemaining)} - stop immediately on session limit`,
+      detail: `remaining ${formatKrw(protectedLossRemaining)} - stop immediately on session limit`,
       tone: "amber"
     },
     {
@@ -4277,16 +4291,16 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: protectedWarnings.length ? "amber" : "green"
     },
     {
-      label: "Protected Runtime",
-      value: String(data.runtimeStatus?.protected_auto_runtime_status ?? protectedDaemon?.protected_auto_runtime_status ?? protectedSessionStatus?.status ?? "STOPPED"),
+      label: "Protected Auto Status",
+      value: protectedRuntimeStatus,
       detail: `${runtimeLockSeparation?.protected_lock_id ?? "protected-full-auto-live-v1"} - ${data.runtimeStatus?.protected_runtime_lock_status ?? protectedDaemon?.protected_runtime_lock_status ?? runtimeLockSeparation?.protected_runtime_lock_status ?? "STOPPED"}`,
-      tone: (data.runtimeStatus?.protected_auto_runtime_status ?? protectedDaemon?.protected_auto_runtime_status) === "RUNNING" ? "green" : "amber"
+      tone: protectedStatusTone
     },
     {
       label: "Protected Worker",
-      value: String(data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status ?? "STOPPED"),
+      value: protectedWorkerStatus,
       detail: `session ${data.runtimeStatus?.protected_session_status ?? protectedDaemon?.protected_session_status ?? "-"} - stale ${protectedDaemon?.stale || protectedDaemon?.stale_lock ? "YES" : "NO"}`,
-      tone: (data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status) === "RUNNING" ? "green" : ((data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status) === "STALE" ? "red" : "amber")
+      tone: protectedWorkerStatus === "RUNNING" ? "green" : (protectedWorkerStatus === "STALE" ? "red" : "amber")
     },
     {
       label: "Protected Heartbeat",
@@ -4299,6 +4313,12 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       value: protectedCandidateDetail,
       detail: protectedSignalDetail,
       tone: Object.values(protectedCandidateCounts ?? {}).some((count: any) => Number(count ?? 0) > 0) ? "green" : "cyan"
+    },
+    {
+      label: "Protected Last Alert",
+      value: String(protectedLastAlertValue),
+      detail: String(protectedLastAlertDetail),
+      tone: protectedLastAlertValue === "CLEAR" ? "green" : (String(protectedLastAlert?.severity ?? "").toUpperCase() === "ERROR" ? "red" : "amber")
     },
     {
       label: "Protected Trades",

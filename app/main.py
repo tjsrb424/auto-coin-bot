@@ -58,6 +58,7 @@ from app.database import (
     load_candidate_strategy,
     load_bot_operation_policy,
     load_global_bot_operation_policy,
+    load_protected_auto_notifications,
     load_latest_live_paper_session,
     load_decision_snapshot,
     load_decision_snapshots,
@@ -443,6 +444,7 @@ def _runtime_status_payload(request: Request) -> dict:
         "protected_last_tick_at_utc": protected.get("protected_last_tick_at_utc"),
         "protected_next_scan_at_utc": protected.get("protected_next_scan_at_utc"),
         "protected_lock_expires_at_utc": protected.get("protected_lock_expires_at_utc"),
+        "protected_last_alert": protected.get("last_alert"),
     }
 
 
@@ -3647,6 +3649,17 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
 @app.get("/api/protected-full-auto-live/v1/status")
 async def protected_full_auto_live_v1_status() -> dict:
     return {"ok": True, "protected_auto": protected_auto_status()}
+
+
+@app.get("/api/protected-full-auto-live/v1/notifications")
+async def protected_full_auto_live_v1_notifications(
+    limit: int = Query(50, ge=1, le=200),
+    event_type: str | None = None,
+) -> dict:
+    return {
+        "ok": True,
+        "notifications": load_protected_auto_notifications(limit=limit, event_type=event_type),
+    }
 
 
 @app.post("/api/protected-full-auto-live/v1/stop")

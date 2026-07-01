@@ -74,6 +74,9 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         self.assertFalse(database.load_global_bot_operation_policy()["auto_trading_enabled"])
         self.assertEqual(database.load_runtime_lock("auto-trading"), None)
         self.assertEqual(database.load_runtime_lock("protected-full-auto-live-v1")["status"], "RUNNING")
+        notifications = database.load_protected_auto_notifications()
+        self.assertEqual(notifications[0]["event_type"], "PROTECTED_AUTO_STARTED")
+        self.assertEqual(notifications[0]["delivery_status"], "DB_ONLY")
 
     def test_status_marks_missing_heartbeat_as_stale(self) -> None:
         start_protected_auto_daemon(
@@ -118,6 +121,48 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         self.assertEqual(stopped["protected_auto_runtime_status"], "STOPPED")
         self.assertEqual(stopped["stop_reason"], "TEST_STOP")
         self.assertEqual(database.load_runtime_lock("protected-full-auto-live-v1")["status"], "STOPPED")
+        notifications = database.load_protected_auto_notifications()
+        self.assertEqual(notifications[0]["event_type"], "PROTECTED_AUTO_STOPPED")
+        self.assertIn("TEST_STOP", notifications[0]["message"])
+
+    def test_stale_safe_stop_records_stale_notification(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+
+        protected_auto_safe_stop("PROTECTED_HEARTBEAT_STALE")
+
+        event_types = [item["event_type"] for item in database.load_protected_auto_notifications()]
+        self.assertIn("PROTECTED_AUTO_STALE", event_types)
+        self.assertIn("PROTECTED_AUTO_STOPPED", event_types)
+
+    def test_webhook_failure_does_not_block_safe_stop(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+
+        with patch.dict("os.environ", {"PROTECTED_AUTO_WEBHOOK_URL": "http://127.0.0.1:9/protected-alert"}, clear=False):
+            stopped = protected_auto_safe_stop("ACCOUNTING_FAILED", failed=True)
+
+        self.assertEqual(stopped["protected_auto_runtime_status"], "FAILED")
+        notifications = database.load_protected_auto_notifications()
+        failed_delivery = [item for item in notifications if item["delivery_status"] == "FAILED"]
+        self.assertTrue(failed_delivery)
+        self.assertIn("ACCOUNTING_ERROR", [item["event_type"] for item in notifications])
 
     def test_startup_recovery_clears_expired_lock_without_active_daemon(self) -> None:
         with database.get_connection() as conn:
