@@ -502,7 +502,7 @@ def start_protected_auto_daemon(
     return {"ok": True, "status": "RUNNING", "protected_auto": {**protected_auto_status(), **state}}
 
 
-def run_protected_auto_startup_recovery() -> dict:
+async def run_protected_auto_startup_recovery_async() -> dict:
     state = load_protected_auto_state()
     if str(state.get("worker_status") or "").upper() not in {"RUNNING", "STALE"}:
         lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
@@ -517,18 +517,18 @@ def run_protected_auto_startup_recovery() -> dict:
         return {"action": "NO_ACTIVE_PROTECTED_DAEMON", "protected_auto": protected_auto_status()}
     exchange = str(state.get("exchange") or "bithumb")
     try:
-        current_epoch = asyncio.run(_current_epoch_with_exchange_equity(exchange))
+        current_epoch = await _current_epoch_with_exchange_equity(exchange)
         blockers = _hard_stop_reasons(exchange, current_epoch)
-        open_blocker = asyncio.run(_open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS)))
+        open_blocker = await _open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS))
         if open_blocker:
             blockers.append(str(open_blocker))
         if blockers:
-            result = protected_auto_safe_stop("STARTUP_RECOVERY_SAFE_STOP:" + ",".join(blockers), failed=False)
+            result = await protected_auto_safe_stop_async("STARTUP_RECOVERY_SAFE_STOP:" + ",".join(blockers), failed=False)
             _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": ",".join(blockers)})
             return {"action": "SAFE_STOP", "reasons": blockers, "protected_auto": result}
         acquired, lock = _acquire_protected_lock()
         if not acquired:
-            result = protected_auto_safe_stop("STARTUP_RECOVERY_LOCK_CONFLICT", failed=True)
+            result = await protected_auto_safe_stop_async("STARTUP_RECOVERY_LOCK_CONFLICT", failed=True)
             _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": "LOCK_CONFLICT"})
             return {"action": "SAFE_STOP", "reasons": ["LOCK_CONFLICT"], "protected_auto": result}
         now = _utc_now()
@@ -546,9 +546,13 @@ def run_protected_auto_startup_recovery() -> dict:
         logger.info("[protected-auto] startup recovery resumed protected daemon session=%s", resumed.get("protected_session_id"))
         return {"action": "RESUMED", "protected_auto": protected_auto_status()}
     except Exception as exc:
-        result = protected_auto_safe_stop(f"STARTUP_RECOVERY_EXCEPTION:{exc.__class__.__name__}", failed=True)
+        result = await protected_auto_safe_stop_async(f"STARTUP_RECOVERY_EXCEPTION:{exc.__class__.__name__}", failed=True)
         _upsert_state({"startup_recovery_action": "SAFE_STOP", "startup_recovery_reason": f"{exc.__class__.__name__}:{str(exc)[:160]}"})
         return {"action": "SAFE_STOP", "reasons": [f"{exc.__class__.__name__}:{str(exc)[:160]}"], "protected_auto": result}
+
+
+def run_protected_auto_startup_recovery() -> dict:
+    return asyncio.run(run_protected_auto_startup_recovery_async())
 
 
 async def _open_order_blocker(exchange: str, symbols: list[str]) -> str | None:

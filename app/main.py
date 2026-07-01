@@ -170,7 +170,7 @@ from app.controlled_auto_live import (
 from app.protected_auto_worker import (
     protected_auto_safe_stop_async,
     protected_auto_status,
-    run_protected_auto_startup_recovery,
+    run_protected_auto_startup_recovery_async,
     run_protected_auto_tick,
     start_protected_auto_daemon,
 )
@@ -955,7 +955,7 @@ async def lifespan(_: FastAPI):
             "[protected-full-auto-v1] safe-stopped %s stale RUNNING sessions on server startup; auto-resume is disabled",
             stopped_protected_sessions,
         )
-    protected_recovery_result = run_protected_auto_startup_recovery()
+    protected_recovery_result = await run_protected_auto_startup_recovery_async()
     logger.info("[protected-auto] startup recovery result=%s", protected_recovery_result)
     scheduler = BackgroundScheduler(timezone="Asia/Seoul")
     scheduler.add_job(

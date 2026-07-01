@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.protected_auto_worker import (
     protected_auto_safe_stop,
     protected_auto_status,
     run_protected_auto_startup_recovery,
+    run_protected_auto_startup_recovery_async,
     start_protected_auto_daemon,
 )
 
@@ -155,3 +157,42 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
 
         self.assertTrue(report["current_epoch_sanity_passed"])
         self.assertEqual(report["current_epoch_current_equity"], 300_000)
+
+    def test_async_startup_recovery_resumes_without_nested_asyncio_run(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+        with database.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE runtime_locks
+                SET expires_at = '2026-06-30T01:00:00Z'
+                WHERE lock_id = 'protected-full-auto-live-v1'
+                """
+            )
+
+        async def fake_epoch(exchange: str) -> dict:
+            return current_epoch()
+
+        async def fake_open_order_blocker(exchange: str, symbols: list[str]) -> str | None:
+            return None
+
+        async def recover_inside_running_loop() -> dict:
+            return await run_protected_auto_startup_recovery_async()
+
+        with (
+            patch("app.protected_auto_worker._current_epoch_with_exchange_equity", side_effect=fake_epoch),
+            patch("app.protected_auto_worker._open_order_blocker", side_effect=fake_open_order_blocker),
+            patch("app.protected_auto_worker._hard_stop_reasons", return_value=[]),
+        ):
+            recovery = asyncio.run(recover_inside_running_loop())
+
+        self.assertEqual(recovery["action"], "RESUMED")
+        self.assertEqual(protected_auto_status()["protected_auto_runtime_status"], "RUNNING")
