@@ -31,6 +31,7 @@ from app.database import (
 )
 from app.live_broker import LiveTradingConfig, is_emergency_stopped
 from app.live_recovery import log_recovery_event
+from app.live_smoke_test import _current_equity
 
 logger = logging.getLogger("uvicorn.error")
 _WORKER_INSTANCE_ID = os.getenv("RUNTIME_INSTANCE_ID", f"{socket.gethostname()}-{uuid.uuid4().hex[:12]}")
@@ -414,6 +415,11 @@ def _hard_stop_reasons(exchange: str, current_epoch: dict | None = None) -> list
     return reasons
 
 
+async def _current_epoch_with_exchange_equity(exchange: str) -> dict:
+    equity = await _current_equity(exchange)
+    return build_current_epoch_diagnostics(exchange=exchange, current_equity=equity)
+
+
 def start_protected_auto_daemon(
     *,
     exchange: str,
@@ -500,7 +506,7 @@ def run_protected_auto_startup_recovery() -> dict:
         return {"action": "NO_ACTIVE_PROTECTED_DAEMON", "protected_auto": protected_auto_status()}
     exchange = str(state.get("exchange") or "bithumb")
     try:
-        current_epoch = build_current_epoch_diagnostics(exchange=exchange)
+        current_epoch = asyncio.run(_current_epoch_with_exchange_equity(exchange))
         blockers = _hard_stop_reasons(exchange, current_epoch)
         open_blocker = asyncio.run(_open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS)))
         if open_blocker:
@@ -548,7 +554,10 @@ async def protected_auto_tick_async() -> dict:
         return await protected_auto_safe_stop_async("PROTECTED_HEARTBEAT_STALE")
     active = _active_protected_job()
     exchange = str(state.get("exchange") or "bithumb")
-    current_epoch = build_current_epoch_diagnostics(exchange=exchange)
+    try:
+        current_epoch = await _current_epoch_with_exchange_equity(exchange)
+    except Exception as exc:
+        return await protected_auto_safe_stop_async(f"EXCHANGE_API_CRITICAL_FAILURE:{exc.__class__.__name__}", failed=True)
     hard_stops = _hard_stop_reasons(exchange, current_epoch)
     if hard_stops:
         return await protected_auto_safe_stop_async(",".join(hard_stops), failed="DB_WRITE_FAILURE" in hard_stops)

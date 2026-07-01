@@ -48,6 +48,7 @@ from app.database import (
     load_aggression_preset_logs,
     insert_smart_rehearsal_review,
     create_accounting_epoch,
+    close_current_accounting_epoch,
     insert_risk_log,
     insert_candles,
     load_live_eligible_candidate_strategies,
@@ -154,6 +155,7 @@ from app.controlled_auto_live import (
     build_controlled_signal_diagnostics,
     controlled_auto_live_job_status,
     controlled_auto_live_gate,
+    protected_position_scope_status,
     record_resolved_duplicate_client_order_safety_event,
     run_controlled_auto_live,
     run_controlled_auto_live_dry_run_force_buy,
@@ -714,6 +716,13 @@ class AccountingEpochCreateRequest(BaseModel):
     cost_basis_policy: str = Field("MARK_TO_MARKET", pattern=r"^(MARK_TO_MARKET|UNKNOWN_LEGACY_COST)$")
 
 
+class ProtectedAccountingEpochRolloverRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    confirmation: str = ""
+    cost_basis_policy: str = Field("MARK_TO_MARKET", pattern=r"^(MARK_TO_MARKET)$")
+    close_status: str = Field("SUPERSEDED", pattern=r"^(CLOSED|SUPERSEDED)$")
+
+
 class SmokeTestPreflightRequest(BaseModel):
     exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
     symbol: str = Field("BTC", pattern=r"^(BTC|ETH|WLD|XLM|RE|STRAX|ID)$")
@@ -803,7 +812,7 @@ class ProtectedFullAutoLiveV1StartRequest(BaseModel):
     runtime_seconds: int = Field(1800, ge=900, le=1800)
     scan_interval_seconds: int = Field(60, ge=30, le=120)
     max_holding_minutes: int = Field(10, ge=10, le=30)
-    max_position_trades: int = Field(3, ge=1, le=3)
+    max_position_trades: int = Field(1, ge=1, le=1)
     confirmation: str = ""
 
 
@@ -2767,6 +2776,8 @@ def _accounting_epoch_from_asset_snapshot(exchange: str, asset: dict, *, cost_ba
                 "opening_position_value": value,
                 "available_quantity": coin.get("available_quantity"),
                 "locked_quantity": coin.get("locked_quantity"),
+                "position_classification": "LEGACY_HOLDING",
+                "protected_slot_eligible": False,
             }
         )
     return {
@@ -2782,6 +2793,61 @@ def _accounting_epoch_from_asset_snapshot(exchange: str, asset: dict, *, cost_ba
         "epoch_status": "ACTIVE",
         "epoch_trust_level": "MEDIUM" if asset.get("balance_fetch_status") == "SUCCESS" else "LOW",
         "legacy_history_isolated": True,
+    }
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _protected_epoch_failure_report(
+    *,
+    current_epoch: dict,
+    asset: dict,
+    controlled_gate: dict | None = None,
+) -> dict:
+    scope = controlled_gate or {}
+    current_equity = asset.get("current_equity_from_exchange")
+    starting_equity = current_epoch.get("current_epoch_starting_equity")
+    expected_equity = asset.get("expected_equity")
+    if expected_equity is None and current_equity is not None:
+        expected_equity = current_equity
+    equity_diff = None
+    if current_equity is not None and expected_equity is not None:
+        equity_diff = _safe_float(current_equity) - _safe_float(expected_equity)
+    equity_diff_rate = None
+    if equity_diff is not None:
+        equity_diff_rate = abs(equity_diff) / max(abs(_safe_float(expected_equity)), 1.0)
+    reasons = [item.get("code") for item in current_epoch.get("current_epoch_blockers", []) if item.get("code")]
+    if not current_epoch.get("current_epoch_sanity_passed") and not reasons:
+        if current_equity is None:
+            reasons.append("CURRENT_EXCHANGE_EQUITY_UNAVAILABLE")
+        else:
+            reasons.append("CURRENT_EPOCH_SANITY_FAILED")
+    return {
+        "current_epoch_id": current_epoch.get("current_epoch_id"),
+        "current_epoch_started_at_utc": current_epoch.get("current_epoch_started_at_utc"),
+        "current_epoch_starting_equity": starting_equity,
+        "current_exchange_equity": current_equity,
+        "expected_equity": expected_equity,
+        "equity_diff": equity_diff,
+        "equity_diff_rate": equity_diff_rate,
+        "current_epoch_fill_count": current_epoch.get("current_epoch_fill_count", 0),
+        "current_epoch_order_count": current_epoch.get("current_epoch_order_count", 0),
+        "current_epoch_accounting_pending_count": current_epoch.get("current_epoch_accounting_pending_count", 0),
+        "current_epoch_accounting_failed_count": current_epoch.get("current_epoch_accounting_failed_count", 0),
+        "legacy_open_position_count": scope.get("legacy_open_position_count"),
+        "protected_open_position_count": scope.get("protected_open_position_count"),
+        "protected_empty_slot_count": scope.get("protected_empty_slot_count"),
+        "valuation_snapshot_at_utc": asset.get("period_end_utc"),
+        "stale_valuation_effect": asset.get("stale_valuation_effect"),
+        "unexplained_diff": (asset.get("equity_diff_breakdown") or {}).get("unexplained"),
+        "sanity_failure_reasons": reasons,
     }
 
 
@@ -2835,6 +2901,126 @@ async def create_current_accounting_epoch(payload: AccountingEpochCreateRequest,
         "current_coin_market_value": asset.get("current_coin_market_value"),
         "coin_count": len(asset.get("coins", []) or []),
     }}
+
+
+@app.post("/api/protected-full-auto-live/v1/accounting-epoch/rollover")
+async def protected_accounting_epoch_rollover(payload: ProtectedAccountingEpochRolloverRequest, request: Request) -> dict:
+    required_confirmation = "ROLLOVER PROTECTED ACCOUNTING EPOCH"
+    policy = load_global_bot_operation_policy()
+    runtime = load_runtime_lock(RUNTIME_LOCK_ID)
+    blockers = []
+    if policy.get("auto_trading_enabled"):
+        blockers.append({"code": "DB_AUTO_TRADING_MUST_REMAIN_FALSE", "count": 1})
+    if str((runtime or {}).get("status") or "").upper() != "STOPPED":
+        blockers.append({"code": "NORMAL_AUTO_RUNTIME_NOT_STOPPED", "count": 1})
+    if payload.confirmation != required_confirmation:
+        blockers.append({"code": "PROTECTED_EPOCH_ROLLOVER_CONFIRMATION_REQUIRED", "count": 1})
+    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
+    old_current_epoch = build_current_epoch_diagnostics(exchange=payload.exchange)
+    old_current_epoch_with_exchange_equity = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    old_audit = await _build_smoke_open_order_audit(payload.exchange, old_current_epoch, "BTC")
+    old_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="protected_full_auto_live_v1",
+        amount_krw=6000,
+        current_epoch=old_current_epoch,
+        open_order_audit=old_audit,
+    )
+    old_gate = controlled_auto_live_gate(old_current_epoch, old_preflight, exchange=payload.exchange)
+    failure_report = _protected_epoch_failure_report(
+        current_epoch=old_current_epoch,
+        asset=asset,
+        controlled_gate=old_gate,
+    )
+    if asset.get("balance_fetch_status") != "SUCCESS":
+        blockers.append({"code": "BALANCE_SNAPSHOT_FAILED", "count": 1})
+    if blockers:
+        return {
+            "ok": False,
+            "message": "Protected accounting epoch rollover is blocked.",
+            "required_confirmation": required_confirmation,
+            "blockers": blockers,
+            "sanity_failure_report": failure_report,
+            "current_epoch": old_current_epoch,
+            "current_epoch_with_exchange_equity": old_current_epoch_with_exchange_equity,
+            **_runtime_status_payload(request),
+        }
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    new_epoch_id = f"epoch-{payload.exchange}-protected-{now_utc.replace(':', '').replace('-', '').replace('Z', '')}"
+    old_epoch_closed = close_current_accounting_epoch(
+        payload.exchange,
+        status=payload.close_status,
+        close_reason="CURRENT_EPOCH_SANITY_FAILED_ROLLOVER",
+        superseded_by_epoch_id=new_epoch_id,
+    )
+    new_epoch_payload = _accounting_epoch_from_asset_snapshot(
+        payload.exchange,
+        asset,
+        cost_basis_policy=payload.cost_basis_policy,
+    )
+    new_epoch_payload.update(
+        {
+            "epoch_id": new_epoch_id,
+            "epoch_started_at_utc": now_utc,
+            "starting_valuation_snapshot_at_utc": asset.get("period_end_utc") or now_utc,
+            "epoch_trust_level": "MEDIUM" if asset.get("balance_fetch_status") == "SUCCESS" else "LOW",
+        }
+    )
+    new_epoch = create_accounting_epoch(new_epoch_payload)
+    new_current_epoch = build_current_epoch_diagnostics(
+        exchange=payload.exchange,
+        current_equity=asset.get("current_equity_from_exchange"),
+    )
+    new_audit = await _build_smoke_open_order_audit(payload.exchange, new_current_epoch, "BTC")
+    new_preflight = build_smoke_test_preflight(
+        exchange=payload.exchange,
+        symbol="BTC",
+        strategy_name="protected_full_auto_live_v1",
+        amount_krw=6000,
+        current_epoch=new_current_epoch,
+        open_order_audit=new_audit,
+    )
+    new_gate = controlled_auto_live_gate(new_current_epoch, new_preflight, exchange=payload.exchange)
+    position_scope = protected_position_scope_status(exchange=payload.exchange)
+    return {
+        "ok": True,
+        "message": "Protected accounting epoch rolled over from current exchange mark-to-market snapshot.",
+        "old_epoch": old_epoch_closed,
+        "old_current_epoch_without_exchange_equity": old_current_epoch,
+        "old_current_epoch_with_exchange_equity": old_current_epoch_with_exchange_equity,
+        "old_epoch_close_result": {
+            "status": (old_epoch_closed or {}).get("epoch_status"),
+            "close_reason": (old_epoch_closed or {}).get("close_reason"),
+            "closed_at_utc": (old_epoch_closed or {}).get("closed_at_utc"),
+            "superseded_by_epoch_id": (old_epoch_closed or {}).get("superseded_by_epoch_id"),
+        },
+        "new_epoch": new_epoch,
+        "new_epoch_id": new_epoch.get("epoch_id"),
+        "current_epoch": new_current_epoch,
+        "sanity_failure_report": failure_report,
+        "asset_snapshot": {
+            "current_equity_from_exchange": asset.get("current_equity_from_exchange"),
+            "current_cash_krw": asset.get("current_cash_krw"),
+            "current_coin_market_value": asset.get("current_coin_market_value"),
+            "coins": asset.get("coins", []),
+            "coin_count": len(asset.get("coins", []) or []),
+            "valuation_snapshot_at_utc": asset.get("period_end_utc"),
+            "balance_fetch_status": asset.get("balance_fetch_status"),
+        },
+        "position_scope": position_scope,
+        "open_order_audit": new_audit,
+        "smoke_test_preflight": new_preflight,
+        "controlled_auto_live_gate": new_gate,
+        "protected_full_auto_live_allowed": new_gate.get("protected_full_auto_live_allowed"),
+        "protected_session_start_allowed": new_gate.get("protected_session_start_allowed"),
+        "protected_auto": protected_auto_status(),
+        **_runtime_status_payload(request),
+    }
 
 
 @app.get("/api/live-smoke-test/preflight")

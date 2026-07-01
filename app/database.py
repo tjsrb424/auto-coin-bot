@@ -961,6 +961,9 @@ def init_db() -> None:
                 starting_valuation_snapshot_at_utc TEXT,
                 cost_basis_policy TEXT NOT NULL DEFAULT 'MARK_TO_MARKET',
                 epoch_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                close_reason TEXT NOT NULL DEFAULT '',
+                closed_at_utc TEXT,
+                superseded_by_epoch_id TEXT,
                 epoch_trust_level TEXT NOT NULL DEFAULT 'MEDIUM',
                 legacy_history_isolated INTEGER NOT NULL DEFAULT 1,
                 created_at_utc TEXT NOT NULL,
@@ -1362,6 +1365,9 @@ def init_db() -> None:
             );
             """
         )
+        _ensure_column(conn, "accounting_epochs", "close_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "accounting_epochs", "closed_at_utc", "TEXT")
+        _ensure_column(conn, "accounting_epochs", "superseded_by_epoch_id", "TEXT")
         _ensure_column(conn, "paper_sessions", "mode", "TEXT NOT NULL DEFAULT 'SIMULATION'")
         _ensure_column(conn, "paper_sessions", "last_processed_candle_time_utc", "TEXT")
         _ensure_column(conn, "paper_sessions", "last_signal", "TEXT NOT NULL DEFAULT 'HOLD'")
@@ -5404,14 +5410,20 @@ def create_accounting_epoch(epoch: dict) -> dict:
     epoch_id = str(epoch.get("epoch_id") or f"epoch-{exchange_name}-{now_utc.replace(':', '').replace('-', '').replace('Z', '')}")
     started_at = str(epoch.get("epoch_started_at_utc") or now_utc)
     positions_json = json.dumps(epoch.get("starting_positions") or epoch.get("starting_positions_json") or [], ensure_ascii=False)
+    rollover_status = str(epoch.get("rollover_status") or "SUPERSEDED")
+    rollover_reason = str(epoch.get("rollover_reason") or "NEW_ACCOUNTING_EPOCH_CREATED")
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE accounting_epochs
-            SET epoch_status = 'ARCHIVED', updated_at_utc = ?
+            SET epoch_status = ?,
+                close_reason = ?,
+                closed_at_utc = ?,
+                superseded_by_epoch_id = ?,
+                updated_at_utc = ?
             WHERE exchange_name = ? AND epoch_status = 'ACTIVE'
             """,
-            (now_utc, exchange_name),
+            (rollover_status, rollover_reason, now_utc, epoch_id, now_utc, exchange_name),
         )
         conn.execute(
             """
@@ -5420,9 +5432,10 @@ def create_accounting_epoch(epoch: dict) -> dict:
                 starting_exchange_equity, starting_cash_krw,
                 starting_positions_json, starting_position_count,
                 starting_valuation_source, starting_valuation_snapshot_at_utc,
-                cost_basis_policy, epoch_status, epoch_trust_level,
+                cost_basis_policy, epoch_status, close_reason, closed_at_utc,
+                superseded_by_epoch_id, epoch_trust_level,
                 legacy_history_isolated, created_at_utc, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 epoch_id,
@@ -5436,6 +5449,9 @@ def create_accounting_epoch(epoch: dict) -> dict:
                 epoch.get("starting_valuation_snapshot_at_utc") or started_at,
                 str(epoch.get("cost_basis_policy") or "MARK_TO_MARKET"),
                 str(epoch.get("epoch_status") or "ACTIVE"),
+                str(epoch.get("close_reason") or ""),
+                epoch.get("closed_at_utc"),
+                epoch.get("superseded_by_epoch_id"),
                 str(epoch.get("epoch_trust_level") or "MEDIUM"),
                 1 if epoch.get("legacy_history_isolated", True) else 0,
                 now_utc,
@@ -5444,6 +5460,46 @@ def create_accounting_epoch(epoch: dict) -> dict:
         )
         row = conn.execute("SELECT * FROM accounting_epochs WHERE epoch_id = ?", (epoch_id,)).fetchone()
     return _decode_accounting_epoch(dict(row)) if row else {}
+
+
+def close_current_accounting_epoch(
+    exchange: str = "bithumb",
+    *,
+    status: str = "SUPERSEDED",
+    close_reason: str = "CURRENT_EPOCH_SANITY_FAILED_ROLLOVER",
+    superseded_by_epoch_id: str | None = None,
+) -> dict | None:
+    now_utc = _utc_now()
+    normalized_status = str(status or "SUPERSEDED").strip().upper()
+    if normalized_status not in {"CLOSED", "SUPERSEDED", "ARCHIVED"}:
+        normalized_status = "SUPERSEDED"
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM accounting_epochs
+            WHERE exchange_name = ? AND epoch_status = 'ACTIVE'
+            ORDER BY epoch_started_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (exchange,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            """
+            UPDATE accounting_epochs
+            SET epoch_status = ?,
+                close_reason = ?,
+                closed_at_utc = ?,
+                superseded_by_epoch_id = ?,
+                updated_at_utc = ?
+            WHERE id = ?
+            """,
+            (normalized_status, close_reason, now_utc, superseded_by_epoch_id, now_utc, int(row["id"])),
+        )
+        updated = conn.execute("SELECT * FROM accounting_epochs WHERE id = ?", (int(row["id"]),)).fetchone()
+    return _decode_accounting_epoch(dict(updated)) if updated else None
 
 
 def load_current_accounting_epoch(exchange: str = "bithumb") -> dict | None:

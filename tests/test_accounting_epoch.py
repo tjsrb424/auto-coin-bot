@@ -113,6 +113,38 @@ class AccountingEpochTests(unittest.TestCase):
         self.assertEqual(epoch["starting_position_count"], 1)
         self.assertEqual(epoch["starting_positions"][0]["opening_cost_basis"], 100_000)
 
+    def test_rollover_supersedes_old_epoch_without_deleting_it(self) -> None:
+        self.create_epoch()
+        closed = database.close_current_accounting_epoch(
+            "bithumb",
+            status="SUPERSEDED",
+            close_reason="CURRENT_EPOCH_SANITY_FAILED_ROLLOVER",
+            superseded_by_epoch_id="epoch-new",
+        )
+        new_epoch = database.create_accounting_epoch(
+            {
+                "exchange_name": "bithumb",
+                "epoch_id": "epoch-new",
+                "epoch_started_at_utc": "2026-06-26T01:00:00Z",
+                "starting_exchange_equity": 260_000,
+                "starting_cash_krw": 20_000,
+                "starting_positions": [],
+                "cost_basis_policy": "MARK_TO_MARKET",
+                "epoch_trust_level": "MEDIUM",
+                "legacy_history_isolated": True,
+            }
+        )
+
+        self.assertEqual(closed["epoch_status"], "SUPERSEDED")
+        self.assertEqual(closed["close_reason"], "CURRENT_EPOCH_SANITY_FAILED_ROLLOVER")
+        self.assertEqual(closed["superseded_by_epoch_id"], "epoch-new")
+        self.assertIsNotNone(closed["closed_at_utc"])
+        self.assertEqual(new_epoch["epoch_status"], "ACTIVE")
+        self.assertEqual(database.load_current_accounting_epoch("bithumb")["epoch_id"], "epoch-new")
+        with database.get_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) AS count FROM accounting_epochs").fetchone()["count"]
+        self.assertEqual(count, 2)
+
     def test_current_epoch_is_clean_immediately_after_creation(self) -> None:
         self.create_epoch()
 

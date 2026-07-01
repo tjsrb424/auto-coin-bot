@@ -10,6 +10,7 @@ from app.protected_auto_worker import (
     PROTECTED_AUTO_RUNTIME_ID,
     PROTECTED_MAX_NOTIONAL_KRW,
     load_protected_auto_state,
+    _current_epoch_with_exchange_equity,
     protected_auto_safe_stop,
     protected_auto_status,
     run_protected_auto_startup_recovery,
@@ -134,3 +135,23 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         self.assertEqual(recovery["action"], "NO_ACTIVE_PROTECTED_DAEMON")
         self.assertEqual(database.load_runtime_lock("protected-full-auto-live-v1")["status"], "STOPPED")
         self.assertEqual(protected_auto_status()["protected_runtime_lock_status"], "STOPPED")
+
+    def test_worker_epoch_diagnostics_use_exchange_equity_snapshot(self) -> None:
+        database.create_accounting_epoch(
+            {
+                "exchange_name": "bithumb",
+                "epoch_id": "epoch-worker",
+                "epoch_started_at_utc": "2026-07-01T00:00:00Z",
+                "starting_exchange_equity": 300_000,
+                "starting_cash_krw": 300_000,
+                "starting_positions": [],
+                "cost_basis_policy": "MARK_TO_MARKET",
+                "epoch_trust_level": "MEDIUM",
+            }
+        )
+
+        with patch("app.protected_auto_worker._current_equity", return_value=300_000):
+            report = __import__("asyncio").run(_current_epoch_with_exchange_equity("bithumb"))
+
+        self.assertTrue(report["current_epoch_sanity_passed"])
+        self.assertEqual(report["current_epoch_current_equity"], 300_000)
