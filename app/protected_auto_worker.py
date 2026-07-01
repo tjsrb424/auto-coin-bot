@@ -283,24 +283,26 @@ def protected_auto_status() -> dict:
     active = _active_protected_job()
     scope = _position_scope(state)
     lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
+    stale_lock = (
+        str(lock.get("status") or "").upper() == "RUNNING"
+        and str(lock.get("expires_at") or "") <= _utc_now()
+    )
     derived_worker = "STALE" if stale else str(state.get("worker_status") or "STOPPED").upper()
+    derived_lock_status = "STALE" if stale_lock else str(lock.get("status") or "STOPPED").upper()
     return {
         **state,
         **scope,
         "protected_auto_runtime_status": str(state.get("session_status") or "STOPPED").upper(),
         "protected_worker_status": derived_worker,
         "protected_session_status": str(state.get("session_status") or "STOPPED").upper(),
-        "protected_runtime_lock_status": str(lock.get("status") or "STOPPED").upper(),
+        "protected_runtime_lock_status": derived_lock_status,
         "protected_runtime_lock": lock,
         "protected_last_heartbeat_at_utc": state.get("last_heartbeat_at_utc"),
         "protected_last_tick_at_utc": state.get("last_tick_at_utc"),
         "protected_next_scan_at_utc": state.get("next_tick_at_utc"),
         "protected_lock_expires_at_utc": state.get("lock_expires_at_utc") or lock.get("expires_at"),
         "stale": stale,
-        "stale_lock": stale or (
-            str(lock.get("status") or "").upper() == "RUNNING"
-            and str(lock.get("expires_at") or "") <= _utc_now()
-        ),
+        "stale_lock": stale or stale_lock,
         "active_controlled_job": active,
         "allowed_symbols": list(PROTECTED_ALLOWED_SYMBOLS),
         "allowed_strategy": CONTROLLED_ENTRY_V3_STRATEGY,
@@ -486,6 +488,15 @@ def start_protected_auto_daemon(
 def run_protected_auto_startup_recovery() -> dict:
     state = load_protected_auto_state()
     if str(state.get("worker_status") or "").upper() not in {"RUNNING", "STALE"}:
+        lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
+        if str(lock.get("status") or "").upper() == "RUNNING" and str(lock.get("expires_at") or "") <= _utc_now():
+            _release_protected_lock("STOPPED")
+            _upsert_state(
+                {
+                    "startup_recovery_action": "CLEARED_STALE_LOCK",
+                    "startup_recovery_reason": "NO_ACTIVE_PROTECTED_DAEMON_LOCK_EXPIRED",
+                }
+            )
         return {"action": "NO_ACTIVE_PROTECTED_DAEMON", "protected_auto": protected_auto_status()}
     exchange = str(state.get("exchange") or "bithumb")
     try:

@@ -12,6 +12,7 @@ from app.protected_auto_worker import (
     load_protected_auto_state,
     protected_auto_safe_stop,
     protected_auto_status,
+    run_protected_auto_startup_recovery,
     start_protected_auto_daemon,
 )
 
@@ -114,3 +115,22 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         self.assertEqual(stopped["protected_auto_runtime_status"], "STOPPED")
         self.assertEqual(stopped["stop_reason"], "TEST_STOP")
         self.assertEqual(database.load_runtime_lock("protected-full-auto-live-v1")["status"], "STOPPED")
+
+    def test_startup_recovery_clears_expired_lock_without_active_daemon(self) -> None:
+        with database.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO runtime_locks (
+                    lock_id, instance_id, hostname, app_env, runtime_owner,
+                    status, acquired_at, expires_at, updated_at
+                ) VALUES ('protected-full-auto-live-v1', 'old', 'old-host', 'production',
+                    'protected-full-auto-live-v1', 'RUNNING',
+                    '2026-06-30T00:00:00Z', '2026-06-30T01:00:00Z', '2026-06-30T00:00:00Z')
+                """
+            )
+
+        recovery = run_protected_auto_startup_recovery()
+
+        self.assertEqual(recovery["action"], "NO_ACTIVE_PROTECTED_DAEMON")
+        self.assertEqual(database.load_runtime_lock("protected-full-auto-live-v1")["status"], "STOPPED")
+        self.assertEqual(protected_auto_status()["protected_runtime_lock_status"], "STOPPED")
