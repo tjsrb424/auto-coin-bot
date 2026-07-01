@@ -14,6 +14,7 @@ from app.protected_auto_worker import (
     _current_epoch_with_exchange_equity,
     protected_auto_safe_stop,
     protected_auto_status,
+    protected_auto_tick_async,
     run_protected_auto_startup_recovery,
     run_protected_auto_startup_recovery_async,
     start_protected_auto_daemon,
@@ -241,3 +242,42 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
 
         self.assertEqual(recovery["action"], "RESUMED")
         self.assertEqual(protected_auto_status()["protected_auto_runtime_status"], "RUNNING")
+
+    def test_worker_tick_does_not_reemit_started_notification(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+        before = [
+            item
+            for item in database.load_protected_auto_notifications()
+            if item["event_type"] == "PROTECTED_AUTO_STARTED"
+        ]
+
+        async def fake_epoch(exchange: str) -> dict:
+            return current_epoch()
+
+        async def fake_open_order_blocker(exchange: str, symbols: list[str]) -> str | None:
+            return None
+
+        with (
+            patch("app.protected_auto_worker._current_epoch_with_exchange_equity", side_effect=fake_epoch),
+            patch("app.protected_auto_worker._open_order_blocker", side_effect=fake_open_order_blocker),
+            patch("app.protected_auto_worker._hard_stop_reasons", return_value=[]),
+            patch("app.protected_auto_worker._position_scope", return_value={"protected_open_position_count": 0, "legacy_open_position_count": 5}),
+            patch("app.protected_auto_worker.controlled_auto_live_gate", return_value={"protected_full_auto_live_allowed": False, "protected_full_auto_live_blockers": [{"code": "TEST_BLOCK"}]}),
+        ):
+            asyncio.run(protected_auto_tick_async())
+
+        after = [
+            item
+            for item in database.load_protected_auto_notifications()
+            if item["event_type"] == "PROTECTED_AUTO_STARTED"
+        ]
+        self.assertEqual(len(after), len(before))

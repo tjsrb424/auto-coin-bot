@@ -4122,6 +4122,7 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const lastNotification = data.runtimeStatus?.last_notification ?? protectedLastAlert ?? null;
   const notificationProvider = notificationConfig?.provider ?? "discord";
   const notificationStatus = notificationConfig?.status ?? (notificationConfig?.enabled ? "Enabled" : "Disabled");
+  const notificationStats = notificationConfig?.stats ?? {};
   const notificationWebhook = notificationConfig?.webhook_url ?? notificationConfig?.discord?.webhook_url ?? "미설정";
   const lastNotificationStatus = lastNotification?.status ?? lastNotification?.delivery_status ?? "-";
   const lastNotificationError = lastNotification?.error_message ?? lastNotification?.delivery_error ?? "";
@@ -4340,6 +4341,12 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       value: String(lastNotification?.event_type ?? "CLEAR"),
       detail: `${lastNotificationStatus} - ${lastNotification?.created_at_utc ?? lastNotification?.sent_at_utc ?? "-"}`,
       tone: lastNotificationStatus === "SENT" ? "green" : (lastNotificationStatus === "FAILED" ? "red" : "amber")
+    },
+    {
+      label: "Notification 1h",
+      value: String(notificationStats?.total_count ?? 0),
+      detail: `sent ${notificationStats?.sent_count ?? 0} - dup ${notificationStats?.skipped_duplicate_count ?? 0} - rate ${notificationStats?.rate_limited_count ?? 0}`,
+      tone: Number(notificationStats?.failed_count ?? 0) > 0 ? "red" : "cyan"
     },
     {
       label: "Notification Error",

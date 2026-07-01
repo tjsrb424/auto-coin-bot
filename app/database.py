@@ -1084,6 +1084,9 @@ def init_db() -> None:
                 event_type TEXT NOT NULL,
                 provider TEXT NOT NULL DEFAULT 'discord',
                 status TEXT NOT NULL DEFAULT 'SKIPPED',
+                event_dedupe_key TEXT,
+                dedupe_status TEXT NOT NULL DEFAULT '',
+                rate_limit_until_utc TEXT,
                 title TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL DEFAULT '{}',
@@ -1091,6 +1094,7 @@ def init_db() -> None:
                 related_session_id TEXT,
                 related_run_id TEXT,
                 related_order_uuid TEXT,
+                related_position_id TEXT,
                 created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 sent_at_utc TEXT
             );
@@ -1510,6 +1514,10 @@ def init_db() -> None:
         _ensure_column(conn, "order_intents", "partial_take_profit_pct", "REAL NOT NULL DEFAULT 0")
         _ensure_column(conn, "order_intents", "trailing_stop_price", "REAL")
         _ensure_column(conn, "order_intents", "position_pnl_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "notification_logs", "event_dedupe_key", "TEXT")
+        _ensure_column(conn, "notification_logs", "dedupe_status", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "notification_logs", "rate_limit_until_utc", "TEXT")
+        _ensure_column(conn, "notification_logs", "related_position_id", "TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_smart_rehearsal_reviews_latest
@@ -1586,6 +1594,12 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_candidate_strategies_dedupe
             ON candidate_strategies(market, strategy, unit, backtest_period, status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_logs_dedupe
+            ON notification_logs(event_dedupe_key, dedupe_status, status, created_at_utc)
             """
         )
         conn.execute(
@@ -3815,6 +3829,9 @@ def insert_notification_log(event: dict) -> dict:
         "event_type": str(event.get("event_type") or "NOTIFICATION"),
         "provider": str(event.get("provider") or "discord").lower(),
         "status": str(event.get("status") or "SKIPPED").upper(),
+        "event_dedupe_key": event.get("event_dedupe_key"),
+        "dedupe_status": str(event.get("dedupe_status") or event.get("status") or "").upper(),
+        "rate_limit_until_utc": event.get("rate_limit_until_utc"),
         "title": str(event.get("title") or ""),
         "summary": str(event.get("summary") or ""),
         "payload": event.get("payload") or {},
@@ -3822,6 +3839,7 @@ def insert_notification_log(event: dict) -> dict:
         "related_session_id": event.get("related_session_id"),
         "related_run_id": event.get("related_run_id"),
         "related_order_uuid": event.get("related_order_uuid"),
+        "related_position_id": event.get("related_position_id"),
         "created_at_utc": str(event.get("created_at_utc") or now),
         "sent_at_utc": event.get("sent_at_utc"),
     }
@@ -3829,10 +3847,11 @@ def insert_notification_log(event: dict) -> dict:
         conn.execute(
             """
             INSERT INTO notification_logs (
-                event_id, event_type, provider, status, title, summary,
+                event_id, event_type, provider, status, event_dedupe_key,
+                dedupe_status, rate_limit_until_utc, title, summary,
                 payload_json, error_message, related_session_id, related_run_id,
-                related_order_uuid, created_at_utc, sent_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                related_order_uuid, related_position_id, created_at_utc, sent_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO NOTHING
             """,
             (
@@ -3840,6 +3859,9 @@ def insert_notification_log(event: dict) -> dict:
                 payload["event_type"],
                 payload["provider"],
                 payload["status"],
+                payload["event_dedupe_key"],
+                payload["dedupe_status"],
+                payload["rate_limit_until_utc"],
                 payload["title"],
                 payload["summary"],
                 json.dumps(payload["payload"], ensure_ascii=False, default=str),
@@ -3847,6 +3869,7 @@ def insert_notification_log(event: dict) -> dict:
                 payload["related_session_id"],
                 payload["related_run_id"],
                 payload["related_order_uuid"],
+                payload["related_position_id"],
                 payload["created_at_utc"],
                 payload["sent_at_utc"],
             ),
@@ -3858,6 +3881,9 @@ def update_notification_log(event_id: str, updates: dict) -> dict | None:
     allowed = {
         "provider",
         "status",
+        "event_dedupe_key",
+        "dedupe_status",
+        "rate_limit_until_utc",
         "title",
         "summary",
         "payload_json",
@@ -3865,6 +3891,7 @@ def update_notification_log(event_id: str, updates: dict) -> dict | None:
         "related_session_id",
         "related_run_id",
         "related_order_uuid",
+        "related_position_id",
         "sent_at_utc",
     }
     normalized = dict(updates)
@@ -3884,6 +3911,49 @@ def update_notification_log(event_id: str, updates: dict) -> dict | None:
 def load_notification_log(event_id: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM notification_logs WHERE event_id = ?", (event_id,)).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["payload"] = json.loads(item.pop("payload_json") or "{}")
+    return item
+
+
+def load_sent_notification_by_dedupe_key(event_dedupe_key: str) -> dict | None:
+    if not event_dedupe_key:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM notification_logs
+            WHERE event_dedupe_key = ?
+              AND (status = 'SENT' OR dedupe_status = 'SENT')
+            ORDER BY sent_at_utc DESC, created_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (event_dedupe_key,),
+        ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["payload"] = json.loads(item.pop("payload_json") or "{}")
+    return item
+
+
+def load_latest_notification_by_dedupe_key(event_dedupe_key: str) -> dict | None:
+    if not event_dedupe_key:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM notification_logs
+            WHERE event_dedupe_key = ?
+            ORDER BY created_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (event_dedupe_key,),
+        ).fetchone()
     if row is None:
         return None
     item = dict(row)
@@ -3920,6 +3990,25 @@ def load_notification_logs(limit: int = 50, event_type: str | None = None, provi
         item["payload"] = json.loads(item.pop("payload_json") or "{}")
         items.append(item)
     return items
+
+
+def notification_log_stats_since(since_utc: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN status = 'SENT' OR dedupe_status = 'SENT' THEN 1 ELSE 0 END) AS sent_count,
+                SUM(CASE WHEN status = 'SKIPPED_DUPLICATE' OR dedupe_status = 'SKIPPED_DUPLICATE' THEN 1 ELSE 0 END) AS skipped_duplicate_count,
+                SUM(CASE WHEN status = 'RATE_LIMITED' OR dedupe_status = 'RATE_LIMITED' THEN 1 ELSE 0 END) AS rate_limited_count,
+                SUM(CASE WHEN status = 'FAILED' OR dedupe_status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count
+            FROM notification_logs
+            WHERE created_at_utc >= ?
+            """,
+            (since_utc,),
+        ).fetchone()
+    data = dict(row) if row else {}
+    return {key: int(data.get(key) or 0) for key in ("total_count", "sent_count", "skipped_duplicate_count", "rate_limited_count", "failed_count")}
 
 
 def update_protected_auto_notification_delivery(event_id: str, updates: dict) -> dict | None:
