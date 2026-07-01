@@ -4086,6 +4086,28 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
   const protectedNextAction = diagnostics?.protected_full_auto_next_action ?? protectedGate?.protected_full_auto_next_action ?? "-";
   const protectedSessionStatus = diagnostics?.protected_full_auto_session_status ?? protectedGate?.protected_full_auto_session_status ?? {};
   const protectedDaemon = data.runtimeStatus?.protected_auto ?? {};
+  const protectedSignalSource = protectedDaemon?.latest_signal_by_timeframe
+    ?? protectedDaemon?.active_controlled_job?.latest_signal_by_timeframe
+    ?? protectedDaemon?.last_scan_result?.latest_signal_by_timeframe
+    ?? protectedDaemon?.latest_report?.latest_signal_by_timeframe
+    ?? {};
+  const protectedCandidateCounts = protectedDaemon?.trade_candidate_count_by_timeframe
+    ?? protectedDaemon?.active_controlled_job?.trade_candidate_count_by_timeframe
+    ?? protectedDaemon?.last_scan_result?.trade_candidate_count_by_timeframe
+    ?? protectedDaemon?.latest_report?.trade_candidate_count_by_timeframe
+    ?? {};
+  const protectedSignalDetail = ["3m", "5m", "15m"]
+    .map((timeframe) => {
+      const signal = protectedSignalSource?.[timeframe];
+      return `${timeframe} ${signal?.symbol ?? "-"}:${signal?.signal_state ?? "-"}`;
+    })
+    .join(" · ");
+  const protectedCandidateDetail = ["3m", "5m", "15m"]
+    .map((timeframe) => `${timeframe} ${protectedCandidateCounts?.[timeframe] ?? 0}`)
+    .join(" · ");
+  const protectedLegacyValuationDelta = protectedDaemon?.latest_report?.legacy_holding_valuation_delta
+    ?? protectedDaemon?.last_scan_result?.legacy_holding_valuation_delta
+    ?? 0;
   const runtimeLockSeparation = diagnostics?.runtime_lock_separation ?? protectedGate?.runtime_lock_separation ?? {};
   const legacyOpenPositionCount = protectedDaemon?.legacy_open_position_count ?? diagnostics?.legacy_open_position_count ?? protectedGate?.legacy_open_position_count ?? 0;
   const protectedOpenPositionCount = protectedDaemon?.protected_open_position_count ?? diagnostics?.protected_open_position_count ?? protectedGate?.protected_open_position_count ?? 0;
@@ -4273,10 +4295,22 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
       tone: protectedDaemon?.stale ? "red" : "cyan"
     },
     {
+      label: "Protected Signals",
+      value: protectedCandidateDetail,
+      detail: protectedSignalDetail,
+      tone: Object.values(protectedCandidateCounts ?? {}).some((count: any) => Number(count ?? 0) > 0) ? "green" : "cyan"
+    },
+    {
       label: "Protected Trades",
       value: String(protectedDaemon?.trade_count ?? 0),
-      detail: `strategy ${formatSignedKrw(protectedDaemon?.protected_strategy_pnl)} - account ${formatSignedKrw(protectedDaemon?.account_session_pnl_delta)}`,
+      detail: `strategy ${formatSignedKrw(protectedDaemon?.protected_strategy_pnl)} - legacy ${formatSignedKrw(protectedLegacyValuationDelta)}`,
       tone: Number(protectedDaemon?.protected_strategy_pnl ?? 0) < 0 ? "red" : "green"
+    },
+    {
+      label: "Protected Account Δ",
+      value: formatSignedKrw(protectedDaemon?.account_session_pnl_delta),
+      detail: "account delta kept separate from protected strategy pnl",
+      tone: Number(protectedDaemon?.account_session_pnl_delta ?? 0) < 0 ? "amber" : "cyan"
     },
     {
       label: "Protected Stop",

@@ -644,6 +644,40 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostic["signal_state"], "TRADE_CANDIDATE")
         self.assertEqual(diagnostic["recommended_next_action"], "CONTROLLED_RUN_REQUIRES_USER_APPROVAL")
 
+    def test_controlled_entry_v3_marks_3m_cost_positive_breakout_as_trade_candidate(self) -> None:
+        candles = []
+        price = 100.0
+        for index in range(60):
+            if index >= 50:
+                price *= 1.006
+            candle_open = price * 0.996
+            candles.append(
+                {
+                    "candle_time_utc": f"2026-06-26T{index // 20:02d}:{(index % 20) * 3:02d}:00Z",
+                    "opening_price": candle_open,
+                    "high_price": price * 1.003,
+                    "low_price": candle_open * 0.997,
+                    "trade_price": price,
+                    "candle_acc_trade_volume": 5 if index >= 52 else 1,
+                }
+            )
+
+        decision = _controlled_entry_v3_decision(
+            "ETH",
+            "KRW-ETH",
+            3,
+            candles,
+            {"best_bid": 100.10, "best_ask": 100.11},
+            6000,
+        )
+        diagnostic = _diagnose_signal_decision(decision)
+        summary = _summarize_signal_diagnostics([diagnostic])
+
+        self.assertEqual(decision["timeframe"], "3m")
+        self.assertEqual(decision["signal_state"], "TRADE_CANDIDATE")
+        self.assertEqual(summary["trade_candidate_count_by_timeframe"]["3m"], 1)
+        self.assertEqual(summary["latest_signal_by_timeframe"]["3m"]["signal_state"], "TRADE_CANDIDATE")
+
     def test_controlled_entry_v3_blocks_low_volatility_low_volume_15m_setup(self) -> None:
         candles = []
         for index in range(60):
@@ -710,6 +744,15 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
                     "edge_allowed": True,
                     "expected_edge_after_cost": 0.02,
                     "signal_score": 99,
+                },
+                {
+                    "symbol": "ETH",
+                    "timeframe": "3m",
+                    "signal": "BUY",
+                    "signal_state": "TRADE_CANDIDATE",
+                    "edge_allowed": True,
+                    "expected_edge_after_cost": 0.03,
+                    "signal_score": 100,
                 },
                 {
                     "symbol": "ETH",
@@ -1444,7 +1487,7 @@ class ControlledAutoLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["allowed_strategies"], ["controlled_entry_v3"])
         self.assertEqual(config["max_notional_per_order_krw"], 6000)
         self.assertEqual(config["max_open_positions"], 1)
-        self.assertEqual(config["max_daily_trades"], 10)
+        self.assertEqual(config["max_daily_trades"], 20)
         self.assertEqual(config["max_consecutive_losses"], 2)
         self.assertEqual(config["daily_max_loss_krw"], 1000.0)
         self.assertFalse(config["averaging_down_allowed"])

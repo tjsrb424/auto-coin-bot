@@ -58,6 +58,8 @@ ENTRY_V3_POSITION_RUN_CONFIRMATION_PHRASE = "RUN CONTROLLED ENTRY V3 POSITION ON
 CONTROLLED_POSITION_LOOP_CONFIRMATION_PHRASE = "RUN CONTROLLED POSITION LOOP ONCE"
 CONTROLLED_ENTRY_V2_STRATEGY = "controlled_entry_v2"
 CONTROLLED_ENTRY_V3_STRATEGY = "controlled_entry_v3"
+CONTROLLED_ENTRY_V3_SCAN_TIMEFRAMES = (3, 5, 15)
+CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS = tuple(f"{timeframe}m" for timeframe in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAMES)
 CONTROLLED_ALLOWED_STRATEGIES = {"ma_cross", "smart_autonomous", CONTROLLED_ENTRY_V2_STRATEGY, CONTROLLED_ENTRY_V3_STRATEGY}
 CONTROLLED_BLOCKED_STRATEGIES = {"rsi"}
 TRADE_PROBE_STRATEGY_SOURCE = "controlled_trade_probe"
@@ -84,6 +86,7 @@ PROTECTED_FULL_AUTO_MODE = "PROTECTED_FULL_AUTO_LIVE_V1"
 PROTECTED_RUNTIME_LOCK_ID = "protected-full-auto-live-v1"
 PROTECTED_SESSION_LOSS_LIMIT_RATE = 0.005
 PROTECTED_SESSION_MAX_DAILY_LOSS_KRW = 1000.0
+PROTECTED_MAX_DAILY_TRADES = 20
 POSITION_CLASSIFICATIONS = {
     "PROTECTED_AUTO_POSITION",
     "LEGACY_HOLDING",
@@ -436,7 +439,7 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         "blocked_symbols": sorted(BLOCKED_SYMBOLS),
         "max_notional_per_order_krw": MAX_NOTIONAL_KRW,
         "max_open_positions": MAX_OPEN_POSITIONS,
-        "max_daily_trades": 10,
+        "max_daily_trades": PROTECTED_MAX_DAILY_TRADES,
         "max_consecutive_losses": 2,
         "daily_max_loss_krw": daily_max_loss,
         "daily_max_loss_rule": "min(1000 KRW, current_equity * 0.005)",
@@ -616,7 +619,7 @@ def build_protected_session_baseline(
         "global_daily_loss_status": global_daily_loss_status,
         "session_loss_limit_krw": session_limit,
         "session_loss_limit_rate": PROTECTED_SESSION_LOSS_LIMIT_RATE,
-        "session_max_trades": 10,
+        "session_max_trades": PROTECTED_MAX_DAILY_TRADES,
         "session_status": "PENDING_USER_CONFIRMATION" if protected_session_id is None else "RUNNING",
         "protected_session_loss_status": "OK",
         "session_pnl_delta": 0.0,
@@ -1956,6 +1959,9 @@ async def run_controlled_entry_v3_watch(
         "watch_duration_seconds": 0,
         "scan_interval_seconds": scan_interval_seconds,
         "scan_count": 0,
+        "scan_timeframes": list(CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS),
+        "latest_signal_by_timeframe": {},
+        "trade_candidate_count_by_timeframe": {label: 0 for label in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS},
         "trade_candidate_detected": False,
         "selected_candidate": None,
         "selected_symbol": None,
@@ -2046,6 +2052,8 @@ async def run_controlled_entry_v3_watch(
                 return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", [open_blocker], before_equity, controlled_gate)
             scan = await _scan_controlled_entry_v3_watch(exchange=exchange, symbols=symbols, notional=notional, current_epoch=current_epoch, controlled_gate=controlled_gate)
             report["scan_count"] = int(report.get("scan_count") or 0) + 1
+            _merge_scan_summary_into_report(report, scan)
+            _update_controlled_job_progress(run_id, report, scan)
             report["watch_scans"].append(scan)
             report["tick_reports"].append(scan)
             selected = scan.get("selected_candidate")
@@ -2149,10 +2157,11 @@ async def _scan_controlled_entry_v3_watch(
     for symbol in symbols:
         market = f"KRW-{symbol}"
         quote = await _orderbook_quote(exchange, market)
-        for timeframe in (5, 15):
+        for timeframe in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAMES:
             candles = await _load_strategy_candles(exchange, market, timeframe)
             decisions.append(_controlled_entry_v3_decision(symbol, market, timeframe, candles, quote, notional))
     diagnostics = _signal_diagnostics_from_decisions(decisions, current_epoch=current_epoch, controlled_gate=controlled_gate)
+    summary = _summarize_signal_diagnostics(diagnostics)
     selected = _select_controlled_entry_v3_watch_candidate(decisions)
     selected_diag = None
     if selected:
@@ -2162,10 +2171,13 @@ async def _scan_controlled_entry_v3_watch(
                 break
     return {
         "evaluated_at_utc": _utc_now(),
+        "scan_timeframes": list(CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS),
         "diagnostics": diagnostics,
-        "summary": _summarize_signal_diagnostics(diagnostics),
+        "summary": summary,
+        "latest_signal_by_timeframe": summary.get("latest_signal_by_timeframe") or {},
+        "trade_candidate_count_by_timeframe": summary.get("trade_candidate_count_by_timeframe") or {},
         "selected_candidate": selected_diag,
-        "priority": ["ETH:15m", "BTC:15m", "ETH:5m", "BTC:5m"],
+        "priority": ["ETH:15m", "BTC:15m", "ETH:5m", "BTC:5m", "ETH:3m", "BTC:3m"],
     }
 
 
@@ -2204,6 +2216,9 @@ async def run_controlled_entry_v3_position_run(
         "runtime_seconds": 0,
         "scan_interval_seconds": scan_interval_seconds,
         "scan_count": 0,
+        "scan_timeframes": list(CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS),
+        "latest_signal_by_timeframe": {},
+        "trade_candidate_count_by_timeframe": {label: 0 for label in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS},
         "max_holding_minutes": max_holding_minutes,
         "min_holding_seconds": POSITION_RUN_MIN_HOLD_SECONDS,
         "trade_candidate_detected": False,
@@ -2316,6 +2331,8 @@ async def run_controlled_entry_v3_position_run(
                 return await _finalize_after_orders(report, exchange, ordered_logs, "STOPPED", [open_blocker], before_equity, controlled_gate)
             scan = await _scan_controlled_entry_v3_watch(exchange=exchange, symbols=symbols, notional=notional, current_epoch=current_epoch, controlled_gate=controlled_gate)
             report["scan_count"] = int(report.get("scan_count") or 0) + 1
+            _merge_scan_summary_into_report(report, scan)
+            _update_controlled_job_progress(run_id, report, scan)
             report["watch_scans"].append(scan)
             report["tick_reports"].append(scan)
             selected = scan.get("selected_candidate")
@@ -2522,6 +2539,9 @@ async def run_controlled_position_loop(
         "runtime_limit_seconds": runtime_seconds,
         "runtime_seconds": 0,
         "scan_interval_seconds": scan_interval_seconds,
+        "scan_timeframes": list(CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS),
+        "latest_signal_by_timeframe": {},
+        "trade_candidate_count_by_timeframe": {label: 0 for label in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS},
         "max_holding_minutes": max_holding_minutes,
         "max_position_trades": max_position_trades,
         "symbols": symbols,
@@ -2702,6 +2722,7 @@ async def run_controlled_position_loop(
 
 
 def _merge_position_loop_subrun(report: dict, sub: dict) -> None:
+    _merge_scan_summary_into_report(report, sub)
     if str(sub.get("controlled_auto_live_status") or "").upper() != "PASSED_POSITION_TRADE":
         return
     report["trade_count"] = int(report.get("trade_count") or 0) + 1
@@ -2801,7 +2822,7 @@ def _finalize_position_loop(report: dict, status: str, reasons: list[str], contr
 
 
 def _select_controlled_entry_v3_watch_candidate(decisions: list[dict]) -> dict | None:
-    priority = {("ETH", "15m"): 0, ("BTC", "15m"): 1, ("ETH", "5m"): 2, ("BTC", "5m"): 3}
+    priority = {("ETH", "15m"): 0, ("BTC", "15m"): 1, ("ETH", "5m"): 2, ("BTC", "5m"): 3, ("ETH", "3m"): 4, ("BTC", "3m"): 5}
     candidates = [
         decision for decision in decisions
         if decision.get("edge_allowed")
@@ -2816,6 +2837,36 @@ def _select_controlled_entry_v3_watch_candidate(decisions: list[dict]) -> dict |
         )
     )
     return candidates[0] if candidates else None
+
+
+def _merge_scan_summary_into_report(report: dict, scan: dict) -> None:
+    latest = scan.get("latest_signal_by_timeframe") or (scan.get("summary") or {}).get("latest_signal_by_timeframe") or {}
+    counts = scan.get("trade_candidate_count_by_timeframe") or (scan.get("summary") or {}).get("trade_candidate_count_by_timeframe") or {}
+    if latest:
+        report["latest_signal_by_timeframe"] = latest
+    if counts:
+        report["trade_candidate_count_by_timeframe"] = {
+            label: int(counts.get(label) or 0)
+            for label in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS
+        }
+    if scan.get("scan_timeframes"):
+        report["scan_timeframes"] = list(scan.get("scan_timeframes") or [])
+
+
+def _update_controlled_job_progress(run_id: str, report: dict, scan: dict) -> None:
+    job = _controlled_jobs.get(run_id)
+    if job is None and "-trade-" in run_id:
+        job = _controlled_jobs.get(run_id.split("-trade-", 1)[0])
+    if job is None:
+        return
+    job["latest_scan_at_utc"] = scan.get("evaluated_at_utc") or _utc_now()
+    job["scan_count"] = int(report.get("scan_count") or 0)
+    job["latest_signal_by_timeframe"] = report.get("latest_signal_by_timeframe") or {}
+    job["trade_candidate_count_by_timeframe"] = report.get("trade_candidate_count_by_timeframe") or {}
+    job["latest_scan_summary"] = scan.get("summary") or {}
+    selected = scan.get("selected_candidate")
+    if selected:
+        job["latest_selected_candidate"] = selected
 
 
 def _active_controlled_job_locked() -> dict | None:
@@ -3006,7 +3057,7 @@ async def _build_entry_decisions(exchange: str, symbols: list[str], notional: fl
         decisions.append(smart_decision)
         entry_v2_decision = _controlled_entry_v2_decision(symbol, market, candles, quote, notional)
         decisions.append(entry_v2_decision)
-        for timeframe in (5, 15):
+        for timeframe in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAMES:
             timeframe_candles = await _load_strategy_candles(exchange, market, timeframe)
             decisions.append(_controlled_entry_v3_decision(symbol, market, timeframe, timeframe_candles, quote, notional))
     decisions.sort(key=lambda item: _float(item.get("expected_edge_rate")), reverse=True)
@@ -3296,6 +3347,30 @@ def _controlled_entry_v2_metrics(candles: list[dict], quote: dict) -> dict:
     }
 
 
+def _controlled_entry_v3_volatility_floor(timeframe: int) -> float:
+    if timeframe == 3:
+        return 0.00045
+    if timeframe == 5:
+        return 0.00055
+    return 0.0008
+
+
+def _controlled_entry_v3_volatility_score_scale(timeframe: int) -> float:
+    if timeframe == 3:
+        return 0.0024
+    if timeframe == 5:
+        return 0.003
+    return 0.0045
+
+
+def _controlled_entry_v3_ma_lengths(timeframe: int) -> tuple[int, int]:
+    if timeframe == 3:
+        return 5, 14
+    if timeframe == 5:
+        return 4, 12
+    return 3, 8
+
+
 def _controlled_entry_v3_decision(symbol: str, market: str, timeframe: int, candles: list[dict], quote: dict, notional: float) -> dict:
     latest = latest_completed_candle(candles, timeframe) or (candles[-1] if candles else {})
     costs = _cost_components(quote)
@@ -3318,7 +3393,7 @@ def _controlled_entry_v3_decision(symbol: str, market: str, timeframe: int, cand
         block_reasons.append("CONTROLLED_ENTRY_V3_SCORE_TOO_LOW")
     if metrics["estimated_spread_rate"] > max(0.003, expected_move * 0.55):
         block_reasons.append("SPREAD_TOO_WIDE")
-    if metrics["volatility_rate"] < (0.00055 if timeframe == 5 else 0.0008):
+    if metrics["volatility_rate"] < _controlled_entry_v3_volatility_floor(timeframe):
         block_reasons.append("VOLATILITY_TOO_LOW")
     if metrics["volume_ratio"] < 0.55:
         block_reasons.append("VOLUME_TOO_LOW")
@@ -3408,8 +3483,7 @@ def _controlled_entry_v3_metrics(candles: list[dict], quote: dict, *, timeframe:
     momentum_8 = _rate(closes[-1], closes[-9]) if len(closes) >= 9 else 0.0
     returns = [_rate(closes[index], closes[index - 1]) for index in range(max(1, len(closes) - 30), len(closes))]
     volatility = statistics.pstdev(returns) if len(returns) >= 2 else 0.0
-    ma_fast_len = 4 if timeframe == 5 else 3
-    ma_slow_len = 12 if timeframe == 5 else 8
+    ma_fast_len, ma_slow_len = _controlled_entry_v3_ma_lengths(timeframe)
     ma_fast = sum(closes[-ma_fast_len:]) / ma_fast_len if len(closes) >= ma_fast_len else last
     ma_slow = sum(closes[-ma_slow_len:]) / ma_slow_len if len(closes) >= ma_slow_len else ma_fast
     prev_fast = sum(closes[-(ma_fast_len + 3):-3]) / ma_fast_len if len(closes) >= ma_fast_len + 3 else ma_fast
@@ -3444,7 +3518,7 @@ def _controlled_entry_v3_metrics(candles: list[dict], quote: dict, *, timeframe:
     edge_component = min(max(edge_after_cost / 0.006, 0.0), 1.0) * 34.0
     direction_component = min(max(directional / 0.006, 0.0), 1.0) * 20.0
     volume_component = min(max((volume_ratio - 0.65) / 1.5, 0.0), 1.0) * 14.0
-    volatility_component = min(max(volatility / (0.003 if timeframe == 5 else 0.0045), 0.0), 1.0) * 14.0
+    volatility_component = min(max(volatility / _controlled_entry_v3_volatility_score_scale(timeframe), 0.0), 1.0) * 14.0
     trend_component = 10.0 if trend_passed else 0.0
     pattern_component = 8.0 if breakout_passed or pullback_rebound_passed else 0.0
     spread_penalty = 15.0 if costs["estimated_spread_rate"] > max(0.003, expected_move * 0.55) else 0.0
@@ -3469,7 +3543,7 @@ def _controlled_entry_v3_metrics(candles: list[dict], quote: dict, *, timeframe:
         trigger_missing_reason.append("CANDLE_CLOSE_NOT_CONFIRMED")
     if volume_ratio < 1.0:
         trigger_missing_reason.append("VOLUME_CONFIRMATION_MISSING")
-    if volatility < (0.00055 if timeframe == 5 else 0.0008):
+    if volatility < _controlled_entry_v3_volatility_floor(timeframe):
         trigger_missing_reason.append("VOLATILITY_CONFIRMATION_MISSING")
     return {
         "candle_count": len(closes),
@@ -4003,6 +4077,7 @@ def _summarize_signal_diagnostics(diagnostics: list[dict]) -> dict:
     symbols = {str(item.get("symbol") or "") for item in diagnostics if item.get("symbol")}
     strategies = {str(item.get("strategy_name") or "") for item in diagnostics if item.get("strategy_name")}
     candidate_signals = [item for item in diagnostics if item.get("signal_generated")]
+    trade_candidates = [item for item in diagnostics if str(item.get("signal_state") or "") == "TRADE_CANDIDATE"]
     blocked_signals = [item for item in diagnostics if item.get("blocked")]
     near_misses = [item for item in diagnostics if item.get("would_order_if_threshold_relaxed")]
     reason_counts: dict[str, int] = {}
@@ -4015,10 +4090,36 @@ def _summarize_signal_diagnostics(diagnostics: list[dict]) -> dict:
         score = abs(gap)
         if closest is None or score < closest["_score"]:
             closest = {**item, "_gap": gap, "_score": score}
+    latest_by_timeframe: dict[str, dict[str, Any]] = {}
+    trade_count_by_timeframe = {label: 0 for label in CONTROLLED_ENTRY_V3_SCAN_TIMEFRAME_LABELS}
+    for item in diagnostics:
+        timeframe = str(item.get("timeframe") or "")
+        if timeframe not in trade_count_by_timeframe:
+            continue
+        if str(item.get("signal_state") or "") == "TRADE_CANDIDATE":
+            trade_count_by_timeframe[timeframe] += 1
+        current = latest_by_timeframe.get(timeframe)
+        item_time = str(item.get("last_candle_at_utc") or "")
+        current_time = str((current or {}).get("last_candle_at_utc") or "")
+        if current is None or item_time >= current_time:
+            latest_by_timeframe[timeframe] = {
+                "timeframe": timeframe,
+                "symbol": item.get("symbol"),
+                "signal_side": item.get("signal_side"),
+                "signal_state": item.get("signal_state"),
+                "signal_score": item.get("signal_score"),
+                "expected_edge_after_cost": item.get("expected_edge_after_cost"),
+                "last_candle_at_utc": item.get("last_candle_at_utc"),
+                "recommended_next_action": item.get("recommended_next_action"),
+                "block_reasons": item.get("block_reasons") or [],
+            }
     summary = {
         "evaluated_symbol_count": len(symbols),
         "evaluated_strategy_count": len(strategies),
         "candidate_signal_count": len(candidate_signals),
+        "trade_candidate_signal_count": len(trade_candidates),
+        "trade_candidate_count_by_timeframe": trade_count_by_timeframe,
+        "latest_signal_by_timeframe": latest_by_timeframe,
         "blocked_signal_count": len(blocked_signals),
         "near_miss_signal_count": len(near_misses),
         "top_block_reasons": [

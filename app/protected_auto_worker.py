@@ -258,6 +258,11 @@ def _sync_latest_report_into_state(state: dict) -> dict:
             "result": status,
             "controlled_run_id": report.get("controlled_run_id"),
             "trade_count": report.get("trade_count", 0),
+            "scan_timeframes": report.get("scan_timeframes") or [],
+            "latest_signal_by_timeframe": report.get("latest_signal_by_timeframe") or {},
+            "trade_candidate_count_by_timeframe": report.get("trade_candidate_count_by_timeframe") or {},
+            "protected_strategy_pnl": report.get("protected_strategy_total_pnl", 0.0),
+            "legacy_holding_valuation_delta": report.get("legacy_holding_valuation_delta", 0.0),
             "stop_reasons": stop_reasons,
             "completed_at_utc": report.get("completed_at_utc"),
         },
@@ -282,6 +287,10 @@ def protected_auto_status() -> dict:
     state = _sync_latest_report_into_state(load_protected_auto_state())
     stale = _is_stale(state)
     active = _active_protected_job()
+    active_signal_by_timeframe = (active or {}).get("latest_signal_by_timeframe") or {}
+    active_candidate_counts = (active or {}).get("trade_candidate_count_by_timeframe") or {}
+    last_scan = state.get("last_scan_result") or {}
+    latest_report = state.get("latest_report") or {}
     scope = _position_scope(state)
     lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
     stale_lock = (
@@ -305,6 +314,8 @@ def protected_auto_status() -> dict:
         "stale": stale,
         "stale_lock": stale or stale_lock,
         "active_controlled_job": active,
+        "latest_signal_by_timeframe": active_signal_by_timeframe or last_scan.get("latest_signal_by_timeframe") or latest_report.get("latest_signal_by_timeframe") or {},
+        "trade_candidate_count_by_timeframe": active_candidate_counts or last_scan.get("trade_candidate_count_by_timeframe") or latest_report.get("trade_candidate_count_by_timeframe") or {},
         "allowed_symbols": list(PROTECTED_ALLOWED_SYMBOLS),
         "allowed_strategy": CONTROLLED_ENTRY_V3_STRATEGY,
         "max_notional_krw": PROTECTED_MAX_NOTIONAL_KRW,
@@ -578,9 +589,18 @@ async def protected_auto_tick_async() -> dict:
         }
     )
     if active:
+        active_scan = {
+            "result": "ACTIVE_CONTROLLED_ENTRY_V3_POSITION_JOB",
+            "active_controlled_run_id": active.get("controlled_run_id"),
+            "scan_count": active.get("scan_count"),
+            "latest_scan_at_utc": active.get("latest_scan_at_utc"),
+            "latest_signal_by_timeframe": active.get("latest_signal_by_timeframe") or {},
+            "trade_candidate_count_by_timeframe": active.get("trade_candidate_count_by_timeframe") or {},
+            "at_utc": now,
+        }
         return {
             **protected_auto_status(),
-            "latest_scan_result": {"result": "ACTIVE_CONTROLLED_ENTRY_V3_POSITION_JOB", "active_controlled_run_id": active.get("controlled_run_id"), "at_utc": now},
+            "latest_scan_result": active_scan,
         }
     open_blocker = await _open_order_blocker(exchange, state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS))
     if open_blocker:
