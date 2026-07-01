@@ -90,7 +90,10 @@ def _post_webhook(url: str, channel: str, text: str) -> None:
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "coin-bot-protected-auto/1.0",
+        },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=5) as response:
