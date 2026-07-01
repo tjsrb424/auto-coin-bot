@@ -466,6 +466,53 @@ def _position_scope(state: dict) -> dict:
     )
 
 
+def _compact_position_scope(scope: dict) -> dict:
+    return {
+        key: value
+        for key, value in (scope or {}).items()
+        if key != "open_position_classifications"
+    }
+
+
+def _compact_notification(event: dict | None) -> dict | None:
+    if not event:
+        return None
+    payload = event.get("payload") or {}
+    compact_payload = {
+        key: payload.get(key)
+        for key in (
+            "status",
+            "worker_status",
+            "session_status",
+            "protected_session_id",
+            "controlled_run_id",
+            "trade_count",
+            "protected_strategy_pnl",
+            "session_loss_remaining",
+            "reason",
+            "message",
+        )
+        if payload.get(key) is not None
+    }
+    return {
+        "id": event.get("id"),
+        "event_id": event.get("event_id"),
+        "event_type": event.get("event_type"),
+        "severity": event.get("severity"),
+        "exchange": event.get("exchange"),
+        "protected_session_id": event.get("protected_session_id"),
+        "controlled_run_id": event.get("controlled_run_id"),
+        "message": event.get("message"),
+        "channel": event.get("channel"),
+        "webhook_configured": event.get("webhook_configured"),
+        "delivery_status": event.get("delivery_status"),
+        "delivery_error": event.get("delivery_error"),
+        "sent_at_utc": event.get("sent_at_utc"),
+        "created_at_utc": event.get("created_at_utc"),
+        "payload": compact_payload,
+    }
+
+
 def protected_auto_status() -> dict:
     state = _sync_latest_report_into_state(load_protected_auto_state())
     stale = _is_stale(state)
@@ -474,9 +521,10 @@ def protected_auto_status() -> dict:
     active_candidate_counts = (active or {}).get("trade_candidate_count_by_timeframe") or {}
     last_scan = state.get("last_scan_result") or {}
     latest_report = state.get("latest_report") or {}
-    scope = _position_scope(state)
+    scope = _compact_position_scope(_position_scope(state))
     lock = load_runtime_lock(PROTECTED_RUNTIME_LOCK_ID) or {}
-    recent_notifications = load_protected_auto_notifications(20)
+    recent_notifications = [_compact_notification(item) for item in load_protected_auto_notifications(5)]
+    recent_notifications = [item for item in recent_notifications if item]
     signal_by_timeframe = active_signal_by_timeframe or last_scan.get("latest_signal_by_timeframe") or latest_report.get("latest_signal_by_timeframe") or {}
     stale_lock = (
         str(lock.get("status") or "").upper() == "RUNNING"
@@ -503,7 +551,7 @@ def protected_auto_status() -> dict:
         "latest_signal_by_timeframe": signal_by_timeframe,
         "trade_candidate_count_by_timeframe": active_candidate_counts or last_scan.get("trade_candidate_count_by_timeframe") or latest_report.get("trade_candidate_count_by_timeframe") or {},
         "session_loss_remaining": _session_loss_remaining(state),
-        "last_alert": recent_notifications[0] if recent_notifications else latest_protected_auto_notification(),
+        "last_alert": recent_notifications[0] if recent_notifications else _compact_notification(latest_protected_auto_notification()),
         "recent_notifications": recent_notifications,
         "allowed_symbols": list(PROTECTED_ALLOWED_SYMBOLS),
         "allowed_strategy": CONTROLLED_ENTRY_V3_STRATEGY,

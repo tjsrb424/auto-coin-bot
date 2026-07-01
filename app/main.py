@@ -398,6 +398,26 @@ def _server_ip() -> str:
         return "unknown"
 
 
+def _compact_notification_log(event: dict | None) -> dict | None:
+    if not event:
+        return None
+    return {
+        "id": event.get("id"),
+        "event_id": event.get("event_id"),
+        "event_type": event.get("event_type"),
+        "provider": event.get("provider"),
+        "status": event.get("status"),
+        "title": event.get("title"),
+        "summary": event.get("summary"),
+        "error_message": event.get("error_message"),
+        "related_session_id": event.get("related_session_id"),
+        "related_run_id": event.get("related_run_id"),
+        "related_order_uuid": event.get("related_order_uuid"),
+        "created_at_utc": event.get("created_at_utc"),
+        "sent_at_utc": event.get("sent_at_utc"),
+    }
+
+
 def _runtime_status_payload(request: Request) -> dict:
     strategy = live_strategy_status()
     auto = auto_live_pilot_status()
@@ -450,7 +470,7 @@ def _runtime_status_payload(request: Request) -> dict:
         "protected_lock_expires_at_utc": protected.get("protected_lock_expires_at_utc"),
         "protected_last_alert": protected.get("last_alert"),
         "notification_config": notification_config,
-        "last_notification": notification_logs[0] if notification_logs else None,
+        "last_notification": _compact_notification_log(notification_logs[0] if notification_logs else None),
     }
 
 
