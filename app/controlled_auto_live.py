@@ -426,6 +426,8 @@ def controlled_auto_live_gate(current_epoch: dict, smoke_preflight: dict, *, exc
         protected_warnings.append({"code": "GENERAL_RUNTIME_PREVIOUS_DRAWDOWN_STOP_WARNING", "count": 1})
     if resolved_position_loop_event:
         protected_warnings.append({"code": "RESOLVED_PREVIOUS_DUPLICATE_CLIENT_ORDER_ID", "count": 1})
+    if _position_loop_server_restart_safe_stop(position_loop):
+        protected_warnings.append({"code": "PREVIOUS_PROTECTED_LOOP_SERVER_RESTART_SAFE_STOP", "count": 1})
     current_equity = _float(
         current_epoch.get("current_epoch_current_equity"),
         _float(current_epoch.get("current_equity_from_exchange")),
@@ -884,6 +886,13 @@ def _resolved_duplicate_client_order_position_loop_event(position_loop: dict) ->
     return event
 
 
+def _position_loop_server_restart_safe_stop(position_loop: dict) -> bool:
+    if str(position_loop.get("status") or "").upper() != "STOPPED":
+        return False
+    reasons = [str(reason) for reason in (position_loop.get("pass_fail_reasons") or [])]
+    return any(reason == "SERVER_RESTART_SAFE_STOP" for reason in reasons)
+
+
 def _protected_position_loop_blockers(position_loop: dict) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     if not position_loop.get("present"):
@@ -896,7 +905,7 @@ def _protected_position_loop_blockers(position_loop: dict) -> list[dict[str, Any
         "PASSED_PROFITABLE_POSITION",
     }
     if status not in allowed_results:
-        if _resolved_duplicate_client_order_position_loop_event(position_loop) is None:
+        if _resolved_duplicate_client_order_position_loop_event(position_loop) is None and not _position_loop_server_restart_safe_stop(position_loop):
             blockers.append({"code": "FINAL_CONTROLLED_POSITION_LOOP_NOT_PASSED", "count": 1})
     metric_checks = [
         ("missing_ledger_fill_count", "CONTROLLED_POSITION_LOOP_MISSING_LEDGER_FILL"),
@@ -914,7 +923,7 @@ def _protected_position_loop_blockers(position_loop: dict) -> list[dict[str, Any
     equity_diff = position_loop.get("equity_diff_after")
     if equity_diff is not None and abs(_float(equity_diff)) > EQUITY_TOLERANCE_KRW:
         blockers.append({"code": "CONTROLLED_POSITION_LOOP_EQUITY_DIFF", "count": 1})
-    if str(position_loop.get("final_runtime_status") or "").upper() != "STOPPED":
+    if str(position_loop.get("final_runtime_status") or "").upper() != "STOPPED" and not _position_loop_server_restart_safe_stop(position_loop):
         blockers.append({"code": "CONTROLLED_POSITION_LOOP_RUNTIME_NOT_STOPPED", "count": 1})
     return blockers
 
