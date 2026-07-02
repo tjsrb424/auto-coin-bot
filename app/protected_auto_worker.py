@@ -569,6 +569,30 @@ def _startup_recovery_status(state: dict | None = None, lock: dict | None = None
 
 def protected_auto_status() -> dict:
     state = _sync_latest_report_into_state(load_protected_auto_state())
+    session_status = str(state.get("session_status") or "STOPPED").upper()
+    worker_status = str(state.get("worker_status") or "STOPPED").upper()
+    if session_status in {"STOPPED", "FAILED"} and worker_status in {"STOPPED", "FAILED"}:
+        return {
+            **state,
+            **_startup_recovery_status(state=state),
+            "protected_open_position_count": int(state.get("protected_open_position_count") or 0),
+            "legacy_open_position_count": int(state.get("legacy_open_position_count") or 0),
+            "protected_strategy_pnl": float(state.get("protected_strategy_pnl") or 0.0),
+            "account_session_pnl_delta": float(state.get("account_session_pnl_delta") or 0.0),
+            "session_loss_remaining": _session_loss_remaining(state),
+            "last_scan_result": state.get("last_scan_result") or {},
+            "latest_signal": {},
+            "latest_signal_by_timeframe": {},
+            "trade_candidate_count_by_timeframe": {},
+            "active_controlled_job": None,
+            "last_alert": None,
+            "recent_notifications": [],
+            "allowed_symbols": list(PROTECTED_ALLOWED_SYMBOLS),
+            "allowed_strategy": CONTROLLED_ENTRY_V3_STRATEGY,
+            "max_notional_krw": PROTECTED_MAX_NOTIONAL_KRW,
+            "max_open_positions": PROTECTED_MAX_OPEN_POSITIONS,
+            "session_loss_limit_krw": PROTECTED_SESSION_LOSS_LIMIT_KRW,
+        }
     stale = _is_stale(state)
     active = _active_protected_job()
     active_signal_by_timeframe = (active or {}).get("latest_signal_by_timeframe") or {}
