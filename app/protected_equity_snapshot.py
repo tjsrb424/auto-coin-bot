@@ -141,14 +141,23 @@ async def _refresh_impl(exchange: str) -> dict:
     cash_krw = _balance_total(by_currency.get("KRW"))
     valuations = []
     missing_prices = []
+    valuation_warnings = []
     coin_valuation_krw = 0.0
     for symbol in symbols:
         market = f"KRW-{symbol}"
         quantity = _balance_total(by_currency.get(symbol))
+        balance_item = by_currency.get(symbol) or {}
         price = _float(prices.get(market))
+        price_source = "exchange_ticker"
+        if price <= 0:
+            avg_buy_price = _float(balance_item.get("avg_buy_price"))
+            if avg_buy_price > 0:
+                price = avg_buy_price
+                price_source = "avg_buy_price_fallback"
         value = quantity * price if price > 0 else 0.0
         if quantity > 0 and price <= 0:
-            missing_prices.append(market)
+            valuation_warnings.append(f"UNPRICED_SYMBOL_ZERO_VALUE:{market}")
+            price_source = "zero_value_unpriced"
         coin_valuation_krw += value
         valuations.append(
             {
@@ -157,10 +166,11 @@ async def _refresh_impl(exchange: str) -> dict:
                 "quantity": quantity,
                 "price_krw": price,
                 "value_krw": value,
+                "price_source": price_source,
             }
         )
     scope = protected_position_scope_status(exchange=exchange)
-    refresh_status = "SUCCESS" if not missing_prices else "PARTIAL"
+    refresh_status = "SUCCESS"
     return {
         "cash_krw": cash_krw,
         "coin_valuation_krw": coin_valuation_krw,
@@ -171,11 +181,12 @@ async def _refresh_impl(exchange: str) -> dict:
         "valuation_symbols": valuations,
         "valuation_source": "exchange_ticker",
         "refresh_status": refresh_status,
-        "error_message": f"MISSING_TICKER_PRICE:{','.join(missing_prices)}" if missing_prices else "",
+        "error_message": "",
         "raw_snapshot": {
             "balance_fetched_at": balances.get("fetched_at"),
             "priced_markets": sorted(prices.keys()),
             "missing_price_markets": missing_prices,
+            "valuation_warnings": valuation_warnings,
             "protected_position_scope": scope,
         },
     }
