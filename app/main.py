@@ -170,8 +170,10 @@ from app.controlled_auto_live import (
     stop_controlled_auto_live_job,
 )
 from app.protected_auto_worker import (
+    emit_protected_auto_started_event,
     protected_auto_safe_stop_async,
     protected_auto_status,
+    run_protected_bootstrap_heartbeat,
     run_protected_auto_startup_recovery_async,
     run_protected_auto_tick,
     start_protected_auto_daemon,
@@ -324,13 +326,16 @@ def _light_protected_health_status() -> dict:
     now = datetime.now(timezone.utc)
     last_heartbeat = _parse_utc(state_dict.get("last_heartbeat_at_utc"))
     lock_expires = _parse_utc(state_dict.get("lock_expires_at_utc") or lock_dict.get("expires_at"))
-    stale = bool(last_heartbeat and (now - last_heartbeat).total_seconds() > 180)
-    stale_lock = bool(lock_expires and lock_expires <= now)
+    state_status = str(state_dict.get("session_status") or "STOPPED").upper()
+    worker_status = str(state_dict.get("worker_status") or "STOPPED").upper()
+    lock_status = str(lock_dict.get("status") or "STOPPED").upper()
+    stale = bool(worker_status == "RUNNING" and last_heartbeat and (now - last_heartbeat).total_seconds() > 180)
+    stale_lock = bool(lock_status == "RUNNING" and lock_expires and lock_expires <= now)
     return {
-        "protected_auto_runtime_status": str(state_dict.get("session_status") or "STOPPED").upper(),
-        "protected_worker_status": "STALE" if stale else str(state_dict.get("worker_status") or "STOPPED").upper(),
-        "protected_session_status": str(state_dict.get("session_status") or "STOPPED").upper(),
-        "protected_runtime_lock_status": "STALE" if stale_lock else str(lock_dict.get("status") or "STOPPED").upper(),
+        "protected_auto_runtime_status": state_status,
+        "protected_worker_status": "STALE" if stale else worker_status,
+        "protected_session_status": state_status,
+        "protected_runtime_lock_status": "STALE" if stale_lock else lock_status,
         "protected_session_id": state_dict.get("protected_session_id"),
         "protected_last_heartbeat_at_utc": state_dict.get("last_heartbeat_at_utc"),
         "protected_last_tick_at_utc": state_dict.get("last_tick_at_utc"),
@@ -3705,7 +3710,7 @@ async def protected_full_auto_live_v1_equity_status(exchange: str = Query("bithu
 
 
 @app.post("/api/protected-full-auto-live/v1/start")
-async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1StartRequest) -> dict:
+async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1StartRequest, background_tasks: BackgroundTasks) -> dict:
     cached_gate = load_cached_protected_gate_snapshot(payload.exchange)
     snapshot = cached_gate.get("snapshot") or {}
     current_epoch = snapshot.get("current_epoch") or {}
@@ -3751,7 +3756,12 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
         max_position_trades=payload.max_position_trades,
         current_epoch=current_epoch,
         gate=gate,
+        emit_started_notification=False,
     )
+    if daemon.get("ok"):
+        state = dict((daemon.get("protected_auto") or {}))
+        background_tasks.add_task(emit_protected_auto_started_event, state)
+        background_tasks.add_task(run_protected_bootstrap_heartbeat)
     return {
         **daemon,
         "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
@@ -3766,6 +3776,35 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
 @app.get("/api/protected-full-auto-live/v1/status")
 async def protected_full_auto_live_v1_status() -> dict:
     return {"ok": True, "protected_auto": _light_protected_health_status()}
+
+
+@app.get("/api/protected-full-auto-live/v1/start-readiness")
+async def protected_full_auto_live_v1_start_readiness(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    gate = load_cached_protected_gate_snapshot(exchange)
+    protected = _light_protected_health_status()
+    blockers = list(gate.get("protected_start_blockers") or [])
+    return {
+        "ok": True,
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "source": "CACHED_READINESS_ONLY",
+        "orders_requested": False,
+        "orders_cancelled": False,
+        "start_api_expected_nonblocking": True,
+        "bootstrap_heartbeat_only_enabled": True,
+        "heartbeat_first_worker_enabled": True,
+        "protected_start_allowed": bool(gate.get("protected_start_allowed")) and not blockers,
+        "critical_gate_allowed": bool(gate.get("critical_gate_allowed")),
+        "gate_status": gate.get("gate_status"),
+        "blockers": blockers,
+        "warnings": gate.get("protected_start_warnings") or [],
+        "protected_auto": protected,
+        "observation_contract": {
+            "start_response_should_return_quickly": True,
+            "heartbeat_expected_within_seconds": 10,
+            "heartbeat_updates_expected_in_60s": 2,
+            "health_must_remain_lightweight": True,
+        },
+    }
 
 
 @app.get("/api/protected-full-auto-live/v1/notifications")

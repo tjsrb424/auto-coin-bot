@@ -50,6 +50,7 @@ PROTECTED_LOCK_TTL_SECONDS = 180
 PROTECTED_STALE_AFTER_SECONDS = 180
 PROTECTED_SCAN_TIMEOUT_SECONDS = float(os.getenv("PROTECTED_AUTO_SCAN_TIMEOUT_SECONDS", "25"))
 PROTECTED_EXCHANGE_TIMEOUT_SECONDS = float(os.getenv("PROTECTED_AUTO_EXCHANGE_TIMEOUT_SECONDS", "8"))
+PROTECTED_BOOTSTRAP_HEARTBEAT_DELAY_SECONDS = float(os.getenv("PROTECTED_AUTO_BOOTSTRAP_HEARTBEAT_DELAY_SECONDS", "2"))
 
 _WORKER_TICK_LOCK = threading.Lock()
 
@@ -312,6 +313,24 @@ def _notify_protected_event(
         return None
 
 
+def emit_protected_auto_started_event(state: dict | None = None) -> dict | None:
+    state = dict(state or load_protected_auto_state())
+    session_id = str(state.get("protected_session_id") or "")
+    started = str(state.get("started_at_utc") or _utc_now())
+    return _notify_protected_event(
+        "PROTECTED_AUTO_STARTED",
+        state=state,
+        severity="INFO",
+        message="Protected auto daemon started.",
+        payload={
+            "started_at_utc": started,
+            "symbols": state.get("symbols") or list(PROTECTED_ALLOWED_SYMBOLS),
+            "amount_krw": state.get("amount_krw"),
+        },
+        event_id=_event_id(session_id, "PROTECTED_AUTO_STARTED", started),
+    )
+
+
 def _mapped_stop_events(reason: str) -> list[str]:
     upper = str(reason or "").upper()
     events: list[str] = []
@@ -420,6 +439,8 @@ def _notify_daily_summary_if_due(state: dict) -> None:
 
 
 def _session_loss_remaining(state: dict) -> Any:
+    if str(state.get("worker_status") or "").upper() not in {"RUNNING", "STALE"}:
+        return (state.get("baseline") or {}).get("session_loss_limit_remaining")
     active = _active_protected_job() or {}
     active_report = active.get("report") or {}
     latest_report = state.get("latest_report") or {}
@@ -764,6 +785,7 @@ def start_protected_auto_daemon(
     max_position_trades: int,
     current_epoch: dict,
     gate: dict,
+    emit_started_notification: bool = True,
 ) -> dict:
     if not gate.get("protected_full_auto_live_allowed"):
         return {
@@ -771,7 +793,7 @@ def start_protected_auto_daemon(
             "status": "ABORTED",
             "message": "Protected full auto daemon gate is blocked.",
             "controlled_auto_live_gate": gate,
-            "protected_auto": protected_auto_status(),
+            "protected_auto": _startup_recovery_status(),
         }
     symbols = [symbol for symbol in [str(item).upper() for item in symbols] if symbol in PROTECTED_ALLOWED_SYMBOLS]
     symbols = symbols or list(PROTECTED_ALLOWED_SYMBOLS)
@@ -783,16 +805,31 @@ def start_protected_auto_daemon(
             "status": "ABORTED",
             "message": "Protected auto daemon lock is already active.",
             "protected_runtime_lock": lock,
-            "protected_auto": protected_auto_status(),
+            "protected_auto": _startup_recovery_status(lock=lock),
         }
     started = _utc_now()
     protected_session_id = f"pv1-{started.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:6]}"
-    baseline = build_protected_session_baseline(
-        current_epoch=current_epoch,
-        exchange=exchange,
-        protected_session_id=protected_session_id,
-        started_at_utc=started,
-    )
+    baseline = dict(gate.get("protected_session_baseline_preview") or {})
+    if baseline:
+        baseline.update(
+            {
+                "protected_session_id": protected_session_id,
+                "protected_session_started_at_utc": started,
+                "session_status": "RUNNING",
+                "protected_session_loss_status": baseline.get("protected_session_loss_status") or "OK",
+                "session_pnl_delta": 0.0,
+                "session_loss_limit_remaining": baseline.get("session_loss_limit_remaining", baseline.get("session_loss_limit_krw", PROTECTED_SESSION_LOSS_LIMIT_KRW)),
+                "protected_session_stop_reason": None,
+            }
+        )
+    else:
+        baseline = build_protected_session_baseline(
+            current_epoch=current_epoch,
+            risk_state={},
+            exchange=exchange,
+            protected_session_id=protected_session_id,
+            started_at_utc=started,
+        )
     state = _upsert_state(
         {
             "worker_status": "RUNNING",
@@ -809,6 +846,8 @@ def start_protected_auto_daemon(
             "stopped_at_utc": None,
             "last_heartbeat_at_utc": started,
             "last_tick_at_utc": None,
+            "last_tick_started_at_utc": None,
+            "last_tick_finished_at_utc": None,
             "next_tick_at_utc": started,
             "lock_expires_at_utc": (lock or {}).get("expires_at") or _plus_seconds(PROTECTED_LOCK_TTL_SECONDS),
             "baseline": baseline,
@@ -822,15 +861,47 @@ def start_protected_auto_daemon(
             "account_session_pnl_delta": 0.0,
         }
     )
-    _notify_protected_event(
-        "PROTECTED_AUTO_STARTED",
-        state=state,
-        severity="INFO",
-        message="Protected auto daemon started.",
-        payload={"started_at_utc": started, "symbols": symbols, "amount_krw": amount},
-        event_id=_event_id(protected_session_id, "PROTECTED_AUTO_STARTED", started),
-    )
-    return {"ok": True, "status": "RUNNING", "protected_auto": {**protected_auto_status(), **state}}
+    if emit_started_notification:
+        emit_protected_auto_started_event(state)
+    return {
+        "ok": True,
+        "status": "RUNNING",
+        "protected_auto": {**state, **_startup_recovery_status(state=state, lock=lock)},
+    }
+
+
+def run_protected_bootstrap_heartbeat() -> dict:
+    started_monotonic = time.monotonic()
+    if not _WORKER_TICK_LOCK.acquire(blocking=False):
+        return _startup_recovery_status()
+    try:
+        state = load_protected_auto_state()
+        if str(state.get("worker_status") or "").upper() != "RUNNING":
+            return _startup_recovery_status(state=state)
+        acquired, lock = _acquire_protected_lock()
+        if not acquired:
+            return protected_auto_safe_stop("PROTECTED_RUNTIME_LOCK_CONFLICT", failed=True)
+        now = _utc_now()
+        next_tick = _plus_seconds(max(int(state.get("scan_interval_seconds") or PROTECTED_SCAN_INTERVAL_SECONDS), 60))
+        updated = _finish_tick(
+            started_monotonic,
+            {
+                "last_heartbeat_at_utc": now,
+                "last_tick_at_utc": now,
+                "last_tick_started_at_utc": now,
+                "next_tick_at_utc": next_tick,
+                "lock_expires_at_utc": (lock or {}).get("expires_at") or _plus_seconds(PROTECTED_LOCK_TTL_SECONDS),
+                "last_scan_error": "",
+                "last_scan_result": {"result": "BOOTSTRAP_HEARTBEAT_ONLY", "at_utc": now, "next_scan_at_utc": next_tick},
+                "consecutive_scan_failures": 0,
+            },
+        )
+        return _startup_recovery_status(state=updated, lock=lock)
+    except Exception as exc:
+        logger.warning("[protected-auto] bootstrap heartbeat failed error=%s", exc)
+        return _startup_recovery_status()
+    finally:
+        _WORKER_TICK_LOCK.release()
 
 
 async def run_protected_auto_startup_recovery_async() -> dict:
@@ -902,16 +973,15 @@ def _record_scan_error(state: dict, started_monotonic: float, error_code: str, *
 
 async def protected_auto_tick_async() -> dict:
     started_monotonic = time.monotonic()
-    state = _sync_latest_report_into_state(load_protected_auto_state())
+    state = load_protected_auto_state()
     if str(state.get("worker_status") or "").upper() != "RUNNING":
-        return protected_auto_status()
+        return _startup_recovery_status(state=state)
     exchange = str(state.get("exchange") or "bithumb")
     acquired, lock = _acquire_protected_lock()
     if not acquired:
         return await protected_auto_safe_stop_async("PROTECTED_RUNTIME_LOCK_CONFLICT", failed=True)
     now = _utc_now()
     next_tick = _plus_seconds(max(int(state.get("scan_interval_seconds") or PROTECTED_SCAN_INTERVAL_SECONDS), 60))
-    scope = _position_scope(state)
     heartbeat = _upsert_state(
         {
             "last_heartbeat_at_utc": now,
@@ -919,11 +989,20 @@ async def protected_auto_tick_async() -> dict:
             "last_tick_started_at_utc": now,
             "next_tick_at_utc": next_tick,
             "lock_expires_at_utc": (lock or {}).get("expires_at") or _plus_seconds(PROTECTED_LOCK_TTL_SECONDS),
-            "protected_open_position_count": scope.get("protected_open_position_count", 0),
-            "legacy_open_position_count": scope.get("legacy_open_position_count", 0),
             "last_scan_error": "",
         }
     )
+    if not state.get("last_tick_finished_at_utc") and (state.get("last_scan_result") or {}).get("result") == "STARTED":
+        bootstrapped = _finish_tick(
+            started_monotonic,
+            {
+                "last_scan_result": {"result": "BOOTSTRAP_HEARTBEAT_ONLY", "at_utc": now, "next_scan_at_utc": next_tick},
+                "last_scan_error": "",
+                "consecutive_scan_failures": 0,
+            },
+        )
+        return _startup_recovery_status(state=bootstrapped, lock=lock)
+    heartbeat = _sync_latest_report_into_state(heartbeat)
     active = _active_protected_job()
     _notify_daily_summary_if_due(heartbeat)
     try:
@@ -932,8 +1011,8 @@ async def protected_auto_tick_async() -> dict:
             timeout=max(0.1, PROTECTED_EXCHANGE_TIMEOUT_SECONDS),
         )
     except asyncio.TimeoutError:
-        _record_scan_error(heartbeat, started_monotonic, "EXCHANGE_EQUITY_TIMEOUT")
-        return protected_auto_status()
+        updated = _record_scan_error(heartbeat, started_monotonic, "EXCHANGE_EQUITY_TIMEOUT")
+        return _startup_recovery_status(state=updated, lock=lock)
     except Exception as exc:
         return await protected_auto_safe_stop_async(f"EXCHANGE_API_CRITICAL_FAILURE:{exc.__class__.__name__}", failed=True)
     hard_stops = _hard_stop_reasons(exchange, current_epoch)
@@ -949,9 +1028,9 @@ async def protected_auto_tick_async() -> dict:
             "trade_candidate_count_by_timeframe": active.get("trade_candidate_count_by_timeframe") or {},
             "at_utc": now,
         }
-        _finish_tick(started_monotonic, {"last_scan_result": active_scan, "consecutive_scan_failures": 0, "last_scan_error": ""})
+        updated = _finish_tick(started_monotonic, {"last_scan_result": active_scan, "consecutive_scan_failures": 0, "last_scan_error": ""})
         return {
-            **protected_auto_status(),
+            **_startup_recovery_status(state=updated, lock=lock),
             "latest_scan_result": active_scan,
         }
     try:
@@ -960,13 +1039,20 @@ async def protected_auto_tick_async() -> dict:
             timeout=max(0.1, PROTECTED_EXCHANGE_TIMEOUT_SECONDS),
         )
     except asyncio.TimeoutError:
-        _record_scan_error(heartbeat, started_monotonic, "OPEN_ORDER_AUDIT_TIMEOUT")
-        return protected_auto_status()
+        updated = _record_scan_error(heartbeat, started_monotonic, "OPEN_ORDER_AUDIT_TIMEOUT")
+        return _startup_recovery_status(state=updated, lock=lock)
     if open_blocker:
         return await protected_auto_safe_stop_async(str(open_blocker))
+    scope = _position_scope(heartbeat)
+    heartbeat = _upsert_state(
+        {
+            "protected_open_position_count": scope.get("protected_open_position_count", 0),
+            "legacy_open_position_count": scope.get("legacy_open_position_count", 0),
+        }
+    )
     open_positions = int(scope.get("protected_open_position_count") or 0)
     if open_positions >= PROTECTED_MAX_OPEN_POSITIONS:
-        return _finish_tick(
+        updated = _finish_tick(
             started_monotonic,
             {
                 "last_scan_result": {"result": "PROTECTED_MAX_OPEN_POSITIONS_REACHED", "protected_open_position_count": open_positions, "at_utc": now},
@@ -974,6 +1060,7 @@ async def protected_auto_tick_async() -> dict:
                 "consecutive_scan_failures": 0,
             }
         )
+        return _startup_recovery_status(state=updated, lock=lock)
     smoke_preflight = build_smoke_test_preflight(
         exchange=exchange,
         symbol="BTC",
@@ -985,7 +1072,7 @@ async def protected_auto_tick_async() -> dict:
     gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=exchange)
     if not gate.get("protected_full_auto_live_allowed"):
         blockers = [str(item.get("code")) for item in gate.get("protected_full_auto_live_blockers") or []]
-        return _finish_tick(
+        updated = _finish_tick(
             started_monotonic,
             {
                 "last_scan_result": {"result": "GATE_BLOCKED", "blockers": blockers, "at_utc": now},
@@ -993,6 +1080,7 @@ async def protected_auto_tick_async() -> dict:
                 "consecutive_scan_failures": 0,
             }
         )
+        return _startup_recovery_status(state=updated, lock=lock)
     gate = {
         **gate,
         "active_protected_session_baseline": heartbeat.get("baseline") or {},
@@ -1012,7 +1100,7 @@ async def protected_auto_tick_async() -> dict:
         mode=PROTECTED_FULL_AUTO_MODE,
         protected_runtime_instance_id=None,
     )
-    _finish_tick(
+    updated = _finish_tick(
         started_monotonic,
         {
             "last_scan_result": {
@@ -1024,7 +1112,7 @@ async def protected_auto_tick_async() -> dict:
             "consecutive_scan_failures": 0,
         }
     )
-    return protected_auto_status()
+    return _startup_recovery_status(state=updated, lock=lock)
 
 
 def run_protected_auto_tick() -> dict:
@@ -1036,7 +1124,7 @@ def run_protected_auto_tick() -> dict:
                 "last_scan_result": {"result": "SKIPPED", "reason": "WORKER_TICK_OVERLAP_SKIPPED", "at_utc": _utc_now()},
             }
         )
-        return protected_auto_status()
+        return _startup_recovery_status()
     try:
         return asyncio.run(protected_auto_tick_async())
     except Exception as exc:

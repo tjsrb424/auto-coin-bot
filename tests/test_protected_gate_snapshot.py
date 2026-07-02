@@ -167,6 +167,23 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
         self.assertEqual(body["gate_status"], "GATE_ALLOWED")
         self.assertNotIn("secret/token", str(body))
 
+    def test_start_readiness_endpoint_uses_cached_snapshot_only(self) -> None:
+        self.insert_snapshot()
+        with (
+            patch("app.protected_gate_snapshot._exchange_open_orders", side_effect=AssertionError("exchange should not be called")),
+            patch("app.protected_equity_snapshot.get_live_broker", side_effect=AssertionError("broker should not be called")),
+        ):
+            response = TestClient(app).get("/api/protected-full-auto-live/v1/start-readiness")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["source"], "CACHED_READINESS_ONLY")
+        self.assertTrue(body["start_api_expected_nonblocking"])
+        self.assertTrue(body["heartbeat_first_worker_enabled"])
+        self.assertTrue(body["bootstrap_heartbeat_only_enabled"])
+        self.assertFalse(body["orders_requested"])
+        self.assertFalse(body["orders_cancelled"])
+
     def test_critical_refresh_does_not_call_optional_diagnostics(self) -> None:
         self.create_epoch()
         self.insert_equity_snapshot()

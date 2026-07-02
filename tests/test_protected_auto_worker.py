@@ -15,6 +15,7 @@ from app.protected_auto_worker import (
     protected_auto_safe_stop,
     protected_auto_status,
     protected_auto_tick_async,
+    run_protected_bootstrap_heartbeat,
     run_protected_auto_startup_recovery,
     run_protected_auto_startup_recovery_async,
     start_protected_auto_daemon,
@@ -78,6 +79,47 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         notifications = database.load_protected_auto_notifications()
         self.assertEqual(notifications[0]["event_type"], "PROTECTED_AUTO_STARTED")
         self.assertEqual(notifications[0]["delivery_status"], "DB_ONLY")
+
+    def test_start_protected_daemon_returns_without_heavy_status(self) -> None:
+        with patch("app.protected_auto_worker.protected_auto_status", side_effect=AssertionError("heavy status should not be called")):
+            result = start_protected_auto_daemon(
+                exchange="bithumb",
+                symbols=["BTC", "ETH"],
+                amount_krw=6000,
+                scan_interval_seconds=60,
+                max_holding_minutes=10,
+                max_position_trades=1,
+                current_epoch=current_epoch(),
+                gate={"protected_full_auto_live_allowed": True},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["protected_auto"]["protected_worker_status"], "RUNNING")
+        self.assertEqual(result["protected_auto"]["protected_auto_runtime_status"], "RUNNING")
+
+    def test_bootstrap_heartbeat_is_lightweight(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+
+        with (
+            patch("app.protected_auto_worker._current_epoch_with_exchange_equity", side_effect=AssertionError("exchange should not be called")),
+            patch("app.protected_auto_worker._position_scope", side_effect=AssertionError("position scope should not be called")),
+            patch("app.protected_auto_worker._active_protected_job", side_effect=AssertionError("active job should not be called")),
+        ):
+            result = run_protected_bootstrap_heartbeat()
+
+        state = load_protected_auto_state()
+        self.assertEqual(result["protected_worker_status"], "RUNNING")
+        self.assertEqual(state["last_scan_result"]["result"], "BOOTSTRAP_HEARTBEAT_ONLY")
+        self.assertTrue(state["last_tick_finished_at_utc"])
 
     def test_status_marks_missing_heartbeat_as_stale(self) -> None:
         start_protected_auto_daemon(
@@ -283,6 +325,30 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
         ]
         self.assertEqual(len(after), len(before))
 
+    def test_first_worker_tick_is_bootstrap_heartbeat_only(self) -> None:
+        start_protected_auto_daemon(
+            exchange="bithumb",
+            symbols=["BTC"],
+            amount_krw=6000,
+            scan_interval_seconds=60,
+            max_holding_minutes=10,
+            max_position_trades=1,
+            current_epoch=current_epoch(),
+            gate={"protected_full_auto_live_allowed": True},
+        )
+
+        with (
+            patch("app.protected_auto_worker._current_epoch_with_exchange_equity", side_effect=AssertionError("first tick should not scan")),
+            patch("app.protected_auto_worker._position_scope", side_effect=AssertionError("first tick should not classify positions")),
+            patch("app.protected_auto_worker._active_protected_job", side_effect=AssertionError("first tick should not inspect active jobs")),
+        ):
+            result = asyncio.run(protected_auto_tick_async())
+
+        state = load_protected_auto_state()
+        self.assertEqual(result["protected_worker_status"], "RUNNING")
+        self.assertEqual(state["last_scan_result"]["result"], "BOOTSTRAP_HEARTBEAT_ONLY")
+        self.assertTrue(state["last_heartbeat_at_utc"])
+
     def test_worker_tick_records_heartbeat_before_exchange_timeout(self) -> None:
         start_protected_auto_daemon(
             exchange="bithumb",
@@ -304,6 +370,7 @@ class ProtectedAutoWorkerTests(unittest.TestCase):
             patch("app.protected_auto_worker._current_epoch_with_exchange_equity", side_effect=slow_epoch),
             patch("app.protected_auto_worker._position_scope", return_value={"protected_open_position_count": 0, "legacy_open_position_count": 5}),
         ):
+            run_protected_bootstrap_heartbeat()
             asyncio.run(protected_auto_tick_async())
 
         status = protected_auto_status()
