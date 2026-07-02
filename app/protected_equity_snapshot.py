@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
+
 from app.controlled_auto_live import protected_position_scope_status
 from app.database import insert_protected_equity_snapshot, load_protected_equity_snapshot
 from app.live_broker import get_live_broker
@@ -78,14 +80,49 @@ async def _ticker_prices(exchange: str, markets: list[str]) -> dict[str, float]:
         return {}
     broker = get_live_broker(exchange)
     base_url = str(getattr(getattr(broker, "config", None), "base_url", "") or "").rstrip("/")
-    tickers = await fetch_tickers(markets, base_url=base_url)
     prices: dict[str, float] = {}
+    try:
+        tickers = await fetch_tickers(markets, base_url=base_url)
+    except Exception:
+        tickers = []
     for item in tickers:
         market = str(item.get("market") or "")
         price = _float(item.get("trade_price") or item.get("close_price"))
         if market and price > 0:
             prices[market] = price
+    missing = [market for market in markets if market not in prices]
+    for market in missing:
+        try:
+            tickers = await fetch_tickers([market], base_url=base_url)
+        except Exception:
+            tickers = []
+        for item in tickers:
+            price = _float(item.get("trade_price") or item.get("close_price"))
+            if price > 0:
+                prices[market] = price
+                break
+        if market not in prices and exchange == "bithumb":
+            legacy_price = await _legacy_bithumb_ticker_price(base_url, market)
+            if legacy_price > 0:
+                prices[market] = legacy_price
     return prices
+
+
+async def _legacy_bithumb_ticker_price(base_url: str, market: str) -> float:
+    symbol = str(market or "").split("-")[-1].upper()
+    if not symbol:
+        return 0.0
+    try:
+        async with httpx.AsyncClient(timeout=max(EQUITY_TICKER_TIMEOUT_SECONDS, 0.1)) as client:
+            response = await client.get(f"{base_url.rstrip('/')}/public/ticker/{symbol}_KRW")
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return 0.0
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        return 0.0
+    return _float(data.get("closing_price") or data.get("trade_price"))
 
 
 async def _refresh_impl(exchange: str) -> dict:
