@@ -52,6 +52,7 @@ REQUIRED_SCHEMA_TABLES = [
     "resolved_safety_events",
     "protected_auto_runtime",
     "protected_auto_notifications",
+    "protected_auto_safety_snapshots",
     "notification_logs",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
@@ -1083,6 +1084,42 @@ def init_db() -> None:
                 created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS protected_auto_safety_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id TEXT NOT NULL UNIQUE,
+                exchange TEXT NOT NULL DEFAULT 'bithumb',
+                created_at_utc TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                broker_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                emergency_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                exchange_open_order_count INTEGER NOT NULL DEFAULT 0,
+                db_open_order_count INTEGER NOT NULL DEFAULT 0,
+                accounting_pending_count INTEGER NOT NULL DEFAULT 0,
+                accounting_failed_count INTEGER NOT NULL DEFAULT 0,
+                current_epoch_id TEXT,
+                current_epoch_sanity_passed INTEGER NOT NULL DEFAULT 0,
+                current_epoch_trust_level TEXT NOT NULL DEFAULT 'LOW',
+                equity_diff_rate REAL,
+                protected_open_position_count INTEGER NOT NULL DEFAULT 0,
+                legacy_open_position_count INTEGER NOT NULL DEFAULT 0,
+                protected_empty_slot_count INTEGER NOT NULL DEFAULT 0,
+                gate_allowed INTEGER NOT NULL DEFAULT 0,
+                gate_blockers_json TEXT NOT NULL DEFAULT '[]',
+                gate_warnings_json TEXT NOT NULL DEFAULT '[]',
+                refresh_duration_ms INTEGER NOT NULL DEFAULT 0,
+                refresh_status TEXT NOT NULL DEFAULT 'FAILED',
+                refresh_error TEXT NOT NULL DEFAULT '',
+                server_load_guard_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                refresh_in_progress INTEGER NOT NULL DEFAULT 0,
+                last_refresh_duration_ms INTEGER NOT NULL DEFAULT 0,
+                consecutive_refresh_failures INTEGER NOT NULL DEFAULT 0,
+                current_epoch_json TEXT NOT NULL DEFAULT '{}',
+                smoke_preflight_json TEXT NOT NULL DEFAULT '{}',
+                controlled_gate_json TEXT NOT NULL DEFAULT '{}',
+                open_order_audit_json TEXT NOT NULL DEFAULT '{}',
+                server_resource_snapshot_json TEXT NOT NULL DEFAULT '{}'
+            );
+
             CREATE TABLE IF NOT EXISTS notification_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
@@ -1610,6 +1647,12 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_notification_logs_dedupe
             ON notification_logs(event_dedupe_key, dedupe_status, status, created_at_utc)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_protected_auto_safety_snapshots_latest
+            ON protected_auto_safety_snapshots(exchange, created_at_utc DESC, id DESC)
             """
         )
         conn.execute(
@@ -3807,6 +3850,147 @@ def load_live_recovery_events(limit: int = 100) -> list[dict]:
         item["payload"] = json.loads(item.pop("payload_json") or "{}")
         events.append(item)
     return events
+
+
+def _decode_safety_snapshot_row(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    for key in (
+        "gate_blockers",
+        "gate_warnings",
+        "current_epoch",
+        "smoke_preflight",
+        "controlled_gate",
+        "open_order_audit",
+        "server_resource_snapshot",
+    ):
+        raw_key = f"{key}_json"
+        if raw_key not in item:
+            continue
+        try:
+            fallback: Any = [] if key in {"gate_blockers", "gate_warnings"} else {}
+            item[key] = json.loads(item.pop(raw_key) or "")
+        except Exception:
+            item[key] = [] if key in {"gate_blockers", "gate_warnings"} else {}
+    for key in ("current_epoch_sanity_passed", "gate_allowed", "refresh_in_progress"):
+        if key in item:
+            item[key] = bool(item[key])
+    return item
+
+
+def insert_protected_auto_safety_snapshot(snapshot: dict) -> dict:
+    now = _utc_now()
+    snapshot_id = str(snapshot.get("snapshot_id") or f"safety-{uuid.uuid4().hex[:12]}")
+    payload = {
+        "snapshot_id": snapshot_id,
+        "exchange": str(snapshot.get("exchange") or "bithumb"),
+        "created_at_utc": str(snapshot.get("created_at_utc") or now),
+        "expires_at_utc": str(snapshot.get("expires_at_utc") or now),
+        "broker_status": str(snapshot.get("broker_status") or "UNKNOWN"),
+        "emergency_status": str(snapshot.get("emergency_status") or "UNKNOWN"),
+        "exchange_open_order_count": int(snapshot.get("exchange_open_order_count") or 0),
+        "db_open_order_count": int(snapshot.get("db_open_order_count") or 0),
+        "accounting_pending_count": int(snapshot.get("accounting_pending_count") or 0),
+        "accounting_failed_count": int(snapshot.get("accounting_failed_count") or 0),
+        "current_epoch_id": snapshot.get("current_epoch_id"),
+        "current_epoch_sanity_passed": 1 if snapshot.get("current_epoch_sanity_passed") else 0,
+        "current_epoch_trust_level": str(snapshot.get("current_epoch_trust_level") or "LOW"),
+        "equity_diff_rate": snapshot.get("equity_diff_rate"),
+        "protected_open_position_count": int(snapshot.get("protected_open_position_count") or 0),
+        "legacy_open_position_count": int(snapshot.get("legacy_open_position_count") or 0),
+        "protected_empty_slot_count": int(snapshot.get("protected_empty_slot_count") or 0),
+        "gate_allowed": 1 if snapshot.get("gate_allowed") else 0,
+        "gate_blockers": snapshot.get("gate_blockers") or [],
+        "gate_warnings": snapshot.get("gate_warnings") or [],
+        "refresh_duration_ms": int(snapshot.get("refresh_duration_ms") or 0),
+        "refresh_status": str(snapshot.get("refresh_status") or "FAILED").upper(),
+        "refresh_error": str(snapshot.get("refresh_error") or ""),
+        "server_load_guard_status": str(snapshot.get("server_load_guard_status") or "UNKNOWN"),
+        "refresh_in_progress": 1 if snapshot.get("refresh_in_progress") else 0,
+        "last_refresh_duration_ms": int(snapshot.get("last_refresh_duration_ms") or snapshot.get("refresh_duration_ms") or 0),
+        "consecutive_refresh_failures": int(snapshot.get("consecutive_refresh_failures") or 0),
+        "current_epoch": snapshot.get("current_epoch") or {},
+        "smoke_preflight": snapshot.get("smoke_preflight") or {},
+        "controlled_gate": snapshot.get("controlled_gate") or {},
+        "open_order_audit": snapshot.get("open_order_audit") or {},
+        "server_resource_snapshot": snapshot.get("server_resource_snapshot") or {},
+    }
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO protected_auto_safety_snapshots (
+                snapshot_id, exchange, created_at_utc, expires_at_utc,
+                broker_status, emergency_status, exchange_open_order_count,
+                db_open_order_count, accounting_pending_count, accounting_failed_count,
+                current_epoch_id, current_epoch_sanity_passed, current_epoch_trust_level,
+                equity_diff_rate, protected_open_position_count, legacy_open_position_count,
+                protected_empty_slot_count, gate_allowed, gate_blockers_json,
+                gate_warnings_json, refresh_duration_ms, refresh_status, refresh_error,
+                server_load_guard_status, refresh_in_progress, last_refresh_duration_ms,
+                consecutive_refresh_failures, current_epoch_json, smoke_preflight_json,
+                controlled_gate_json, open_order_audit_json, server_resource_snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_id) DO NOTHING
+            """,
+            (
+                payload["snapshot_id"],
+                payload["exchange"],
+                payload["created_at_utc"],
+                payload["expires_at_utc"],
+                payload["broker_status"],
+                payload["emergency_status"],
+                payload["exchange_open_order_count"],
+                payload["db_open_order_count"],
+                payload["accounting_pending_count"],
+                payload["accounting_failed_count"],
+                payload["current_epoch_id"],
+                payload["current_epoch_sanity_passed"],
+                payload["current_epoch_trust_level"],
+                payload["equity_diff_rate"],
+                payload["protected_open_position_count"],
+                payload["legacy_open_position_count"],
+                payload["protected_empty_slot_count"],
+                payload["gate_allowed"],
+                json.dumps(payload["gate_blockers"], ensure_ascii=False, default=str),
+                json.dumps(payload["gate_warnings"], ensure_ascii=False, default=str),
+                payload["refresh_duration_ms"],
+                payload["refresh_status"],
+                payload["refresh_error"],
+                payload["server_load_guard_status"],
+                payload["refresh_in_progress"],
+                payload["last_refresh_duration_ms"],
+                payload["consecutive_refresh_failures"],
+                json.dumps(payload["current_epoch"], ensure_ascii=False, default=str),
+                json.dumps(payload["smoke_preflight"], ensure_ascii=False, default=str),
+                json.dumps(payload["controlled_gate"], ensure_ascii=False, default=str),
+                json.dumps(payload["open_order_audit"], ensure_ascii=False, default=str),
+                json.dumps(payload["server_resource_snapshot"], ensure_ascii=False, default=str),
+            ),
+        )
+    latest = load_protected_auto_safety_snapshot(snapshot_id=snapshot_id)
+    return latest or {**payload, "id": None}
+
+
+def load_protected_auto_safety_snapshot(*, snapshot_id: str | None = None, exchange: str = "bithumb") -> dict | None:
+    with get_connection() as conn:
+        if snapshot_id:
+            row = conn.execute(
+                "SELECT * FROM protected_auto_safety_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM protected_auto_safety_snapshots
+                WHERE exchange = ?
+                ORDER BY created_at_utc DESC, id DESC
+                LIMIT 1
+                """,
+                (exchange,),
+            ).fetchone()
+    return _decode_safety_snapshot_row(row)
 
 
 def insert_protected_auto_notification(event: dict) -> dict:

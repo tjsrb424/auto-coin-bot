@@ -176,6 +176,10 @@ from app.protected_auto_worker import (
     run_protected_auto_tick,
     start_protected_auto_daemon,
 )
+from app.protected_gate_snapshot import (
+    load_cached_protected_gate_snapshot,
+    refresh_protected_gate_safety_snapshot,
+)
 from app.notifications import notification_config_status, send_discord_notification
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
 from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
@@ -239,7 +243,9 @@ def _configure_runtime_logging() -> None:
     root.addHandler(handler)
 
 
-def _parse_utc(value: str) -> datetime:
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
     normalized = value.replace(" ", "T")
     if normalized.endswith("Z"):
         normalized = normalized[:-1] + "+00:00"
@@ -438,6 +444,7 @@ def _runtime_status_payload(request: Request) -> dict:
         runtime_status = "OFF"
     lock = load_runtime_lock(RUNTIME_LOCK_ID)
     protected = protected_auto_status()
+    gate_snapshot = load_cached_protected_gate_snapshot(str(protected.get("exchange") or strategy.get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb")))
     notification_logs = load_notification_logs(limit=1)
     notification_config = notification_config_status()
     live_config = LiveTradingConfig.for_exchange(strategy.get("exchange") or os.getenv("AUTO_ALLOWED_EXCHANGE", "bithumb"))
@@ -463,6 +470,10 @@ def _runtime_status_payload(request: Request) -> dict:
         "runtime_owner": lock.get("runtime_owner") if lock else None,
         "runtime_lock": lock,
         "protected_auto": protected,
+        "protected_gate_safety_snapshot": gate_snapshot.get("snapshot"),
+        "protected_gate_status": gate_snapshot.get("gate_status"),
+        "protected_gate_allowed": gate_snapshot.get("gate_allowed"),
+        "protected_gate_refresh_in_progress": gate_snapshot.get("refresh_in_progress"),
         "protected_auto_runtime_status": protected.get("protected_auto_runtime_status"),
         "protected_worker_status": protected.get("protected_worker_status"),
         "protected_session_status": protected.get("protected_session_status"),
@@ -845,6 +856,12 @@ class ProtectedFullAutoLiveV1StartRequest(BaseModel):
     max_holding_minutes: int = Field(10, ge=10, le=30)
     max_position_trades: int = Field(1, ge=1, le=1)
     confirmation: str = ""
+
+
+class ProtectedGateRefreshRequest(BaseModel):
+    exchange: str = Field("bithumb", pattern=r"^(bithumb)$")
+    amount_krw: float = Field(6000, gt=0, le=6000)
+    force: bool = False
 
 
 class ResolvedSafetyEventRequest(BaseModel):
@@ -3624,37 +3641,64 @@ async def protected_full_auto_live_v1_resolve_duplicate_client_order(payload: Re
     }
 
 
+@app.post("/api/protected-full-auto-live/v1/gate/refresh")
+async def protected_full_auto_live_v1_gate_refresh(payload: ProtectedGateRefreshRequest | None = None) -> dict:
+    request_payload = payload or ProtectedGateRefreshRequest()
+    result = await refresh_protected_gate_safety_snapshot(
+        exchange=request_payload.exchange,
+        amount_krw=request_payload.amount_krw,
+        force=request_payload.force,
+    )
+    return {
+        **result,
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "orders_requested": False,
+        "orders_cancelled": False,
+    }
+
+
+@app.get("/api/protected-full-auto-live/v1/gate/status")
+async def protected_full_auto_live_v1_gate_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    return {
+        **load_cached_protected_gate_snapshot(exchange),
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "source": "CACHED_SAFETY_SNAPSHOT_ONLY",
+    }
+
+
 @app.post("/api/protected-full-auto-live/v1/start")
 async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1StartRequest) -> dict:
-    asset = await _asset_reconciliation_from_exchange(payload.exchange, None, days=1, persist_exchange_ledger=False)
-    current_epoch = build_current_epoch_diagnostics(
-        exchange=payload.exchange,
-        current_equity=asset.get("current_equity_from_exchange"),
-    )
-    open_order_audit = await _build_smoke_open_order_audit(payload.exchange, current_epoch, "BTC")
-    smoke_preflight = build_smoke_test_preflight(
-        exchange=payload.exchange,
-        symbol="BTC",
-        strategy_name="protected_full_auto_live_v1",
-        amount_krw=payload.amount_krw,
-        current_epoch=current_epoch,
-        open_order_audit=open_order_audit,
-    )
-    gate = controlled_auto_live_gate(current_epoch, smoke_preflight, exchange=payload.exchange)
+    cached_gate = load_cached_protected_gate_snapshot(payload.exchange)
+    snapshot = cached_gate.get("snapshot") or {}
+    current_epoch = snapshot.get("current_epoch") or {}
+    gate = snapshot.get("controlled_gate") or {}
+    gate_status = str(cached_gate.get("gate_status") or "GATE_REFRESH_REQUIRED")
+    if gate_status in {"GATE_REFRESH_REQUIRED", "GATE_SNAPSHOT_STALE"}:
+        return {
+            "ok": False,
+            "status": "GATE_REFRESH_REQUIRED",
+            "message": "Protected full auto live v1 requires a fresh cached safety snapshot before start.",
+            "required_action": "POST /api/protected-full-auto-live/v1/gate/refresh",
+            "snapshot_gate_status": gate_status,
+            "safety_snapshot": snapshot or None,
+            "gate_status": cached_gate,
+        }
     if payload.confirmation != PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE:
         return {
             "ok": False,
             "status": "ABORTED",
             "message": "Protected full auto live v1 confirmation phrase is required.",
             "required_confirmation": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+            "safety_snapshot": snapshot,
             "current_epoch": current_epoch,
             "controlled_auto_live_gate": gate,
         }
-    if not gate.get("protected_full_auto_live_allowed"):
+    if not cached_gate.get("gate_allowed") or not gate.get("protected_full_auto_live_allowed"):
         return {
             "ok": False,
             "status": "ABORTED",
             "message": "Protected full auto live v1 gate is blocked.",
+            "safety_snapshot": snapshot,
             "current_epoch": current_epoch,
             "controlled_auto_live_gate": gate,
         }
@@ -3673,6 +3717,7 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
         **daemon,
         "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
         "required_confirmation": PROTECTED_FULL_AUTO_CONFIRMATION_PHRASE,
+        "safety_snapshot": snapshot,
         "current_epoch": current_epoch,
         "controlled_auto_live_gate": gate,
         "protected_session_baseline_preview": gate.get("protected_session_baseline_preview"),

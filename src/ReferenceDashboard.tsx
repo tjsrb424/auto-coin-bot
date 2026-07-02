@@ -344,6 +344,10 @@ type RuntimeStatus = {
   protected_last_tick_at_utc?: string | null;
   protected_next_scan_at_utc?: string | null;
   protected_lock_expires_at_utc?: string | null;
+  protected_gate_safety_snapshot?: Record<string, any> | null;
+  protected_gate_status?: string;
+  protected_gate_allowed?: boolean;
+  protected_gate_refresh_in_progress?: boolean;
   protected_last_alert?: Record<string, any> | null;
   notification_config?: Record<string, any> | null;
   last_notification?: Record<string, any> | null;
@@ -4113,6 +4117,10 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
     ?? 0;
   const protectedRuntimeStatus = String(data.runtimeStatus?.protected_auto_runtime_status ?? protectedDaemon?.protected_auto_runtime_status ?? protectedSessionStatus?.status ?? "STOPPED");
   const protectedWorkerStatus = String(data.runtimeStatus?.protected_worker_status ?? protectedDaemon?.protected_worker_status ?? "STOPPED");
+  const protectedGateSnapshot = data.runtimeStatus?.protected_gate_safety_snapshot ?? {};
+  const protectedCachedGateStatus = data.runtimeStatus?.protected_gate_status ?? (protectedGateSnapshot?.is_fresh ? (protectedGateSnapshot?.gate_allowed ? "GATE_ALLOWED" : "GATE_BLOCKED") : "GATE_REFRESH_REQUIRED");
+  const protectedGateBlockers = protectedGateSnapshot?.gate_blockers ?? [];
+  const protectedGateWarnings = protectedGateSnapshot?.gate_warnings ?? [];
   const protectedLastAlert = protectedDaemon?.last_alert ?? data.runtimeStatus?.protected_last_alert ?? protectedDaemon?.recent_notifications?.[0] ?? null;
   const protectedLastAlertValue = protectedLastAlert?.event_type ?? "CLEAR";
   const protectedLastAlertDetail = protectedLastAlert
@@ -4303,6 +4311,30 @@ function AutoOperationsStrip({ data }: { data: DashboardData }) {
         ? "오늘 전체 손실 한도는 이미 초과했습니다."
         : "검증 손실 제외 session baseline ready",
       tone: protectedWarnings.length ? "amber" : "green"
+    },
+    {
+      label: "Protected Gate",
+      value: String(protectedCachedGateStatus),
+      detail: `snapshot ${protectedGateSnapshot?.snapshot_id ?? "-"} - fresh ${protectedGateSnapshot?.is_fresh ? "YES" : "NO"}`,
+      tone: protectedCachedGateStatus === "GATE_ALLOWED" ? "green" : (protectedCachedGateStatus === "GATE_BLOCKED" ? "red" : "amber")
+    },
+    {
+      label: "Gate Refresh",
+      value: String(protectedGateSnapshot?.refresh_status ?? "MISSING"),
+      detail: `${protectedGateSnapshot?.refresh_duration_ms ?? 0}ms - ${protectedGateSnapshot?.created_at_utc ?? "-"}`,
+      tone: protectedGateSnapshot?.refresh_status === "SUCCESS" ? "green" : (protectedGateSnapshot?.refresh_status === "TIMEOUT" || protectedGateSnapshot?.refresh_status === "FAILED" ? "red" : "amber")
+    },
+    {
+      label: "Gate Blockers",
+      value: String(protectedGateBlockers.length),
+      detail: protectedGateBlockers.slice(0, 2).map((item: any) => item.code).join(" / ") || "cached gate clear",
+      tone: protectedGateBlockers.length ? "red" : "green"
+    },
+    {
+      label: "Gate Warnings",
+      value: String(protectedGateWarnings.length),
+      detail: protectedGateWarnings.slice(0, 2).map((item: any) => item.code).join(" / ") || protectedGateSnapshot?.server_load_guard_status || "OK",
+      tone: protectedGateWarnings.length ? "amber" : "cyan"
     },
     {
       label: "Protected Auto Status",
