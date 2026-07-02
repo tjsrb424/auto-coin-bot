@@ -671,7 +671,7 @@ def protected_auto_safe_stop(reason: str, *, failed: bool = False) -> dict:
         payload={"reason": reason, "worker_status": worker_status},
     )
     _notify_stop_events(state, reason, worker_status, failed)
-    return protected_auto_status()
+    return _startup_recovery_status(state=state)
 
 
 async def protected_auto_safe_stop_async(reason: str, *, failed: bool = False) -> dict:
@@ -701,7 +701,7 @@ async def protected_auto_safe_stop_async(reason: str, *, failed: bool = False) -
         payload={"reason": reason, "worker_status": worker_status},
     )
     _notify_stop_events(state, reason, worker_status, failed)
-    return protected_auto_status()
+    return _startup_recovery_status(state=state)
 
 
 def _hard_stop_reasons(exchange: str, current_epoch: dict | None = None) -> list[str]:
