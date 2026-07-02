@@ -568,7 +568,7 @@ def _startup_recovery_status(state: dict | None = None, lock: dict | None = None
 
 
 def protected_auto_status() -> dict:
-    state = _sync_latest_report_into_state(load_protected_auto_state())
+    state = load_protected_auto_state()
     session_status = str(state.get("session_status") or "STOPPED").upper()
     worker_status = str(state.get("worker_status") or "STOPPED").upper()
     if session_status in {"STOPPED", "FAILED"} and worker_status in {"STOPPED", "FAILED"}:
@@ -593,6 +593,7 @@ def protected_auto_status() -> dict:
             "max_open_positions": PROTECTED_MAX_OPEN_POSITIONS,
             "session_loss_limit_krw": PROTECTED_SESSION_LOSS_LIMIT_KRW,
         }
+    state = _sync_latest_report_into_state(state)
     stale = _is_stale(state)
     active = _active_protected_job()
     active_signal_by_timeframe = (active or {}).get("latest_signal_by_timeframe") or {}
