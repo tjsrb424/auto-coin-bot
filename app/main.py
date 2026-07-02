@@ -3765,7 +3765,7 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
 
 @app.get("/api/protected-full-auto-live/v1/status")
 async def protected_full_auto_live_v1_status() -> dict:
-    return {"ok": True, "protected_auto": protected_auto_status()}
+    return {"ok": True, "protected_auto": _lightweight_protected_auto_health()}
 
 
 @app.get("/api/protected-full-auto-live/v1/notifications")
