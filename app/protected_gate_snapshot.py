@@ -333,7 +333,8 @@ def _refresh_worker_entry(exchange: str, amount_krw: float, queue: multiprocessi
 
 
 def _refresh_impl_subprocess(exchange: str, amount_krw: float, timeout_seconds: float) -> dict:
-    ctx = multiprocessing.get_context("spawn")
+    start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    ctx = multiprocessing.get_context(start_method)
     queue: multiprocessing.Queue = ctx.Queue(maxsize=1)
     process = ctx.Process(target=_refresh_worker_entry, args=(exchange, amount_krw, queue), daemon=True)
     process.start()
