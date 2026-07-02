@@ -21,6 +21,7 @@ from app.database import (
 )
 from app.live_broker import LiveTradingConfig, get_live_broker, is_emergency_stopped
 from app.live_smoke_test import _current_equity
+from app.protected_equity_snapshot import load_cached_protected_equity_snapshot, refresh_protected_equity_snapshot
 
 SNAPSHOT_TTL_SECONDS = int(os.getenv("PROTECTED_GATE_SNAPSHOT_TTL_SECONDS", "60"))
 EXCHANGE_OPEN_ORDER_TIMEOUT_SECONDS = float(os.getenv("PROTECTED_GATE_OPEN_ORDER_TIMEOUT_SECONDS", "3"))
@@ -424,26 +425,17 @@ def _current_epoch_accounting_counts(exchange: str, started_at_utc: str) -> dict
     return {"pending": int(pending or 0), "failed": int(failed or 0)}
 
 
-def _latest_successful_equity_snapshot(exchange: str) -> dict | None:
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM protected_auto_safety_snapshots
-            WHERE exchange = ?
-              AND refresh_status = 'SUCCESS'
-              AND current_epoch_sanity_passed = 1
-            ORDER BY created_at_utc DESC, id DESC
-            LIMIT 1
-            """,
-            (exchange,),
-        ).fetchone()
-    if not row:
-        return None
-    return dict(row)
+async def _fresh_or_refresh_equity_snapshot(exchange: str) -> dict | None:
+    cached = load_cached_protected_equity_snapshot(exchange)
+    if cached.get("equity_snapshot_fresh"):
+        return cached.get("snapshot")
+    refreshed = await refresh_protected_equity_snapshot(exchange=exchange)
+    if refreshed.get("equity_snapshot_fresh") and str(refreshed.get("status") or "").upper() == "SUCCESS":
+        return refreshed.get("snapshot")
+    return None
 
 
-def _lightweight_epoch_sanity(exchange: str, accounting_counts: dict, latest_successful_snapshot: dict | None) -> dict:
+def _lightweight_epoch_sanity(exchange: str, accounting_counts: dict, equity_snapshot: dict | None) -> dict:
     epoch = load_current_accounting_epoch(exchange)
     if not epoch:
         return {
@@ -470,9 +462,10 @@ def _lightweight_epoch_sanity(exchange: str, accounting_counts: dict, latest_suc
         blockers.append(_blocker("CURRENT_EPOCH_ACCOUNTING_PENDING", pending))
     if failed:
         blockers.append(_blocker("CURRENT_EPOCH_ACCOUNTING_FAILED", failed))
-    equity_snapshot_status = "LAST_SUCCESSFUL" if latest_successful_snapshot else "MISSING"
-    if latest_successful_snapshot is None:
+    equity_snapshot_status = "FRESH" if equity_snapshot else "MISSING"
+    if equity_snapshot is None:
         blockers.append(_blocker("EQUITY_SNAPSHOT_UNAVAILABLE"))
+    current_equity = equity_snapshot.get("total_equity_krw") if equity_snapshot else None
     return {
         "current_epoch_exists": True,
         "current_epoch_id": epoch.get("epoch_id"),
@@ -480,9 +473,9 @@ def _lightweight_epoch_sanity(exchange: str, accounting_counts: dict, latest_suc
         "current_epoch_status": status,
         "current_epoch_trust_level": trust,
         "current_epoch_starting_equity": epoch.get("starting_exchange_equity"),
-        "current_epoch_current_equity": None,
+        "current_epoch_current_equity": current_equity,
         "current_epoch_equity_diff": None,
-        "current_epoch_equity_diff_rate": latest_successful_snapshot.get("equity_diff_rate") if latest_successful_snapshot else None,
+        "current_epoch_equity_diff_rate": None,
         "current_epoch_accounting_pending_count": pending,
         "current_epoch_accounting_failed_count": failed,
         "current_epoch_sanity_passed": not blockers,
@@ -491,7 +484,7 @@ def _lightweight_epoch_sanity(exchange: str, accounting_counts: dict, latest_suc
         "cost_basis_policy": epoch.get("cost_basis_policy"),
         "legacy_history_isolated": bool(epoch.get("legacy_history_isolated")),
         "equity_snapshot_status": equity_snapshot_status,
-        "equity_snapshot_id": latest_successful_snapshot.get("snapshot_id") if latest_successful_snapshot else None,
+        "equity_snapshot_id": equity_snapshot.get("equity_snapshot_id") if equity_snapshot else None,
     }
 
 
@@ -730,7 +723,7 @@ async def refresh_protected_gate_critical_snapshot(
     db_open_order_count = 0
     scope: dict = {}
     current_epoch: dict = {}
-    latest_successful_snapshot: dict | None = None
+    equity_snapshot: dict | None = None
 
     def build_snapshot() -> dict:
         slowest_step, timeout_step = _step_summary(timings)
@@ -856,11 +849,16 @@ async def refresh_protected_gate_critical_snapshot(
             _record_refresh_notification("SAFETY_SNAPSHOT_REFRESH_TIMEOUT", snapshot, refresh_error)
             return _critical_refresh_response(snapshot, ok=False)
 
-        latest_successful_snapshot = _timed_sync_step(timings, "equity_snapshot_check", lambda: _latest_successful_equity_snapshot(exchange))
+        equity_snapshot = await _timed_async_step(
+            timings,
+            "equity_snapshot_check",
+            lambda: _fresh_or_refresh_equity_snapshot(exchange),
+            timeout_seconds=_remaining_critical_budget_seconds(started),
+        )
         current_epoch = _timed_sync_step(
             timings,
             "current_epoch_sanity_check",
-            lambda: _lightweight_epoch_sanity(exchange, accounting_counts, latest_successful_snapshot),
+            lambda: _lightweight_epoch_sanity(exchange, accounting_counts, equity_snapshot),
         )
 
         def decide() -> bool:

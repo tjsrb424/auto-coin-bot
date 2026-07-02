@@ -12,6 +12,7 @@ from app import database
 from app.main import app
 from app.protected_auto_worker import start_protected_auto_daemon, protected_auto_status
 from app import protected_gate_snapshot as gate_snapshot
+from app import protected_equity_snapshot
 
 
 def current_epoch() -> dict:
@@ -91,6 +92,27 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
             }
         )
 
+    def insert_equity_snapshot(self, **overrides: object) -> dict:
+        payload = {
+            "equity_snapshot_id": "equity-test",
+            "exchange_name": "bithumb",
+            "created_at_utc": gate_snapshot.utc_now(),
+            "expires_at_utc": gate_snapshot._plus_seconds(60),
+            "cash_krw": 300_000,
+            "coin_valuation_krw": 0,
+            "total_equity_krw": 300_000,
+            "positions_count": 0,
+            "legacy_positions_count": 0,
+            "protected_positions_count": 0,
+            "valuation_symbols": [],
+            "valuation_source": "exchange_ticker",
+            "refresh_status": "SUCCESS",
+            "refresh_duration_ms": 10,
+            "error_message": "",
+        }
+        payload.update(overrides)
+        return database.insert_protected_equity_snapshot(payload)
+
     def test_start_gate_requires_refresh_when_snapshot_missing(self) -> None:
         with patch.dict("os.environ", {"APP_ENV": "development"}, clear=False):
             response = TestClient(app).post("/api/protected-full-auto-live/v1/start", json={"confirmation": ""})
@@ -147,7 +169,7 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
 
     def test_critical_refresh_does_not_call_optional_diagnostics(self) -> None:
         self.create_epoch()
-        self.insert_snapshot(snapshot_id="equity-ok")
+        self.insert_equity_snapshot()
 
         async def open_orders(exchange: str, markets: list[str], *, broker=None) -> dict:
             return {"status": "SUCCESS", "orders": [], "errors": [], "markets": markets}
@@ -171,7 +193,7 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
 
     def test_critical_open_order_check_targets_btc_eth_and_db_unresolved_only(self) -> None:
         self.create_epoch()
-        self.insert_snapshot(snapshot_id="equity-ok")
+        self.insert_equity_snapshot()
         markets_seen: list[str] = []
         with database.get_connection() as conn:
             conn.execute(
@@ -202,7 +224,7 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
 
     def test_critical_exchange_open_order_timeout_records_timeout_step(self) -> None:
         self.create_epoch()
-        self.insert_snapshot(snapshot_id="equity-ok")
+        self.insert_equity_snapshot()
 
         async def slow_open_orders(exchange: str, markets: list[str], *, broker=None) -> dict:
             await asyncio.sleep(0.1)
@@ -223,6 +245,7 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
 
     def test_optional_diagnostics_timeout_does_not_block_critical_start_gate(self) -> None:
         self.create_epoch()
+        self.insert_equity_snapshot()
         self.insert_snapshot(snapshot_id="equity-ok", created_at_utc="2026-07-01T00:00:00Z")
         self.insert_snapshot(
             snapshot_id="latest-timeout",
@@ -243,6 +266,128 @@ class ProtectedGateSnapshotTests(unittest.TestCase):
 
         self.assertTrue(result["protected_start_allowed"])
         self.assertEqual(result["snapshot"]["optional_diagnostics_status"], "TIMEOUT")
+
+    def test_missing_equity_snapshot_blocks_critical_gate(self) -> None:
+        self.create_epoch()
+
+        async def open_orders(exchange: str, markets: list[str], *, broker=None) -> dict:
+            return {"status": "SUCCESS", "orders": [], "errors": []}
+
+        with (
+            patch("app.protected_gate_snapshot._broker_status", return_value={"broker_status": "READY", "emergency_status": "OFF"}),
+            patch("app.protected_gate_snapshot._exchange_open_orders_for_markets", side_effect=open_orders),
+            patch("app.protected_gate_snapshot.refresh_protected_equity_snapshot", return_value={"ok": False, "status": "TIMEOUT", "equity_snapshot_fresh": False, "snapshot": None}),
+        ):
+            result = asyncio.run(gate_snapshot.refresh_protected_gate_critical_snapshot(exchange="bithumb", force=True))
+
+        self.assertFalse(result["protected_start_allowed"])
+        blockers = [item["code"] for item in result["snapshot"]["protected_start_blockers"]]
+        self.assertIn("EQUITY_SNAPSHOT_UNAVAILABLE", blockers)
+
+    def test_equity_snapshot_refresh_success_removes_equity_blocker(self) -> None:
+        self.create_epoch()
+
+        async def open_orders(exchange: str, markets: list[str], *, broker=None) -> dict:
+            return {"status": "SUCCESS", "orders": [], "errors": []}
+
+        async def refresh_equity(exchange: str) -> dict:
+            snapshot = self.insert_equity_snapshot(equity_snapshot_id="equity-refreshed")
+            snapshot["is_fresh"] = True
+            return {"ok": True, "status": "SUCCESS", "equity_snapshot_fresh": True, "snapshot": snapshot}
+
+        with (
+            patch("app.protected_gate_snapshot._broker_status", return_value={"broker_status": "READY", "emergency_status": "OFF"}),
+            patch("app.protected_gate_snapshot._exchange_open_orders_for_markets", side_effect=open_orders),
+            patch("app.protected_gate_snapshot.refresh_protected_equity_snapshot", side_effect=refresh_equity),
+        ):
+            result = asyncio.run(gate_snapshot.refresh_protected_gate_critical_snapshot(exchange="bithumb", force=True))
+
+        self.assertTrue(result["protected_start_allowed"])
+        blockers = [item["code"] for item in result["snapshot"]["protected_start_blockers"]]
+        self.assertNotIn("EQUITY_SNAPSHOT_UNAVAILABLE", blockers)
+
+    def test_stale_equity_snapshot_refresh_timeout_blocks_gate(self) -> None:
+        self.create_epoch()
+        self.insert_equity_snapshot(expires_at_utc="2026-07-01T00:00:00Z")
+
+        async def open_orders(exchange: str, markets: list[str], *, broker=None) -> dict:
+            return {"status": "SUCCESS", "orders": [], "errors": []}
+
+        with (
+            patch("app.protected_gate_snapshot._broker_status", return_value={"broker_status": "READY", "emergency_status": "OFF"}),
+            patch("app.protected_gate_snapshot._exchange_open_orders_for_markets", side_effect=open_orders),
+            patch("app.protected_gate_snapshot.refresh_protected_equity_snapshot", return_value={"ok": False, "status": "TIMEOUT", "equity_snapshot_fresh": False, "snapshot": None}),
+        ):
+            result = asyncio.run(gate_snapshot.refresh_protected_gate_critical_snapshot(exchange="bithumb", force=True))
+
+        self.assertFalse(result["protected_start_allowed"])
+        blockers = [item["code"] for item in result["snapshot"]["protected_start_blockers"]]
+        self.assertIn("EQUITY_SNAPSHOT_UNAVAILABLE", blockers)
+
+    def test_equity_refresh_timeout_does_not_stop_backend_path(self) -> None:
+        class SlowBroker:
+            async def get_balances(self) -> dict:
+                await asyncio.sleep(0.1)
+                return {"by_currency": {"KRW": {"balance": 1, "locked": 0}}}
+
+        with (
+            patch("app.protected_equity_snapshot.get_live_broker", return_value=SlowBroker()),
+            patch("app.protected_equity_snapshot.EQUITY_BALANCE_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = asyncio.run(protected_equity_snapshot.refresh_protected_equity_snapshot(exchange="bithumb"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "TIMEOUT")
+        self.assertFalse(result["equity_snapshot_fresh"])
+
+    def test_equity_status_endpoint_uses_cached_snapshot_only(self) -> None:
+        self.insert_equity_snapshot()
+        with patch("app.protected_equity_snapshot.get_live_broker", side_effect=AssertionError("exchange should not be called")):
+            response = TestClient(app).get("/api/protected-full-auto-live/v1/equity/status")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["source"], "CACHED_EQUITY_SNAPSHOT_ONLY")
+        self.assertTrue(body["equity_snapshot_fresh"])
+
+    def test_lightweight_equity_includes_legacy_holdings_without_protected_slot_block(self) -> None:
+        with database.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_positions (
+                    session_id, exchange, market, candidate_strategy_id, strategy_name, status,
+                    entry_price, entry_volume, entry_amount_krw, current_price, unrealized_pnl,
+                    realized_pnl, stop_loss_price, take_profit_price, opened_at, created_at, updated_at
+                ) VALUES (1, 'bithumb', 'KRW-RE', 1, 'legacy', 'OPEN',
+                    5, 10, 50, 5, 0, 0, 0, 0, '2026-07-01T00:00:00Z',
+                    '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')
+                """
+            )
+
+        class Broker:
+            async def get_balances(self) -> dict:
+                return {
+                    "by_currency": {
+                        "KRW": {"balance": 100_000, "locked": 0},
+                        "RE": {"balance": 10, "locked": 0},
+                    },
+                    "fetched_at": gate_snapshot.utc_now(),
+                }
+
+        async def tickers(markets: list[str], *, base_url: str = "") -> list[dict]:
+            return [{"market": "KRW-RE", "trade_price": 5}]
+
+        with (
+            patch("app.protected_equity_snapshot.get_live_broker", return_value=Broker()),
+            patch("app.protected_equity_snapshot.fetch_tickers", side_effect=tickers),
+        ):
+            result = asyncio.run(protected_equity_snapshot.refresh_protected_equity_snapshot(exchange="bithumb"))
+
+        snapshot = result["snapshot"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(snapshot["total_equity_krw"], 100_050)
+        self.assertEqual(snapshot["legacy_positions_count"], 1)
+        self.assertEqual(snapshot["protected_positions_count"], 0)
 
     def test_stale_critical_snapshot_blocks_start(self) -> None:
         self.insert_snapshot(

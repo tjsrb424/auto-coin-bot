@@ -53,6 +53,7 @@ REQUIRED_SCHEMA_TABLES = [
     "protected_auto_runtime",
     "protected_auto_notifications",
     "protected_auto_safety_snapshots",
+    "protected_equity_snapshots",
     "notification_logs",
 ]
 LIVE_ORDER_EVENT_REQUEST_ID_FILTER = """
@@ -1132,6 +1133,26 @@ def init_db() -> None:
                 server_resource_snapshot_json TEXT NOT NULL DEFAULT '{}'
             );
 
+            CREATE TABLE IF NOT EXISTS protected_equity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                equity_snapshot_id TEXT NOT NULL UNIQUE,
+                exchange_name TEXT NOT NULL DEFAULT 'bithumb',
+                created_at_utc TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                cash_krw REAL NOT NULL DEFAULT 0,
+                coin_valuation_krw REAL NOT NULL DEFAULT 0,
+                total_equity_krw REAL NOT NULL DEFAULT 0,
+                positions_count INTEGER NOT NULL DEFAULT 0,
+                legacy_positions_count INTEGER NOT NULL DEFAULT 0,
+                protected_positions_count INTEGER NOT NULL DEFAULT 0,
+                valuation_symbols_json TEXT NOT NULL DEFAULT '[]',
+                valuation_source TEXT NOT NULL DEFAULT 'exchange_ticker',
+                refresh_status TEXT NOT NULL DEFAULT 'FAILED',
+                refresh_duration_ms INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT NOT NULL DEFAULT '',
+                raw_snapshot_json TEXT NOT NULL DEFAULT '{}'
+            );
+
             CREATE TABLE IF NOT EXISTS notification_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
@@ -1677,6 +1698,12 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_protected_auto_safety_snapshots_latest
             ON protected_auto_safety_snapshots(exchange, created_at_utc DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_protected_equity_snapshots_latest
+            ON protected_equity_snapshots(exchange_name, created_at_utc DESC, id DESC)
             """
         )
         conn.execute(
@@ -4065,6 +4092,102 @@ def load_protected_auto_safety_snapshot(*, snapshot_id: str | None = None, excha
                 (exchange,),
             ).fetchone()
     return _decode_safety_snapshot_row(row)
+
+
+def _decode_protected_equity_snapshot_row(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    for key in ("valuation_symbols", "raw_snapshot"):
+        raw_key = f"{key}_json"
+        if raw_key not in item:
+            continue
+        try:
+            item[key] = json.loads(item.pop(raw_key) or ("[]" if key == "valuation_symbols" else "{}"))
+        except Exception:
+            item[key] = [] if key == "valuation_symbols" else {}
+    return item
+
+
+def insert_protected_equity_snapshot(snapshot: dict) -> dict:
+    now = _utc_now()
+    snapshot_id = str(snapshot.get("equity_snapshot_id") or f"equity-{uuid.uuid4().hex[:12]}")
+    payload = {
+        "equity_snapshot_id": snapshot_id,
+        "exchange_name": str(snapshot.get("exchange_name") or snapshot.get("exchange") or "bithumb"),
+        "created_at_utc": str(snapshot.get("created_at_utc") or now),
+        "expires_at_utc": str(snapshot.get("expires_at_utc") or now),
+        "cash_krw": float(snapshot.get("cash_krw") or 0.0),
+        "coin_valuation_krw": float(snapshot.get("coin_valuation_krw") or 0.0),
+        "total_equity_krw": float(snapshot.get("total_equity_krw") or 0.0),
+        "positions_count": int(snapshot.get("positions_count") or 0),
+        "legacy_positions_count": int(snapshot.get("legacy_positions_count") or 0),
+        "protected_positions_count": int(snapshot.get("protected_positions_count") or 0),
+        "valuation_symbols": snapshot.get("valuation_symbols") or [],
+        "valuation_source": str(snapshot.get("valuation_source") or "exchange_ticker"),
+        "refresh_status": str(snapshot.get("refresh_status") or "FAILED").upper(),
+        "refresh_duration_ms": int(snapshot.get("refresh_duration_ms") or 0),
+        "error_message": str(snapshot.get("error_message") or ""),
+        "raw_snapshot": snapshot.get("raw_snapshot") or {},
+    }
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO protected_equity_snapshots (
+                equity_snapshot_id, exchange_name, created_at_utc, expires_at_utc,
+                cash_krw, coin_valuation_krw, total_equity_krw, positions_count,
+                legacy_positions_count, protected_positions_count, valuation_symbols_json,
+                valuation_source, refresh_status, refresh_duration_ms, error_message,
+                raw_snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(equity_snapshot_id) DO NOTHING
+            """,
+            (
+                payload["equity_snapshot_id"],
+                payload["exchange_name"],
+                payload["created_at_utc"],
+                payload["expires_at_utc"],
+                payload["cash_krw"],
+                payload["coin_valuation_krw"],
+                payload["total_equity_krw"],
+                payload["positions_count"],
+                payload["legacy_positions_count"],
+                payload["protected_positions_count"],
+                json.dumps(payload["valuation_symbols"], ensure_ascii=False, default=str),
+                payload["valuation_source"],
+                payload["refresh_status"],
+                payload["refresh_duration_ms"],
+                payload["error_message"],
+                json.dumps(payload["raw_snapshot"], ensure_ascii=False, default=str),
+            ),
+        )
+    latest = load_protected_equity_snapshot(equity_snapshot_id=snapshot_id)
+    return latest or {**payload, "id": None}
+
+
+def load_protected_equity_snapshot(
+    *,
+    equity_snapshot_id: str | None = None,
+    exchange: str = "bithumb",
+) -> dict | None:
+    with get_connection() as conn:
+        if equity_snapshot_id:
+            row = conn.execute(
+                "SELECT * FROM protected_equity_snapshots WHERE equity_snapshot_id = ?",
+                (equity_snapshot_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM protected_equity_snapshots
+                WHERE exchange_name = ?
+                ORDER BY created_at_utc DESC, id DESC
+                LIMIT 1
+                """,
+                (exchange,),
+            ).fetchone()
+    return _decode_protected_equity_snapshot_row(row)
 
 
 def insert_protected_auto_notification(event: dict) -> dict:

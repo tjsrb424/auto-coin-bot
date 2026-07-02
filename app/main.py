@@ -181,6 +181,7 @@ from app.protected_gate_snapshot import (
     refresh_protected_gate_critical_snapshot,
     refresh_protected_gate_safety_snapshot,
 )
+from app.protected_equity_snapshot import load_cached_protected_equity_snapshot, refresh_protected_equity_snapshot
 from app.notifications import notification_config_status, send_discord_notification
 from app.limited_auto_live import CONFIRMATION_PHRASE as LIMITED_AUTO_LIVE_CONFIRMATION, run_one_shot_limited_auto_live
 from app.live_smoke_test import CONFIRMATION_PHRASE as SMOKE_TEST_CONFIRMATION, run_one_shot_live_smoke_test
@@ -3679,6 +3680,27 @@ async def protected_full_auto_live_v1_gate_status(exchange: str = Query("bithumb
         **load_cached_protected_gate_snapshot(exchange),
         "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
         "source": "CACHED_SAFETY_SNAPSHOT_ONLY",
+    }
+
+
+@app.post("/api/protected-full-auto-live/v1/equity/refresh")
+async def protected_full_auto_live_v1_equity_refresh(payload: ProtectedGateRefreshRequest | None = None) -> dict:
+    request_payload = payload or ProtectedGateRefreshRequest()
+    result = await refresh_protected_equity_snapshot(exchange=request_payload.exchange)
+    return {
+        **result,
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "orders_requested": False,
+        "orders_cancelled": False,
+    }
+
+
+@app.get("/api/protected-full-auto-live/v1/equity/status")
+async def protected_full_auto_live_v1_equity_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
+    return {
+        **load_cached_protected_equity_snapshot(exchange),
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "source": "CACHED_EQUITY_SNAPSHOT_ONLY",
     }
 
 
