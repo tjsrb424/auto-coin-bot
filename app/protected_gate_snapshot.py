@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import os
 import threading
 import time
@@ -35,6 +36,13 @@ _REFRESH_LOCK = threading.Lock()
 
 class SafetySnapshotTimeout(TimeoutError):
     pass
+
+
+def _use_subprocess_refresh() -> bool:
+    configured = os.getenv("PROTECTED_GATE_USE_SUBPROCESS_REFRESH", "").strip().lower()
+    if configured:
+        return configured in {"1", "true", "yes", "on"}
+    return os.getenv("APP_ENV", "development").strip().lower() == "production"
 
 
 def utc_now() -> str:
@@ -316,6 +324,51 @@ async def _refresh_impl(exchange: str, *, amount_krw: float) -> dict:
     }
 
 
+def _refresh_worker_entry(exchange: str, amount_krw: float, queue: multiprocessing.Queue) -> None:
+    try:
+        result = asyncio.run(_refresh_impl(exchange, amount_krw=amount_krw))
+        queue.put(("ok", result))
+    except BaseException as exc:
+        queue.put(("error", {"type": exc.__class__.__name__, "message": str(exc)[:240]}))
+
+
+def _refresh_impl_subprocess(exchange: str, amount_krw: float, timeout_seconds: float) -> dict:
+    ctx = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=_refresh_worker_entry, args=(exchange, amount_krw, queue), daemon=True)
+    process.start()
+    process.join(max(timeout_seconds, 0.1))
+    if process.is_alive():
+        process.terminate()
+        process.join(2)
+        if process.is_alive():
+            try:
+                process.kill()
+            except AttributeError:
+                pass
+            process.join(1)
+        raise SafetySnapshotTimeout("Safety snapshot subprocess timed out.")
+    if queue.empty():
+        raise RuntimeError(f"Safety snapshot subprocess exited without result: {process.exitcode}")
+    status, payload = queue.get()
+    if status == "ok":
+        return payload
+    error_type = str((payload or {}).get("type") or "RuntimeError")
+    message = str((payload or {}).get("message") or "Safety snapshot subprocess failed.")
+    if error_type in {"SafetySnapshotTimeout", "TimeoutError"}:
+        raise SafetySnapshotTimeout(message)
+    raise RuntimeError(f"{error_type}:{message}")
+
+
+async def _refresh_details(exchange: str, amount_krw: float) -> dict:
+    if _use_subprocess_refresh():
+        return await asyncio.to_thread(_refresh_impl_subprocess, exchange, amount_krw, REFRESH_TIMEOUT_SECONDS)
+    return await asyncio.wait_for(
+        _refresh_impl(exchange, amount_krw=amount_krw),
+        timeout=max(REFRESH_TIMEOUT_SECONDS, 0.1),
+    )
+
+
 async def refresh_protected_gate_safety_snapshot(
     *,
     exchange: str = "bithumb",
@@ -347,10 +400,7 @@ async def refresh_protected_gate_safety_snapshot(
             )
             return {"ok": False, "status": "FAILED", "snapshot": _with_freshness(snapshot), "gate_allowed": False}
         try:
-            details = await asyncio.wait_for(
-                _refresh_impl(exchange, amount_krw=amount_krw),
-                timeout=max(REFRESH_TIMEOUT_SECONDS, 0.1),
-            )
+            details = await _refresh_details(exchange, amount_krw)
         except asyncio.TimeoutError as exc:
             snapshot = _failure_snapshot(
                 exchange=exchange,
