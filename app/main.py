@@ -178,6 +178,7 @@ from app.protected_auto_worker import (
 )
 from app.protected_gate_snapshot import (
     load_cached_protected_gate_snapshot,
+    refresh_protected_gate_critical_snapshot,
     refresh_protected_gate_safety_snapshot,
 )
 from app.notifications import notification_config_status, send_discord_notification
@@ -3657,6 +3658,21 @@ async def protected_full_auto_live_v1_gate_refresh(payload: ProtectedGateRefresh
     }
 
 
+@app.post("/api/protected-full-auto-live/v1/gate/refresh-critical")
+async def protected_full_auto_live_v1_gate_refresh_critical(payload: ProtectedGateRefreshRequest | None = None) -> dict:
+    request_payload = payload or ProtectedGateRefreshRequest()
+    result = await refresh_protected_gate_critical_snapshot(
+        exchange=request_payload.exchange,
+        force=request_payload.force,
+    )
+    return {
+        **result,
+        "mode": "PROTECTED_FULL_AUTO_LIVE_V1",
+        "orders_requested": False,
+        "orders_cancelled": False,
+    }
+
+
 @app.get("/api/protected-full-auto-live/v1/gate/status")
 async def protected_full_auto_live_v1_gate_status(exchange: str = Query("bithumb", pattern=r"^(bithumb)$")) -> dict:
     return {
@@ -3673,12 +3689,12 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
     current_epoch = snapshot.get("current_epoch") or {}
     gate = snapshot.get("controlled_gate") or {}
     gate_status = str(cached_gate.get("gate_status") or "GATE_REFRESH_REQUIRED")
-    if gate_status in {"GATE_REFRESH_REQUIRED", "GATE_SNAPSHOT_STALE"}:
+    if gate_status in {"GATE_REFRESH_REQUIRED", "GATE_SNAPSHOT_STALE", "CRITICAL_SNAPSHOT_STALE"}:
         return {
             "ok": False,
             "status": "GATE_REFRESH_REQUIRED",
             "message": "Protected full auto live v1 requires a fresh cached safety snapshot before start.",
-            "required_action": "POST /api/protected-full-auto-live/v1/gate/refresh",
+            "required_action": "POST /api/protected-full-auto-live/v1/gate/refresh-critical",
             "snapshot_gate_status": gate_status,
             "safety_snapshot": snapshot or None,
             "gate_status": cached_gate,
@@ -3693,7 +3709,7 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
             "current_epoch": current_epoch,
             "controlled_auto_live_gate": gate,
         }
-    if not cached_gate.get("gate_allowed") or not gate.get("protected_full_auto_live_allowed"):
+    if not cached_gate.get("protected_start_allowed") or not gate.get("protected_full_auto_live_allowed"):
         return {
             "ok": False,
             "status": "ABORTED",
@@ -3701,6 +3717,7 @@ async def protected_full_auto_live_v1_start(payload: ProtectedFullAutoLiveV1Star
             "safety_snapshot": snapshot,
             "current_epoch": current_epoch,
             "controlled_auto_live_gate": gate,
+            "protected_start_blockers": cached_gate.get("protected_start_blockers") or snapshot.get("protected_start_blockers") or [],
         }
     symbols = [symbol.upper() for symbol in payload.symbols if symbol.upper() in {"BTC", "ETH"}]
     daemon = start_protected_auto_daemon(

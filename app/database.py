@@ -1106,6 +1106,18 @@ def init_db() -> None:
                 gate_allowed INTEGER NOT NULL DEFAULT 0,
                 gate_blockers_json TEXT NOT NULL DEFAULT '[]',
                 gate_warnings_json TEXT NOT NULL DEFAULT '[]',
+                critical_gate_allowed INTEGER NOT NULL DEFAULT 0,
+                critical_gate_blockers_json TEXT NOT NULL DEFAULT '[]',
+                critical_gate_warnings_json TEXT NOT NULL DEFAULT '[]',
+                protected_start_allowed INTEGER NOT NULL DEFAULT 0,
+                protected_start_blockers_json TEXT NOT NULL DEFAULT '[]',
+                protected_start_warnings_json TEXT NOT NULL DEFAULT '[]',
+                optional_diagnostics_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                critical_refresh_duration_ms INTEGER NOT NULL DEFAULT 0,
+                critical_step_timings_json TEXT NOT NULL DEFAULT '[]',
+                slowest_step_json TEXT NOT NULL DEFAULT '{}',
+                timeout_step_json TEXT NOT NULL DEFAULT '{}',
+                refresh_error_detail TEXT NOT NULL DEFAULT '',
                 refresh_duration_ms INTEGER NOT NULL DEFAULT 0,
                 refresh_status TEXT NOT NULL DEFAULT 'FAILED',
                 refresh_error TEXT NOT NULL DEFAULT '',
@@ -1560,6 +1572,18 @@ def init_db() -> None:
         _ensure_column(conn, "notification_logs", "dedupe_status", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "notification_logs", "rate_limit_until_utc", "TEXT")
         _ensure_column(conn, "notification_logs", "related_position_id", "TEXT")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "critical_gate_allowed", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "critical_gate_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "critical_gate_warnings_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "protected_start_allowed", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "protected_start_blockers_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "protected_start_warnings_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "optional_diagnostics_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "critical_refresh_duration_ms", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "critical_step_timings_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "slowest_step_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "timeout_step_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "protected_auto_safety_snapshots", "refresh_error_detail", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "protected_auto_runtime", "last_tick_started_at_utc", "TEXT")
         _ensure_column(conn, "protected_auto_runtime", "last_tick_finished_at_utc", "TEXT")
         _ensure_column(conn, "protected_auto_runtime", "last_scan_error", "TEXT NOT NULL DEFAULT ''")
@@ -3859,6 +3883,13 @@ def _decode_safety_snapshot_row(row: sqlite3.Row | dict | None) -> dict | None:
     for key in (
         "gate_blockers",
         "gate_warnings",
+        "critical_gate_blockers",
+        "critical_gate_warnings",
+        "protected_start_blockers",
+        "protected_start_warnings",
+        "critical_step_timings",
+        "slowest_step",
+        "timeout_step",
         "current_epoch",
         "smoke_preflight",
         "controlled_gate",
@@ -3870,10 +3901,24 @@ def _decode_safety_snapshot_row(row: sqlite3.Row | dict | None) -> dict | None:
             continue
         try:
             fallback: Any = [] if key in {"gate_blockers", "gate_warnings"} else {}
+            if key in {
+                "critical_gate_blockers",
+                "critical_gate_warnings",
+                "protected_start_blockers",
+                "protected_start_warnings",
+                "critical_step_timings",
+            }:
+                fallback = []
             item[key] = json.loads(item.pop(raw_key) or "")
         except Exception:
-            item[key] = [] if key in {"gate_blockers", "gate_warnings"} else {}
-    for key in ("current_epoch_sanity_passed", "gate_allowed", "refresh_in_progress"):
+            item[key] = fallback
+    for key in (
+        "current_epoch_sanity_passed",
+        "gate_allowed",
+        "critical_gate_allowed",
+        "protected_start_allowed",
+        "refresh_in_progress",
+    ):
         if key in item:
             item[key] = bool(item[key])
     return item
@@ -3903,6 +3948,18 @@ def insert_protected_auto_safety_snapshot(snapshot: dict) -> dict:
         "gate_allowed": 1 if snapshot.get("gate_allowed") else 0,
         "gate_blockers": snapshot.get("gate_blockers") or [],
         "gate_warnings": snapshot.get("gate_warnings") or [],
+        "critical_gate_allowed": 1 if snapshot.get("critical_gate_allowed", snapshot.get("gate_allowed")) else 0,
+        "critical_gate_blockers": snapshot.get("critical_gate_blockers") or snapshot.get("gate_blockers") or [],
+        "critical_gate_warnings": snapshot.get("critical_gate_warnings") or snapshot.get("gate_warnings") or [],
+        "protected_start_allowed": 1 if snapshot.get("protected_start_allowed", snapshot.get("gate_allowed")) else 0,
+        "protected_start_blockers": snapshot.get("protected_start_blockers") or snapshot.get("gate_blockers") or [],
+        "protected_start_warnings": snapshot.get("protected_start_warnings") or snapshot.get("gate_warnings") or [],
+        "optional_diagnostics_status": str(snapshot.get("optional_diagnostics_status") or "UNKNOWN").upper(),
+        "critical_refresh_duration_ms": int(snapshot.get("critical_refresh_duration_ms") or snapshot.get("refresh_duration_ms") or 0),
+        "critical_step_timings": snapshot.get("critical_step_timings") or snapshot.get("refresh_step_timings") or [],
+        "slowest_step": snapshot.get("slowest_step") or {},
+        "timeout_step": snapshot.get("timeout_step") or {},
+        "refresh_error_detail": str(snapshot.get("refresh_error_detail") or snapshot.get("refresh_error") or ""),
         "refresh_duration_ms": int(snapshot.get("refresh_duration_ms") or 0),
         "refresh_status": str(snapshot.get("refresh_status") or "FAILED").upper(),
         "refresh_error": str(snapshot.get("refresh_error") or ""),
@@ -3926,11 +3983,16 @@ def insert_protected_auto_safety_snapshot(snapshot: dict) -> dict:
                 current_epoch_id, current_epoch_sanity_passed, current_epoch_trust_level,
                 equity_diff_rate, protected_open_position_count, legacy_open_position_count,
                 protected_empty_slot_count, gate_allowed, gate_blockers_json,
-                gate_warnings_json, refresh_duration_ms, refresh_status, refresh_error,
+                gate_warnings_json, critical_gate_allowed, critical_gate_blockers_json,
+                critical_gate_warnings_json, protected_start_allowed,
+                protected_start_blockers_json, protected_start_warnings_json,
+                optional_diagnostics_status, critical_refresh_duration_ms,
+                critical_step_timings_json, slowest_step_json, timeout_step_json,
+                refresh_error_detail, refresh_duration_ms, refresh_status, refresh_error,
                 server_load_guard_status, refresh_in_progress, last_refresh_duration_ms,
                 consecutive_refresh_failures, current_epoch_json, smoke_preflight_json,
                 controlled_gate_json, open_order_audit_json, server_resource_snapshot_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(snapshot_id) DO NOTHING
             """,
             (
@@ -3954,6 +4016,18 @@ def insert_protected_auto_safety_snapshot(snapshot: dict) -> dict:
                 payload["gate_allowed"],
                 json.dumps(payload["gate_blockers"], ensure_ascii=False, default=str),
                 json.dumps(payload["gate_warnings"], ensure_ascii=False, default=str),
+                payload["critical_gate_allowed"],
+                json.dumps(payload["critical_gate_blockers"], ensure_ascii=False, default=str),
+                json.dumps(payload["critical_gate_warnings"], ensure_ascii=False, default=str),
+                payload["protected_start_allowed"],
+                json.dumps(payload["protected_start_blockers"], ensure_ascii=False, default=str),
+                json.dumps(payload["protected_start_warnings"], ensure_ascii=False, default=str),
+                payload["optional_diagnostics_status"],
+                payload["critical_refresh_duration_ms"],
+                json.dumps(payload["critical_step_timings"], ensure_ascii=False, default=str),
+                json.dumps(payload["slowest_step"], ensure_ascii=False, default=str),
+                json.dumps(payload["timeout_step"], ensure_ascii=False, default=str),
+                payload["refresh_error_detail"],
                 payload["refresh_duration_ms"],
                 payload["refresh_status"],
                 payload["refresh_error"],
